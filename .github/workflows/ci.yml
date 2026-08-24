@@ -13,6 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # sqex-admin links libpcsc (via card-backend-pcsc) for YubiKey access.
+      # macOS has the PCSC framework built in; Linux CI needs the dev package.
+      - name: Install PC/SC
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -25,4 +30,4 @@ jobs:
         run: cargo test --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
