@@ -144,8 +144,11 @@ impl Command {
         })
     }
 
-    /// The domain-separated message actually passed to Ed25519.
-    fn signing_input(&self) -> Vec<u8> {
+    /// The domain-separated bytes actually passed to Ed25519. Public so a
+    /// fallible hardware signer (a YubiKey) can obtain them, sign out of band,
+    /// and assemble a [`SignedCommand`] directly — the infallible [`Signer`]
+    /// trait does not fit a card that can fail or need a PIN.
+    pub fn signing_bytes(&self) -> Vec<u8> {
         let body = self.encode();
         let mut msg = Vec::with_capacity(SIG_CONTEXT.len() + body.len());
         msg.extend_from_slice(SIG_CONTEXT);
@@ -199,7 +202,7 @@ impl SignedCommand {
     /// claimed admin identity; [`verify`](Self::verify) confirms the signature
     /// matches it.
     pub fn create(command: Command, signer: &dyn Signer) -> Self {
-        let signature = signer.sign(&command.signing_input());
+        let signature = signer.sign(&command.signing_bytes());
         SignedCommand {
             command,
             admin: PubKey::new(signer.public()),
@@ -220,7 +223,7 @@ impl SignedCommand {
         }
         let vk = self.admin.verifying_key()?;
         let sig = Signature::from_bytes(&self.signature);
-        vk.verify(&self.command.signing_input(), &sig)
+        vk.verify(&self.command.signing_bytes(), &sig)
             .map_err(|_| Error::BadSignature)
     }
 

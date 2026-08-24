@@ -1,16 +1,25 @@
 //! sqex-admin — the desktop administrator app.
 //!
-//! Phase 5 (see the plan): an eframe/egui GUI that connects to sqexd over
-//! HTTP/3 and signs admin commands with a YubiKey (OpenPGP Ed25519
-//! Authentication key via INTERNAL AUTHENTICATE, yielding a raw Ed25519
-//! signature verifiable by the server). The command protocol it will speak is
-//! already defined and tested in `sqex-core`.
+//! Connects to sqexd over HTTP/3 and signs whitelist-management commands with a
+//! YubiKey (OpenPGP Ed25519 Authentication key). Admin authority is the command
+//! signature, verified against the server's config admin list; the connection's
+//! transport key is irrelevant. The command protocol lives in `sqex-core`; the
+//! YubiKey path is the one proven by `yubikey_spike`.
 
-fn main() {
-    eprintln!(
-        "sqex-admin {}: the desktop admin app is not built yet.\n\
-         The signed-command protocol it will use lives in sqex-core; the server \
-         (sqexd) implements the matching endpoints.",
-        sqex_core::VERSION
-    );
+mod app;
+mod card;
+mod client;
+mod worker;
+
+fn main() -> eframe::Result<()> {
+    let _ = env_logger::try_init();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([720.0, 640.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "sqex admin",
+        options,
+        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+    )
 }

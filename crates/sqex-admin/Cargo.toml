@@ -3,26 +3,34 @@ name = "sqex-admin"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Desktop admin app for sqex (YubiKey-signed commands) — under construction"
+description = "Desktop admin app for sqex: YubiKey-signed commands over HTTP/3"
 
 [[bin]]
 name = "sqex-admin"
 path = "src/main.rs"
 
-# Spike: prove the YubiKey OpenPGP Authentication key produces a raw Ed25519
-# signature over arbitrary bytes, verifiable by ed25519-dalek. See Phase 5.
+# Spike / provisioning tool: prove and set up the YubiKey OpenPGP auth key.
 [[bin]]
 name = "yubikey_spike"
 path = "src/bin/yubikey_spike.rs"
 
 [dependencies]
 sqex-core = { workspace = true }
+squic = { workspace = true }
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 bs58 = { workspace = true }
+serde_json = { workspace = true }
 openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
 secrecy = "0.10"
 rpassword = "7"
 env_logger = "0.11"
 sha1 = "0.10"
+eframe = "0.29"
