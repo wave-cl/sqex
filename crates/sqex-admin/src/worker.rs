@@ -36,8 +36,33 @@ pub enum Msg {
 
 struct Session {
     client: Client,
+    addr: SocketAddr,
     server: PubKey,
     admin: PubKey,
+}
+
+impl Session {
+    /// Rebuild the HTTP/3 connection (after an idle timeout or a server
+    /// restart), reusing the same address and pinned server key.
+    async fn reconnect(&mut self) -> Result<(), String> {
+        self.client = Client::connect(self.addr, self.server.as_bytes()).await?;
+        Ok(())
+    }
+}
+
+/// Whether an error looks like a dead/stale connection worth one reconnect.
+fn is_connection_error(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    [
+        "timeout",
+        "closed",
+        "connection",
+        "reset",
+        "h3",
+        "not connected",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle))
 }
 
 /// Spawn the worker thread. Returns the sender the UI uses to issue commands.
@@ -114,6 +139,7 @@ async fn connect(addr: &str, server_pub: &str) -> Result<Session, String> {
     let client = Client::connect(socket, server.as_bytes()).await?;
     Ok(Session {
         client,
+        addr: socket,
         server,
         admin,
     })
@@ -135,8 +161,25 @@ async fn fetch_status(client: &mut Client) -> Option<String> {
     ))
 }
 
-/// Fetch a challenge, sign the command with the card, POST it, return the JSON.
+/// Run an admin command, reconnecting once if the connection has gone stale
+/// (idle timeout, server restart). The card only signs after a live challenge,
+/// so a reconnect re-fetches a fresh nonce and re-signs — no double-apply.
 async fn run_admin(
+    sess: &mut Session,
+    action: Action,
+    pin: String,
+) -> Result<serde_json::Value, String> {
+    match run_admin_once(sess, action.clone(), pin.clone()).await {
+        Err(e) if is_connection_error(&e) => {
+            sess.reconnect().await?;
+            run_admin_once(sess, action, pin).await
+        }
+        other => other,
+    }
+}
+
+/// Fetch a challenge, sign the command with the card, POST it, return the JSON.
+async fn run_admin_once(
     sess: &mut Session,
     action: Action,
     pin: String,

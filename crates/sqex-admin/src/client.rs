@@ -20,6 +20,10 @@ impl Client {
             server_pub,
             SquicConfig {
                 alpn_protocols: vec![b"h3".to_vec()],
+                // Keep the connection alive across idle periods. The server's
+                // idle timeout is 60s; pinging well inside that stops an idle
+                // admin session from dying between actions.
+                keep_alive: Some(std::time::Duration::from_secs(15)),
                 ..Default::default()
             },
         )
