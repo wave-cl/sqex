@@ -1,0 +1,15 @@
+[package]
+name = "sqex-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types and the signed admin-command protocol for sqex"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+bs58 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand_core = { workspace = true }

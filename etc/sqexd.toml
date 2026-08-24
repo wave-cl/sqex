@@ -1,0 +1,28 @@
+# sqex exchange server configuration.
+
+# Address to listen on: host:port, a bare IP (default port 5400), or a bare port.
+listen = "[::]:5400"
+
+# This server's identity — a file holding a hex Ed25519 seed. Created on first
+# run if absent (unless the path was given explicitly on the command line).
+key_file = "/etc/sqex/host_key"
+
+# Where the managed whitelist and audit log are snapshotted. Omit to run
+# memory-only (state is lost on restart).
+state_file = "/var/lib/sqex/sqex.state"
+
+# Administrators: base58 Ed25519 public keys permitted to issue signed admin
+# commands. For a YubiKey admin this is the card's OpenPGP Authentication
+# subkey. Change this list and send a `reload-admins` command, or restart.
+admins = [
+    # "Base58AdminKey1...",
+]
+
+# Keys the managed whitelist starts with on first run only. Once a state_file
+# exists, runtime changes win and this is ignored.
+seed_whitelist = [
+    # "Base58PeerKey1...",
+]
+
+# How long an issued challenge nonce stays valid, in seconds.
+challenge_ttl_secs = 30

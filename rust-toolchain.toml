@@ -1,0 +1,7 @@
+[toolchain]
+# Pin stable to a specific minor version so new clippy lints don't surprise CI
+# between commits. CI (dtolnay/rust-toolchain@stable) honors this file, so local
+# and CI run the same clippy. Bump deliberately: update the channel, run
+# `cargo clippy --all-targets -- -D warnings` locally, fix in the same commit.
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

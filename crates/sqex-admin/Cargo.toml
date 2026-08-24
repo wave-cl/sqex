@@ -1,0 +1,13 @@
+[package]
+name = "sqex-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Desktop admin app for sqex (YubiKey-signed commands) — under construction"
+
+[[bin]]
+name = "sqex-admin"
+path = "src/main.rs"
+
+[dependencies]
+sqex-core = { workspace = true }

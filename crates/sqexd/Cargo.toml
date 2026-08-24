@@ -1,0 +1,36 @@
+[package]
+name = "sqexd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The sqex exchange server: HTTP/3 over sQUIC with Ed25519 admin authorization"
+
+[[bin]]
+name = "sqexd"
+path = "src/main.rs"
+
+[dependencies]
+sqex-core = { workspace = true }
+squic = { workspace = true }
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+bs58 = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+futures = { workspace = true }
