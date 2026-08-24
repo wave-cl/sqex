@@ -28,9 +28,16 @@ pub enum Cmd {
 /// A result pushed back to the UI.
 pub enum Msg {
     Status(String),
-    Connected { admin_key: String },
-    Whitelist { enabled: bool, keys: Vec<String> },
+    Connected {
+        admin_key: String,
+    },
+    Whitelist {
+        enabled: bool,
+        keys: Vec<String>,
+    },
     Audit(Vec<String>),
+    /// The card is blinking, waiting for a physical touch to sign.
+    AwaitingTouch,
     Error(String),
 }
 
@@ -115,7 +122,7 @@ async fn run(
                     send(Msg::Error("not connected".into()));
                     continue;
                 };
-                match run_admin(sess, action.clone(), pin).await {
+                match run_admin(sess, action.clone(), pin, &send).await {
                     Ok(value) => dispatch_result(&action, value, &send),
                     Err(e) => send(Msg::Error(e)),
                 }
@@ -168,11 +175,12 @@ async fn run_admin(
     sess: &mut Session,
     action: Action,
     pin: String,
+    notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
-    match run_admin_once(sess, action.clone(), pin.clone()).await {
+    match run_admin_once(sess, action.clone(), pin.clone(), notify).await {
         Err(e) if is_connection_error(&e) => {
             sess.reconnect().await?;
-            run_admin_once(sess, action, pin).await
+            run_admin_once(sess, action, pin, notify).await
         }
         other => other,
     }
@@ -183,6 +191,7 @@ async fn run_admin_once(
     sess: &mut Session,
     action: Action,
     pin: String,
+    notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
     let (cs, nonce_bytes) = sess.client.get("/admin/challenge").await?;
     if cs != 200 || nonce_bytes.len() != 32 {
@@ -197,6 +206,10 @@ async fn run_admin_once(
     };
     let msg = command.signing_bytes();
 
+    // If the card's touch policy is on, INTERNAL AUTHENTICATE blocks until the
+    // key is tapped — tell the UI to prompt for it. Harmless when touch is off
+    // (the sign returns immediately and the next message clears the prompt).
+    notify(Msg::AwaitingTouch);
     let sig = tokio::task::spawn_blocking(move || card::sign(&pin, &msg))
         .await
         .map_err(|e| e.to_string())??;

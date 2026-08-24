@@ -29,6 +29,7 @@ pub struct App {
     audit: Vec<String>,
     new_key: String,
     log: Vec<String>,
+    awaiting_touch: bool,
 }
 
 impl App {
@@ -49,12 +50,19 @@ impl App {
             audit: Vec::new(),
             new_key: String::new(),
             log: Vec::new(),
+            awaiting_touch: false,
         }
     }
 
     fn drain_messages(&mut self) {
         while let Ok(msg) = self.msg_rx.try_recv() {
+            // Any message other than the touch prompt itself means the wait is
+            // over (the signature completed, failed, or produced a result).
+            if !matches!(msg, Msg::AwaitingTouch) {
+                self.awaiting_touch = false;
+            }
             match msg {
+                Msg::AwaitingTouch => self.awaiting_touch = true,
                 Msg::Status(s) => {
                     self.status = s.clone();
                     self.push_log(s);
@@ -144,6 +152,18 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.awaiting_touch {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0x33, 0x2b, 0x00))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xff, 0xd5, 0x4f),
+                            "👆  Touch your YubiKey to sign…",
+                        );
+                    });
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
                 ui.label("YubiKey user PIN");
                 ui.add(
