@@ -166,6 +166,37 @@ The stats line then carries `rtt p50` and `rtt p95`, counting both relay hops
 in each direction. `--rtt` is meaningless against another `call`, whose sequence
 numbers are its own.
 
+## Silence is free-ish (SIP-14)
+
+A speaker who is not talking stops transmitting. Measured on a live exchange,
+two seconds of speech followed by ten of silence:
+
+| | packets |
+|---|---|
+| `--no-dtx` (continuous) | 600 |
+| default | **157** |
+
+In a room that saving applies to every one of the N(N−1) streams, which is what
+makes eight people affordable.
+
+Getting this right needs more than "stop sending". A receiver seeing missing
+packets cannot tell a pause from loss, and a jitter buffer that guesses wrong
+asks the codec to conceal — which extrapolates from the last thing it heard, and
+so invents speech out of a silence nobody spoke. SIP-14 carries a media
+timestamp beside the packet sequence, so the two are distinguishable: a
+timestamp gap with no sequence gap is a pause, a sequence gap is loss. The
+`silent` and `concealed` counters on the stats line report which is happening.
+
+Two things Opus does that are worth knowing, both measured rather than
+documented: DTX takes about **ten frames to engage**, so short pauses save less
+than long ones; and it **refreshes its comfort noise** every few hundred
+milliseconds, so a settled pause is not literally one keepalive per second.
+
+`--no-dtx` restores continuous transmission. That is a **privacy** switch, not a
+quality one: with DTX, packet timing tells anyone watching — the exchange
+included — exactly when each person speaks. The content stays sealed; the
+pattern of the conversation does not.
+
 ## What the numbers mean
 
 ```
@@ -178,6 +209,8 @@ sent 412 · recv 410 · loss 0.5% · late 0 · dup 0 · concealed 2 · trimmed 0
   jitter buffer was too shallow for the path. Raise `--jitter`, at 20 ms of
   added delay per frame.
 - **concealed** is a slot Opus invented because the packet never came.
+- **silent** is a slot the speaker deliberately left empty (SIP-14). Never
+  concealed — that is the whole point of carrying a timestamp.
 - **trimmed** is a frame decoded but not played, to shed delay the buffer had
   accumulated. A fixed-depth buffer cannot drain a backlog on its own — frames
   arrive no faster than they are played — so a stall early in the call would
@@ -196,6 +229,7 @@ received audio was still a 440.0 Hz tone at the amplitude it left with.
 - `src/audio.rs` — devices, the tone generator, WAV in and out, and the 48 kHz
   requirement.
 - `src/room.rs` — SIP-13: the roster, proof checking, and a session per peer.
+- `src/media.rs` — SIP-14: the timestamp that tells a pause from a lost packet.
 - `src/mix.rs` — adding several people together without pumping.
 - `src/main.rs` — the rendezvous and the call loops.
 - `tests/voice_flow.rs` — a tone through a real `sqexd`, out the far side still

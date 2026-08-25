@@ -18,6 +18,7 @@ use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME};
 use sqexd::config::FileConfig;
 use sqex_voice::audio::{Rate, amplitude_at, tone_at};
 use sqex_voice::jitter::{FRAME_SAMPLES, Playout, SAMPLE_RATE};
+use sqex_voice::media;
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{Event, Membership};
 use sqnr::Client;
@@ -124,7 +125,8 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
             assert!(packet.len() <= MAX_DATAGRAM_FRAME);
             let seq = m.seq;
             for peer in m.room.peers.values() {
-                let sealed = peer.session.seal_datagram(seq, &packet).unwrap();
+                let body = media::Frame { timestamp: seq as u32, payload: packet.clone() }.encode();
+                let sealed = peer.session.seal_datagram(seq, &body).unwrap();
                 m.client
                     .send_datagram(
                         DatagramFrame {
@@ -155,11 +157,12 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
             let Some(peer) = m.room.peers.get_mut(&frame.session_id) else {
                 continue;
             };
-            let packet = peer
+            let plaintext = peer
                 .session
                 .open(frame.seq, &frame.ciphertext)
                 .expect("a room peer's frames open");
-            peer.jitter.push(frame.seq, packet);
+            let m = media::Frame::decode(&plaintext).expect("a media frame");
+            peer.jitter.push(frame.seq, m.timestamp, m.payload);
             got += 1;
         }
         assert_eq!(got, want, "{} did not hear everyone", m.identity);
@@ -178,6 +181,10 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
                 let decoded = match peer.jitter.pop() {
                     Playout::Frame(p) => peer.decoder.decode_float(&p, &mut pcm, false).is_ok(),
                     Playout::Conceal => peer.decoder.decode_float(&[], &mut pcm, false).is_ok(),
+                    Playout::Silence => {
+                        pcm.fill(0.0);
+                        true
+                    }
                     Playout::Idle => false,
                 };
                 if decoded {

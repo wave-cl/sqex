@@ -863,6 +863,53 @@ mod tests {
         );
     }
 
+    /// What Opus actually emits with discontinuous transmission on.
+    ///
+    /// Reports rather than asserts, like the carriage measurement in sqexd:
+    /// the numbers inform the design and should not gate CI.
+    /// `cargo test -p sqex-voice -- --ignored --nocapture dtx`
+    #[test]
+    #[ignore = "reports numbers; run explicitly"]
+    fn dtx_packet_sizes() {
+        let rate = Rate::DEFAULT;
+        let mut enc =
+            opus::Encoder::new(rate.hz(), opus::Channels::Mono, opus::Application::Voip).unwrap();
+        enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+        enc.set_dtx(true).unwrap();
+
+        let mut phase = 0.0f32;
+        let step = std::f32::consts::TAU * TONE_HZ / rate.hz() as f32;
+        let mut sizes = Vec::new();
+        for i in 0..200 {
+            let speaking = !(50..150).contains(&i);
+            let pcm: Vec<f32> = (0..rate.frame())
+                .map(|_| {
+                    let s = if speaking { phase.sin() * 0.5 } else { 0.0 };
+                    phase = (phase + step) % std::f32::consts::TAU;
+                    s
+                })
+                .collect();
+            sizes.push((i, enc.encode_vec_float(&pcm, 1024).unwrap().len()));
+        }
+        let of = |r: std::ops::Range<usize>| -> Vec<usize> {
+            sizes.iter().filter(|(i, _)| r.contains(i)).map(|(_, l)| *l).collect()
+        };
+        let speech = of(0..50);
+        // Skip the first ten silent frames: the encoder takes a moment to decide.
+        let silence = of(60..150);
+        let mean = |v: &[usize]| v.iter().sum::<usize>() / v.len();
+
+        println!("\n  Opus DTX, 20 ms frames at 24 kbit/s:");
+        println!("    speech  : mean {} bytes", mean(&speech));
+        println!("    silence : mean {} bytes", mean(&silence));
+        println!(
+            "    silent frames of <= 2 bytes: {}/{}",
+            silence.iter().filter(|l| **l <= 2).count(),
+            silence.len()
+        );
+        println!("    first 20 of the silent run: {:?}\n", &silence[..20]);
+    }
+
     #[test]
     fn a_rate_is_only_one_opus_will_accept() {
         assert_eq!(Rate::new(48_000).unwrap().frame(), 960);

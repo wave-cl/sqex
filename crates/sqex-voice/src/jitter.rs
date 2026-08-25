@@ -14,6 +14,15 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::media::classify;
+
+/// One arrived frame: the packet that carried it, and what it holds.
+struct Media {
+    /// SIP-12 packet sequence — counts packets, so a hole here is loss.
+    seq: u64,
+    packet: Vec<u8>,
+}
+
 /// Opus is happiest at 48 kHz and the transport does not care, so there is no
 /// reason to run anything else.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -29,6 +38,10 @@ pub enum Playout {
     Frame(Vec<u8>),
     /// The packet for this slot is not coming. Ask Opus to invent one.
     Conceal,
+    /// The sender deliberately said nothing here (SIP-14). **Never conceal
+    /// this** — concealment extrapolates from what was last heard, so it would
+    /// invent speech out of a silence nobody spoke.
+    Silence,
     /// Nothing is in flight, or the buffer is still filling. Play silence and
     /// do not advance — an idle line is not a lost packet.
     Idle,
@@ -44,6 +57,8 @@ pub struct Stats {
     pub duplicate: u64,
     /// Slots played from Opus's imagination rather than from a packet.
     pub concealed: u64,
+    /// Slots the sender chose not to fill (SIP-14 discontinuous transmission).
+    pub silent: u64,
     /// Times the buffer emptied and had to refill.
     pub underruns: u64,
     /// Frames thrown away to shed accumulated delay.
@@ -66,12 +81,22 @@ impl Stats {
 /// Holds arriving packets briefly so that reordering and variable delay come
 /// out the far side as an even cadence.
 pub struct Jitter {
-    frames: BTreeMap<u64, Vec<u8>>,
-    /// The sequence number the next tick will play.
+    /// Keyed by media timestamp — *where audio belongs in time* — not by
+    /// packet sequence. With SIP-14 the two differ: a sender that stops talking
+    /// stops sending, so the timestamp runs on while the sequence does not.
+    frames: BTreeMap<u64, Media>,
+    /// The media timestamp the next tick will play.
     cursor: u64,
-    /// Lowest and highest sequence numbers ever seen, for the loss estimate.
+    /// Lowest and highest *sequence* numbers seen, for the loss estimate.
     lowest: Option<u64>,
     highest: u64,
+    /// Sequence and timestamp of the last frame handed to playout, so a gap can
+    /// be split into loss and silence.
+    last_played: Option<(u64, u32)>,
+    /// Slots in the gap we are crossing that were lost, and slots that were
+    /// somebody not talking. Computed once on entering the gap.
+    conceal_run: u64,
+    silent_run: u64,
     /// How many frames to hold before starting to play.
     depth: u64,
     playing: bool,
@@ -85,6 +110,9 @@ impl Jitter {
             cursor: 0,
             lowest: None,
             highest: 0,
+            last_played: None,
+            conceal_run: 0,
+            silent_run: 0,
             depth,
             playing: false,
             stats: Stats::default(),
@@ -104,22 +132,25 @@ impl Jitter {
         }
     }
 
-    pub fn push(&mut self, seq: u64, packet: Vec<u8>) {
+    /// Take one arrived frame: its packet sequence number, its media timestamp,
+    /// and the codec packet.
+    pub fn push(&mut self, seq: u64, timestamp: u32, packet: Vec<u8>) {
         self.stats.received += 1;
         self.lowest = Some(self.lowest.map_or(seq, |l| l.min(seq)));
         self.highest = self.highest.max(seq);
 
+        let slot = u64::from(timestamp);
         // Before playing there is no cursor to be behind: the first slot is
-        // whatever the buffer's lowest sequence number turns out to be when
-        // playout starts, which need not be zero and need not be the first
-        // packet the peer sent.
-        if self.playing && seq < self.cursor {
+        // whatever the buffer's lowest timestamp turns out to be when playout
+        // starts, which need not be zero and need not be the first frame the
+        // peer produced.
+        if self.playing && slot < self.cursor {
             // Its slot has already been played and concealed. Nothing useful
             // left to do with it, and inserting it would play it out of order.
             self.stats.late += 1;
             return;
         }
-        if self.frames.insert(seq, packet).is_some() {
+        if self.frames.insert(slot, Media { seq, packet }).is_some() {
             self.stats.duplicate += 1;
         }
     }
@@ -150,10 +181,13 @@ impl Jitter {
         if !self.overfull() {
             return None;
         }
-        let packet = self.frames.remove(&self.cursor)?;
+        let media = self.frames.remove(&self.cursor)?;
+        self.last_played = Some((media.seq, self.cursor as u32));
         self.cursor += 1;
+        self.conceal_run = 0;
+        self.silent_run = 0;
         self.stats.trimmed += 1;
-        Some(packet)
+        Some(media.packet)
     }
 
     /// Decide what the next 20 ms of audio comes from, and advance.
@@ -168,9 +202,13 @@ impl Jitter {
             self.playing = true;
         }
 
-        if let Some(packet) = self.frames.remove(&self.cursor) {
+        if let Some(media) = self.frames.remove(&self.cursor) {
+            self.last_played = Some((media.seq, self.cursor as u32));
             self.cursor += 1;
-            return Playout::Frame(packet);
+            // The gap, if there was one, is behind us now.
+            self.conceal_run = 0;
+            self.silent_run = 0;
+            return Playout::Frame(media.packet);
         }
 
         if self.frames.is_empty() {
@@ -179,14 +217,39 @@ impl Jitter {
             // of silence, so stop and refill instead.
             self.stats.underruns += 1;
             self.playing = false;
+            self.conceal_run = 0;
+            self.silent_run = 0;
             return Playout::Idle;
         }
 
-        // Later frames are already waiting, so this one is genuinely missing
-        // rather than merely slow.
+        // An empty slot with something waiting further on. Work out *once*, on
+        // entering the gap, how much of it was lost and how much was somebody
+        // not talking — the answer needs the frame on the far side, which is
+        // why it cannot be decided when the gap is left behind.
+        if self.conceal_run == 0 && self.silent_run == 0 {
+            if let (Some(prev), Some((&ts, next))) = (self.last_played, self.frames.iter().next()) {
+                let gap = classify(prev, (next.seq, ts as u32));
+                self.conceal_run = gap.lost;
+                self.silent_run = gap.silent;
+            } else {
+                // Nothing has been played yet, so there is no gap to measure
+                // against — treat the slot as loss, as before.
+                self.conceal_run = 1;
+            }
+        }
+
         self.cursor += 1;
-        self.stats.concealed += 1;
-        Playout::Conceal
+        // Conceal first, then fall silent. Loss adjacent to real audio is where
+        // the codec's extrapolation is worth anything; deep inside a pause it
+        // would be inventing from nothing.
+        if self.conceal_run > 0 {
+            self.conceal_run -= 1;
+            self.stats.concealed += 1;
+            return Playout::Conceal;
+        }
+        self.silent_run -= 1;
+        self.stats.silent += 1;
+        Playout::Silence
     }
 }
 
@@ -243,7 +306,7 @@ mod tests {
     fn primed(depth: u64, from: u64) -> Jitter {
         let mut j = Jitter::new(depth);
         for i in 0..=depth {
-            j.push(from + i, packet(i as u8));
+            j.push(from + i, (from + i) as u32, packet(i as u8));
         }
         j
     }
@@ -252,19 +315,19 @@ mod tests {
     fn holds_until_the_buffer_has_filled() {
         let mut j = Jitter::new(3);
         for i in 0..3 {
-            j.push(i, packet(i as u8));
+            j.push(i, (i) as u32, packet(i as u8));
             assert_eq!(j.pop(), Playout::Idle, "should still be filling at {i}");
         }
-        j.push(3, packet(3));
+        j.push(3, 3, packet(3));
         assert_eq!(j.pop(), Playout::Frame(packet(0)));
     }
 
     #[test]
     fn plays_in_order_despite_arriving_out_of_it() {
         let mut j = Jitter::new(1);
-        j.push(1, packet(1));
-        j.push(0, packet(0));
-        j.push(2, packet(2));
+        j.push(1, 1, packet(1));
+        j.push(0, 0, packet(0));
+        j.push(2, 2, packet(2));
         assert_eq!(j.pop(), Playout::Frame(packet(0)));
         assert_eq!(j.pop(), Playout::Frame(packet(1)));
         assert_eq!(j.pop(), Playout::Frame(packet(2)));
@@ -274,7 +337,7 @@ mod tests {
     #[test]
     fn conceals_a_gap_that_later_frames_have_overtaken() {
         let mut j = primed(2, 0);
-        j.push(4, packet(4)); // 3 is missing
+        j.push(4, 4, packet(4)); // 3 is missing
         assert_eq!(j.pop(), Playout::Frame(packet(0)));
         assert_eq!(j.pop(), Playout::Frame(packet(1)));
         assert_eq!(j.pop(), Playout::Frame(packet(2)));
@@ -299,7 +362,7 @@ mod tests {
         let mut j = primed(1, 0);
         assert_eq!(j.pop(), Playout::Frame(packet(0)));
         assert_eq!(j.pop(), Playout::Frame(packet(1)));
-        j.push(0, packet(0));
+        j.push(0, 0, packet(0));
         assert_eq!(j.stats.late, 1);
         assert_eq!(j.depth_now(), 0, "it should not be queued for replay");
     }
@@ -314,9 +377,9 @@ mod tests {
     #[test]
     fn a_repeat_is_counted_and_not_played_twice() {
         let mut j = Jitter::new(1);
-        j.push(0, packet(0));
-        j.push(0, packet(0));
-        j.push(1, packet(1));
+        j.push(0, 0, packet(0));
+        j.push(0, 0, packet(0));
+        j.push(1, 1, packet(1));
         assert_eq!(j.stats.duplicate, 1);
         assert_eq!(j.pop(), Playout::Frame(packet(0)));
         assert_eq!(j.pop(), Playout::Frame(packet(1)));
@@ -328,7 +391,7 @@ mod tests {
         let mut j = Jitter::new(3);
         // A burst: the peer was not listening, then read everything at once.
         for i in 0..40 {
-            j.push(i, packet(i as u8));
+            j.push(i, (i) as u32, packet(i as u8));
         }
         assert!(matches!(j.pop(), Playout::Frame(_)), "starts playing");
         assert!(j.overfull(), "36 frames is not a jitter buffer, it is a delay");
@@ -350,18 +413,88 @@ mod tests {
     fn a_healthy_buffer_is_never_trimmed() {
         let mut j = primed(3, 0);
         for i in 4..40 {
-            j.push(i, packet(i as u8));
+            j.push(i, (i) as u32, packet(i as u8));
             assert!(j.trim().is_none(), "steady state should not shed frames");
             assert!(matches!(j.pop(), Playout::Frame(_)));
         }
         assert_eq!(j.stats.trimmed, 0);
     }
 
+    /// The whole point of SIP-14. A speaker who stops talking stops sending,
+    /// so the timestamp runs on while the sequence does not — and those slots
+    /// must be played as silence, never concealed. Concealment extrapolates
+    /// from what was last heard, so concealing here would put words in a
+    /// silent person's mouth.
+    #[test]
+    fn a_pause_in_speech_is_silence_and_is_never_concealed() {
+        let mut j = Jitter::new(1);
+        // Two frames of speech, then the speaker stops for a second: fifty
+        // slots pass and not one packet is lost.
+        j.push(0, 0, packet(0));
+        j.push(1, 1, packet(1));
+        j.push(2, 51, packet(2));
+
+        assert_eq!(j.pop(), Playout::Frame(packet(0)));
+        assert_eq!(j.pop(), Playout::Frame(packet(1)));
+        for slot in 2..51 {
+            assert_eq!(j.pop(), Playout::Silence, "slot {slot} was a pause");
+        }
+        assert_eq!(j.pop(), Playout::Frame(packet(2)), "and then they spoke");
+        assert_eq!(j.stats.concealed, 0, "nothing was invented");
+        assert_eq!(j.stats.silent, 49);
+    }
+
+    /// And the converse: a hole in the *sequence* is real loss, even though the
+    /// timestamps say the same thing they would for a pause.
+    #[test]
+    fn a_hole_in_the_sequence_is_still_concealed() {
+        let mut j = Jitter::new(1);
+        j.push(0, 0, packet(0));
+        j.push(1, 1, packet(1));
+        // Three slots on, and three packets never arrived.
+        j.push(5, 5, packet(5));
+
+        assert_eq!(j.pop(), Playout::Frame(packet(0)));
+        assert_eq!(j.pop(), Playout::Frame(packet(1)));
+        for _ in 0..3 {
+            assert_eq!(j.pop(), Playout::Conceal);
+        }
+        assert_eq!(j.pop(), Playout::Frame(packet(5)));
+        assert_eq!(j.stats.concealed, 3);
+        assert_eq!(j.stats.silent, 0);
+    }
+
+    /// A pause that also loses a packet: only as many slots as there were
+    /// missing packets may be concealed, and the rest is the pause.
+    #[test]
+    fn a_pause_with_loss_in_it_splits_the_difference() {
+        let mut j = Jitter::new(1);
+        j.push(0, 0, packet(0));
+        j.push(1, 1, packet(1));
+        // Twenty slots on, but two packets are missing from the sequence.
+        j.push(4, 21, packet(4));
+
+        assert_eq!(j.pop(), Playout::Frame(packet(0)));
+        assert_eq!(j.pop(), Playout::Frame(packet(1)));
+        let mut concealed = 0;
+        let mut silent = 0;
+        for _ in 2..21 {
+            match j.pop() {
+                Playout::Conceal => concealed += 1,
+                Playout::Silence => silent += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(concealed, 2, "bounded by the packets that went missing");
+        assert_eq!(silent, 17);
+        assert_eq!(j.pop(), Playout::Frame(packet(4)));
+    }
+
     #[test]
     fn loss_is_judged_from_the_span_of_sequence_numbers() {
         let mut j = Jitter::new(1);
         for i in [0u64, 1, 2, 3, 5, 6, 7, 8, 9] {
-            j.push(i, packet(i as u8));
+            j.push(i, (i) as u32, packet(i as u8));
         }
         assert_eq!(j.span(), 10);
         assert_eq!(j.stats.received, 9);

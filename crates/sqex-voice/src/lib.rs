@@ -14,5 +14,6 @@
 
 pub mod audio;
 pub mod jitter;
+pub mod media;
 pub mod mix;
 pub mod room;
