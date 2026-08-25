@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
-use sqex_core::Nonce;
+use sqnr_core::Nonce;
 
 pub struct Challenges {
     ttl: Duration,

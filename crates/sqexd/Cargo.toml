@@ -10,7 +10,7 @@ name = "sqexd"
 path = "src/main.rs"
 
 [dependencies]
-sqex-core = { workspace = true }
+sqnr-core = { workspace = true }
 squic = { workspace = true }
 quinn = { workspace = true }
 h3 = { workspace = true }
@@ -34,3 +34,6 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 futures = { workspace = true }
+# Exercise the real sqnr client + flow + signer against a live server (the CLI's
+# own code path). Dependency direction is sqex -> sqnr, which is allowed.
+sqnr = { workspace = true }

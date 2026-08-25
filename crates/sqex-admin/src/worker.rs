@@ -5,12 +5,10 @@
 use std::net::SocketAddr;
 use std::sync::mpsc::Sender as StdSender;
 
-use sqex_core::PubKey;
-use sqex_core::protocol::{Action, Command, SignedCommand};
+use sqnr::{Backend, Card, Client, flow};
+use sqnr_core::PubKey;
+use sqnr_core::protocol::Action;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-use crate::card::Card;
-use crate::client::Client;
 
 /// A request from the UI.
 pub enum Cmd {
@@ -222,35 +220,11 @@ async fn run_admin_once(
     action: Action,
     notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
-    let (cs, nonce_bytes) = sess.client.get("/admin/challenge").await?;
-    if cs != 200 || nonce_bytes.len() != 32 {
-        return Err(format!("challenge failed (status {cs})"));
-    }
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&nonce_bytes);
-    let command = Command {
-        action,
-        nonce,
-        server: sess.server,
-    };
-
-    // With touch enabled the card blocks until tapped — prompt for it.
-    notify(Msg::AwaitingTouch);
-    let sig = card.sign(command.signing_bytes()).await?;
-
-    let signed = SignedCommand {
-        command,
-        admin: sess.admin,
-        signature: sig,
-    };
-    let (status, body) = sess.client.post("/admin/command", signed.encode()).await?;
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-    if status != 200 {
-        let detail = value["detail"].as_str().unwrap_or("").to_string();
-        let kind = value["error"].as_str().unwrap_or("error");
-        return Err(format!("{kind} ({status}) {detail}"));
-    }
-    Ok(value)
+    // The whole challenge→sign→POST transaction lives in sqnr; the GUI wraps it
+    // only to surface the touch prompt and (in run_admin) to reconnect/retry.
+    let backend = Backend::yubikey(card.clone(), sess.admin);
+    let on_touch = || notify(Msg::AwaitingTouch);
+    flow::run_once(&mut sess.client, &backend, sess.server, action, &on_touch).await
 }
 
 fn dispatch_result(action: &Action, value: serde_json::Value, send: &impl Fn(Msg)) {

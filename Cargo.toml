@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/sqex-core",
     "crates/sqexd",
     "crates/sqex-admin",
 ]
@@ -13,7 +12,11 @@ license = "MIT"
 
 [workspace.dependencies]
 squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.14.0" }
-sqex-core = { path = "crates/sqex-core" }
+# sqnr owns the signed-command protocol + PubKey (sqnr-core) and the signer/
+# client/CLI (sqnr). Local path deps during active development; switch to a
+# pinned git tag (like squic, above) when cutting a release.
+sqnr-core = { path = "../sqnr/crates/sqnr-core" }
+sqnr = { path = "../sqnr/crates/sqnr" }
 tokio = { version = "1", features = ["full"] }
 quinn = "0.11"
 h3 = "0.0.8"

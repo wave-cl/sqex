@@ -67,7 +67,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Sign a message shaped like a real sqex command signing input, then verify.
     let message = {
-        let mut m = sqex_core::SIG_CONTEXT.to_vec();
+        let mut m = sqnr_core::SIG_CONTEXT.to_vec();
         m.extend_from_slice(b"yubikey-spike test payload");
         m
     };

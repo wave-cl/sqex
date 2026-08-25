@@ -8,14 +8,18 @@ use std::time::Instant;
 use bytes::Buf;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
-use sqex_core::key::PubKey;
-use sqex_core::protocol::{Action, SignedCommand};
-use sqex_core::{Error, Result};
+use sqnr_core::key::PubKey;
+use sqnr_core::protocol::{Action, SignedCommand};
+use sqnr_core::{Error, Result};
 use squic::Config as SquicConfig;
 
 use crate::challenge::Challenges;
 use crate::config::Config;
 use crate::state::{AuditEntry, State, now_unix};
+
+/// The server's own version, reported in status. The protocol lives in
+/// sqnr-core, but this string identifies the daemon.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// ALPN for sqex: plain HTTP/3.
 const ALPN: &[u8] = b"h3";
@@ -106,7 +110,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
         listen = %local_addr,
         key = %public_key,
         admins = server.admins.read().unwrap().len(),
-        "sqexd {} listening (HTTP/3)", sqex_core::VERSION
+        "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");
 
@@ -223,7 +227,7 @@ async fn route(
         ("GET", "/health") => (
             200,
             "application/json",
-            json!({ "status": "ok", "service": "sqex", "version": sqex_core::VERSION })
+            json!({ "status": "ok", "service": "sqex", "version": VERSION })
                 .to_string()
                 .into_bytes(),
         ),
@@ -271,7 +275,7 @@ impl Server {
     fn status_json(&self) -> Vec<u8> {
         let state = self.state.lock().unwrap();
         json!({
-            "version": sqex_core::VERSION,
+            "version": VERSION,
             "uptime_secs": self.started.elapsed().as_secs(),
             "connections": self.connections.load(Ordering::Relaxed),
             "whitelist_enabled": state.enabled(),

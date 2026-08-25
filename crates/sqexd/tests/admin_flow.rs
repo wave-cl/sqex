@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 
 use bytes::Buf;
 use ed25519_dalek::SigningKey;
-use sqex_core::PubKey;
-use sqex_core::protocol::{Action, Command, SignedCommand, SoftwareSigner};
+use sqnr_core::PubKey;
+use sqnr_core::protocol::{Action, Command, SignedCommand, SoftwareSigner};
 use sqexd::config::FileConfig;
 use squic::Config as SquicConfig;
 

@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use sqex_core::key::PubKey;
-use sqex_core::{Error, Result};
+use sqnr_core::key::PubKey;
+use sqnr_core::{Error, Result};
 
 /// Default UDP port for sqex.
 pub const DEFAULT_PORT: u16 = 5400;

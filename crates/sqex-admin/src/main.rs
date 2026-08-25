@@ -3,12 +3,11 @@
 //! Connects to sqexd over HTTP/3 and signs whitelist-management commands with a
 //! YubiKey (OpenPGP Ed25519 Authentication key). Admin authority is the command
 //! signature, verified against the server's config admin list; the connection's
-//! transport key is irrelevant. The command protocol lives in `sqex-core`; the
+//! transport key is irrelevant. The command protocol and the signing/client
+//! machinery now live in `sqnr`; this crate is the egui front end over it. The
 //! YubiKey path is the one proven by `yubikey_spike`.
 
 mod app;
-mod card;
-mod client;
 mod worker;
 
 fn main() -> eframe::Result<()> {

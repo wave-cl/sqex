@@ -3,8 +3,8 @@
 use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui;
-use sqex_core::PubKey;
-use sqex_core::protocol::Action;
+use sqnr_core::PubKey;
+use sqnr_core::protocol::Action;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::worker::{self, Cmd, Msg};

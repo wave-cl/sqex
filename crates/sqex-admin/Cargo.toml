@@ -15,18 +15,15 @@ name = "yubikey_spike"
 path = "src/bin/yubikey_spike.rs"
 
 [dependencies]
-sqex-core = { workspace = true }
-squic = { workspace = true }
-quinn = { workspace = true }
-h3 = { workspace = true }
-h3-quinn = { workspace = true }
-http = { workspace = true }
-bytes = { workspace = true }
+# Signing, the HTTP/3 client, and the transaction flow all live in sqnr now.
+sqnr-core = { workspace = true }
+sqnr = { workspace = true }
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 bs58 = { workspace = true }
 serde_json = { workspace = true }
+# Retained for the yubikey_spike provisioning tool.
 openpgp-card = "0.7"
 card-backend-pcsc = "0.5"
 secrecy = "0.10"

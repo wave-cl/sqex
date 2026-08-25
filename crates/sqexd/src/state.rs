@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use sqex_core::key::PubKey;
-use sqex_core::{Error, Result};
+use sqnr_core::key::PubKey;
+use sqnr_core::{Error, Result};
 
 /// One recorded administrative action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
