@@ -24,8 +24,8 @@ use sqex_proto::session::{BySession, DatagramFrame, MAX_DATAGRAM_FRAME, Open, Op
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::{PubKey, Signer};
 
-use sqex_voice::audio::{self, Sink, Source};
-use sqex_voice::jitter::{FRAME_MS, FRAME_SAMPLES, Jitter, Playout, Rtt, SAMPLE_RATE};
+use sqex_voice::audio::{self, Rate, Sink, Source};
+use sqex_voice::jitter::{FRAME_MS, Jitter, Playout, Rtt};
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{self, Event as RoomEvent, Membership};
 
@@ -60,8 +60,24 @@ struct Cli {
     #[arg(short, long, global = true)]
     quiet: bool,
 
+    /// Capture device, by any part of its name. Defaults to the system input.
+    ///
+    /// Worth setting on macOS: capturing from a Bluetooth headset drops it into
+    /// narrowband in both directions, while capturing from the built-in
+    /// microphone leaves the headset in high quality.
+    #[arg(long = "in", global = true)]
+    input_device: Option<String>,
+
+    /// Playback device, by any part of its name. Defaults to the system output.
+    #[arg(long = "out", global = true)]
+    output_device: Option<String>,
+
+    /// List the audio devices and the rates each offers, then exit.
+    #[arg(long)]
+    list_devices: bool,
+
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -154,7 +170,13 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
+    if cli.list_devices {
+        return audio::list_devices();
+    }
     let cfg = Config::load();
+    let Some(cmd) = &cli.cmd else {
+        return Err("nothing to do — give a command, or --list-devices".into());
+    };
 
     // A room has no peer to name and may not need a connection at all.
     if let Cmd::Room {
@@ -165,7 +187,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         jitter,
         bitrate,
         seconds,
-    } = &cli.cmd
+    } = cmd
     {
         if *new {
             println!("{}", RoomId::generate().to_base58());
@@ -186,6 +208,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             CallOpts {
                 source: source.clone(),
                 sink: sink.clone(),
+                input: cli.input_device.clone(),
+                output: cli.output_device.clone(),
                 depth: *jitter,
                 bitrate: *bitrate,
                 seconds: *seconds,
@@ -196,13 +220,19 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await;
     }
 
-    let peer = parse_key(match &cli.cmd {
+    let peer = parse_key(match cmd {
         Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer,
         Cmd::Room { .. } => unreachable!("handled above"),
     })?;
+    // Echo rendezvouses inside its own loop, so that it can do so again when a
+    // caller goes away; a call does it once.
+    if let Cmd::Echo { .. } = cmd {
+        let (client, signer) = dial(&cli, &cfg, peer).await?;
+        return echo(client, signer, peer, cli.wait, cli.quiet).await;
+    }
     let (client, session, id) = establish(&cli, &cfg, peer).await?;
 
-    match &cli.cmd {
+    match cmd {
         Cmd::Call {
             source,
             sink,
@@ -219,6 +249,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                 CallOpts {
                     source: source.clone(),
                     sink: sink.clone(),
+                    input: cli.input_device.clone(),
+                    output: cli.output_device.clone(),
                     depth: *jitter,
                     bitrate: *bitrate,
                     seconds: *seconds,
@@ -228,7 +260,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             )
             .await
         }
-        Cmd::Echo { .. } => echo(client, session, id, cli.quiet).await,
+        Cmd::Echo { .. } => unreachable!("handled above"),
         Cmd::Room { .. } => unreachable!("handled above"),
     }
 }
@@ -243,17 +275,44 @@ async fn run(cli: Cli) -> Result<(), String> {
 /// the `sqnr` client it deliberately does not have, which is a lot of structure
 /// to buy for thirty lines in a demo.
 async fn establish(cli: &Cli, cfg: &Config, peer: PubKey) -> Result<(Client, Session, u64), String> {
+    let (mut client, signer) = dial(cli, cfg, peer).await?;
+    let (session, id) = rendezvous(&mut client, &signer, peer, cli.wait).await?;
+    Ok((client, session, id))
+}
+
+/// Connect to the exchange as this identity. No session yet.
+async fn dial(
+    cli: &Cli,
+    cfg: &Config,
+    peer: PubKey,
+) -> Result<(Client, sqnr_core::SoftwareSigner), String> {
     let signer = load_identity(cli, cfg)?;
     let me = PubKey::new(signer.public());
     if me == peer {
         return Err("a session needs two identities".into());
     }
     let (addr, server) = endpoint(cli, cfg)?;
-    let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+    let client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
 
     if client.max_datagram_size().is_none() {
         return Err("this path does not carry datagrams, so it cannot carry a call".into());
     }
+    eprintln!("you are {me}");
+    Ok((client, signer))
+}
+
+/// Open a relayed session with `peer` on a connection we already hold.
+///
+/// Separate from [`dial`] because it may need doing more than once: a session
+/// does not survive the peer restarting, and whoever is left holding the old one
+/// has to ask again.
+async fn rendezvous(
+    client: &mut Client,
+    signer: &sqnr_core::SoftwareSigner,
+    peer: PubKey,
+    wait: u64,
+) -> Result<(Session, u64), String> {
+    let me = PubKey::new(signer.public());
 
     // Our contribution to the key agreement. The exchange relays it but cannot
     // use it: completing the agreement needs a static private key from each of
@@ -264,9 +323,10 @@ async fn establish(cli: &Cli, cfg: &Config, peer: PubKey) -> Result<(Client, Ses
         ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
     };
 
-    eprintln!("you are {me}");
     eprintln!("waiting for {peer} to open a session with you…");
-    let deadline = Instant::now() + Duration::from_secs(cli.wait);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(wait);
+    let mut hinted = false;
     let ack = loop {
         let (code, body) = client.post("/session/open", open.encode()).await?;
         if code != 200 {
@@ -279,6 +339,20 @@ async fn establish(cli: &Cli, cfg: &Config, peer: PubKey) -> Result<(Client, Ses
         if ack.state == OpenState::Established {
             break ack;
         }
+        // Waiting is normal for a few seconds and suspicious after ten. The two
+        // causes are both invisible from here, so say them out loud rather than
+        // let someone watch a silent line forever.
+        if !hinted && started.elapsed() > Duration::from_secs(10) {
+            eprintln!(
+                "  still waiting. Two things do this:\n    \
+                 - the other end is not running, or names someone else. It needs \
+                 to name you: {me}\n    \
+                 - two processes are sharing one identity. Only one client may \
+                 use an identity at a time; a second one keeps discarding the \
+                 first one's session, and neither ever connects."
+            );
+            hinted = true;
+        }
         if Instant::now() >= deadline {
             return Err("the peer did not join in time".into());
         }
@@ -287,15 +361,15 @@ async fn establish(cli: &Cli, cfg: &Config, peer: PubKey) -> Result<(Client, Ses
 
     let session = Session::derive(&signer.seed(), &eph, &peer, &ack.peer_ephemeral)
         .map_err(|e| e.to_string())?;
-    Ok((client, session, ack.session_id))
+    Ok((session, ack.session_id))
 }
 
 // ---- the call ---------------------------------------------------------------
 
 /// One encoder, configured the same way whether it is feeding one peer or
 /// seven — a frame is encoded once and sealed per peer, never encoded per peer.
-fn encoder(bitrate: i32) -> Result<opus::Encoder, String> {
-    let mut e = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+fn encoder(bitrate: i32, rate: Rate) -> Result<opus::Encoder, String> {
+    let mut e = opus::Encoder::new(rate.hz(), opus::Channels::Mono, opus::Application::Voip)
         .map_err(|e| format!("opus encoder: {e}"))?;
     e.set_bitrate(opus::Bitrate::Bits(bitrate))
         .map_err(|e| format!("opus bitrate: {e}"))?;
@@ -309,6 +383,8 @@ fn encoder(bitrate: i32) -> Result<opus::Encoder, String> {
 struct CallOpts {
     source: Source,
     sink: Sink,
+    input: Option<String>,
+    output: Option<String>,
     depth: u64,
     bitrate: i32,
     seconds: Option<u64>,
@@ -322,15 +398,16 @@ async fn call(
     id: u64,
     opts: CallOpts,
 ) -> Result<(), String> {
-    let mut encoder = encoder(opts.bitrate)?;
-    let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
+    // Capture and playback pick their own rates, and Opus converts between them
+    // and whatever the far end chose. Nothing is negotiated.
+    let (mut source, capture) = audio::open_source(&opts.source, opts.seconds, opts.input.as_deref())?;
+    let (out, playback) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
+    let mut encoder = encoder(opts.bitrate, capture)?;
+    let mut decoder = opus::Decoder::new(playback.hz(), opus::Channels::Mono)
         .map_err(|e| format!("opus decoder: {e}"))?;
-
-    let mut source = audio::open_source(&opts.source, opts.seconds)?;
-    let out = audio::open_sink(&opts.sink)?;
     let mut buffer = Jitter::new(opts.depth);
     let mut rtt = Rtt::default();
-    let mut pcm = vec![0f32; FRAME_SAMPLES];
+    let mut pcm = vec![0f32; playback.frame()];
 
     let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
     let mut report = tokio::time::interval(Duration::from_secs(1));
@@ -344,6 +421,7 @@ async fn call(
 
     let mut seq = 0u64;
     let mut hangup: Option<Instant> = None;
+    let mut deaf = false;
 
     loop {
         tokio::select! {
@@ -418,7 +496,25 @@ async fn call(
                 }
             }
 
-            _ = report.tick(), if !opts.quiet => eprintln!("{}", summary(&buffer, &rtt)),
+            _ = report.tick() => {
+                if !opts.quiet {
+                    eprintln!("{}", summary(&buffer, &rtt));
+                }
+                // Sending steadily and hearing nothing at all is not a quiet
+                // peer: with no discontinuous transmission a peer in a call
+                // sends fifty frames a second. Say so once — the causes are
+                // invisible from here, and the symptom points at none of them.
+                if !deaf && buffer.stats.sent > 150 && buffer.stats.received == 0 {
+                    eprintln!(
+                        "  nothing has arrived from the peer at all. Usually one of:\n    \
+                         - they are not sending (check their end)\n    \
+                         - two processes are sharing one identity, so the session \
+                         you hold is not the one they hold. Only one client may use \
+                         an identity at a time: `pgrep -fl sqex-voice`"
+                    );
+                    deaf = true;
+                }
+            }
 
             _ = tokio::signal::ctrl_c() => {
                 eprintln!();
@@ -485,12 +581,13 @@ async fn room_call(
         return Err("this path does not carry datagrams, so it cannot carry a room".into());
     }
 
-    let mut encoder = encoder(opts.bitrate)?;
-    let mut source = audio::open_source(&opts.source, opts.seconds)?;
-    let out = audio::open_sink(&opts.sink)?;
-    let mut mixer = Mixer::new(FRAME_SAMPLES);
-    let mut pcm = vec![0f32; FRAME_SAMPLES];
-    let mut members = Membership::new(room, me, signer.seed(), opts.depth);
+    let (mut source, capture) = audio::open_source(&opts.source, opts.seconds, opts.input.as_deref())?;
+    let (out, playback) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
+    let mut encoder = encoder(opts.bitrate, capture)?;
+    let mut mixer = Mixer::new(playback.frame());
+    let mut pcm = vec![0f32; playback.frame()];
+    // Every peer decodes at our playback rate, whatever rate they encoded at.
+    let mut members = Membership::new(room, me, signer.seed(), opts.depth, playback);
 
     let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
     let mut roster = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
@@ -666,43 +763,88 @@ fn room_summary(members: &Membership) -> String {
 ///
 /// Re-sealing is unavoidable — each direction has its own nonce space — but the
 /// audio is never decoded, so nothing here needs a codec.
-async fn echo(mut client: Client, session: Session, id: u64, quiet: bool) -> Result<(), String> {
-    eprintln!("session {id} up on datagrams — reflecting. Ctrl-C to stop.");
-    let mut reflected = 0u64;
-    let mut report = tokio::time::interval(Duration::from_secs(1));
-    report.tick().await;
+/// How long the responder waits in silence before deciding its caller has gone.
+///
+/// Nothing suppresses transmission — there is no discontinuous transmission
+/// here — so a live caller sends fifty frames a second whether or not anyone is
+/// talking. Silence this long is a broken session, not a quiet room.
+const CALLER_GONE: Duration = Duration::from_secs(15);
 
+/// Why the reflect loop stopped.
+enum Stopped {
+    Interrupted,
+    CallerGone,
+}
+
+/// Reflect frames until the caller stops or the operator does.
+///
+/// A responder has to outlive the callers it answers. A session does not
+/// survive its peer restarting — the peer comes back with a fresh ephemeral,
+/// which discards the old session by design — and the side left holding the
+/// dead one hears nothing ever again unless it asks for a new session. Sitting
+/// in this loop forever is how a responder becomes permanently unreachable
+/// while looking perfectly healthy, so quiet means go back and rendezvous.
+async fn echo(
+    mut client: Client,
+    signer: sqnr_core::SoftwareSigner,
+    peer: PubKey,
+    wait: u64,
+    quiet: bool,
+) -> Result<(), String> {
     loop {
-        tokio::select! {
-            got = client.read_datagram() => {
-                let bytes = got?;
-                let frame = DatagramFrame::decode(&bytes).map_err(|e| e.to_string())?;
-                if frame.session_id != id {
-                    continue;
+        let (session, id) = rendezvous(&mut client, &signer, peer, wait).await?;
+        eprintln!("session {id} up on datagrams — reflecting. Ctrl-C to stop.");
+
+        let mut reflected = 0u64;
+        let mut last_heard = Instant::now();
+        let mut report = tokio::time::interval(Duration::from_secs(1));
+        report.tick().await;
+
+        let stopped = loop {
+            tokio::select! {
+                got = client.read_datagram() => {
+                    let bytes = got?;
+                    let frame = DatagramFrame::decode(&bytes).map_err(|e| e.to_string())?;
+                    if frame.session_id != id {
+                        continue;
+                    }
+                    let Ok(packet) = session.open(frame.seq, &frame.ciphertext) else {
+                        eprintln!("(undecryptable frame {})", frame.seq);
+                        continue;
+                    };
+                    let sealed = session.seal_datagram(frame.seq, &packet).map_err(|e| e.to_string())?;
+                    client.send_datagram(
+                        DatagramFrame { session_id: id, seq: frame.seq, ciphertext: sealed }.encode(),
+                    )?;
+                    reflected += 1;
+                    last_heard = Instant::now();
                 }
-                let Ok(packet) = session.open(frame.seq, &frame.ciphertext) else {
-                    eprintln!("(undecryptable frame {})", frame.seq);
-                    continue;
-                };
-                let sealed = session.seal_datagram(frame.seq, &packet).map_err(|e| e.to_string())?;
-                client.send_datagram(
-                    DatagramFrame { session_id: id, seq: frame.seq, ciphertext: sealed }.encode(),
-                )?;
-                reflected += 1;
+                _ = report.tick() => {
+                    if !quiet {
+                        eprintln!("reflected {reflected}");
+                    }
+                    if last_heard.elapsed() > CALLER_GONE {
+                        break Stopped::CallerGone;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!();
+                    break Stopped::Interrupted;
+                }
             }
-            _ = report.tick(), if !quiet => eprintln!("reflected {reflected}"),
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!();
-                break;
+        };
+
+        eprintln!("reflected {reflected}");
+        let _ = client
+            .post("/session/close", BySession::close(id).encode())
+            .await;
+        match stopped {
+            Stopped::Interrupted => return Ok(()),
+            Stopped::CallerGone => {
+                eprintln!("(quiet for {}s — waiting for the next caller)", CALLER_GONE.as_secs());
             }
         }
     }
-
-    eprintln!("reflected {reflected}");
-    let _ = client
-        .post("/session/close", BySession::close(id).encode())
-        .await;
-    Ok(())
 }
 
 // ---- identity and endpoint --------------------------------------------------

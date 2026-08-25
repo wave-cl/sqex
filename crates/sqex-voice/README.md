@@ -52,6 +52,56 @@ sqex-voice call <your-identity>
 `--server` / `SQEX_SERVER`, `--server-key` / `SQEX_SERVER_KEY` and `--identity`
 work exactly as they do in `sqex`, including the `~/.sqnr/config` defaults.
 
+**One identity, one client.** A session is named by two identities, so two
+processes running as the same identity look identical to the exchange and will
+keep discarding each other's session. Neither connects, and whoever they are
+both calling waits forever. If a call sits at "waiting" for more than a few
+seconds, check for a stray earlier process before anything else:
+
+```bash
+pgrep -fl sqex-voice
+```
+
+### Devices and rates
+
+```bash
+sqex-voice --list-devices
+```
+
+```
+Inputs:
+  ACCENTUM Plus  (default)
+    offers: 16000
+    would run at: 16 kHz
+  MacBook Pro Microphone
+    offers: 44100, 48000, 88200, 96000
+    would run at: 48 kHz
+Outputs:
+  ACCENTUM Plus  (default)
+    offers: 16000, 44100
+    would run at: 44100 device, resampled to 48 kHz
+```
+
+`--in <name>` and `--out <name>` pick devices by any part of the name; without
+them the system defaults are used.
+
+There is nothing to negotiate about rates. Opus encodes at 8, 12, 16, 24 or
+48 kHz and decodes any stream at whatever rate the listener wants, so each end
+just runs at its own device's rate and the codec reconciles them. A 16 kHz
+caller and a 48 kHz listener is a perfectly ordinary call. Only a device that
+offers none of those rates — usually a 44.1 kHz output — needs the resampler,
+and that happens at the device edge.
+
+**The Bluetooth trap.** On macOS, capturing from a Bluetooth headset switches it
+into HFP, which drops **both** directions to 16 kHz mono and sounds noticeably
+worse. It works, and `sqex-voice` says so when it happens. To avoid it, capture
+from the built-in microphone and play to the headset, which keeps the headset in
+A2DP:
+
+```bash
+sqex-voice call <peer> --in "MacBook Pro Microphone" --out ACCENTUM
+```
+
 ### Without a microphone
 
 Every part of the call works without audio hardware, which is how it is tested:
@@ -61,7 +111,7 @@ sqex-voice call <peer> --source tone --sink /tmp/heard.wav --seconds 10
 ```
 
 - `--source mic | tone | <file.wav>` — `tone` is a 440 Hz sine; a file must be
-  48 kHz (there is no resampler here).
+  48 kHz, since a file has no device whose rate to follow.
 - `--sink speaker | null | <file.wav>`.
 
 ### More than two: rooms (SIP-13)

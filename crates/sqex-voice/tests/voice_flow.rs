@@ -287,3 +287,84 @@ async fn the_exchange_carrying_the_call_cannot_listen_to_it() {
         "and opens under the right one"
     );
 }
+
+/// A call between two ends running at different rates.
+///
+/// One peer is on a Bluetooth headset at 16 kHz and the other on a 48 kHz
+/// device — the pairing that used to be impossible, since the demo refused
+/// anything but 48. Nothing negotiates: the sender encodes at its rate, the
+/// receiver decodes at its own, and Opus reconciles them.
+#[tokio::test]
+async fn a_16k_caller_is_heard_by_a_48k_listener() {
+    let c = call().await;
+
+    let low = 16_000u32;
+    let mut enc = opus::Encoder::new(low, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+    let low_frame = (low as usize * 20) / 1000;
+
+    // A 440 Hz tone as a 16 kHz microphone would deliver it.
+    let mut phase = 0.0f32;
+    let step = std::f32::consts::TAU * TONE_HZ / low as f32;
+    for seq in 0..FRAMES as u64 {
+        let frame: Vec<f32> = (0..low_frame)
+            .map(|_| {
+                let s = phase.sin() * 0.5;
+                phase = (phase + step) % std::f32::consts::TAU;
+                s
+            })
+            .collect();
+        let packet = enc.encode_vec_float(&frame, MAX_DATAGRAM_FRAME).unwrap();
+        assert!(packet.len() <= MAX_DATAGRAM_FRAME);
+        let sealed = c.a_sess.seal_datagram(seq, &packet).unwrap();
+        c.a.send_datagram(
+            DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // The far end knows nothing of 16 kHz and decodes at its own rate.
+    let mut buffer = Jitter::new(3);
+    let mut arrived = 0;
+    while arrived < FRAMES {
+        let Ok(Ok(bytes)) =
+            tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
+        else {
+            break;
+        };
+        let frame = DatagramFrame::decode(&bytes).unwrap();
+        let packet = c.b_sess.open(frame.seq, &frame.ciphertext).unwrap();
+        buffer.push(frame.seq, packet);
+        arrived += 1;
+    }
+    assert_eq!(arrived, FRAMES);
+
+    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+    let mut pcm = vec![0f32; FRAME_SAMPLES];
+    let mut played: Vec<f32> = Vec::new();
+    loop {
+        match buffer.pop() {
+            Playout::Frame(p) => {
+                let n = dec.decode_float(&p, &mut pcm, false).unwrap();
+                assert_eq!(n, FRAME_SAMPLES, "decoded at 48 kHz regardless of the sender");
+                played.extend_from_slice(&pcm[..n]);
+            }
+            Playout::Conceal => {
+                dec.decode_float(&[], &mut pcm, false).unwrap();
+                played.extend_from_slice(&pcm);
+            }
+            Playout::Idle => break,
+        }
+    }
+
+    // A second in at 16 kHz is a second out at 48 kHz, and still a 440 Hz tone.
+    assert_eq!(played.len(), FRAME_SAMPLES * FRAMES);
+    let steady = &played[FRAME_SAMPLES * 3..];
+    let measured = dominant_hz(steady);
+    assert!(
+        (measured - TONE_HZ).abs() < 5.0,
+        "a narrowband caller should still sound like themselves, measured {measured}"
+    );
+    assert!(rms(steady) > 0.2, "and be audible");
+}

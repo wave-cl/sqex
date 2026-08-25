@@ -27,7 +27,8 @@ use sqex_proto::session::{BySession, Open, OpenAck, OpenState, Session};
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-use crate::jitter::{Jitter, SAMPLE_RATE};
+use crate::audio::Rate;
+use crate::jitter::Jitter;
 
 /// One other person in the room, once we can actually hear them.
 pub struct Peer {
@@ -85,6 +86,9 @@ pub struct Membership {
     me: PubKey,
     seed: [u8; 32],
     depth: u64,
+    /// What our playback device runs at. Every peer's decoder is built here,
+    /// whatever rate they chose to encode at — Opus converts.
+    rate: Rate,
     /// Peers with a live session, keyed by session id — which is what arriving
     /// datagrams carry.
     pub peers: HashMap<u64, Peer>,
@@ -113,12 +117,13 @@ impl Membership {
     /// If voice activity detection is ever added, this rule has to go with it.
     pub const STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
-    pub fn new(room: RoomId, me: PubKey, seed: [u8; 32], depth: u64) -> Membership {
+    pub fn new(room: RoomId, me: PubKey, seed: [u8; 32], depth: u64, rate: Rate) -> Membership {
         Membership {
             room,
             me,
             seed,
             depth,
+            rate,
             peers: HashMap::new(),
             by_identity: HashMap::new(),
             pending: HashMap::new(),
@@ -259,7 +264,7 @@ impl Membership {
             session,
             session_id: ack.session_id,
             jitter: Jitter::new(self.depth),
-            decoder: opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
+            decoder: opus::Decoder::new(self.rate.hz(), opus::Channels::Mono)
                 .map_err(|e| format!("opus decoder: {e}"))?,
             out_seq: 0,
             level: 0.0,

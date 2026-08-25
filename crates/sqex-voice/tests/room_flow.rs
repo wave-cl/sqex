@@ -16,7 +16,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::room::RoomId;
 use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME};
 use sqexd::config::FileConfig;
-use sqex_voice::audio::{amplitude_at, tone_at};
+use sqex_voice::audio::{Rate, amplitude_at, tone_at};
 use sqex_voice::jitter::{FRAME_SAMPLES, Playout, SAMPLE_RATE};
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{Event, Membership};
@@ -72,7 +72,7 @@ impl Member {
         let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
         Member {
             client,
-            room: Membership::new(room, identity, seed, 3),
+            room: Membership::new(room, identity, seed, 3, Rate::DEFAULT),
             identity,
             note,
             seq: 0,
@@ -322,7 +322,7 @@ async fn a_member_who_cannot_prove_the_secret_is_never_connected_to() {
     // handle — but her membership is built from a different secret, so her
     // proof is for a room nobody else is in.
     let mut eve = Member::new(addr, server_pub, room, 122, NOTES[1]).await;
-    eve.room = Membership::new(wrong_room, eve.identity, [122u8; 32], 3);
+    eve.room = Membership::new(wrong_room, eve.identity, [122u8; 32], 3, Rate::DEFAULT);
 
     // She cannot even join under her own secret, because that is a different
     // handle. So she joins under the right handle with a bogus proof.
