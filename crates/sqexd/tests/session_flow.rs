@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::session::{
-    BySession, Frames, Open, OpenAck, OpenState, SendFrame, Session,
+    BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -319,6 +319,243 @@ async fn an_anonymous_connection_has_no_session() {
         .await
         .unwrap();
     assert_eq!(code, 403, "there is no identity to be a party to a session");
+
+    handle.abort();
+}
+
+/// The unreliable path: frames ride QUIC datagrams instead of request-response,
+/// which is what makes real-time media viable (SIP-12).
+#[tokio::test]
+async fn frames_ride_datagrams_with_the_same_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, handle) = bare_server(dir.path()).await;
+
+    let (a_seed, a_id) = identity(71);
+    let (b_seed, b_id) = identity(72);
+    let (a_eph, a_eph_pub) = ephemeral();
+    let (b_eph, b_eph_pub) = ephemeral();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+
+    // Datagrams have to be available on both ends, or there is no fast path.
+    assert!(
+        a.max_datagram_size().is_some(),
+        "the path must carry datagrams"
+    );
+
+    open_session(&mut a, b_id, a_eph_pub).await;
+    let b_ack = open_session(&mut b, a_id, b_eph_pub).await;
+    let a_ack = open_session(&mut a, b_id, a_eph_pub).await;
+    let id = a_ack.session_id;
+    let a_sess = Session::derive(&a_seed, &a_eph, &b_id, &a_ack.peer_ephemeral).unwrap();
+    let b_sess = Session::derive(&b_seed, &b_eph, &a_id, &b_ack.peer_ephemeral).unwrap();
+
+    // The session was negotiated over HTTP/3; the media rides datagrams on the
+    // very same connection, with the very same keys.
+    let audio = b"\x01\x02 pretend this is a 20ms opus frame";
+    let ct = a_sess.seal_datagram(0, audio).unwrap();
+    a.send_datagram(
+        DatagramFrame {
+            session_id: id,
+            seq: 0,
+            ciphertext: ct,
+        }
+        .encode(),
+    )
+    .unwrap();
+
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), b.read_datagram())
+        .await
+        .expect("a datagram should arrive")
+        .unwrap();
+    let frame = DatagramFrame::decode(&got).unwrap();
+    assert_eq!(frame.session_id, id);
+    assert_eq!(b_sess.open(frame.seq, &frame.ciphertext).unwrap(), audio);
+
+    // And back the other way.
+    let ct = b_sess.seal_datagram(0, b"reply").unwrap();
+    b.send_datagram(
+        DatagramFrame {
+            session_id: id,
+            seq: 0,
+            ciphertext: ct,
+        }
+        .encode(),
+    )
+    .unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), a.read_datagram())
+        .await
+        .expect("a datagram should come back")
+        .unwrap();
+    let frame = DatagramFrame::decode(&got).unwrap();
+    assert_eq!(a_sess.open(frame.seq, &frame.ciphertext).unwrap(), b"reply");
+
+    handle.abort();
+}
+
+/// A stream of frames arrives without the polling delay the reliable path has,
+/// and losing one does not disturb the rest.
+#[tokio::test]
+async fn a_datagram_stream_flows_and_tolerates_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, handle) = bare_server(dir.path()).await;
+
+    let (a_seed, a_id) = identity(81);
+    let (b_seed, b_id) = identity(82);
+    let (a_eph, a_eph_pub) = ephemeral();
+    let (b_eph, b_eph_pub) = ephemeral();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+
+    open_session(&mut a, b_id, a_eph_pub).await;
+    let b_ack = open_session(&mut b, a_id, b_eph_pub).await;
+    let a_ack = open_session(&mut a, b_id, a_eph_pub).await;
+    let id = a_ack.session_id;
+    let a_sess = Session::derive(&a_seed, &a_eph, &b_id, &a_ack.peer_ephemeral).unwrap();
+    let b_sess = Session::derive(&b_seed, &b_eph, &a_id, &b_ack.peer_ephemeral).unwrap();
+
+    // Send a run of frames, deliberately skipping one sequence number as a lost
+    // packet would.
+    let sent: Vec<u64> = vec![0, 1, 3, 4];
+    for seq in &sent {
+        let ct = a_sess.seal_datagram(*seq, format!("frame {seq}").as_bytes()).unwrap();
+        a.send_datagram(
+            DatagramFrame {
+                session_id: id,
+                seq: *seq,
+                ciphertext: ct,
+            }
+            .encode(),
+        )
+        .unwrap();
+    }
+
+    let mut seen = Vec::new();
+    for _ in 0..sent.len() {
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), b.read_datagram())
+            .await
+            .expect("frames should arrive")
+            .unwrap();
+        let f = DatagramFrame::decode(&got).unwrap();
+        // Each frame opens on its own: seq 2 never existing costs nothing.
+        let plain = b_sess.open(f.seq, &f.ciphertext).unwrap();
+        assert_eq!(plain, format!("frame {}", f.seq).as_bytes());
+        seen.push(f.seq);
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, sent, "every sent frame arrived; the gap was never needed");
+
+    handle.abort();
+}
+
+/// A datagram naming a session the sender is not party to is dropped, not
+/// forwarded — the same rule the reliable path enforces, and the reason the
+/// forwarder checks membership rather than trusting the header.
+#[tokio::test]
+async fn a_stranger_cannot_inject_datagrams() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, handle) = bare_server(dir.path()).await;
+
+    let (a_seed, a_id) = identity(91);
+    let (b_seed, b_id) = identity(92);
+    let (eve_seed, _eve_id) = identity(93);
+    let (_a_eph, a_eph_pub) = ephemeral();
+    let (_b_eph, b_eph_pub) = ephemeral();
+
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let eve = Client::connect_as(addr, &server_pub, &eve_seed).await.unwrap();
+
+    open_session(&mut a, b_id, a_eph_pub).await;
+    let id = open_session(&mut b, a_id, b_eph_pub).await.session_id;
+
+    eve.send_datagram(
+        DatagramFrame {
+            session_id: id,
+            seq: 0,
+            ciphertext: vec![0u8; 32],
+        }
+        .encode(),
+    )
+    .unwrap();
+
+    // Nothing should reach B. Give the forwarder a generous window to be wrong.
+    let nothing = tokio::time::timeout(std::time::Duration::from_millis(700), b.read_datagram()).await;
+    assert!(nothing.is_err(), "an outsider's datagram must not be relayed");
+
+    handle.abort();
+}
+
+/// A measurement rather than an assertion: how long a frame takes to reach the
+/// peer on each path. Timing is machine- and load-dependent, so this is
+/// `#[ignore]`d and never gates CI — run it with
+/// `cargo test --test session_flow -- --ignored --nocapture` to see the numbers.
+#[tokio::test]
+#[ignore]
+async fn measure_carriage_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, handle) = bare_server(dir.path()).await;
+
+    let (a_seed, a_id) = identity(101);
+    let (b_seed, b_id) = identity(102);
+    let (a_eph, a_eph_pub) = ephemeral();
+    let (b_eph, b_eph_pub) = ephemeral();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+
+    open_session(&mut a, b_id, a_eph_pub).await;
+    let b_ack = open_session(&mut b, a_id, b_eph_pub).await;
+    let a_ack = open_session(&mut a, b_id, a_eph_pub).await;
+    let id = a_ack.session_id;
+    let a_sess = Session::derive(&a_seed, &a_eph, &b_id, &a_ack.peer_ephemeral).unwrap();
+    let b_sess = Session::derive(&b_seed, &b_eph, &a_id, &b_ack.peer_ephemeral).unwrap();
+
+    const N: u32 = 20;
+    const POLL: u64 = 200; // what the reliable-path client uses
+
+    // Datagram: send, then await arrival. No polling, no response to wait for.
+    let mut dg_total = std::time::Duration::ZERO;
+    for seq in 0..N as u64 {
+        let ct = a_sess.seal_datagram(seq, b"20ms of audio").unwrap();
+        let t0 = std::time::Instant::now();
+        a.send_datagram(
+            DatagramFrame { session_id: id, seq, ciphertext: ct }.encode(),
+        )
+        .unwrap();
+        let got = b.read_datagram().await.unwrap();
+        dg_total += t0.elapsed();
+        let f = DatagramFrame::decode(&got).unwrap();
+        assert_eq!(b_sess.open(f.seq, &f.ciphertext).unwrap(), b"20ms of audio");
+    }
+
+    // Reliable: POST the frame, then poll until it shows up. Model the client's
+    // real behaviour — a poll lands on average half an interval after arrival.
+    let mut rel_total = std::time::Duration::ZERO;
+    for seq in 0..N as u64 {
+        let ct = a_sess.seal(seq, b"20ms of audio").unwrap();
+        let t0 = std::time::Instant::now();
+        a.post("/session/send", SendFrame { session_id: id, seq, ciphertext: ct }.encode())
+            .await
+            .unwrap();
+        loop {
+            let f = recv(&mut b, id).await;
+            if !f.frames.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        rel_total += t0.elapsed();
+    }
+
+    let dg = dg_total / N;
+    let rel = rel_total / N;
+    println!("\n─── carriage latency over loopback, {N} frames ───");
+    println!("  datagram (push)          : {dg:?} per frame");
+    println!("  reliable (POST + drain)  : {rel:?} per frame");
+    println!("  reliable + {POLL}ms polling : ~{:?} per frame (as the CLI polls)", rel + std::time::Duration::from_millis(POLL / 2));
+    println!("\n  A voice budget is ~150ms mouth-to-ear. Loopback removes the");
+    println!("  network, so these show protocol overhead only: the datagram path");
+    println!("  adds ~nothing, while polling alone spends most of the budget.\n");
 
     handle.abort();
 }

@@ -256,6 +256,19 @@ impl Sessions {
         }
     }
 
+    /// The other party to a live session, if `me` is a party to it.
+    ///
+    /// This is all the datagram forwarder needs: it does not queue, inspect or
+    /// store anything, it only needs to know where to point a packet.
+    pub fn counterpart(&self, me: &PubKey, session_id: u64) -> Option<PubKey> {
+        let inner = self.inner.lock().unwrap();
+        let live = inner.sessions.get(&session_id).filter(|l| l.open)?;
+        match live.role_of(me)? {
+            Role::First => Some(live.second),
+            Role::Second => Some(live.first),
+        }
+    }
+
     /// How many sessions are live.
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().unwrap();
@@ -387,6 +400,22 @@ mod tests {
         // Once B collects, A can send again.
         s.recv(&b, id);
         assert!(s.send(&a, id, 999, vec![1]).is_ok());
+    }
+
+    #[test]
+    fn counterpart_is_only_visible_to_a_party() {
+        let s = Sessions::new();
+        let (a, b, eve) = (key(1), key(2), key(3));
+        s.open(a, b, [10u8; 32]);
+        let id = s.open(b, a, [20u8; 32]).session_id;
+
+        assert_eq!(s.counterpart(&a, id), Some(b));
+        assert_eq!(s.counterpart(&b, id), Some(a));
+        assert_eq!(s.counterpart(&eve, id), None, "a stranger cannot aim a packet");
+        assert_eq!(s.counterpart(&a, 999), None, "nor can anyone at a phantom session");
+
+        s.close(&a, id);
+        assert_eq!(s.counterpart(&a, id), None, "a closed session forwards nothing");
     }
 
     #[test]

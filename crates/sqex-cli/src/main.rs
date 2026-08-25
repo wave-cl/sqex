@@ -14,7 +14,7 @@ use sqex_proto::Op;
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
 use sqex_proto::session::{
-    BySession, Frames, Open, OpenAck, OpenState, SendFrame, Session,
+    BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
 };
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
@@ -79,6 +79,13 @@ enum SessionCmd {
         /// Give up if the peer has not joined within this many seconds.
         #[arg(long, default_value_t = 120)]
         wait: u64,
+        /// Carry frames on QUIC datagrams instead of request-response.
+        ///
+        /// Unreliable and unordered — a lost frame is not retransmitted — which
+        /// is the right trade for real-time media, and the wrong one for
+        /// anything that cannot lose a packet. Removes the polling delay.
+        #[arg(long)]
+        datagram: bool,
     },
 }
 
@@ -180,7 +187,11 @@ async fn run(cli: Cli) -> Result<(), String> {
 // ---- relayed session --------------------------------------------------------
 
 async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String> {
-    let SessionCmd::Talk { peer, wait } = cmd;
+    let SessionCmd::Talk {
+        peer,
+        wait,
+        datagram,
+    } = cmd;
     let peer = parse_key(peer)?;
     let (mut client, signer) = mail_client(cli, cfg).await?;
     let me = PubKey::new(signer.public());
@@ -220,26 +231,87 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
 
     let session = Session::derive(&signer.seed(), &eph, &peer, &ack.peer_ephemeral)
         .map_err(|e| e.to_string())?;
-    eprintln!("session {} established — type to send, Ctrl-D to end", ack.session_id);
+    if *datagram {
+        match client.max_datagram_size() {
+            Some(max) => eprintln!(
+                "session {} established on datagrams (up to {max} bytes) — type to send, Ctrl-D to end",
+                ack.session_id
+            ),
+            None => return Err("this path does not carry datagrams".into()),
+        }
+        return talk_datagram(client, session, ack.session_id).await;
+    }
 
+    eprintln!("session {} established — type to send, Ctrl-D to end", ack.session_id);
     talk(client, session, ack.session_id).await
 }
 
-/// Pump stdin to the peer and their frames to stdout until either end stops.
-async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), String> {
-    // stdin is blocking, so it gets its own thread and a channel.
-    let (lines_tx, mut lines_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+/// Read stdin on its own thread; blocking reads cannot live on the runtime.
+fn stdin_lines() -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
         use std::io::BufRead;
         for line in std::io::stdin().lock().lines() {
             let Ok(l) = line else { break };
-            if lines_tx.send(l).is_err() {
+            if tx.send(l).is_err() {
                 break;
             }
         }
-        // Dropping the sender signals end-of-input.
     });
+    rx
+}
 
+/// The unreliable path: frames ride datagrams, so nothing polls and nothing
+/// waits on a response. This is the shape real-time media needs.
+async fn talk_datagram(mut client: Client, session: Session, id: u64) -> Result<(), String> {
+    let mut lines = stdin_lines();
+    let mut out_seq = 0u64;
+    let mut last_seen: Option<u64> = None;
+
+    loop {
+        tokio::select! {
+            // Anything to send goes out immediately — no request, no response.
+            line = lines.recv() => match line {
+                Some(l) => {
+                    let ct = session.seal_datagram(out_seq, l.as_bytes()).map_err(|e| e.to_string())?;
+                    client.send_datagram(
+                        DatagramFrame { session_id: id, seq: out_seq, ciphertext: ct }.encode(),
+                    )?;
+                    out_seq += 1;
+                }
+                None => {
+                    let _ = client.post("/session/close", BySession::close(id).encode()).await;
+                    eprintln!("(input ended; closing)");
+                    return Ok(());
+                }
+            },
+            // Anything inbound arrives the moment the exchange forwards it.
+            got = client.read_datagram() => {
+                let bytes = got?;
+                let frame = DatagramFrame::decode(&bytes).map_err(|e| e.to_string())?;
+                if frame.session_id != id {
+                    continue; // some other session on this connection
+                }
+                // A gap means a lost frame. Say so rather than hide it: with
+                // media you would conceal it, and either way it is not an error.
+                if let Some(prev) = last_seen
+                    && frame.seq > prev + 1
+                {
+                    eprintln!("(lost {} frame(s))", frame.seq - prev - 1);
+                }
+                last_seen = Some(frame.seq);
+                match session.open(frame.seq, &frame.ciphertext) {
+                    Ok(plain) => println!("{}", String::from_utf8_lossy(&plain)),
+                    Err(e) => eprintln!("(undecryptable frame {}: {e})", frame.seq),
+                }
+            }
+        }
+    }
+}
+
+/// Pump stdin to the peer and their frames to stdout until either end stops.
+async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), String> {
+    let mut lines_rx = stdin_lines();
     let mut out_seq = 0u64;
     let mut stdin_open = true;
     loop {

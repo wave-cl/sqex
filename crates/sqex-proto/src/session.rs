@@ -43,8 +43,17 @@ use sqnr_core::{Error, PubKey, Result};
 /// Domain separator for the session key agreement.
 pub const SESSION_CONTEXT: &[u8] = b"sqex-session-v1";
 
-/// Largest plaintext one frame may carry.
+/// Largest plaintext one frame may carry over the reliable path.
 pub const MAX_FRAME: usize = 32 * 1024;
+
+/// Largest plaintext one **datagram** frame may carry.
+///
+/// A QUIC datagram is not fragmented and not retransmitted, so it has to fit
+/// the path MTU whole. 1024 leaves comfortable room under a 1200-byte path for
+/// the QUIC header, the 16-byte datagram header below and the 16-byte AEAD tag.
+/// A 20 ms Opus frame is well under a hundred bytes, so this is generous for
+/// voice and deliberately too small to be a file transfer.
+pub const MAX_DATAGRAM_FRAME: usize = 1024;
 /// Most bytes that may be queued in one direction awaiting collection.
 pub const MAX_QUEUED_BYTES: usize = 1024 * 1024;
 /// Most frames that may be queued in one direction.
@@ -434,6 +443,76 @@ impl Frames {
     }
 }
 
+/// One sealed frame carried as a QUIC datagram.
+///
+/// `| session_id: u64 | seq: u64 | ciphertext |`
+///
+/// There is no type byte and no length prefix: a datagram is already framed by
+/// the transport, and every byte of header is a byte not spent on audio. The
+/// ciphertext is sealed exactly as a reliable frame is, with the same
+/// direction-and-sequence nonce, so **the same session keys and framing serve
+/// both paths** and a peer may move between them mid-session.
+///
+/// Unreliable by design: no acknowledgement, no retransmission, no ordering.
+/// A gap in `seq` is a lost frame, which media conceals and a file transfer
+/// must not tolerate — use the reliable path for anything that cannot lose a
+/// packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagramFrame {
+    pub session_id: u64,
+    pub seq: u64,
+    pub ciphertext: Vec<u8>,
+}
+
+impl DatagramFrame {
+    /// Bytes of header before the ciphertext.
+    pub const HEADER: usize = 16;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::HEADER + self.ciphertext.len());
+        out.extend_from_slice(&self.session_id.to_be_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<DatagramFrame> {
+        if b.len() < Self::HEADER {
+            return Err(Error::Malformed(format!(
+                "datagram is {} bytes, want >= {}",
+                b.len(),
+                Self::HEADER
+            )));
+        }
+        let ciphertext = b[Self::HEADER..].to_vec();
+        if ciphertext.len() > MAX_DATAGRAM_FRAME + 16 {
+            return Err(Error::Malformed(format!(
+                "datagram payload is {} bytes, limit is {}",
+                ciphertext.len(),
+                MAX_DATAGRAM_FRAME + 16
+            )));
+        }
+        Ok(DatagramFrame {
+            session_id: u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            seq: u64::from_be_bytes(b[8..16].try_into().unwrap()),
+            ciphertext,
+        })
+    }
+}
+
+impl Session {
+    /// Seal a frame destined for a datagram, bounded by what one will carry.
+    pub fn seal_datagram(&self, seq: u64, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if plaintext.len() > MAX_DATAGRAM_FRAME {
+            return Err(Error::Malformed(format!(
+                "datagram frame is {} bytes, limit is {MAX_DATAGRAM_FRAME}",
+                plaintext.len()
+            )));
+        }
+        self.seal(seq, plaintext)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,6 +681,49 @@ mod tests {
         let mut trailing = f.encode();
         trailing.push(0);
         assert!(Frames::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn a_datagram_frame_uses_the_same_keys_as_a_reliable_one() {
+        // The point of sharing the framing: a peer can move between the
+        // reliable and unreliable paths mid-session without rekeying.
+        let (a, b) = agree();
+        let ct = a.seal_datagram(5, b"audio").unwrap();
+        let dg = DatagramFrame {
+            session_id: 1,
+            seq: 5,
+            ciphertext: ct,
+        };
+        let wire = dg.encode();
+        let back = DatagramFrame::decode(&wire).unwrap();
+        assert_eq!(back, dg);
+        assert_eq!(b.open(back.seq, &back.ciphertext).unwrap(), b"audio");
+    }
+
+    #[test]
+    fn a_lost_datagram_does_not_break_the_next() {
+        // Each frame is sealed independently, so unreliable delivery is safe:
+        // dropping one does not affect any other.
+        let (a, b) = agree();
+        let _lost = a.seal_datagram(0, b"dropped").unwrap();
+        let kept = a.seal_datagram(1, b"arrived").unwrap();
+        assert_eq!(b.open(1, &kept).unwrap(), b"arrived");
+    }
+
+    #[test]
+    fn datagram_frames_are_bounded_to_the_path() {
+        let (a, _b) = agree();
+        assert!(a.seal_datagram(0, &vec![0u8; MAX_DATAGRAM_FRAME]).is_ok());
+        assert!(a.seal_datagram(0, &vec![0u8; MAX_DATAGRAM_FRAME + 1]).is_err());
+        let mut oversized = DatagramFrame {
+            session_id: 1,
+            seq: 0,
+            ciphertext: vec![],
+        }
+        .encode();
+        oversized.extend(std::iter::repeat_n(0u8, MAX_DATAGRAM_FRAME + 17));
+        assert!(DatagramFrame::decode(&oversized).is_err());
+        assert!(DatagramFrame::decode(&[0u8; 8]).is_err());
     }
 
     #[test]

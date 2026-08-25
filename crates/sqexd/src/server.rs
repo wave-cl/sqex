@@ -1,5 +1,6 @@
 //! The sqex HTTP/3 server: bind, serve, route, and execute admin commands.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -21,7 +22,7 @@ use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
-use sqex_proto::session::{BySession, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
+use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -47,6 +48,49 @@ pub struct Peer {
     pub identity: Option<PubKey>,
 }
 
+/// Live connections by the identity that advertised itself on them (SIP-3).
+///
+/// Only datagram forwarding needs this: relaying a packet means writing it to
+/// the *other* peer's connection, which the request path never has to do. An
+/// identity may hold several connections at once; a datagram goes to all of
+/// them, and the peer's session keys mean only the intended one can open it.
+#[derive(Default)]
+struct Connections {
+    by_identity: Mutex<HashMap<PubKey, Vec<quinn::Connection>>>,
+}
+
+impl Connections {
+    fn add(&self, id: PubKey, conn: quinn::Connection) {
+        self.by_identity.lock().unwrap().entry(id).or_default().push(conn);
+    }
+
+    /// Forget a connection, and the identity entirely once its last one goes.
+    fn remove(&self, id: &PubKey, conn: &quinn::Connection) {
+        let mut map = self.by_identity.lock().unwrap();
+        if let Some(v) = map.get_mut(id) {
+            v.retain(|c| c.stable_id() != conn.stable_id());
+            if v.is_empty() {
+                map.remove(id);
+            }
+        }
+    }
+
+    /// Every live connection for an identity. Closed ones are dropped as found,
+    /// so a peer that has gone away stops being written to.
+    fn get(&self, id: &PubKey) -> Vec<quinn::Connection> {
+        let mut map = self.by_identity.lock().unwrap();
+        let Some(v) = map.get_mut(id) else {
+            return Vec::new();
+        };
+        v.retain(|c| c.close_reason().is_none());
+        if v.is_empty() {
+            map.remove(id);
+            return Vec::new();
+        }
+        v.clone()
+    }
+}
+
 /// Everything a request handler needs.
 pub struct Server {
     pub public_key: PubKey,
@@ -57,6 +101,7 @@ pub struct Server {
     beacons: Beacons,
     mailbox: Mailbox,
     sessions: Sessions,
+    live_conns: Connections,
     started: Instant,
     connections: AtomicU64,
 }
@@ -92,6 +137,9 @@ pub async fn bind(
     let squic_config = SquicConfig {
         alpn_protocols: vec![ALPN.to_vec()],
         max_idle_timeout: std::time::Duration::from_secs(60),
+        // Sessions may carry real-time media over datagrams (SIP-12). Costs
+        // nothing for the connections that never send one.
+        enable_datagrams: true,
         ..Default::default()
     };
 
@@ -111,6 +159,7 @@ pub async fn bind(
         beacons: Beacons::new(),
         mailbox: Mailbox::new(),
         sessions: Sessions::new(),
+        live_conns: Connections::default(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
     });
@@ -185,7 +234,15 @@ async fn serve_h3(
     conn: quinn::Connection,
     peer: Peer,
 ) -> Result<()> {
-    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
+    // An identified connection can carry session datagrams, so register it and
+    // pump them for as long as it lives. Anonymous connections cannot be a
+    // party to a session, so they are never registered and never forwarded to.
+    let registered = peer.identity.inspect(|id| {
+        server.live_conns.add(*id, conn.clone());
+        tokio::spawn(forward_datagrams(Arc::clone(&server), conn.clone(), *id));
+    });
+
+    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn.clone()))
         .await
         .map_err(|e| Error::Malformed(format!("h3 setup: {e}")))?;
 
@@ -206,7 +263,36 @@ async fn serve_h3(
             }
         }
     }
+    if let Some(id) = registered {
+        server.live_conns.remove(&id, &conn);
+    }
     Ok(())
+}
+
+/// Relay session datagrams for one connection until it closes.
+///
+/// This is the whole unreliable path: read a datagram, check the sender is a
+/// party to the session it names, write it to the other party's connection.
+/// Nothing is queued, retried, acknowledged or inspected — a packet that cannot
+/// be delivered right now is dropped, which is the correct behaviour for media
+/// and the reason this path exists (SIP-12).
+async fn forward_datagrams(server: Arc<Server>, conn: quinn::Connection, from: PubKey) {
+    loop {
+        let Ok(bytes) = conn.read_datagram().await else {
+            return; // connection closed
+        };
+        let Ok(frame) = DatagramFrame::decode(&bytes) else {
+            continue; // malformed: drop it, say nothing
+        };
+        let Some(to) = server.sessions.counterpart(&from, frame.session_id) else {
+            continue; // not a party, or no live session: drop it
+        };
+        // Forwarded verbatim: the exchange cannot read the ciphertext and has
+        // no reason to touch the header it routed on.
+        for peer_conn in server.live_conns.get(&to) {
+            let _ = peer_conn.send_datagram(bytes.clone());
+        }
+    }
 }
 
 async fn handle_stream(
