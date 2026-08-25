@@ -16,8 +16,10 @@ use squic::Config as SquicConfig;
 use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::config::Config;
+use crate::mailbox::Mailbox;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
+use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -51,6 +53,7 @@ pub struct Server {
     admins: RwLock<Vec<PubKey>>,
     challenges: Challenges,
     beacons: Beacons,
+    mailbox: Mailbox,
     started: Instant,
     connections: AtomicU64,
 }
@@ -103,6 +106,7 @@ pub async fn bind(
         admins: RwLock::new(config.admins),
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
+        mailbox: Mailbox::new(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
     });
@@ -302,6 +306,69 @@ async fn route(
             }
         },
 
+        // SIP-5 store-and-forward mailbox. Every operation is by the caller's
+        // transport identity (SIP-3): a sender is whoever connected, and a
+        // mailbox belongs to whoever can connect as its key. Nothing is signed.
+        ("POST", "/mailbox/send") => match (peer.identity, MailSend::decode(body)) {
+            (None, _) => no_identity("sending"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(from), Ok(msg)) => {
+                match server.mailbox.send(from, msg.recipient, msg.sealed) {
+                    Ok((id, now)) => (
+                        200,
+                        "application/octet-stream",
+                        SendAck { id, now }.encode(),
+                    ),
+                    Err(e) => (
+                        507,
+                        "application/json",
+                        json!({ "error": e.as_str() }).to_string().into_bytes(),
+                    ),
+                }
+            }
+        },
+        ("POST", "/mailbox/list") => match peer.identity {
+            None => no_identity("listing"),
+            Some(me) => (
+                200,
+                "application/octet-stream",
+                server.mailbox.list(&me).encode(),
+            ),
+        },
+        ("POST", "/mailbox/fetch") => match (peer.identity, ById::decode(body, TYPE_FETCH)) {
+            (None, _) => no_identity("fetching"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                let out = match server.mailbox.fetch(&me, req.id) {
+                    Some((sender, received, sealed)) => Fetched {
+                        found: true,
+                        sender,
+                        received,
+                        sealed,
+                    },
+                    None => Fetched::none(),
+                };
+                (200, "application/octet-stream", out.encode())
+            }
+        },
+        ("POST", "/mailbox/delete") => match (peer.identity, ById::decode(body, TYPE_DELETE)) {
+            (None, _) => no_identity("deleting"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                let deleted = server.mailbox.delete(&me, req.id);
+                (200, "application/octet-stream", vec![u8::from(deleted)])
+            }
+        },
+        ("POST", "/mailbox/status") => match (peer.identity, ById::decode(body, TYPE_STATUS)) {
+            (None, _) => no_identity("asking"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => (
+                200,
+                "application/octet-stream",
+                server.mailbox.status(&me, req.id).encode(),
+            ),
+        },
+
         // A protected exchange endpoint, to demonstrate whitelist enforcement.
         ("GET", "/exchange/ping") => {
             if server.state.lock().unwrap().peer_allowed(peer.key) {
@@ -335,6 +402,7 @@ impl Server {
             "whitelist_enabled": state.enabled(),
             "whitelist_count": state.keys().len(),
             "beacons": self.beacons.len(),
+            "mail_waiting": self.mailbox.waiting(),
             "admins": self.admins.read().unwrap().len(),
         })
     }
@@ -468,6 +536,22 @@ impl Server {
         *self.admins.write().unwrap() = config.admins;
         Ok(n)
     }
+}
+
+/// The answer to an identity-bound request from a connection that carries no
+/// identity. There is nothing to act as, so this is a refusal, not an empty
+/// result.
+fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
+    (
+        403,
+        "application/json",
+        json!({
+            "error": "no_identity",
+            "detail": format!("{action} requires an advertised Ed25519 identity (SIP-3)"),
+        })
+        .to_string()
+        .into_bytes(),
+    )
 }
 
 fn error_status(e: &Error) -> (u16, &'static str) {

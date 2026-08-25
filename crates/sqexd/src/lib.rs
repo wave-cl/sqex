@@ -3,6 +3,7 @@
 pub mod beacon;
 pub mod challenge;
 pub mod config;
+pub mod mailbox;
 pub mod server;
 pub mod state;
 

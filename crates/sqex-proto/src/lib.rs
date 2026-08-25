@@ -11,6 +11,7 @@
 //! provably corresponds to what executes.
 
 pub mod beacon;
+pub mod mailbox;
 
 use sqnr_core::{Error, Operation, PubKey, Result};
 

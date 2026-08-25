@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
+use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
@@ -52,6 +53,32 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BeaconCmd,
     },
+    /// Store-and-forward mailbox: leave sealed messages, collect your own.
+    Mail {
+        #[command(subcommand)]
+        cmd: MailCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailCmd {
+    /// Seal a message to a recipient and leave it at the exchange.
+    Send {
+        /// Recipient's Ed25519 identity, base58.
+        recipient: String,
+        /// The message. Omit to read it from stdin.
+        message: Option<String>,
+    },
+    /// List the messages waiting for you.
+    List,
+    /// Fetch and open one message. Leaves it on the exchange until `delete`.
+    Fetch { id: u64 },
+    /// Complete collection: drop the message from the exchange.
+    Delete { id: u64 },
+    /// Ask what became of a message you sent.
+    Status { id: u64 },
+    /// Fetch, open, delete — every message waiting for you, in order.
+    Collect,
 }
 
 #[derive(Subcommand)]
@@ -123,7 +150,192 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Status => status(&cli, &cfg).await,
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
+        Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
     }
+}
+
+// ---- mailbox ----------------------------------------------------------------
+
+/// Every mailbox operation acts *as* an identity, so all of them dial with
+/// `connect_as`. A YubiKey cannot: it signs, but cannot be a transport key.
+async fn mail_client(
+    cli: &Cli,
+    cfg: &Config,
+) -> Result<(Client, sqnr_core::SoftwareSigner), String> {
+    if cli.yubikey {
+        return Err(
+            "a YubiKey cannot use the mailbox: it signs, but cannot be a transport identity. \
+             Use a software identity (see SIP-11 on delegation)."
+                .into(),
+        );
+    }
+    let signer = load_software_identity(cli, cfg)?;
+    let (addr, server) = endpoint(cli, cfg)?;
+    let client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+    Ok((client, signer))
+}
+
+async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
+    match cmd {
+        MailCmd::Send { recipient, message } => {
+            let to = parse_key(recipient)?;
+            let plaintext = match message {
+                Some(m) => m.clone().into_bytes(),
+                None => {
+                    use std::io::Read as _;
+                    let mut buf = Vec::new();
+                    std::io::stdin()
+                        .read_to_end(&mut buf)
+                        .map_err(|e| format!("read stdin: {e}"))?;
+                    buf
+                }
+            };
+            // Sealed here, on this machine. The exchange only ever sees
+            // ciphertext and cannot do otherwise.
+            let sealed = mailbox::seal(&to, &plaintext).map_err(|e| e.to_string())?;
+            let (mut client, _signer) = mail_client(cli, cfg).await?;
+            let (code, body) = client
+                .post("/mailbox/send", MailSend { recipient: to, sealed }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!(
+                    "send refused ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+            let ack = SendAck::decode(&body).map_err(|e| e.to_string())?;
+            println!("sent to {to} as message {}", ack.id);
+            Ok(())
+        }
+
+        MailCmd::List => {
+            let (mut client, signer) = mail_client(cli, cfg).await?;
+            let listing = list_mail(&mut client).await?;
+            if listing.entries.is_empty() {
+                println!("no messages waiting for {}", PubKey::new(signer.public()));
+                return Ok(());
+            }
+            println!("{} message(s) waiting:", listing.entries.len());
+            for e in &listing.entries {
+                println!(
+                    "  [{}] from {}  {} bytes  {}s ago",
+                    e.id,
+                    e.sender,
+                    e.len,
+                    listing.now.saturating_sub(e.received)
+                );
+            }
+            Ok(())
+        }
+
+        MailCmd::Fetch { id } => {
+            let (mut client, signer) = mail_client(cli, cfg).await?;
+            match fetch_one(&mut client, &signer, *id).await? {
+                Some((sender, text)) => {
+                    println!("from {sender}:");
+                    println!("{text}");
+                    println!("\n(still on the exchange — `sqex mail delete {id}` to complete collection)");
+                    Ok(())
+                }
+                None => Err(format!("no message {id} for you")),
+            }
+        }
+
+        MailCmd::Delete { id } => {
+            let (mut client, _) = mail_client(cli, cfg).await?;
+            let deleted = delete_one(&mut client, *id).await?;
+            if deleted {
+                println!("collected message {id}");
+            } else {
+                println!("nothing to collect for message {id}");
+            }
+            Ok(())
+        }
+
+        MailCmd::Status { id } => {
+            let (mut client, _) = mail_client(cli, cfg).await?;
+            let (code, body) = client
+                .post("/mailbox/status", ById::status(*id).encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("status failed ({code})"));
+            }
+            let s = Status::decode(&body).map_err(|e| e.to_string())?;
+            match s.state {
+                State::Unknown => println!("message {id}: unknown (never sent by you, or expired)"),
+                State::Waiting => println!(
+                    "message {id}: waiting, left {}s ago",
+                    s.now.saturating_sub(s.received)
+                ),
+                State::Collected => println!(
+                    "message {id}: collected {}s ago",
+                    s.now.saturating_sub(s.collected)
+                ),
+            }
+            Ok(())
+        }
+
+        MailCmd::Collect => {
+            let (mut client, signer) = mail_client(cli, cfg).await?;
+            let listing = list_mail(&mut client).await?;
+            if listing.entries.is_empty() {
+                println!("nothing waiting");
+                return Ok(());
+            }
+            for e in &listing.entries {
+                match fetch_one(&mut client, &signer, e.id).await? {
+                    Some((sender, text)) => {
+                        println!("── [{}] from {sender} ──", e.id);
+                        println!("{text}");
+                        // Only delete once it is in hand: at-least-once means a
+                        // failure here costs a retry, never the message.
+                        delete_one(&mut client, e.id).await?;
+                    }
+                    None => println!("── [{}] vanished before collection", e.id),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn list_mail(client: &mut Client) -> Result<Listing, String> {
+    let (code, body) = client.post("/mailbox/list", Vec::new()).await?;
+    if code != 200 {
+        return Err(format!(
+            "list failed ({code}): {}",
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    Listing::decode(&body).map_err(|e| e.to_string())
+}
+
+/// Fetch and open one message, returning (sender, plaintext).
+async fn fetch_one(
+    client: &mut Client,
+    signer: &sqnr_core::SoftwareSigner,
+    id: u64,
+) -> Result<Option<(PubKey, String)>, String> {
+    let (code, body) = client.post("/mailbox/fetch", ById::fetch(id).encode()).await?;
+    if code != 200 {
+        return Err(format!("fetch failed ({code})"));
+    }
+    let f = Fetched::decode(&body).map_err(|e| e.to_string())?;
+    if !f.found {
+        return Ok(None);
+    }
+    let plain = mailbox::open(&signer.seed(), &f.sealed).map_err(|e| e.to_string())?;
+    Ok(Some((f.sender, String::from_utf8_lossy(&plain).into_owned())))
+}
+
+async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
+    let (code, body) = client
+        .post("/mailbox/delete", ById::delete(id).encode())
+        .await?;
+    if code != 200 {
+        return Err(format!("delete failed ({code})"));
+    }
+    Ok(body.first().copied().unwrap_or(0) != 0)
 }
 
 // ---- beacon -----------------------------------------------------------------

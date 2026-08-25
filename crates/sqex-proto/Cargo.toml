@@ -7,3 +7,11 @@ description = "sqex admin command vocabulary: opaque operation payloads + human 
 
 [dependencies]
 sqnr-core = { workspace = true }
+# Sealing (SIP-5 mailbox). Clients seal and open; sqexd links this but never
+# calls it — the exchange handles ciphertext only.
+squic = { workspace = true }
+x25519-dalek = "2"
+ed25519-dalek = { workspace = true }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rand_core = { workspace = true }
