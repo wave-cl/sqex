@@ -5,6 +5,7 @@ members = [
     "crates/sqexd",
     "crates/sqex-cli",
     "crates/sqex-admin",
+    "crates/sqex-voice",
 ]
 
 [workspace.package]

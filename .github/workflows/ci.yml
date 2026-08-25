@@ -15,8 +15,10 @@ jobs:
 
       # sqex-admin links libpcsc (via card-backend-pcsc) for YubiKey access.
       # macOS has the PCSC framework built in; Linux CI needs the dev package.
-      - name: Install PC/SC
-        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config
+      # sqex-voice (the voice demo, not shipped) links ALSA through cpal, and
+      # builds libopus from source with cmake, which the runner already has.
+      - name: Install PC/SC and ALSA
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libasound2-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
