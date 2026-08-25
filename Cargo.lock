@@ -4012,6 +4012,7 @@ dependencies = [
 [[package]]
 name = "sqnr"
 version = "0.1.0"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.1.0#99b7f0de085f29b1e82c23c9b00c168992a5d693"
 dependencies = [
  "argon2",
  "bs58",
@@ -4040,6 +4041,7 @@ dependencies = [
 [[package]]
 name = "sqnr-core"
 version = "0.1.0"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.1.0#99b7f0de085f29b1e82c23c9b00c168992a5d693"
 dependencies = [
  "bs58",
  "ed25519-dalek",
