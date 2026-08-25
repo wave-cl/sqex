@@ -1,17 +1,16 @@
 //! End-to-end through the *real* sqnr code path: `sqnr::Client` +
-//! `sqnr::flow::run_once` + `sqnr::Backend::software` driving signed admin
-//! commands against a live sqexd. This is what the `sqnr` CLI runs, minus the
-//! terminal passphrase prompt — proof the signer/client/flow apply correctly
-//! against the server.
+//! `sqnr::flow::sign_and_submit` + `sqnr::Backend::software` driving a signed
+//! transaction against a live sqexd. This is what the sqex CLI runs, minus the
+//! terminal prompt. Also proves batch application (multiple ops, one signature).
 
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
+use sqex_proto::Op;
 use sqexd::config::FileConfig;
 use sqnr::signer::Backend;
 use sqnr::{Client, flow};
-use sqnr_core::PubKey;
-use sqnr_core::protocol::{Action, SoftwareSigner};
+use sqnr_core::{PubKey, Transaction};
 
 async fn spawn_server(
     config_toml: &str,
@@ -33,7 +32,7 @@ async fn spawn_server(
 }
 
 #[tokio::test]
-async fn cli_flow_signs_and_applies() {
+async fn cli_flow_signs_a_batch() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("host_key");
     let state_path = dir.path().join("sqex.state");
@@ -57,45 +56,58 @@ async fn cli_flow_signs_and_applies() {
     let server = PubKey::new(server_pub_bytes);
 
     let mut client = Client::connect(addr, &server_pub_bytes).await.unwrap();
-    let admin = Backend::software(SoftwareSigner::new(admin_sk));
+    let admin = Backend::software(sqnr_core::SoftwareSigner::new(admin_sk));
+    let no_review = |_: &Transaction| {};
     let no_touch = || {};
 
-    // Enable the whitelist, then read it back — both signed by the software admin.
-    flow::run_once(&mut client, &admin, server, Action::WhitelistEnable, &no_touch)
-        .await
-        .expect("enable accepted");
-    let listed = flow::run_once(&mut client, &admin, server, Action::WhitelistList, &no_touch)
-        .await
-        .expect("list accepted");
-    assert_eq!(listed["enabled"], true, "whitelist reports enabled");
-
-    // Add a peer key and confirm it appears in the list.
+    // One signed transaction that enables the whitelist AND adds a peer.
     let peer = PubKey::new(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
-    flow::run_once(
+    let v = flow::sign_and_submit(
         &mut client,
         &admin,
         server,
-        Action::WhitelistAdd(peer),
+        vec![
+            Op::WhitelistEnable.to_operation(),
+            Op::WhitelistAdd(peer).to_operation(),
+        ],
+        &no_review,
         &no_touch,
     )
     .await
-    .expect("add accepted");
-    let listed = flow::run_once(&mut client, &admin, server, Action::WhitelistList, &no_touch)
-        .await
-        .expect("list accepted");
-    let keys = listed["keys"].as_array().unwrap();
+    .expect("batch accepted");
+    assert_eq!(v["results"][0]["enabled"], true, "enable applied");
+    assert_eq!(v["results"][1]["changed"], true, "add applied");
+
+    // Read it back with a separate signed transaction.
+    let v = flow::sign_and_submit(
+        &mut client,
+        &admin,
+        server,
+        vec![Op::WhitelistList.to_operation()],
+        &no_review,
+        &no_touch,
+    )
+    .await
+    .expect("list accepted");
+    let listed = &v["results"][0];
+    assert_eq!(listed["enabled"], true);
     assert!(
-        keys.iter().any(|k| k.as_str() == Some(&peer.to_base58())),
-        "added peer is present in the whitelist"
+        listed["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k.as_str() == Some(&peer.to_base58())),
+        "both ops in the batch took effect"
     );
 
-    // A non-admin backend is refused by the server.
-    let outsider = Backend::software(SoftwareSigner::new(SigningKey::from_bytes(&[8u8; 32])));
-    let err = flow::run_once(
+    // A non-admin backend is refused.
+    let outsider = Backend::software(sqnr_core::SoftwareSigner::new(SigningKey::from_bytes(&[8u8; 32])));
+    let err = flow::sign_and_submit(
         &mut client,
         &outsider,
         server,
-        Action::WhitelistDisable,
+        vec![Op::WhitelistDisable.to_operation()],
+        &no_review,
         &no_touch,
     )
     .await;

@@ -3,8 +3,8 @@
 use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui;
+use sqex_proto::Op;
 use sqnr_core::PubKey;
-use sqnr_core::protocol::Action;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::worker::{self, Cmd, Msg};
@@ -98,14 +98,14 @@ impl App {
         }
     }
 
-    /// Issue a signed admin command, if the PIN is present.
-    fn admin(&mut self, action: Action) {
+    /// Issue a signed admin op, if the PIN is present.
+    fn admin(&mut self, op: Op) {
         if self.pin.is_empty() {
             self.push_log("enter the YubiKey user PIN first".into());
             return;
         }
         let _ = self.cmd_tx.send(Cmd::Admin {
-            action,
+            op,
             pin: self.pin.clone(),
         });
     }
@@ -190,13 +190,13 @@ impl eframe::App for App {
                         "(disabled)"
                     });
                     if ui.button("Refresh").clicked() {
-                        self.admin(Action::WhitelistList);
+                        self.admin(Op::WhitelistList);
                     }
                     if ui.button("Enable").clicked() {
-                        self.admin(Action::WhitelistEnable);
+                        self.admin(Op::WhitelistEnable);
                     }
                     if ui.button("Disable").clicked() {
-                        self.admin(Action::WhitelistDisable);
+                        self.admin(Op::WhitelistDisable);
                     }
                 });
 
@@ -228,7 +228,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.strong("Audit");
                     if ui.button("Refresh").clicked() {
-                        self.admin(Action::AuditTail(50));
+                        self.admin(Op::AuditTail(50));
                     }
                 });
                 // Fill the rest of the central panel with the audit view.
@@ -252,9 +252,9 @@ impl App {
         match key.parse::<PubKey>() {
             Ok(k) => {
                 let action = if add {
-                    Action::WhitelistAdd(k)
+                    Op::WhitelistAdd(k)
                 } else {
-                    Action::WhitelistRemove(k)
+                    Op::WhitelistRemove(k)
                 };
                 self.admin(action);
             }

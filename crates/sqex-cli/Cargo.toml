@@ -1,0 +1,19 @@
+[package]
+name = "sqex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line admin tool for sqex: builds signed transactions and submits them over HTTP/3."
+
+[[bin]]
+name = "sqex"
+path = "src/main.rs"
+
+[dependencies]
+sqnr = { workspace = true }
+sqnr-core = { workspace = true }
+sqex-proto = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+rpassword = "7"

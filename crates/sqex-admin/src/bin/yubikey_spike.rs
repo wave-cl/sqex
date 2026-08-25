@@ -65,9 +65,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("auth key (Ed25519): {}", bs58::encode(ed_pub).into_string());
     println!("  hex: {}", hex::encode(ed_pub));
 
-    // Sign a message shaped like a real sqex command signing input, then verify.
+    // Sign a domain-separated message, then verify. Any tag works here; this is
+    // just proving the card produces a raw Ed25519 signature.
     let message = {
-        let mut m = sqnr_core::SIG_CONTEXT.to_vec();
+        let mut m = b"sqex-yubikey-spike".to_vec();
         m.extend_from_slice(b"yubikey-spike test payload");
         m
     };

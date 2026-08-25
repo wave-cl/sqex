@@ -1,0 +1,9 @@
+[package]
+name = "sqex-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sqex admin command vocabulary: opaque operation payloads + human summaries, over sqnr transactions."
+
+[dependencies]
+sqnr-core = { workspace = true }

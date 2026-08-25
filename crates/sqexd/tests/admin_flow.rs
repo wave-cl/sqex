@@ -1,17 +1,17 @@
-//! End-to-end: drive the signed admin-command flow over real HTTP/3 with a
-//! software signer, and prove whitelist enforcement, non-admin rejection,
-//! replay rejection, and persistence across a restart.
+//! End-to-end over real HTTP/3 with a software signer: whitelist enforcement,
+//! non-admin rejection, replay rejection, batch atomicity, summary-binding, and
+//! persistence across a restart. Drives the raw transaction protocol with an
+//! inline client (the sqnr-library path is covered in `sqnr_flow.rs`).
 
 use std::net::SocketAddr;
 
 use bytes::Buf;
 use ed25519_dalek::SigningKey;
-use sqnr_core::PubKey;
-use sqnr_core::protocol::{Action, Command, SignedCommand, SoftwareSigner};
+use sqex_proto::Op;
 use sqexd::config::FileConfig;
+use sqnr_core::{Operation, PubKey, SignedTransaction, SoftwareSigner, Transaction};
 use squic::Config as SquicConfig;
 
-/// Spawn a server on an ephemeral port; return (addr, server pubkey bytes, task).
 async fn spawn_server(
     config_toml: &str,
     config_path: std::path::PathBuf,
@@ -94,10 +94,10 @@ impl Client {
         (status, out)
     }
 
-    /// Run one admin action: fetch a challenge, sign, POST. Returns (status, body).
-    async fn admin(
+    /// Fetch a challenge and POST a transaction of `ops` signed by `signer`.
+    async fn tx(
         &mut self,
-        action: Action,
+        ops: Vec<Operation>,
         server_pub: &PubKey,
         signer: &SoftwareSigner,
     ) -> (u16, Vec<u8>) {
@@ -105,13 +105,29 @@ impl Client {
         assert_eq!(cs, 200, "challenge should be issued");
         let mut nonce = [0u8; 32];
         nonce.copy_from_slice(&nonce_bytes);
-        let cmd = Command {
-            action,
-            nonce,
+        let txn = Transaction {
             server: *server_pub,
+            nonce,
+            ops,
         };
-        let signed = SignedCommand::create(cmd, signer);
+        let signed = SignedTransaction::create(txn, signer);
         self.post("/admin/command", signed.encode()).await
+    }
+
+    /// Convenience: a one-op transaction.
+    async fn admin(
+        &mut self,
+        op: Op,
+        server_pub: &PubKey,
+        signer: &SoftwareSigner,
+    ) -> (u16, Vec<u8>) {
+        self.tx(vec![op.to_operation()], server_pub, signer).await
+    }
+
+    async fn whitelist_enabled(&mut self) -> bool {
+        let (_s, body) = self.get("/status").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["whitelist_enabled"].as_bool().unwrap_or(false)
     }
 }
 
@@ -121,17 +137,14 @@ async fn full_admin_flow() {
     let key_path = dir.path().join("host_key");
     let state_path = dir.path().join("sqex.state");
 
-    // Server identity.
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
 
-    // Admin identity (goes in config); a non-admin identity for rejection test.
     let admin_sk = SigningKey::from_bytes(&[7u8; 32]);
     let admin_pub = PubKey::new(admin_sk.verifying_key().to_bytes());
     let admin_signer = SoftwareSigner::new(admin_sk);
     let outsider = SoftwareSigner::new(SigningKey::from_bytes(&[8u8; 32]));
 
-    // Client transport identity (what the whitelist will gate on).
     let client_seed = [42u8; 32];
     let client_pub = PubKey::new(
         SigningKey::from_bytes(&client_seed)
@@ -150,62 +163,128 @@ async fn full_admin_flow() {
 
     let (addr, server_pub_bytes, handle) = spawn_server(&config_toml, config_path.clone()).await;
     let server_pub = PubKey::new(server_pub_bytes);
-
     let mut client = Client::connect(addr, &server_pub_bytes, &client_seed).await;
 
     // Public endpoints.
-    let (s, _) = client.get("/health").await;
-    assert_eq!(s, 200, "health is public");
-    let (s, _) = client.get("/exchange/ping").await;
-    assert_eq!(s, 200, "ping allowed while whitelist disabled");
+    assert_eq!(client.get("/health").await.0, 200, "health is public");
+    assert_eq!(
+        client.get("/exchange/ping").await.0,
+        200,
+        "ping allowed while whitelist disabled"
+    );
+
+    // A summary that does not match its payload is rejected (context binding).
+    let (s, _) = client
+        .tx(
+            vec![Operation {
+                summary: "Do something harmless".into(),
+                detail: vec![],
+                payload: Op::WhitelistEnable.payload(),
+            }],
+            &server_pub,
+            &admin_signer,
+        )
+        .await;
+    assert_eq!(s, 400, "summary/payload mismatch refused");
+    assert!(!client.whitelist_enabled().await, "and nothing was applied");
+
+    // A batch containing a bad op applies NONE of it (atomicity): enable first,
+    // then an undecodable payload.
+    let (s, _) = client
+        .tx(
+            vec![
+                Op::WhitelistEnable.to_operation(),
+                Operation {
+                    summary: "bogus".into(),
+                    detail: vec![],
+                    payload: vec![0xFF],
+                },
+            ],
+            &server_pub,
+            &admin_signer,
+        )
+        .await;
+    assert_eq!(s, 400, "batch with a bad op is refused");
+    assert!(
+        !client.whitelist_enabled().await,
+        "the good op in the bad batch was not applied"
+    );
 
     // Enable the whitelist (admin, signed).
     let (s, body) = client
-        .admin(Action::WhitelistEnable, &server_pub, &admin_signer)
+        .admin(Op::WhitelistEnable, &server_pub, &admin_signer)
         .await;
+    assert_eq!(s, 200, "admin enable: {}", String::from_utf8_lossy(&body));
+
+    // Non-whitelisted client now refused on the protected endpoint.
     assert_eq!(
-        s,
-        200,
-        "admin enable accepted: {}",
-        String::from_utf8_lossy(&body)
+        client.get("/exchange/ping").await.0,
+        403,
+        "ping refused: whitelist on, client not listed"
     );
 
-    // Now the (non-whitelisted) client is refused on the protected endpoint.
-    let (s, _) = client.get("/exchange/ping").await;
-    assert_eq!(s, 403, "ping refused: whitelist on, client not listed");
-
-    // Add the client's identity, then it is allowed again.
-    let (s, _) = client
-        .admin(Action::WhitelistAdd(client_pub), &server_pub, &admin_signer)
+    // A batch: add the client key AND read the list in one signed transaction.
+    let (s, body) = client
+        .tx(
+            vec![
+                Op::WhitelistAdd(client_pub).to_operation(),
+                Op::WhitelistList.to_operation(),
+            ],
+            &server_pub,
+            &admin_signer,
+        )
         .await;
-    assert_eq!(s, 200, "admin add accepted");
-    let (s, _) = client.get("/exchange/ping").await;
-    assert_eq!(s, 200, "ping allowed after the client's key is whitelisted");
+    assert_eq!(s, 200, "batch add+list accepted");
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let listed = &v["results"][1];
+    assert_eq!(listed["enabled"], true);
+    assert!(
+        listed["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k.as_str() == Some(&client_pub.to_base58())),
+        "the added key is in the returned list"
+    );
+    assert_eq!(
+        client.get("/exchange/ping").await.0,
+        200,
+        "ping allowed after the client's key is whitelisted"
+    );
 
     // A non-admin signer is rejected.
-    let (s, _) = client
-        .admin(Action::WhitelistDisable, &server_pub, &outsider)
-        .await;
-    assert_eq!(s, 403, "outsider is not an admin");
+    assert_eq!(
+        client
+            .admin(Op::WhitelistDisable, &server_pub, &outsider)
+            .await
+            .0,
+        403,
+        "outsider is not an admin"
+    );
 
     // Replay: reuse a consumed nonce.
     let (cs, nonce_bytes) = client.get("/admin/challenge").await;
     assert_eq!(cs, 200);
     let mut nonce = [0u8; 32];
     nonce.copy_from_slice(&nonce_bytes);
-    let cmd = Command {
-        action: Action::Status,
-        nonce,
+    let txn = Transaction {
         server: server_pub,
+        nonce,
+        ops: vec![Op::Status.to_operation()],
     };
-    let signed = SignedCommand::create(cmd, &admin_signer);
-    let (s, _) = client.post("/admin/command", signed.encode()).await;
-    assert_eq!(s, 200, "first use of the nonce works");
-    let (s, _) = client.post("/admin/command", signed.encode()).await;
-    assert_eq!(s, 401, "second use of the same nonce is refused");
+    let signed = SignedTransaction::create(txn, &admin_signer);
+    assert_eq!(
+        client.post("/admin/command", signed.encode()).await.0,
+        200,
+        "first use of the nonce works"
+    );
+    assert_eq!(
+        client.post("/admin/command", signed.encode()).await.0,
+        401,
+        "second use of the same nonce is refused"
+    );
 
-    // Persistence across a restart: stop the server, start a fresh one on the
-    // same state file, and confirm the whitelist survived.
+    // Persistence across a restart.
     handle.abort();
     let _ = handle.await;
     let (addr2, server_pub2, handle2) = spawn_server(&config_toml, config_path).await;

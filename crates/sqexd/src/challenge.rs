@@ -9,7 +9,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rand::RngCore;
-use sqnr_core::Nonce;
+
+/// A single-use challenge nonce.
+type Nonce = [u8; 32];
 
 pub struct Challenges {
     ttl: Duration,

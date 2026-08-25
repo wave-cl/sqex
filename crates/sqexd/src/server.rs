@@ -9,8 +9,8 @@ use bytes::Buf;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 use sqnr_core::key::PubKey;
-use sqnr_core::protocol::{Action, SignedCommand};
-use sqnr_core::{Error, Result};
+use sqnr_core::{Error, Result, SignedTransaction};
+use sqex_proto::Op;
 use squic::Config as SquicConfig;
 
 use crate::challenge::Challenges;
@@ -272,8 +272,9 @@ async fn route(
 }
 
 impl Server {
-    fn status_json(&self) -> Vec<u8> {
-        let state = self.state.lock().unwrap();
+    /// Build the status JSON from an already-borrowed state (so it can run both
+    /// from the public endpoint and from inside a locked batch).
+    fn status_value(&self, state: &State) -> serde_json::Value {
         json!({
             "version": VERSION,
             "uptime_secs": self.started.elapsed().as_secs(),
@@ -282,17 +283,23 @@ impl Server {
             "whitelist_count": state.keys().len(),
             "admins": self.admins.read().unwrap().len(),
         })
-        .to_string()
-        .into_bytes()
     }
 
-    /// Decode, authenticate, and apply a signed admin command; return the JSON
-    /// response body on success.
+    fn status_json(&self) -> Vec<u8> {
+        let state = self.state.lock().unwrap();
+        self.status_value(&state).to_string().into_bytes()
+    }
+
+    /// Decode, authenticate, and apply a signed transaction (a batch of ops);
+    /// return the JSON response body on success. The batch is applied
+    /// atomically: every op is decoded and checked first, so one bad op means
+    /// none are applied.
     async fn execute(&self, body: &[u8]) -> Result<Vec<u8>> {
-        let signed = SignedCommand::decode(body)?;
+        let signed = SignedTransaction::decode(body)?;
+        let txn = &signed.transaction;
 
         // 1. The nonce must be one we issued and have not seen.
-        if !self.challenges.consume(&signed.command.nonce) {
+        if !self.challenges.consume(&txn.nonce) {
             return Err(Error::BadChallenge);
         }
         // 2. Signature + server binding.
@@ -302,67 +309,80 @@ impl Server {
             return Err(Error::NotAdmin);
         }
 
-        let action = signed.command.action.clone();
-        let result = self.apply(&action)?;
-
-        if action.is_mutation() {
-            let target = match &action {
-                Action::WhitelistAdd(k) | Action::WhitelistRemove(k) => Some(k.to_base58()),
-                _ => None,
-            };
-            let mut state = self.state.lock().unwrap();
-            state.record(AuditEntry {
-                time: now_unix(),
-                admin: signed.admin.to_base58(),
-                action: action.name().to_string(),
-                target,
-                outcome: "ok".into(),
-            });
-            state.save()?;
-            tracing::info!(admin = %signed.admin.short(), action = action.name(), "admin command applied");
+        // 4. Decode every op up front. Reject if the summary the operator signed
+        //    does not match what this op actually is — so the displayed context
+        //    provably corresponds to what will execute.
+        let mut ops = Vec::with_capacity(txn.ops.len());
+        for wire in &txn.ops {
+            let op = Op::decode(&wire.payload)?;
+            if op.summary() != wire.summary {
+                return Err(Error::Malformed(format!(
+                    "op summary {:?} does not match payload ({})",
+                    wire.summary,
+                    op.name()
+                )));
+            }
+            ops.push(op);
         }
-        Ok(result)
+
+        // 5. Apply the batch under one lock, then persist once.
+        let mut state = self.state.lock().unwrap();
+        let mut results = Vec::with_capacity(ops.len());
+        let mut mutated = false;
+        for op in &ops {
+            results.push(self.apply(&mut state, op));
+            if op.is_mutation() {
+                mutated = true;
+                state.record(AuditEntry {
+                    time: now_unix(),
+                    admin: signed.admin.to_base58(),
+                    action: op.name().to_string(),
+                    target: op.target(),
+                    outcome: "ok".into(),
+                });
+                tracing::info!(admin = %signed.admin.short(), action = op.name(), "admin op applied");
+            }
+        }
+        if mutated {
+            state.save()?;
+        }
+        Ok(json!({ "results": results }).to_string().into_bytes())
     }
 
-    /// Carry out an already-authenticated action.
-    fn apply(&self, action: &Action) -> Result<Vec<u8>> {
-        let mut state = self.state.lock().unwrap();
-        let body = match action {
-            Action::WhitelistEnable => {
+    /// Carry out one already-authenticated op against the locked state, and
+    /// return its JSON result.
+    fn apply(&self, state: &mut State, op: &Op) -> serde_json::Value {
+        match op {
+            Op::WhitelistEnable => {
                 state.set_enabled(true);
                 json!({ "ok": true, "enabled": true })
             }
-            Action::WhitelistDisable => {
+            Op::WhitelistDisable => {
                 state.set_enabled(false);
                 json!({ "ok": true, "enabled": false })
             }
-            Action::WhitelistAdd(k) => {
+            Op::WhitelistAdd(k) => {
                 let changed = state.add(*k);
                 json!({ "ok": true, "changed": changed })
             }
-            Action::WhitelistRemove(k) => {
+            Op::WhitelistRemove(k) => {
                 let changed = state.remove(k);
                 json!({ "ok": true, "changed": changed })
             }
-            Action::WhitelistList => {
+            Op::WhitelistList => {
                 let keys: Vec<String> = state.keys().iter().map(|k| k.to_base58()).collect();
                 json!({ "enabled": state.enabled(), "keys": keys })
             }
-            Action::Status => {
-                drop(state);
-                return Ok(self.status_json());
-            }
-            Action::ReloadAdmins => {
-                drop(state);
-                let n = self.reload_admins()?;
-                json!({ "ok": true, "admins": n })
-            }
-            Action::AuditTail(n) => {
+            Op::Status => self.status_value(state),
+            Op::ReloadAdmins => match self.reload_admins() {
+                Ok(n) => json!({ "ok": true, "admins": n }),
+                Err(e) => json!({ "ok": false, "error": e.to_string() }),
+            },
+            Op::AuditTail(n) => {
                 let entries = state.audit_tail(*n as usize);
                 json!({ "entries": entries })
             }
-        };
-        Ok(body.to_string().into_bytes())
+        }
     }
 
     /// Re-read the admin list from the config file.

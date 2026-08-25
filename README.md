@@ -22,20 +22,24 @@ from the start.
 
 ## How admin commands work
 
-Every command is replay-protected by challenge-response and bound to this
-server:
+Admins sign **transactions** — an ordered batch of operations — with
+[sqnr](https://github.com/wave-cl/sqnr), the generic signer. sqex only supplies
+the command vocabulary (`sqex-proto`); the signer never parses a payload.
 
 1. `GET /admin/challenge` → the server returns a single-use 32-byte nonce.
-2. The admin signs the canonical bytes of `{ action, nonce, server_pubkey }`
-   with their Ed25519 key (domain-separated by `sqex-admin-v1`).
-3. `POST /admin/command` with `{ command, admin_pubkey, signature }`.
-4. The server checks, in order: the nonce is one it issued and has not used;
-   the command names this server; the signature verifies under `admin_pubkey`;
-   and `admin_pubkey` is in the configured admin list. Only then does it act.
+2. The client builds one or more ops (each an opaque payload + a human summary),
+   assembles `Transaction { server, nonce, ops }`, and signs its hash
+   (`sqnr-tx-v1`) once with the admin Ed25519 key.
+3. `POST /admin/command` with `{ transaction, admin_pubkey, signature }`.
+4. The server checks, in order: the nonce is one it issued and has not used; the
+   transaction names this server; the signature verifies under `admin_pubkey`;
+   `admin_pubkey` is in the configured admin list; and every op decodes with a
+   summary matching what it will do. Only then does it apply the batch
+   **atomically** (all ops, or none).
 
-Actions: enable/disable the whitelist, add/remove a peer key, list it, read
-status, reload the admin list, and read the audit tail. Every mutation is
-recorded to a persisted audit log (who, what, when).
+Ops: enable/disable the whitelist, add/remove a peer key, list it, read status,
+reload the admin list, and read the audit tail. Every mutation is recorded to a
+persisted audit log (who, what, when).
 
 ## Whitelist enforcement
 
@@ -49,9 +53,11 @@ Admin commands are signature-gated and always reachable.
 
 ## Layout
 
-- `sqex-core` — keys and the signed admin-command protocol (no networking).
-- `sqexd` — the HTTP/3 server, whitelist store, audit log, command execution.
-- `sqex-admin` — the desktop admin app (YubiKey), under construction.
+- `sqex-proto` — the admin command vocabulary: opaque op payloads + human
+  summaries, over [sqnr](https://github.com/wave-cl/sqnr) transactions.
+- `sqexd` — the HTTP/3 server, whitelist store, audit log, transaction execution.
+- `sqex-cli` — the `sqex` command-line admin tool (signs via sqnr).
+- `sqex-admin` — the desktop GUI (YubiKey), parked.
 
 ## Running
 

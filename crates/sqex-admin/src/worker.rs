@@ -5,9 +5,9 @@
 use std::net::SocketAddr;
 use std::sync::mpsc::Sender as StdSender;
 
+use sqex_proto::Op;
 use sqnr::{Backend, Card, Client, flow};
-use sqnr_core::PubKey;
-use sqnr_core::protocol::Action;
+use sqnr_core::{PubKey, Transaction};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A request from the UI.
@@ -16,9 +16,9 @@ pub enum Cmd {
         addr: String,
         server_pub: String,
     },
-    /// Run a signed admin command; `pin` unlocks the card for this action.
+    /// Run a signed admin op; `pin` unlocks the card for this action.
     Admin {
-        action: Action,
+        op: Op,
         pin: String,
     },
 }
@@ -127,13 +127,13 @@ async fn run(
                 }
                 Err(e) => send(Msg::Error(e)),
             },
-            Cmd::Admin { action, pin } => {
+            Cmd::Admin { op, pin } => {
                 let Some(sess) = session.as_mut() else {
                     send(Msg::Error("not connected".into()));
                     continue;
                 };
-                match run_admin(sess, &card, &mut unlocked, action.clone(), pin, &send).await {
-                    Ok(value) => dispatch_result(&action, value, &send),
+                match run_admin(sess, &card, &mut unlocked, op.clone(), pin, &send).await {
+                    Ok(value) => dispatch_result(&op, value, &send),
                     Err(e) => send(Msg::Error(e)),
                 }
             }
@@ -182,15 +182,15 @@ async fn run_admin(
     sess: &mut Session,
     card: &Card,
     unlocked: &mut bool,
-    action: Action,
+    op: Op,
     pin: String,
     notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
     ensure_unlocked(card, unlocked, &pin).await?;
-    match run_admin_once(sess, card, action.clone(), notify).await {
+    match run_admin_once(sess, card, op.clone(), notify).await {
         Err(e) if is_connection_error(&e) => {
             sess.reconnect().await?;
-            run_admin_once(sess, card, action, notify).await
+            run_admin_once(sess, card, op, notify).await
         }
         Err(e) if is_pin_lost(&e) => {
             // The card session dropped its PIN (removed/reinserted). Re-verify
@@ -198,7 +198,7 @@ async fn run_admin(
             // hand from this action.
             *unlocked = false;
             ensure_unlocked(card, unlocked, &pin).await?;
-            run_admin_once(sess, card, action, notify).await
+            run_admin_once(sess, card, op, notify).await
         }
         other => other,
     }
@@ -213,25 +213,40 @@ async fn ensure_unlocked(card: &Card, unlocked: &mut bool, pin: &str) -> Result<
     Ok(())
 }
 
-/// Fetch a challenge, sign the command on the card (touch), POST it, return JSON.
+/// Fetch a challenge, sign the op on the card (touch), POST it, return JSON.
 async fn run_admin_once(
     sess: &mut Session,
     card: &Card,
-    action: Action,
+    op: Op,
     notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
-    // The whole challenge→sign→POST transaction lives in sqnr; the GUI wraps it
-    // only to surface the touch prompt and (in run_admin) to reconnect/retry.
+    // The whole challenge→sign→POST transaction lives in sqnr; the GUI signs a
+    // one-op batch and wraps it only to surface the touch prompt and (in
+    // run_admin) to reconnect/retry.
     let backend = Backend::yubikey(card.clone(), sess.admin);
+    let on_review = |_: &Transaction| {};
     let on_touch = || notify(Msg::AwaitingTouch);
-    flow::run_once(&mut sess.client, &backend, sess.server, action, &on_touch).await
+    flow::sign_and_submit(
+        &mut sess.client,
+        &backend,
+        sess.server,
+        vec![op.to_operation()],
+        &on_review,
+        &on_touch,
+    )
+    .await
 }
 
-fn dispatch_result(action: &Action, value: serde_json::Value, send: &impl Fn(Msg)) {
-    match action {
-        Action::WhitelistList => {
-            let enabled = value["enabled"].as_bool().unwrap_or(false);
-            let keys = value["keys"]
+fn dispatch_result(op: &Op, value: serde_json::Value, send: &impl Fn(Msg)) {
+    // A one-op batch returns { "results": [ <result> ] }.
+    let r0 = value["results"]
+        .get(0)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    match op {
+        Op::WhitelistList => {
+            let enabled = r0["enabled"].as_bool().unwrap_or(false);
+            let keys = r0["keys"]
                 .as_array()
                 .map(|a| {
                     a.iter()
@@ -241,14 +256,14 @@ fn dispatch_result(action: &Action, value: serde_json::Value, send: &impl Fn(Msg
                 .unwrap_or_default();
             send(Msg::Whitelist { enabled, keys });
         }
-        Action::AuditTail(_) => {
-            let rows = value["entries"]
+        Op::AuditTail(_) => {
+            let rows = r0["entries"]
                 .as_array()
                 .map(|a| a.iter().map(format_audit).collect())
                 .unwrap_or_default();
             send(Msg::Audit(rows));
         }
-        other => send(Msg::Status(format!("{}: {}", other.name(), value))),
+        other => send(Msg::Status(format!("{}: {}", other.name(), r0))),
     }
 }
 

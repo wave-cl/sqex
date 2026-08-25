@@ -15,9 +15,11 @@ name = "yubikey_spike"
 path = "src/bin/yubikey_spike.rs"
 
 [dependencies]
-# Signing, the HTTP/3 client, and the transaction flow all live in sqnr now.
+# Signing, the HTTP/3 client, and the transaction flow all live in sqnr now;
+# the sqex command vocabulary lives in sqex-proto.
 sqnr-core = { workspace = true }
 sqnr = { workspace = true }
+sqex-proto = { workspace = true }
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
