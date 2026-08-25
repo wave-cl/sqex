@@ -17,11 +17,11 @@ use sqnr_core::{Operation, PubKey, Transaction};
 #[derive(Parser)]
 #[command(name = "sqex", version, about = "Administer a sqex server with signed transactions")]
 struct Cli {
-    /// Server address, host:port (overrides ~/.sqnr/config).
+    /// Server address, host:port (overrides SQEX_SERVER and ~/.sqnr/config).
     #[arg(long, global = true)]
     server: Option<String>,
 
-    /// Server's pinned Ed25519 public key, base58 (overrides ~/.sqnr/config).
+    /// Server's pinned Ed25519 public key, base58 (overrides SQEX_SERVER_KEY and ~/.sqnr/config).
     #[arg(long = "server-key", global = true)]
     server_key: Option<String>,
 
@@ -241,16 +241,25 @@ fn print_audit(v: &serde_json::Value) {
 // ---- resolution helpers ------------------------------------------------------
 
 async fn connect(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey), String> {
+    // Precedence for both address and key: CLI flag > env var > config file.
     let addr = cli
         .server
         .clone()
+        .or_else(|| env_nonempty("SQEX_SERVER"))
         .or_else(|| cfg.server.clone())
-        .ok_or_else(|| "no server address (pass --server or set it in ~/.sqnr/config)".to_string())?;
+        .ok_or_else(|| {
+            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
+                .to_string()
+        })?;
     let key = cli
         .server_key
         .clone()
+        .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
         .or_else(|| cfg.server_key.clone())
-        .ok_or_else(|| "no server key (pass --server-key or set it in ~/.sqnr/config)".to_string())?;
+        .ok_or_else(|| {
+            "no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)"
+                .to_string()
+        })?;
     let socket: SocketAddr = addr
         .parse()
         .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
@@ -299,4 +308,9 @@ fn identity_path(cli: &Cli, cfg: &Config) -> Result<PathBuf, String> {
 
 fn parse_key(s: &str) -> Result<PubKey, String> {
     s.trim().parse().map_err(|e| format!("bad key {s:?}: {e}"))
+}
+
+/// An environment variable's value, or None if unset or empty.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
 }

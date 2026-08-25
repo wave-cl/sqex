@@ -22,6 +22,19 @@ curl -fsSL https://raw.githubusercontent.com/wave-cl/sqex/main/install.sh | sh -
 You also need a signing identity for admin commands — install
 [sqnr](https://github.com/wave-cl/sqnr) and run `sqnr keygen`, or use a YubiKey.
 
+## Pointing the CLI at a server
+
+`sqex` resolves the server address and pinned key with the precedence
+**flag > environment > `~/.sqnr/config`**:
+
+```
+sqex --server host:5400 --server-key <b58> status   # flags
+SQEX_SERVER=host:5400 SQEX_SERVER_KEY=<b58> sqex status   # environment
+# or set server / server_key in ~/.sqnr/config and just: sqex status
+```
+
+`SQEXD_LOG` sets the server's log filter (`RUST_LOG`-style; default `info`).
+
 ## Why
 
 sQUIC proves a caller's key during the handshake, so a service need not
