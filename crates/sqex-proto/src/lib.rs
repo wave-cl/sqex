@@ -12,6 +12,7 @@
 
 pub mod beacon;
 pub mod mailbox;
+pub mod session;
 
 use sqnr_core::{Error, Operation, PubKey, Result};
 

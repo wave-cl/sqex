@@ -13,6 +13,9 @@ use clap::{Parser, Subcommand};
 use sqex_proto::Op;
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
+use sqex_proto::session::{
+    BySession, Frames, Open, OpenAck, OpenState, SendFrame, Session,
+};
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
@@ -57,6 +60,25 @@ enum Cmd {
     Mail {
         #[command(subcommand)]
         cmd: MailCmd,
+    },
+    /// Relayed session: exchange data with a peer through the exchange, when
+    /// neither of you is reachable by the other.
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Open a session with a peer and talk: stdin goes to them, their frames
+    /// come to stdout. Waits until they open a session with you too.
+    Talk {
+        /// The peer's Ed25519 identity, base58.
+        peer: String,
+        /// Give up if the peer has not joined within this many seconds.
+        #[arg(long, default_value_t = 120)]
+        wait: u64,
     },
 }
 
@@ -151,6 +173,129 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
+        Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
+    }
+}
+
+// ---- relayed session --------------------------------------------------------
+
+async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String> {
+    let SessionCmd::Talk { peer, wait } = cmd;
+    let peer = parse_key(peer)?;
+    let (mut client, signer) = mail_client(cli, cfg).await?;
+    let me = PubKey::new(signer.public());
+    if me == peer {
+        return Err("a session needs two identities".into());
+    }
+
+    // Our contribution to the key agreement. The exchange relays it but cannot
+    // use it: completing the agreement needs a static private key from each of
+    // us, and it holds neither.
+    let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let eph_pub = x25519_dalek::PublicKey::from(&eph).to_bytes();
+    let open = Open {
+        peer,
+        ephemeral: eph_pub,
+    };
+
+    eprintln!("waiting for {peer} to open a session with you…");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(*wait);
+    let ack = loop {
+        let (code, body) = client.post("/session/open", open.encode()).await?;
+        if code != 200 {
+            return Err(format!(
+                "open failed ({code}): {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        let ack = OpenAck::decode(&body).map_err(|e| e.to_string())?;
+        if ack.state == OpenState::Established {
+            break ack;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("the peer did not join in time".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+
+    let session = Session::derive(&signer.seed(), &eph, &peer, &ack.peer_ephemeral)
+        .map_err(|e| e.to_string())?;
+    eprintln!("session {} established — type to send, Ctrl-D to end", ack.session_id);
+
+    talk(client, session, ack.session_id).await
+}
+
+/// Pump stdin to the peer and their frames to stdout until either end stops.
+async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), String> {
+    // stdin is blocking, so it gets its own thread and a channel.
+    let (lines_tx, mut lines_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(l) = line else { break };
+            if lines_tx.send(l).is_err() {
+                break;
+            }
+        }
+        // Dropping the sender signals end-of-input.
+    });
+
+    let mut out_seq = 0u64;
+    let mut stdin_open = true;
+    loop {
+        // Anything to send?
+        if stdin_open {
+            match lines_rx.try_recv() {
+                Ok(line) => {
+                    let ct = session.seal(out_seq, line.as_bytes()).map_err(|e| e.to_string())?;
+                    let frame = SendFrame {
+                        session_id: id,
+                        seq: out_seq,
+                        ciphertext: ct,
+                    };
+                    let (code, body) = client.post("/session/send", frame.encode()).await?;
+                    if code != 200 {
+                        return Err(format!(
+                            "send failed ({code}): {}",
+                            String::from_utf8_lossy(&body)
+                        ));
+                    }
+                    out_seq += 1;
+                    continue; // drain stdin eagerly before polling
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    stdin_open = false;
+                    let _ = client
+                        .post("/session/close", BySession::close(id).encode())
+                        .await;
+                    eprintln!("(input ended; closing)");
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Anything waiting for us?
+        let (code, body) = client
+            .post("/session/recv", BySession::recv(id).encode())
+            .await?;
+        if code != 200 {
+            return Err(format!("recv failed ({code})"));
+        }
+        let frames = Frames::decode(&body).map_err(|e| e.to_string())?;
+        for (seq, ct) in &frames.frames {
+            match session.open(*seq, ct) {
+                Ok(plain) => println!("{}", String::from_utf8_lossy(&plain)),
+                Err(e) => eprintln!("(undecryptable frame {seq}: {e})"),
+            }
+        }
+        if !frames.open {
+            eprintln!("(the session has ended)");
+            return Ok(());
+        }
+        if !stdin_open && frames.frames.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 

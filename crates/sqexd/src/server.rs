@@ -17,9 +17,11 @@ use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::config::Config;
 use crate::mailbox::Mailbox;
+use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
+use sqex_proto::session::{BySession, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -54,6 +56,7 @@ pub struct Server {
     challenges: Challenges,
     beacons: Beacons,
     mailbox: Mailbox,
+    sessions: Sessions,
     started: Instant,
     connections: AtomicU64,
 }
@@ -107,6 +110,7 @@ pub async fn bind(
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
         mailbox: Mailbox::new(),
+        sessions: Sessions::new(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
     });
@@ -369,6 +373,52 @@ async fn route(
             ),
         },
 
+        // SIP-12 relayed sessions. Consent is strictly mutual: an open
+        // discloses nothing until the named peer has asked in return. The
+        // exchange relays frames it cannot read — the session key needs a
+        // static private key from each peer, which it does not hold.
+        ("POST", "/session/open") => match (peer.identity, Open::decode(body)) {
+            (None, _) => no_identity("opening a session"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(open)) => (
+                200,
+                "application/octet-stream",
+                server.sessions.open(me, open.peer, open.ephemeral).encode(),
+            ),
+        },
+        ("POST", "/session/send") => match (peer.identity, SendFrame::decode(body)) {
+            (None, _) => no_identity("sending"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(f)) => {
+                match server.sessions.send(&me, f.session_id, f.seq, f.ciphertext) {
+                    Ok(()) => (200, "application/octet-stream", vec![1u8]),
+                    Err(e) => (
+                        409,
+                        "application/json",
+                        json!({ "error": e.as_str() }).to_string().into_bytes(),
+                    ),
+                }
+            }
+        },
+        ("POST", "/session/recv") => match (peer.identity, BySession::decode(body, TYPE_RECV)) {
+            (None, _) => no_identity("receiving"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(r)) => (
+                200,
+                "application/octet-stream",
+                server.sessions.recv(&me, r.session_id).encode(),
+            ),
+        },
+        ("POST", "/session/close") => match (peer.identity, BySession::decode(body, TYPE_CLOSE)) {
+            (None, _) => no_identity("closing"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(r)) => (
+                200,
+                "application/octet-stream",
+                vec![u8::from(server.sessions.close(&me, r.session_id))],
+            ),
+        },
+
         // A protected exchange endpoint, to demonstrate whitelist enforcement.
         ("GET", "/exchange/ping") => {
             if server.state.lock().unwrap().peer_allowed(peer.key) {
@@ -403,6 +453,7 @@ impl Server {
             "whitelist_count": state.keys().len(),
             "beacons": self.beacons.len(),
             "mail_waiting": self.mailbox.waiting(),
+            "sessions": self.sessions.len(),
             "admins": self.admins.read().unwrap().len(),
         })
     }
