@@ -174,7 +174,7 @@ state_file = "/var/lib/sqex/sqex.state"
 
 # Base58 Ed25519 admin keys, authorised to sign management transactions.
 # Add your key (sqnr pubkey, or sqnr --yubikey pubkey) and restart, or once one
-# admin exists, add more with: sqex --yubikey reload-admins after editing here.
+# admin exists, add more with: sqex --yubikey admin reload-admins after editing here.
 admins = []
 
 # Keys seeded into the managed whitelist on first run (base58 Ed25519).
@@ -269,7 +269,7 @@ SVC
     printf "  2. On a client, set ~/.sqnr/config:\n"
     printf "        server = \"%s:5400\"\n" "$HOSTNAME"
     printf "        server_key = \"%s\"\n\n" "$PUBKEY"
-    info "Then: sqex status   and   sqex --yubikey whitelist enable"
+    info "Then: sqex status   and   sqex --yubikey admin whitelist enable"
     printf "\n"
 else
     printf "\n"
@@ -277,9 +277,9 @@ else
     printf "  1. Point at a server in ~/.sqnr/config:\n"
     printf "        server = \"host:5400\"\n"
     printf "        server_key = \"<base58 server pubkey>\"\n"
-    printf "  2. sqex status                             # public, no signing\n"
-    printf "     sqex --yubikey whitelist enable         # PIN + touch\n"
-    printf "     sqex --yubikey whitelist add <peer>     # authorise a peer\n\n"
+    printf "  2. sqex status                                   # public, no signing\n"
+    printf "     sqex --yubikey admin whitelist enable         # PIN + touch\n"
+    printf "     sqex --yubikey admin whitelist add <peer>     # authorise a peer\n\n"
     info "You need a signing identity — install sqnr and run 'sqnr keygen' (or use --yubikey):"
     printf "  curl -fsSL https://raw.githubusercontent.com/wave-cl/sqnr/main/install.sh | sh\n\n"
     info "Set up a server:"

@@ -41,6 +41,15 @@ struct Cli {
 enum Cmd {
     /// Show server status (public; no signing).
     Status,
+    /// Signed administration (whitelist, audit, admin list).
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCmd {
     /// Manage the connection whitelist.
     Whitelist {
         #[command(subcommand)]
@@ -86,14 +95,20 @@ async fn run(cli: Cli) -> Result<(), String> {
     let cfg = Config::load();
     match &cli.cmd {
         Cmd::Status => status(&cli, &cfg).await,
-        Cmd::Whitelist { action } => whitelist(&cli, &cfg, action).await,
-        Cmd::Audit { count } => {
-            let v = submit(&cli, &cfg, vec![Op::AuditTail(*count).to_operation()]).await?;
+        Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
+    }
+}
+
+async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
+    match cmd {
+        AdminCmd::Whitelist { action } => whitelist(cli, cfg, action).await,
+        AdminCmd::Audit { count } => {
+            let v = submit(cli, cfg, vec![Op::AuditTail(*count).to_operation()]).await?;
             print_audit(&result(&v, 0));
             Ok(())
         }
-        Cmd::ReloadAdmins => {
-            let v = submit(&cli, &cfg, vec![Op::ReloadAdmins.to_operation()]).await?;
+        AdminCmd::ReloadAdmins => {
+            let v = submit(cli, cfg, vec![Op::ReloadAdmins.to_operation()]).await?;
             println!("{}", result(&v, 0));
             Ok(())
         }

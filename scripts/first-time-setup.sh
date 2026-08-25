@@ -79,17 +79,17 @@ sleep 1
 echo "    sqexd pid $SQEXD_PID (log: $SQEX_HOME/sqexd.log)"
 
 echo "==> 7. Enabling the whitelist (enter your PIN, then touch the key)"
-sqex --yubikey whitelist enable
+sqex --yubikey admin whitelist enable
 
 cat <<EOF
 
 Done. sqexd is running (pid $SQEXD_PID) at $LISTEN, trusting your YubiKey.
 
 Try:
-    sqex status                                   # public, no card
-    sqex --yubikey whitelist list                 # PIN + touch
-    sqex --yubikey whitelist add <peer-base58>    # add a peer
-    sqex --yubikey audit -n 20
+    sqex status                                         # public, no card
+    sqex --yubikey admin whitelist list                 # PIN + touch
+    sqex --yubikey admin whitelist add <peer-base58>    # add a peer
+    sqex --yubikey admin audit -n 20
 
 Stop the server:  kill $SQEXD_PID
 
