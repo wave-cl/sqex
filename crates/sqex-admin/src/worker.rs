@@ -9,7 +9,7 @@ use sqex_core::PubKey;
 use sqex_core::protocol::{Action, Command, SignedCommand};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::card;
+use crate::card::Card;
 use crate::client::Client;
 
 /// A request from the UI.
@@ -72,6 +72,13 @@ fn is_connection_error(e: &str) -> bool {
     .any(|needle| e.contains(needle))
 }
 
+/// Whether a signing error means the card lost its PW1 verification (so we
+/// should re-unlock), rather than a genuine refusal.
+fn is_pin_lost(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    e.contains("security status")
+}
+
 /// Spawn the worker thread. Returns the sender the UI uses to issue commands.
 pub fn spawn(
     msg_tx: StdSender<Msg>,
@@ -97,6 +104,11 @@ async fn run(
     ctx: eframe::egui::Context,
 ) {
     let mut session: Option<Session> = None;
+    let card = Card::spawn();
+    // Whether the card's PW1 has been verified this session. Set on the first
+    // successful unlock; cleared only if a signature later reports the PIN was
+    // lost (e.g. the card was removed and reinserted).
+    let mut unlocked = false;
     let send = |m: Msg| {
         let _ = msg_tx.send(m);
         ctx.request_repaint();
@@ -104,7 +116,7 @@ async fn run(
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
-            Cmd::Connect { addr, server_pub } => match connect(&addr, &server_pub).await {
+            Cmd::Connect { addr, server_pub } => match connect(&card, &addr, &server_pub).await {
                 Ok(mut sess) => {
                     send(Msg::Connected {
                         admin_key: sess.admin.to_base58(),
@@ -122,7 +134,7 @@ async fn run(
                     send(Msg::Error("not connected".into()));
                     continue;
                 };
-                match run_admin(sess, action.clone(), pin, &send).await {
+                match run_admin(sess, &card, &mut unlocked, action.clone(), pin, &send).await {
                     Ok(value) => dispatch_result(&action, value, &send),
                     Err(e) => send(Msg::Error(e)),
                 }
@@ -131,7 +143,7 @@ async fn run(
     }
 }
 
-async fn connect(addr: &str, server_pub: &str) -> Result<Session, String> {
+async fn connect(card: &Card, addr: &str, server_pub: &str) -> Result<Session, String> {
     let socket: SocketAddr = addr
         .parse()
         .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
@@ -139,10 +151,7 @@ async fn connect(addr: &str, server_pub: &str) -> Result<Session, String> {
         .trim()
         .parse()
         .map_err(|e| format!("bad server key: {e}"))?;
-    let admin_bytes = tokio::task::spawn_blocking(card::read_auth_pubkey)
-        .await
-        .map_err(|e| e.to_string())??;
-    let admin = PubKey::new(admin_bytes);
+    let admin = PubKey::new(card.pubkey().await?);
     let client = Client::connect(socket, server.as_bytes()).await?;
     Ok(Session {
         client,
@@ -173,24 +182,44 @@ async fn fetch_status(client: &mut Client) -> Option<String> {
 /// so a reconnect re-fetches a fresh nonce and re-signs — no double-apply.
 async fn run_admin(
     sess: &mut Session,
+    card: &Card,
+    unlocked: &mut bool,
     action: Action,
     pin: String,
     notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
-    match run_admin_once(sess, action.clone(), pin.clone(), notify).await {
+    ensure_unlocked(card, unlocked, &pin).await?;
+    match run_admin_once(sess, card, action.clone(), notify).await {
         Err(e) if is_connection_error(&e) => {
             sess.reconnect().await?;
-            run_admin_once(sess, action, pin, notify).await
+            run_admin_once(sess, card, action, notify).await
+        }
+        Err(e) if is_pin_lost(&e) => {
+            // The card session dropped its PIN (removed/reinserted). Re-verify
+            // once and retry — this re-prompts nothing new; the PIN is still in
+            // hand from this action.
+            *unlocked = false;
+            ensure_unlocked(card, unlocked, &pin).await?;
+            run_admin_once(sess, card, action, notify).await
         }
         other => other,
     }
 }
 
-/// Fetch a challenge, sign the command with the card, POST it, return the JSON.
+/// Verify the card PIN once for the session.
+async fn ensure_unlocked(card: &Card, unlocked: &mut bool, pin: &str) -> Result<(), String> {
+    if !*unlocked {
+        card.unlock(pin.to_string()).await?;
+        *unlocked = true;
+    }
+    Ok(())
+}
+
+/// Fetch a challenge, sign the command on the card (touch), POST it, return JSON.
 async fn run_admin_once(
     sess: &mut Session,
+    card: &Card,
     action: Action,
-    pin: String,
     notify: &impl Fn(Msg),
 ) -> Result<serde_json::Value, String> {
     let (cs, nonce_bytes) = sess.client.get("/admin/challenge").await?;
@@ -204,15 +233,10 @@ async fn run_admin_once(
         nonce,
         server: sess.server,
     };
-    let msg = command.signing_bytes();
 
-    // If the card's touch policy is on, INTERNAL AUTHENTICATE blocks until the
-    // key is tapped — tell the UI to prompt for it. Harmless when touch is off
-    // (the sign returns immediately and the next message clears the prompt).
+    // With touch enabled the card blocks until tapped — prompt for it.
     notify(Msg::AwaitingTouch);
-    let sig = tokio::task::spawn_blocking(move || card::sign(&pin, &msg))
-        .await
-        .map_err(|e| e.to_string())??;
+    let sig = card.sign(command.signing_bytes()).await?;
 
     let signed = SignedCommand {
         command,
