@@ -139,10 +139,11 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::bottom("log")
             .resizable(true)
+            .default_height(200.0)
             .show(ctx, |ui| {
                 ui.label("Log");
                 egui::ScrollArea::vertical()
-                    .max_height(120.0)
+                    .auto_shrink([false, false]) // fill width and the panel's height
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         for line in &self.log {
@@ -214,7 +215,8 @@ impl eframe::App for App {
                 });
 
                 egui::ScrollArea::vertical()
-                    .max_height(160.0)
+                    .max_height(140.0)
+                    .auto_shrink([false, false]) // full width; capped so audit gets the rest
                     .id_salt("wl")
                     .show(ui, |ui| {
                         for k in &self.whitelist {
@@ -229,8 +231,10 @@ impl eframe::App for App {
                         self.admin(Action::AuditTail(50));
                     }
                 });
+                // Fill the rest of the central panel with the audit view.
                 egui::ScrollArea::vertical()
-                    .max_height(160.0)
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
                     .id_salt("audit")
                     .show(ui, |ui| {
                         for row in &self.audit {
