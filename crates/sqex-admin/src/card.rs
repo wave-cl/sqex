@@ -74,9 +74,13 @@ fn open() -> Result<OpenPGP, String> {
     OpenPGP::new(backend).map_err(|e| e.to_string())
 }
 
-/// Own the card across requests. One open session holds PW1 for its lifetime;
-/// a communication failure (card removed/reset) drops the session and the next
-/// request reopens it — re-locking, so the PIN is asked again.
+/// Own the card across requests. The PC/SC connection is held open in *shared*
+/// mode (so other tools and other instances can still reach the card), and each
+/// request runs in its own brief transaction. PW1 persists across those
+/// transactions because the backend only re-SELECTs the applet after a card
+/// reset — so the PIN is verified once, yet the card is never locked
+/// exclusively for the app's lifetime. A comm failure drops the connection and
+/// the next request reopens it, re-locking.
 fn card_loop(rx: Receiver<Req>) {
     loop {
         // Block until there is work, so we don't open the card speculatively.
@@ -89,24 +93,29 @@ fn card_loop(rx: Receiver<Req>) {
                 continue;
             }
         };
-        let mut tx = match card.transaction() {
-            Ok(t) => t,
-            Err(e) => {
-                reply_err(first, &e.to_string());
-                continue;
-            }
-        };
 
-        if !handle(&mut tx, first) {
+        if !handle_req(&mut card, first) {
             continue; // card went away mid-request; reopen on the next one
         }
         loop {
             let Ok(req) = rx.recv() else { return };
-            if !handle(&mut tx, req) {
+            if !handle_req(&mut card, req) {
                 break;
             }
         }
     }
+}
+
+/// Run one request in a short-lived transaction on the held connection.
+fn handle_req(card: &mut OpenPGP, req: Req) -> bool {
+    let mut tx = match card.transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            reply_err(req, &e.to_string());
+            return false; // reopen the connection on the next request
+        }
+    };
+    handle(&mut tx, req)
 }
 
 /// Handle one request. Returns false if the session should be reopened.
