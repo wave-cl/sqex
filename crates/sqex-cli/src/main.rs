@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
+use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
-use sqnr_core::{Operation, PubKey, Transaction};
+use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
 #[derive(Parser)]
 #[command(name = "sqex", version, about = "Administer a sqex server with signed transactions")]
@@ -45,6 +46,31 @@ enum Cmd {
     Admin {
         #[command(subcommand)]
         cmd: AdminCmd,
+    },
+    /// Liveness beacon: assert this identity is alive, or ask about another.
+    Beacon {
+        #[command(subcommand)]
+        cmd: BeaconCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BeaconCmd {
+    /// Beat: tell the exchange this identity is alive. Connects *as* the
+    /// identity, so no signature is needed — the connection is the proof.
+    Beat {
+        /// How often this identity intends to beat, in seconds. Consumers read
+        /// it to judge staleness; the exchange does not enforce it.
+        #[arg(short = 'n', long, default_value_t = 60)]
+        interval: u32,
+        /// Withhold this record from queries by other identities.
+        #[arg(long)]
+        withhold: bool,
+    },
+    /// Ask when the exchange last saw an identity.
+    Read {
+        /// The identity to ask about, base58. Defaults to your own.
+        key: Option<String>,
     },
 }
 
@@ -96,7 +122,144 @@ async fn run(cli: Cli) -> Result<(), String> {
     match &cli.cmd {
         Cmd::Status => status(&cli, &cfg).await,
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
+        Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
     }
+}
+
+// ---- beacon -----------------------------------------------------------------
+
+async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> {
+    match cmd {
+        BeaconCmd::Beat { interval, withhold } => {
+            // Beating means connecting *as* the identity, so the transport
+            // carries it (SIP-3). That needs the identity's seed, which only a
+            // software identity has — a YubiKey cannot be a transport key.
+            if cli.yubikey {
+                return Err(
+                    "a YubiKey cannot beat: it signs, but cannot be a transport identity. \
+                     Beat with a software identity (see SIP-11 on delegation)."
+                        .into(),
+                );
+            }
+            let signer = load_software_identity(cli, cfg)?;
+            let seed = signer.seed();
+            let (addr, server) = endpoint(cli, cfg)?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &seed).await?;
+
+            let beat = Beat {
+                interval_secs: *interval,
+                withhold: *withhold,
+            };
+            let (code, body) = client.post("/beacon/beat", beat.encode()).await?;
+            if code != 200 {
+                return Err(format!(
+                    "beat refused ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+            let ack = BeatAck::decode(&body).map_err(|e| e.to_string())?;
+            println!(
+                "beat recorded for {} at {} (interval {}s{})",
+                PubKey::new(signer.public()),
+                ack.now,
+                interval,
+                if *withhold { ", withheld" } else { "" }
+            );
+            Ok(())
+        }
+        BeaconCmd::Read { key } => {
+            // Reading is open, but connecting as ourselves is what lets the
+            // exchange disclose our own withheld record.
+            let target = match key {
+                Some(k) => parse_key(k)?,
+                None => own_identity(cli, cfg)?,
+            };
+            let (addr, server) = endpoint(cli, cfg)?;
+            let mut client = match load_software_identity(cli, cfg) {
+                Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?,
+                // No usable identity: ask anonymously. Withheld records stay hidden.
+                Err(_) => Client::connect(addr, server.as_bytes()).await?,
+            };
+
+            let (code, body) = client.post("/beacon/read", Read { key: target }.encode()).await?;
+            if code != 200 {
+                return Err(format!(
+                    "read failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+            let r = Reply::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                println!("{target}: not seen");
+                return Ok(());
+            }
+            // Report the facts; the threshold is the caller's to choose, so
+            // print how many declared intervals have elapsed rather than a
+            // verdict (SIP-4 forbids the exchange deciding this, and a CLI
+            // deciding it silently would be the same mistake one layer up).
+            let missed = if r.interval_secs > 0 {
+                format!(" ({} intervals)", r.staleness() / u64::from(r.interval_secs))
+            } else {
+                String::new()
+            };
+            println!(
+                "{target}: last seen {}s ago{missed}, declared interval {}s",
+                r.staleness(),
+                r.interval_secs
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The software identity, for connecting *as* it. Prompts only if encrypted.
+fn load_software_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::SoftwareSigner, String> {
+    let path = identity_path(cli, cfg)?;
+    if !path.exists() {
+        return Err(format!(
+            "no identity at {} — run `sqnr keygen` first",
+            path.display()
+        ));
+    }
+    if identity::is_encrypted(&path)? {
+        let pass = rpassword::prompt_password(format!("Passphrase for {}: ", path.display()))
+            .map_err(|e| e.to_string())?;
+        identity::load(&path, Some(&pass))
+    } else {
+        identity::load(&path, None)
+    }
+}
+
+/// This caller's own Ed25519 identity, without needing to decrypt it.
+fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
+    identity::read_public(&identity_path(cli, cfg)?)
+}
+
+/// Resolve the server address and pinned key without connecting.
+fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
+    let addr = cli
+        .server
+        .clone()
+        .or_else(|| env_nonempty("SQEX_SERVER"))
+        .or_else(|| cfg.server.clone())
+        .ok_or_else(|| {
+            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
+                .to_string()
+        })?;
+    let key = cli
+        .server_key
+        .clone()
+        .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
+        .or_else(|| cfg.server_key.clone())
+        .ok_or_else(|| {
+            "no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)"
+                .to_string()
+        })?;
+    let socket: SocketAddr = addr
+        .parse()
+        .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
+    let server: PubKey = key.trim().parse().map_err(|e| format!("bad server key: {e}"))?;
+    Ok((socket, server))
 }
 
 async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
@@ -242,28 +405,7 @@ fn print_audit(v: &serde_json::Value) {
 
 async fn connect(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey), String> {
     // Precedence for both address and key: CLI flag > env var > config file.
-    let addr = cli
-        .server
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER"))
-        .or_else(|| cfg.server.clone())
-        .ok_or_else(|| {
-            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
-                .to_string()
-        })?;
-    let key = cli
-        .server_key
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
-        .or_else(|| cfg.server_key.clone())
-        .ok_or_else(|| {
-            "no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)"
-                .to_string()
-        })?;
-    let socket: SocketAddr = addr
-        .parse()
-        .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
-    let server: PubKey = key.trim().parse().map_err(|e| format!("bad server key: {e}"))?;
+    let (socket, server) = endpoint(cli, cfg)?;
     let client = Client::connect(socket, server.as_bytes()).await?;
     Ok((client, server))
 }

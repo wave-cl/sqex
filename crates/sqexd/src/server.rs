@@ -13,9 +13,11 @@ use sqnr_core::{Error, Result, SignedTransaction};
 use sqex_proto::Op;
 use squic::Config as SquicConfig;
 
+use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::config::Config;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
+use sqex_proto::beacon::{Beat, BeatAck, Read};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -27,6 +29,20 @@ const ALPN: &[u8] = b"h3";
 /// Largest admin-command body we will read.
 const MAX_BODY: usize = 64 * 1024;
 
+/// What the transport established about the caller on one connection.
+///
+/// Both facts come from the same MAC1-verified Initial: the X25519 key SIP-2
+/// exposes, and the Ed25519 name SIP-3 lets a caller assert. A caller may have
+/// neither (an anonymous, ephemeral connection), the key alone (a persistent
+/// caller that did not advertise), or both.
+#[derive(Clone, Copy, Default)]
+pub struct Peer {
+    /// MAC1-verified X25519 transport key (SIP-2).
+    pub key: Option<[u8; 32]>,
+    /// MAC1-bound Ed25519 identity, if the caller advertised one (SIP-3).
+    pub identity: Option<PubKey>,
+}
+
 /// Everything a request handler needs.
 pub struct Server {
     pub public_key: PubKey,
@@ -34,6 +50,7 @@ pub struct Server {
     state: Mutex<State>,
     admins: RwLock<Vec<PubKey>>,
     challenges: Challenges,
+    beacons: Beacons,
     started: Instant,
     connections: AtomicU64,
 }
@@ -85,6 +102,7 @@ pub async fn bind(
         state: Mutex::new(state),
         admins: RwLock::new(config.admins),
         challenges: Challenges::new(config.challenge_ttl),
+        beacons: Beacons::new(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
     });
@@ -122,13 +140,16 @@ pub async fn serve(bound: Bound) -> Result<()> {
             };
             // Capture the MAC1-verified peer key BEFORE awaiting the Incoming:
             // peer_key drains on read and is keyed off the original DCID.
-            let peer_x25519 = listener.peer_key(&incoming);
+            let peer = Peer {
+                key: listener.peer_key(&incoming),
+                identity: listener.peer_identity(&incoming).map(PubKey::new),
+            };
             let server = Arc::clone(&server);
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
                         server.connections.fetch_add(1, Ordering::Relaxed);
-                        if let Err(e) = serve_h3(server, conn, peer_x25519).await {
+                        if let Err(e) = serve_h3(server, conn, peer).await {
                             tracing::debug!("connection ended: {e}");
                         }
                     }
@@ -154,7 +175,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
 async fn serve_h3(
     server: Arc<Server>,
     conn: quinn::Connection,
-    peer_x25519: Option<[u8; 32]>,
+    peer: Peer,
 ) -> Result<()> {
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
         .await
@@ -165,7 +186,7 @@ async fn serve_h3(
             Ok(Some(resolver)) => {
                 let server = Arc::clone(&server);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(server, resolver, peer_x25519).await {
+                    if let Err(e) = handle_stream(server, resolver, peer).await {
                         tracing::debug!("request error: {e}");
                     }
                 });
@@ -183,7 +204,7 @@ async fn serve_h3(
 async fn handle_stream(
     server: Arc<Server>,
     resolver: h3::server::RequestResolver<h3_quinn::Connection, bytes::Bytes>,
-    peer_x25519: Option<[u8; 32]>,
+    peer: Peer,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -211,7 +232,7 @@ async fn handle_stream(
     }
 
     let (status, content_type, out) =
-        route(&server, method.as_str(), &path, &body, peer_x25519).await;
+        route(&server, method.as_str(), &path, &body, peer).await;
     respond(&mut stream, status, content_type, out).await
 }
 
@@ -221,7 +242,7 @@ async fn route(
     method: &str,
     path: &str,
     body: &[u8],
-    peer_x25519: Option<[u8; 32]>,
+    peer: Peer,
 ) -> (u16, &'static str, Vec<u8>) {
     match (method, path) {
         ("GET", "/health") => (
@@ -249,9 +270,41 @@ async fn route(
                 )
             }
         },
+        // SIP-4 liveness beacon. Beating requires an advertised Ed25519
+        // identity (SIP-3) and nothing else — this is an *open* set: any
+        // identity may beat, registered or not, which is the whole point.
+        // Reading is open to anyone holding the server key.
+        ("POST", "/beacon/beat") => match Beat::decode(body) {
+            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Ok(beat) => match peer.identity {
+                None => (
+                    403,
+                    "application/json",
+                    json!({ "error": "no_identity",
+                            "detail": "beating requires an advertised Ed25519 identity (SIP-3)" })
+                    .to_string()
+                    .into_bytes(),
+                ),
+                Some(id) => {
+                    let now = server
+                        .beacons
+                        .record(id, beat.interval_secs, beat.withhold);
+                    tracing::debug!(identity = %id.short(), interval = beat.interval_secs, "beat");
+                    (200, "application/octet-stream", BeatAck { now }.encode())
+                }
+            },
+        },
+        ("POST", "/beacon/read") => match Read::decode(body) {
+            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Ok(read) => {
+                let reply = server.beacons.read(&read.key, peer.identity.as_ref());
+                (200, "application/octet-stream", reply.encode())
+            }
+        },
+
         // A protected exchange endpoint, to demonstrate whitelist enforcement.
         ("GET", "/exchange/ping") => {
-            if server.state.lock().unwrap().peer_allowed(peer_x25519) {
+            if server.state.lock().unwrap().peer_allowed(peer.key) {
                 (
                     200,
                     "application/json",
@@ -281,6 +334,7 @@ impl Server {
             "connections": self.connections.load(Ordering::Relaxed),
             "whitelist_enabled": state.enabled(),
             "whitelist_count": state.keys().len(),
+            "beacons": self.beacons.len(),
             "admins": self.admins.read().unwrap().len(),
         })
     }

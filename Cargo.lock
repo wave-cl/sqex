@@ -3962,7 +3962,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-admin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bs58",
  "card-backend-pcsc",
@@ -3983,7 +3983,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "rpassword",
@@ -3996,14 +3996,14 @@ dependencies = [
 
 [[package]]
 name = "sqex-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sqnr-core",
 ]
 
 [[package]]
 name = "sqexd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bs58",
  "bytes",
@@ -4033,8 +4033,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr"
-version = "0.3.0"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.3.0#cf5b69dc6c367371081181f19aeddac92bf54193"
+version = "0.4.0"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.4.0#84cbff834d358e9c75306225c30b8136f15f8a8a"
 dependencies = [
  "argon2",
  "bs58",
@@ -4046,6 +4046,7 @@ dependencies = [
  "ed25519-dalek",
  "h3",
  "h3-quinn",
+ "hex",
  "http",
  "openpgp-card",
  "rand_core 0.6.4",
@@ -4062,8 +4063,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr-core"
-version = "0.3.0"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.3.0#cf5b69dc6c367371081181f19aeddac92bf54193"
+version = "0.4.0"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.4.0#84cbff834d358e9c75306225c30b8136f15f8a8a"
 dependencies = [
  "bs58",
  "ed25519-dalek",

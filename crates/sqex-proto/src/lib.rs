@@ -10,6 +10,8 @@
 //! decoded payload and checks it matches — so the operator's displayed context
 //! provably corresponds to what executes.
 
+pub mod beacon;
+
 use sqnr_core::{Error, Operation, PubKey, Result};
 
 /// Longest label accepted on a whitelist add.
