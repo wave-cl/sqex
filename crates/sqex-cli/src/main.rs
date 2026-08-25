@@ -64,7 +64,12 @@ enum WhitelistCmd {
     /// Stop enforcing the whitelist.
     Disable,
     /// Add one or more peer keys (signed as a single batch).
-    Add { keys: Vec<String> },
+    Add {
+        keys: Vec<String>,
+        /// Optional human label recorded as provenance for each key.
+        #[arg(long)]
+        label: Option<String>,
+    },
     /// Remove one or more peer keys (signed as a single batch).
     Remove { keys: Vec<String> },
 }
@@ -121,8 +126,8 @@ async fn whitelist(cli: &Cli, cfg: &Config, action: &WhitelistCmd) -> Result<(),
         WhitelistCmd::List => vec![Op::WhitelistList.to_operation()],
         WhitelistCmd::Enable => vec![Op::WhitelistEnable.to_operation()],
         WhitelistCmd::Disable => vec![Op::WhitelistDisable.to_operation()],
-        WhitelistCmd::Add { keys } => ops_for_keys(keys, true)?,
-        WhitelistCmd::Remove { keys } => ops_for_keys(keys, false)?,
+        WhitelistCmd::Add { keys, label } => add_ops(keys, label)?,
+        WhitelistCmd::Remove { keys } => remove_ops(keys)?,
     };
     let v = submit(cli, cfg, ops).await?;
     match action {
@@ -132,20 +137,28 @@ async fn whitelist(cli: &Cli, cfg: &Config, action: &WhitelistCmd) -> Result<(),
     Ok(())
 }
 
-fn ops_for_keys(keys: &[String], add: bool) -> Result<Vec<Operation>, String> {
+fn add_ops(keys: &[String], label: &Option<String>) -> Result<Vec<Operation>, String> {
     if keys.is_empty() {
         return Err("give at least one key".into());
     }
     keys.iter()
         .map(|k| {
             let key = parse_key(k)?;
-            let op = if add {
-                Op::WhitelistAdd(key)
-            } else {
-                Op::WhitelistRemove(key)
-            };
-            Ok(op.to_operation())
+            Ok(Op::WhitelistAdd {
+                key,
+                label: label.clone(),
+            }
+            .to_operation())
         })
+        .collect()
+}
+
+fn remove_ops(keys: &[String]) -> Result<Vec<Operation>, String> {
+    if keys.is_empty() {
+        return Err("give at least one key".into());
+    }
+    keys.iter()
+        .map(|k| Ok(Op::WhitelistRemove(parse_key(k)?).to_operation()))
         .collect()
 }
 
@@ -181,10 +194,17 @@ fn print_list(v: &serde_json::Value) {
         if enabled { "enabled" } else { "disabled" },
         keys.len()
     );
-    for k in keys {
-        if let Some(s) = k.as_str() {
-            println!("  {s}");
+    for e in keys {
+        let key = e["key"].as_str().unwrap_or("?");
+        let mut line = format!("  {key}");
+        if let Some(label) = e["label"].as_str() {
+            line.push_str(&format!("  [{label}]"));
         }
+        if let Some(by) = e["added_by"].as_str() {
+            let short: String = by.chars().take(8).collect();
+            line.push_str(&format!("  (by {short}…)"));
+        }
+        println!("{line}");
     }
 }
 

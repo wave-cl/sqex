@@ -227,7 +227,11 @@ async fn full_admin_flow() {
     let (s, body) = client
         .tx(
             vec![
-                Op::WhitelistAdd(client_pub).to_operation(),
+                Op::WhitelistAdd {
+                    key: client_pub,
+                    label: Some("test-peer".into()),
+                }
+                .to_operation(),
                 Op::WhitelistList.to_operation(),
             ],
             &server_pub,
@@ -238,14 +242,15 @@ async fn full_admin_flow() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let listed = &v["results"][1];
     assert_eq!(listed["enabled"], true);
-    assert!(
-        listed["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|k| k.as_str() == Some(&client_pub.to_base58())),
-        "the added key is in the returned list"
-    );
+    let entry = listed["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"].as_str() == Some(&client_pub.to_base58()))
+        .expect("the added key is in the returned list");
+    // Provenance was recorded: the label the operator gave and the signing admin.
+    assert_eq!(entry["label"].as_str(), Some("test-peer"));
+    assert_eq!(entry["added_by"].as_str(), Some(admin_pub.to_base58().as_str()));
     assert_eq!(
         client.get("/exchange/ping").await.0,
         200,

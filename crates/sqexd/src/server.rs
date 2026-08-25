@@ -15,7 +15,7 @@ use squic::Config as SquicConfig;
 
 use crate::challenge::Challenges;
 use crate::config::Config;
-use crate::state::{AuditEntry, State, now_unix};
+use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -330,7 +330,7 @@ impl Server {
         let mut results = Vec::with_capacity(ops.len());
         let mut mutated = false;
         for op in &ops {
-            results.push(self.apply(&mut state, op));
+            results.push(self.apply(&mut state, op, &signed.admin));
             if op.is_mutation() {
                 mutated = true;
                 state.record(AuditEntry {
@@ -350,8 +350,9 @@ impl Server {
     }
 
     /// Carry out one already-authenticated op against the locked state, and
-    /// return its JSON result.
-    fn apply(&self, state: &mut State, op: &Op) -> serde_json::Value {
+    /// return its JSON result. `admin` is the signer, recorded as provenance on
+    /// an add.
+    fn apply(&self, state: &mut State, op: &Op, admin: &PubKey) -> serde_json::Value {
         match op {
             Op::WhitelistEnable => {
                 state.set_enabled(true);
@@ -361,8 +362,15 @@ impl Server {
                 state.set_enabled(false);
                 json!({ "ok": true, "enabled": false })
             }
-            Op::WhitelistAdd(k) => {
-                let changed = state.add(*k);
+            Op::WhitelistAdd { key, label } => {
+                let changed = state.add(
+                    *key,
+                    WhitelistEntry {
+                        added_by: Some(admin.to_base58()),
+                        label: label.clone(),
+                        added_at: now_unix(),
+                    },
+                );
                 json!({ "ok": true, "changed": changed })
             }
             Op::WhitelistRemove(k) => {
@@ -370,7 +378,18 @@ impl Server {
                 json!({ "ok": true, "changed": changed })
             }
             Op::WhitelistList => {
-                let keys: Vec<String> = state.keys().iter().map(|k| k.to_base58()).collect();
+                let keys: Vec<serde_json::Value> = state
+                    .list()
+                    .into_iter()
+                    .map(|(k, e)| {
+                        json!({
+                            "key": k.to_base58(),
+                            "added_by": e.added_by,
+                            "label": e.label,
+                            "added_at": e.added_at,
+                        })
+                    })
+                    .collect();
                 json!({ "enabled": state.enabled(), "keys": keys })
             }
             Op::Status => self.status_value(state),

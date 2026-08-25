@@ -12,6 +12,9 @@
 
 use sqnr_core::{Error, Operation, PubKey, Result};
 
+/// Longest label accepted on a whitelist add.
+pub const MAX_LABEL: usize = 256;
+
 /// A single administrative operation against sqex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -19,11 +22,12 @@ pub enum Op {
     WhitelistEnable,
     /// Turn the managed whitelist off.
     WhitelistDisable,
-    /// Add a peer's Ed25519 key to the managed whitelist.
-    WhitelistAdd(PubKey),
+    /// Add a peer's Ed25519 key to the managed whitelist, with an optional
+    /// human label recorded as provenance.
+    WhitelistAdd { key: PubKey, label: Option<String> },
     /// Remove a peer's Ed25519 key from the managed whitelist.
     WhitelistRemove(PubKey),
-    /// Read the current whitelist (enabled flag + keys).
+    /// Read the current whitelist (enabled flag + entries).
     WhitelistList,
     /// Read server status.
     Status,
@@ -38,7 +42,7 @@ impl Op {
         match self {
             Op::WhitelistEnable => 0x01,
             Op::WhitelistDisable => 0x02,
-            Op::WhitelistAdd(_) => 0x03,
+            Op::WhitelistAdd { .. } => 0x03,
             Op::WhitelistRemove(_) => 0x04,
             Op::WhitelistList => 0x05,
             Op::Status => 0x06,
@@ -52,7 +56,18 @@ impl Op {
         let mut out = Vec::with_capacity(1 + 32);
         out.push(self.tag());
         match self {
-            Op::WhitelistAdd(k) | Op::WhitelistRemove(k) => out.extend_from_slice(k.as_bytes()),
+            Op::WhitelistAdd { key, label } => {
+                out.extend_from_slice(key.as_bytes());
+                match label {
+                    Some(s) => {
+                        out.push(1);
+                        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
+            Op::WhitelistRemove(k) => out.extend_from_slice(k.as_bytes()),
             Op::AuditTail(n) => out.extend_from_slice(&n.to_be_bytes()),
             _ => {}
         }
@@ -68,7 +83,7 @@ impl Op {
         let op = match tag {
             0x01 => Op::WhitelistEnable,
             0x02 => Op::WhitelistDisable,
-            0x03 => Op::WhitelistAdd(key(rest)?),
+            0x03 => decode_add(rest)?,
             0x04 => Op::WhitelistRemove(key(rest)?),
             0x05 => Op::WhitelistList,
             0x06 => Op::Status,
@@ -76,13 +91,9 @@ impl Op {
             0x08 => Op::AuditTail(u32_arg(rest)?),
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
-        // No op takes trailing bytes beyond what it consumed.
-        let expected = op.payload().len();
-        if payload.len() != expected {
-            return Err(Error::Malformed(format!(
-                "op payload is {} bytes, expected {expected}",
-                payload.len()
-            )));
+        // Every op consumes its payload exactly; reject trailing bytes.
+        if payload.len() != op.payload().len() {
+            return Err(Error::Malformed("op payload has trailing bytes".into()));
         }
         Ok(op)
     }
@@ -92,7 +103,7 @@ impl Op {
         match self {
             Op::WhitelistEnable => "whitelist-enable",
             Op::WhitelistDisable => "whitelist-disable",
-            Op::WhitelistAdd(_) => "whitelist-add",
+            Op::WhitelistAdd { .. } => "whitelist-add",
             Op::WhitelistRemove(_) => "whitelist-remove",
             Op::WhitelistList => "whitelist-list",
             Op::Status => "status",
@@ -106,7 +117,7 @@ impl Op {
         match self {
             Op::WhitelistEnable => "Enable the connection whitelist".into(),
             Op::WhitelistDisable => "Disable the connection whitelist".into(),
-            Op::WhitelistAdd(_) => "Add a peer to the whitelist".into(),
+            Op::WhitelistAdd { .. } => "Add a peer to the whitelist".into(),
             Op::WhitelistRemove(_) => "Remove a peer from the whitelist".into(),
             Op::WhitelistList => "Read the whitelist".into(),
             Op::Status => "Read server status".into(),
@@ -115,10 +126,17 @@ impl Op {
         }
     }
 
-    /// Extra context lines (e.g. the affected key).
+    /// Extra context lines (e.g. the affected key and its label).
     pub fn detail(&self) -> Vec<String> {
         match self {
-            Op::WhitelistAdd(k) | Op::WhitelistRemove(k) => vec![format!("peer: {}", k.to_base58())],
+            Op::WhitelistAdd { key, label } => {
+                let mut d = vec![format!("peer: {}", key.to_base58())];
+                if let Some(s) = label {
+                    d.push(format!("label: {s}"));
+                }
+                d
+            }
+            Op::WhitelistRemove(k) => vec![format!("peer: {}", k.to_base58())],
             _ => vec![],
         }
     }
@@ -129,7 +147,7 @@ impl Op {
             self,
             Op::WhitelistEnable
                 | Op::WhitelistDisable
-                | Op::WhitelistAdd(_)
+                | Op::WhitelistAdd { .. }
                 | Op::WhitelistRemove(_)
                 | Op::ReloadAdmins
         )
@@ -138,7 +156,8 @@ impl Op {
     /// The affected key, if this op names one (for audit records).
     pub fn target(&self) -> Option<String> {
         match self {
-            Op::WhitelistAdd(k) | Op::WhitelistRemove(k) => Some(k.to_base58()),
+            Op::WhitelistAdd { key, .. } => Some(key.to_base58()),
+            Op::WhitelistRemove(k) => Some(k.to_base58()),
             _ => None,
         }
     }
@@ -151,6 +170,33 @@ impl Op {
             payload: self.payload(),
         }
     }
+}
+
+fn decode_add(rest: &[u8]) -> Result<Op> {
+    if rest.len() < 33 {
+        return Err(Error::Malformed("whitelist-add: too short".into()));
+    }
+    let key = PubKey::new(rest[0..32].try_into().unwrap());
+    let tail = &rest[32..];
+    let label = match tail[0] {
+        0 if tail.len() == 1 => None,
+        1 => {
+            if tail.len() < 5 {
+                return Err(Error::Malformed("whitelist-add: truncated label".into()));
+            }
+            let len = u32::from_be_bytes(tail[1..5].try_into().unwrap()) as usize;
+            if len > MAX_LABEL {
+                return Err(Error::Malformed(format!("label of {len} bytes exceeds {MAX_LABEL}")));
+            }
+            let body = &tail[5..];
+            if body.len() != len {
+                return Err(Error::Malformed("whitelist-add: label length mismatch".into()));
+            }
+            Some(String::from_utf8(body.to_vec()).map_err(|_| Error::Malformed("label is not utf-8".into()))?)
+        }
+        _ => return Err(Error::Malformed("whitelist-add: bad label marker".into())),
+    };
+    Ok(Op::WhitelistAdd { key, label })
 }
 
 fn key(rest: &[u8]) -> Result<PubKey> {
@@ -175,7 +221,14 @@ mod tests {
         vec![
             Op::WhitelistEnable,
             Op::WhitelistDisable,
-            Op::WhitelistAdd(PubKey::new([5u8; 32])),
+            Op::WhitelistAdd {
+                key: PubKey::new([5u8; 32]),
+                label: None,
+            },
+            Op::WhitelistAdd {
+                key: PubKey::new([5u8; 32]),
+                label: Some("colin-laptop".into()),
+            },
             Op::WhitelistRemove(PubKey::new([6u8; 32])),
             Op::WhitelistList,
             Op::Status,
@@ -200,11 +253,25 @@ mod tests {
     }
 
     #[test]
-    fn add_remove_detail_names_key() {
+    fn add_detail_names_key_and_label() {
         let k = PubKey::new([7u8; 32]);
-        let op = Op::WhitelistAdd(k);
-        assert_eq!(op.detail(), vec![format!("peer: {}", k.to_base58())]);
-        assert!(op.to_operation().summary.contains("Add a peer"));
+        let op = Op::WhitelistAdd {
+            key: k,
+            label: Some("ci-runner".into()),
+        };
+        let d = op.detail();
+        assert_eq!(d[0], format!("peer: {}", k.to_base58()));
+        assert_eq!(d[1], "label: ci-runner");
+        assert_eq!(op.target(), Some(k.to_base58()));
+    }
+
+    #[test]
+    fn oversized_label_rejected() {
+        let op = Op::WhitelistAdd {
+            key: PubKey::new([1u8; 32]),
+            label: Some("x".repeat(MAX_LABEL + 1)),
+        };
+        assert!(Op::decode(&op.payload()).is_err());
     }
 
     #[test]

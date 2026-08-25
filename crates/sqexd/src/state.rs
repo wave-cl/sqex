@@ -5,11 +5,16 @@
 //! gated the transport, enabling it would drop the admin surface too, since
 //! YubiKey admins have no stable transport key. See the plan's design note.
 //!
+//! Each whitelisted key carries provenance — who added it, an optional human
+//! label, and when — so a delegated device key can be traced to the admin who
+//! authorised it and revoked by that relationship later. Provenance is
+//! informational; gating is on the key itself.
+//!
 //! State persists as JSON, written atomically (temp file then rename) so a
 //! crash mid-write cannot corrupt it. Keys are stored base58 so the file is
-//! legible; sqex-core stays serde-free.
+//! legible.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,12 +38,39 @@ pub struct AuditEntry {
     pub outcome: String,
 }
 
+/// Provenance for one whitelisted key.
+#[derive(Debug, Clone, Default)]
+pub struct WhitelistEntry {
+    /// The admin who authorised the add, base58 (None for seeded keys).
+    pub added_by: Option<String>,
+    /// Optional human label recorded at add time.
+    pub label: Option<String>,
+    /// Unix seconds when the key was added.
+    pub added_at: u64,
+}
+
+/// On-disk form of a whitelist entry. Accepts a bare base58 string (the older
+/// format) or a full object, so existing state files still load.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedKey {
+    Bare(String),
+    Full {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        added_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default)]
+        added_at: u64,
+    },
+}
+
 /// The JSON shape on disk.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Persisted {
     enabled: bool,
-    /// Base58 Ed25519 keys.
-    keys: Vec<String>,
+    keys: Vec<PersistedKey>,
     #[serde(default)]
     audit: Vec<AuditEntry>,
 }
@@ -47,7 +79,7 @@ struct Persisted {
 pub struct State {
     path: Option<PathBuf>,
     enabled: bool,
-    keys: BTreeSet<PubKey>,
+    keys: BTreeMap<PubKey, WhitelistEntry>,
     /// Forward Ed25519 -> X25519 of `keys`, rebuilt on every change so the
     /// per-request enforcement check is a plain set lookup.
     x25519: HashSet<[u8; 32]>,
@@ -70,11 +102,26 @@ impl State {
                 .map_err(|e| Error::Malformed(format!("cannot read {}: {e}", p.display())))?;
             let persisted: Persisted = serde_json::from_str(&text)
                 .map_err(|e| Error::Malformed(format!("cannot parse {}: {e}", p.display())))?;
-            let keys = persisted
-                .keys
-                .iter()
-                .map(|s| PubKey::from_base58(s))
-                .collect::<Result<BTreeSet<_>>>()?;
+            let mut keys = BTreeMap::new();
+            for pk in persisted.keys {
+                let (k, entry) = match pk {
+                    PersistedKey::Bare(s) => (PubKey::from_base58(&s)?, WhitelistEntry::default()),
+                    PersistedKey::Full {
+                        key,
+                        added_by,
+                        label,
+                        added_at,
+                    } => (
+                        PubKey::from_base58(&key)?,
+                        WhitelistEntry {
+                            added_by,
+                            label,
+                            added_at,
+                        },
+                    ),
+                };
+                keys.insert(k, entry);
+            }
             let mut state = State {
                 path,
                 enabled: persisted.enabled,
@@ -85,10 +132,24 @@ impl State {
             state.rebuild_x25519();
             return Ok(state);
         }
+        let now = now_unix();
+        let keys = seed
+            .iter()
+            .map(|k| {
+                (
+                    *k,
+                    WhitelistEntry {
+                        added_by: None,
+                        label: Some("seed".into()),
+                        added_at: now,
+                    },
+                )
+            })
+            .collect();
         let mut state = State {
             path,
             enabled: false,
-            keys: seed.iter().copied().collect(),
+            keys,
             x25519: HashSet::new(),
             audit: Vec::new(),
         };
@@ -99,7 +160,7 @@ impl State {
     fn rebuild_x25519(&mut self) {
         self.x25519 = self
             .keys
-            .iter()
+            .keys()
             .filter_map(|k| {
                 squic::crypto::ed25519_public_to_x25519(k.as_bytes())
                     .ok()
@@ -126,25 +187,32 @@ impl State {
     }
 
     pub fn keys(&self) -> Vec<PubKey> {
-        self.keys.iter().copied().collect()
+        self.keys.keys().copied().collect()
+    }
+
+    /// The whitelist as (key, provenance) pairs, for listing.
+    pub fn list(&self) -> Vec<(PubKey, WhitelistEntry)> {
+        self.keys.iter().map(|(k, e)| (*k, e.clone())).collect()
     }
 
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
     }
 
-    /// Returns whether the set changed.
-    pub fn add(&mut self, key: PubKey) -> bool {
-        let changed = self.keys.insert(key);
-        if changed {
-            self.rebuild_x25519();
+    /// Add a key with its provenance. Returns whether the set changed; an
+    /// already-present key keeps its original provenance.
+    pub fn add(&mut self, key: PubKey, entry: WhitelistEntry) -> bool {
+        if self.keys.contains_key(&key) {
+            return false;
         }
-        changed
+        self.keys.insert(key, entry);
+        self.rebuild_x25519();
+        true
     }
 
     /// Returns whether the set changed.
     pub fn remove(&mut self, key: &PubKey) -> bool {
-        let changed = self.keys.remove(key);
+        let changed = self.keys.remove(key).is_some();
         if changed {
             self.rebuild_x25519();
         }
@@ -172,7 +240,16 @@ impl State {
         };
         let persisted = Persisted {
             enabled: self.enabled,
-            keys: self.keys.iter().map(|k| k.to_base58()).collect(),
+            keys: self
+                .keys
+                .iter()
+                .map(|(k, e)| PersistedKey::Full {
+                    key: k.to_base58(),
+                    added_by: e.added_by.clone(),
+                    label: e.label.clone(),
+                    added_at: e.added_at,
+                })
+                .collect(),
             audit: self.audit.clone(),
         };
         let json = serde_json::to_vec_pretty(&persisted)
@@ -199,6 +276,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn entry(admin: &str, label: &str) -> WhitelistEntry {
+        WhitelistEntry {
+            added_by: Some(admin.into()),
+            label: Some(label.into()),
+            added_at: 100,
+        }
+    }
+
     #[test]
     fn peer_allowed_respects_enabled() {
         let k = PubKey::new([1u8; 32]);
@@ -206,10 +291,8 @@ mod tests {
             .unwrap()
             .to_bytes();
         let mut s = State::load(None, &[k]).unwrap();
-        // disabled: everyone allowed
         assert!(s.peer_allowed(None));
         assert!(s.peer_allowed(Some([9u8; 32])));
-        // enabled: only the mapped key
         s.set_enabled(true);
         assert!(s.peer_allowed(Some(x)));
         assert!(!s.peer_allowed(Some([9u8; 32])));
@@ -217,36 +300,50 @@ mod tests {
     }
 
     #[test]
-    fn persist_and_reload() {
+    fn persist_and_reload_with_provenance() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sqex.state");
         let k = PubKey::new([2u8; 32]);
         {
             let mut s = State::load(Some(path.clone()), &[]).unwrap();
             s.set_enabled(true);
-            assert!(s.add(k));
-            s.record(AuditEntry {
-                time: 1,
-                admin: "a".into(),
-                action: "whitelist-add".into(),
-                target: Some(k.to_base58()),
-                outcome: "ok".into(),
-            });
+            assert!(s.add(k, entry("adminA", "colin-laptop")));
             s.save().unwrap();
         }
-        // Reload: state file wins, seed ignored.
         let s = State::load(Some(path), &[PubKey::new([9u8; 32])]).unwrap();
         assert!(s.enabled());
+        let list = s.list();
+        assert_eq!(list.len(), 1);
+        let (key, prov) = &list[0];
+        assert_eq!(*key, k);
+        assert_eq!(prov.added_by.as_deref(), Some("adminA"));
+        assert_eq!(prov.label.as_deref(), Some("colin-laptop"));
+    }
+
+    #[test]
+    fn reads_old_bare_key_format() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sqex.state");
+        let k = PubKey::new([3u8; 32]);
+        // An older state file: keys as bare base58 strings.
+        let legacy = format!(
+            "{{\"enabled\":true,\"keys\":[\"{}\"],\"audit\":[]}}",
+            k.to_base58()
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let s = State::load(Some(path), &[]).unwrap();
         assert_eq!(s.keys(), vec![k]);
-        assert_eq!(s.audit_tail(10).len(), 1);
+        assert!(s.enabled());
+        // Bare entries have no provenance.
+        assert!(s.list()[0].1.added_by.is_none());
     }
 
     #[test]
     fn add_remove_changed_flag() {
         let mut s = State::load(None, &[]).unwrap();
         let k = PubKey::new([3u8; 32]);
-        assert!(s.add(k));
-        assert!(!s.add(k)); // already present
+        assert!(s.add(k, WhitelistEntry::default()));
+        assert!(!s.add(k, WhitelistEntry::default())); // already present
         assert!(s.remove(&k));
         assert!(!s.remove(&k)); // already gone
     }

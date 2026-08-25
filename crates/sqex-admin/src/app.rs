@@ -252,7 +252,7 @@ impl App {
         match key.parse::<PubKey>() {
             Ok(k) => {
                 let action = if add {
-                    Op::WhitelistAdd(k)
+                    Op::WhitelistAdd { key: k, label: None }
                 } else {
                     Op::WhitelistRemove(k)
                 };

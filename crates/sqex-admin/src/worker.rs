@@ -250,7 +250,13 @@ fn dispatch_result(op: &Op, value: serde_json::Value, send: &impl Fn(Msg)) {
                 .as_array()
                 .map(|a| {
                     a.iter()
-                        .filter_map(|k| k.as_str().map(String::from))
+                        .map(|e| {
+                            let key = e["key"].as_str().unwrap_or("?");
+                            match e["label"].as_str() {
+                                Some(l) => format!("{key}  [{l}]"),
+                                None => key.to_string(),
+                            }
+                        })
                         .collect()
                 })
                 .unwrap_or_default();

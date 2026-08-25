@@ -68,7 +68,11 @@ async fn cli_flow_signs_a_batch() {
         server,
         vec![
             Op::WhitelistEnable.to_operation(),
-            Op::WhitelistAdd(peer).to_operation(),
+            Op::WhitelistAdd {
+                key: peer,
+                label: Some("device-1".into()),
+            }
+            .to_operation(),
         ],
         &no_review,
         &no_touch,
@@ -91,14 +95,13 @@ async fn cli_flow_signs_a_batch() {
     .expect("list accepted");
     let listed = &v["results"][0];
     assert_eq!(listed["enabled"], true);
-    assert!(
-        listed["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|k| k.as_str() == Some(&peer.to_base58())),
-        "both ops in the batch took effect"
-    );
+    let entry = listed["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"].as_str() == Some(&peer.to_base58()))
+        .expect("both ops in the batch took effect");
+    assert_eq!(entry["label"].as_str(), Some("device-1"), "label recorded");
 
     // A non-admin backend is refused.
     let outsider = Backend::software(sqnr_core::SoftwareSigner::new(SigningKey::from_bytes(&[8u8; 32])));
