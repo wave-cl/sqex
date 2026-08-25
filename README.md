@@ -5,6 +5,23 @@ connection can use without signing anything further. It speaks **HTTP/3 over
 sQUIC** and, as its first capability, lets administrators manage its connection
 whitelist by **Ed25519-signed commands** — ready for a YubiKey.
 
+## Install
+
+Admin client (`sqex`, and `sqexd`):
+
+```
+curl -fsSL https://raw.githubusercontent.com/wave-cl/sqex/main/install.sh | sh
+```
+
+Set up a server (Linux, root — installs and starts `sqexd` under systemd):
+
+```
+curl -fsSL https://raw.githubusercontent.com/wave-cl/sqex/main/install.sh | sh -s -- --server
+```
+
+You also need a signing identity for admin commands — install
+[sqnr](https://github.com/wave-cl/sqnr) and run `sqnr keygen`, or use a YubiKey.
+
 ## Why
 
 sQUIC proves a caller's key during the handshake, so a service need not
