@@ -78,6 +78,13 @@ if [ "$OS_NAME" = "darwin" ]; then
     esac
 fi
 
+# The sqex CLI links libpcsclite (via sqnr, for the YubiKey), which is awkward to
+# cross-build for Linux/aarch64; releases cover Linux x86_64 and both macOS
+# arches. On aarch64 Linux, build from source.
+if [ "$OS_NAME" = "linux" ] && [ "$TARGET" = "aarch64-linux-gnu" ]; then
+    err "no prebuilt sqex for aarch64 Linux — build from source: cargo install --git https://github.com/$REPO sqexd sqex-cli"
+fi
+
 if [ -n "$INSTALL_DIR" ]; then
     BIN_DIR="$INSTALL_DIR"
 elif [ "$(id -u)" -eq 0 ]; then
