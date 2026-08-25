@@ -97,6 +97,14 @@ impl Live {
         }
     }
 
+    /// The ephemeral the peer in `role` contributed when this session was made.
+    fn own_ephemeral_for(&self, role: Role) -> [u8; 32] {
+        match role {
+            Role::First => self.eph_first,
+            Role::Second => self.eph_second,
+        }
+    }
+
     fn expired(&self, now: u64) -> bool {
         now.saturating_sub(self.created) > TTL_SECS
     }
@@ -138,18 +146,30 @@ impl Sessions {
 
         // Already established? Answer idempotently, so a repeated open (a retry,
         // or a peer that lost its ack) resumes rather than starting again.
-        if let Some((id, live)) = inner
+        //
+        // A *retry* re-offers the ephemeral it offered before. An open carrying
+        // a different one is not a retry — it is somebody starting again, most
+        // often because they restarted and have no idea a session survives them.
+        // Answering that idempotently would hand back an ephemeral their new
+        // secret cannot pair with, and both ends would derive keys that do not
+        // match: connected, apparently healthy, and permanently unable to read
+        // each other. So a fresh ephemeral discards the old session instead.
+        let existing = inner
             .sessions
             .iter()
             .find(|(_, l)| l.open && l.role_of(&me).is_some() && l.role_of(&peer).is_some())
-        {
-            let role = live.role_of(&me).expect("membership just checked");
-            return OpenAck {
-                state: OpenState::Established,
-                session_id: *id,
-                peer_ephemeral: live.peer_ephemeral_for(role),
-                now,
-            };
+            .map(|(id, l)| (*id, l.role_of(&me).expect("membership just checked")));
+        if let Some((id, role)) = existing {
+            let live = &inner.sessions[&id];
+            if live.own_ephemeral_for(role) == ephemeral {
+                return OpenAck {
+                    state: OpenState::Established,
+                    session_id: id,
+                    peer_ephemeral: live.peer_ephemeral_for(role),
+                    now,
+                };
+            }
+            inner.sessions.remove(&id);
         }
 
         // Has the peer already asked for me? Then both have consented.

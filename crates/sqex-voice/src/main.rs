@@ -19,12 +19,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use sqex_proto::room::{HEARTBEAT_SECS, RoomId};
 use sqex_proto::session::{BySession, DatagramFrame, MAX_DATAGRAM_FRAME, Open, OpenAck, OpenState, Session};
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::{PubKey, Signer};
 
 use sqex_voice::audio::{self, Sink, Source};
 use sqex_voice::jitter::{FRAME_MS, FRAME_SAMPLES, Jitter, Playout, Rtt, SAMPLE_RATE};
+use sqex_voice::mix::Mixer;
+use sqex_voice::room::{self, Event as RoomEvent, Membership};
 
 #[derive(Parser)]
 #[command(
@@ -103,6 +106,43 @@ enum Cmd {
         /// The peer's Ed25519 identity, base58.
         peer: String,
     },
+
+    /// Join a room and talk to everyone in it (SIP-13).
+    ///
+    /// A room is named by a secret, and holding the secret is what being in the
+    /// room consists of — there is no owner and no way to remove someone.
+    /// Anyone you give it to can join, and can pass it on. Media is a mesh of
+    /// ordinary two-party sessions, so the exchange can read no more of a room
+    /// than it can of a call.
+    Room {
+        /// The room secret, base58. Omit with --new to mint one.
+        room: Option<String>,
+
+        /// Print a fresh room secret and exit. Give it to the people you want
+        /// in the room, and to nobody else.
+        #[arg(long)]
+        new: bool,
+
+        /// Where the audio comes from: `mic`, `tone`, or a 48 kHz WAV.
+        #[arg(long, default_value = "mic")]
+        source: Source,
+
+        /// Where the audio goes: `speaker`, `null`, or a path to write a WAV.
+        #[arg(long, default_value = "speaker")]
+        sink: Sink,
+
+        /// Frames to hold before playing, per peer.
+        #[arg(long, default_value_t = 3)]
+        jitter: u64,
+
+        /// Opus bitrate in bits per second, to each peer.
+        #[arg(long, default_value_t = 24_000)]
+        bitrate: i32,
+
+        /// Leave after N seconds.
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -115,8 +155,50 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), String> {
     let cfg = Config::load();
+
+    // A room has no peer to name and may not need a connection at all.
+    if let Cmd::Room {
+        room,
+        new,
+        source,
+        sink,
+        jitter,
+        bitrate,
+        seconds,
+    } = &cli.cmd
+    {
+        if *new {
+            println!("{}", RoomId::generate().to_base58());
+            eprintln!(
+                "Give this to the people you want in the room. Anyone who has it can \
+                 join, and it cannot be taken back."
+            );
+            return Ok(());
+        }
+        let text = room
+            .as_deref()
+            .ok_or("no room — pass a room secret, or --new to mint one")?;
+        let id: RoomId = text.trim().parse().map_err(|e| format!("bad room: {e}"))?;
+        return room_call(
+            &cli,
+            &cfg,
+            id,
+            CallOpts {
+                source: source.clone(),
+                sink: sink.clone(),
+                depth: *jitter,
+                bitrate: *bitrate,
+                seconds: *seconds,
+                rtt: false,
+                quiet: cli.quiet,
+            },
+        )
+        .await;
+    }
+
     let peer = parse_key(match &cli.cmd {
         Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer,
+        Cmd::Room { .. } => unreachable!("handled above"),
     })?;
     let (client, session, id) = establish(&cli, &cfg, peer).await?;
 
@@ -147,6 +229,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .await
         }
         Cmd::Echo { .. } => echo(client, session, id, cli.quiet).await,
+        Cmd::Room { .. } => unreachable!("handled above"),
     }
 }
 
@@ -209,6 +292,20 @@ async fn establish(cli: &Cli, cfg: &Config, peer: PubKey) -> Result<(Client, Ses
 
 // ---- the call ---------------------------------------------------------------
 
+/// One encoder, configured the same way whether it is feeding one peer or
+/// seven — a frame is encoded once and sealed per peer, never encoded per peer.
+fn encoder(bitrate: i32) -> Result<opus::Encoder, String> {
+    let mut e = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+        .map_err(|e| format!("opus encoder: {e}"))?;
+    e.set_bitrate(opus::Bitrate::Bits(bitrate))
+        .map_err(|e| format!("opus bitrate: {e}"))?;
+    // Forward error correction lets the decoder rebuild a lost frame from the
+    // next one, which on an unreliable path is worth the few bits it costs.
+    e.set_inband_fec(true).map_err(|e| e.to_string())?;
+    e.set_packet_loss_perc(10).map_err(|e| e.to_string())?;
+    Ok(e)
+}
+
 struct CallOpts {
     source: Source,
     sink: Sink,
@@ -225,21 +322,7 @@ async fn call(
     id: u64,
     opts: CallOpts,
 ) -> Result<(), String> {
-    let mut encoder = opus::Encoder::new(
-        SAMPLE_RATE,
-        opus::Channels::Mono,
-        opus::Application::Voip,
-    )
-    .map_err(|e| format!("opus encoder: {e}"))?;
-    encoder
-        .set_bitrate(opus::Bitrate::Bits(opts.bitrate))
-        .map_err(|e| format!("opus bitrate: {e}"))?;
-    // Forward error correction lets the decoder rebuild a lost frame from the
-    // next one, which on an unreliable path is worth the few bits it costs.
-    encoder.set_inband_fec(true).map_err(|e| e.to_string())?;
-    encoder
-        .set_packet_loss_perc(10)
-        .map_err(|e| e.to_string())?;
+    let mut encoder = encoder(opts.bitrate)?;
     let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono)
         .map_err(|e| format!("opus decoder: {e}"))?;
 
@@ -374,6 +457,203 @@ fn summary(buffer: &Jitter, rtt: &Rtt) -> String {
             p50.as_secs_f64() * 1000.0,
             p95.as_secs_f64() * 1000.0
         ));
+    }
+    line
+}
+
+// ---- the room ---------------------------------------------------------------
+
+/// Talk to everyone in a room (SIP-13).
+///
+/// The shape is the two-party loop above with the singular made plural: one
+/// encoder still, because a frame is encoded once and only *sealed* per peer,
+/// but a jitter buffer, a decoder and a sequence counter each. The two loops
+/// are kept apart rather than unified — `call` carries the round-trip
+/// measurement and a fixed peer, this carries a roster that changes underneath
+/// it, and folding them together made both harder to follow than either.
+async fn room_call(
+    cli: &Cli,
+    cfg: &Config,
+    room: RoomId,
+    opts: CallOpts,
+) -> Result<(), String> {
+    let signer = load_identity(cli, cfg)?;
+    let me = PubKey::new(signer.public());
+    let (addr, server) = endpoint(cli, cfg)?;
+    let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+    if client.max_datagram_size().is_none() {
+        return Err("this path does not carry datagrams, so it cannot carry a room".into());
+    }
+
+    let mut encoder = encoder(opts.bitrate)?;
+    let mut source = audio::open_source(&opts.source, opts.seconds)?;
+    let out = audio::open_sink(&opts.sink)?;
+    let mut mixer = Mixer::new(FRAME_SAMPLES);
+    let mut pcm = vec![0f32; FRAME_SAMPLES];
+    let mut members = Membership::new(room, me, signer.seed(), opts.depth);
+
+    let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
+    let mut roster = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    let mut report = tokio::time::interval(Duration::from_secs(1));
+    report.tick().await;
+
+    eprintln!("you are {me}");
+    eprintln!(
+        "in the room — {} kbit/s to each peer, {} ms of jitter buffer. Ctrl-C to leave.",
+        opts.bitrate / 1000,
+        opts.depth * FRAME_MS
+    );
+
+    let mut hangup: Option<Instant> = None;
+    let result = loop {
+        tokio::select! {
+            // Roster, heartbeat and session establishment are the same tick.
+            // Everything here is a request-response on the one connection, so
+            // it is sequential by construction; media does not wait for it.
+            _ = roster.tick() => {
+                match members.poll(&mut client).await {
+                    Ok(events) => for e in events {
+                        match e {
+                            RoomEvent::Joined(id) => eprintln!("+ {} joined", room::short(&id)),
+                            RoomEvent::Left(id) => eprintln!("- {} left", room::short(&id)),
+                            RoomEvent::Rejected(id) => eprintln!(
+                                "! {} is listed in the room but cannot prove they hold the \
+                                 secret — ignoring them",
+                                room::short(&id)
+                            ),
+                            RoomEvent::Restarted(id) => eprintln!(
+                                "~ {} went quiet — rebuilding the session",
+                                room::short(&id)
+                            ),
+                        }
+                    },
+                    Err(e) => break Err(e),
+                }
+            }
+
+            // One encode, then a seal per peer: the ciphertext differs because
+            // every session has its own key, but the Opus packet does not.
+            frame = source.recv(), if hangup.is_none() => match frame {
+                Some(samples) => {
+                    let packet = match encoder.encode_vec_float(&samples, MAX_DATAGRAM_FRAME) {
+                        Ok(p) => p,
+                        Err(e) => break Err(format!("encode: {e}")),
+                    };
+                    for peer in members.peers.values_mut() {
+                        let Ok(sealed) = peer.session.seal_datagram(peer.out_seq, &packet) else {
+                            continue;
+                        };
+                        let _ = client.send_datagram(
+                            DatagramFrame {
+                                session_id: peer.session_id,
+                                seq: peer.out_seq,
+                                ciphertext: sealed,
+                            }
+                            .encode(),
+                        );
+                        peer.out_seq += 1;
+                    }
+                }
+                None => {
+                    eprintln!("(source ended; leaving)");
+                    hangup = Some(Instant::now() + Duration::from_millis(500 + opts.depth * FRAME_MS));
+                }
+            },
+
+            got = client.read_datagram() => {
+                let bytes = match got {
+                    Ok(b) => b,
+                    Err(e) => break Err(e),
+                };
+                let Ok(frame) = DatagramFrame::decode(&bytes) else {
+                    continue; // malformed: not ours to fix
+                };
+                // The session id says who this is. A frame for a session we do
+                // not hold is one from a peer who has since left.
+                if let Some(peer) = members.peers.get_mut(&frame.session_id) {
+                    // A frame we cannot open is one we do not play. On this
+                    // path anything may arrive, and in a room saying so once
+                    // per frame would drown the roster.
+                    if let Ok(packet) = peer.session.open(frame.seq, &frame.ciphertext) {
+                        peer.heard();
+                        peer.jitter.push(frame.seq, packet);
+                    }
+                }
+            }
+
+            _ = playout.tick() => {
+                mixer.start();
+                for peer in members.peers.values_mut() {
+                    // Each peer's delay is its own: one bad path should not
+                    // add latency to everybody else in the room.
+                    if let Some(stale) = peer.jitter.trim() {
+                        let _ = peer.decoder.decode_float(&stale, &mut pcm, false);
+                    }
+                    let decoded = match peer.jitter.pop() {
+                        Playout::Frame(packet) => {
+                            peer.decoder.decode_float(&packet, &mut pcm, false).is_ok()
+                        }
+                        Playout::Conceal => {
+                            peer.decoder.decode_float(&[], &mut pcm, false).is_ok()
+                        }
+                        Playout::Idle => false,
+                    };
+                    if decoded {
+                        peer.note_level(audio::rms(&pcm));
+                        mixer.add(&pcm);
+                    } else {
+                        peer.note_level(0.0);
+                    }
+                }
+                if mixer.active() > 0 {
+                    out.play(mixer.finish());
+                }
+                if hangup.is_some_and(|at| Instant::now() >= at) {
+                    break Ok(());
+                }
+            }
+
+            _ = report.tick(), if !opts.quiet => eprintln!("{}", room_summary(&members)),
+
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!();
+                break Ok(());
+            }
+        }
+    };
+
+    eprintln!("{}", room_summary(&members));
+    out.finish()?;
+    members.leave(&mut client).await;
+    result
+}
+
+/// Who is here, who is talking, and how the paths to them are holding up.
+fn room_summary(members: &Membership) -> String {
+    let present = members.present();
+    if present.is_empty() {
+        return match members.connecting() {
+            0 => "nobody else here yet".to_string(),
+            n => format!("connecting to {n}…"),
+        };
+    }
+    let who: Vec<String> = present
+        .iter()
+        .map(|p| {
+            let mark = if p.is_speaking() { "*" } else { " " };
+            let s = &p.jitter.stats;
+            format!(
+                "{mark}{} loss {:.0}% conceal {} buf {}",
+                room::short(&p.identity),
+                s.loss_pct(p.jitter.span()),
+                s.concealed,
+                p.jitter.depth_now()
+            )
+        })
+        .collect();
+    let mut line = format!("{} here · {}", present.len(), who.join(" | "));
+    if members.connecting() > 0 {
+        line.push_str(&format!(" · {} connecting", members.connecting()));
     }
     line
 }

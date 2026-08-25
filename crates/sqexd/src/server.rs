@@ -18,10 +18,12 @@ use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::config::Config;
 use crate::mailbox::Mailbox;
+use crate::room::Rooms;
 use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
+use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
 
 /// The server's own version, reported in status. The protocol lives in
@@ -100,6 +102,7 @@ pub struct Server {
     challenges: Challenges,
     beacons: Beacons,
     mailbox: Mailbox,
+    rooms: Rooms,
     sessions: Sessions,
     live_conns: Connections,
     started: Instant,
@@ -158,6 +161,7 @@ pub async fn bind(
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
         mailbox: Mailbox::new(),
+        rooms: Rooms::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
         started: Instant::now(),
@@ -396,6 +400,36 @@ async fn route(
             }
         },
 
+        // SIP-13 rooms. The exchange holds a roster and nothing else: it is
+        // given a handle, never the room secret, so it cannot join a room it
+        // carries. It relays each member's proof without checking it — checking
+        // needs the secret it has deliberately not been told — and the members
+        // verify each other.
+        ("POST", "/room/join") => match (peer.identity, RoomJoin::decode(body)) {
+            (None, _) => no_identity("joining a room"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(join)) => match server.rooms.join(join.handle, me, join.proof) {
+                Ok(roster) => (200, "application/octet-stream", roster.encode()),
+                Err(e) => (
+                    507,
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+        ("POST", "/room/leave") => match (peer.identity, RoomLeave::decode(body)) {
+            (None, _) => no_identity("leaving a room"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(leave)) => {
+                let was_there = server.rooms.leave(&leave.handle, &me);
+                (
+                    200,
+                    "application/json",
+                    json!({ "left": was_there }).to_string().into_bytes(),
+                )
+            }
+        },
+
         // SIP-5 store-and-forward mailbox. Every operation is by the caller's
         // transport identity (SIP-3): a sender is whoever connected, and a
         // mailbox belongs to whoever can connect as its key. Nothing is signed.
@@ -540,6 +574,7 @@ impl Server {
             "beacons": self.beacons.len(),
             "mail_waiting": self.mailbox.waiting(),
             "sessions": self.sessions.len(),
+            "rooms": self.rooms.len(),
             "admins": self.admins.read().unwrap().len(),
         })
     }

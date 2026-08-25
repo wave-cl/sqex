@@ -90,8 +90,13 @@ pub fn open_sink(sink: &Sink) -> Result<Output, String> {
 
 /// A 440 Hz sine, continuous across frames so there is no click at the seam.
 fn tone_frames() -> impl Iterator<Item = Vec<f32>> {
+    sine(TONE_HZ)
+}
+
+/// A sine at `hz`, in 20 ms frames, with the phase carried across the seam.
+fn sine(hz: f32) -> impl Iterator<Item = Vec<f32>> {
     let mut phase = 0.0f32;
-    let step = std::f32::consts::TAU * TONE_HZ / SAMPLE_RATE as f32;
+    let step = std::f32::consts::TAU * hz / SAMPLE_RATE as f32;
     std::iter::from_fn(move || {
         let mut frame = Vec::with_capacity(FRAME_SAMPLES);
         for _ in 0..FRAME_SAMPLES {
@@ -425,6 +430,32 @@ pub fn dominant_hz(samples: &[f32]) -> f32 {
     (crossings as f32 / 2.0) * (SAMPLE_RATE as f32 / samples.len() as f32)
 }
 
+/// How much of one specific frequency is present, as an amplitude.
+///
+/// [`dominant_hz`] cannot read a mix — zero crossings only describe a single
+/// tone — and a room is several tones at once. This is the Goertzel algorithm:
+/// one bin of a DFT, about ten lines, and no FFT dependency for what is only
+/// ever used to ask "is that person's tone in here?".
+///
+/// Returns roughly the amplitude of that component, so a 0.5-amplitude sine at
+/// `hz` reads about 0.5 and a frequency that is absent reads about 0.
+pub fn amplitude_at(samples: &[f32], hz: f32) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let k = (samples.len() as f32 * hz / SAMPLE_RATE as f32).round();
+    let w = std::f32::consts::TAU * k / samples.len() as f32;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for x in samples {
+        let s0 = x + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+    2.0 * power.max(0.0).sqrt() / samples.len() as f32
+}
+
 /// Root mean square: how loud a stretch of audio is, regardless of its shape.
 pub fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -436,6 +467,12 @@ pub fn rms(samples: &[f32]) -> f32 {
 /// A 440 Hz sine at 48 kHz in 20 ms frames, for tests and for `--source tone`.
 pub fn tone(frames: usize) -> Vec<Vec<f32>> {
     tone_frames().take(frames).collect()
+}
+
+/// The same, at a frequency of your choosing — so several people in a room can
+/// each be a different note and the mix can be checked note by note.
+pub fn tone_at(hz: f32, frames: usize) -> Vec<Vec<f32>> {
+    sine(hz).take(frames).collect()
 }
 
 #[cfg(test)]
@@ -461,6 +498,21 @@ mod tests {
                 "click at frame seam {seam}"
             );
         }
+    }
+
+    #[test]
+    fn a_single_frequency_can_be_picked_out_of_a_mix() {
+        let n = FRAME_SAMPLES * 25;
+        let a: Vec<f32> = sine(440.0).take(25).flatten().collect();
+        let b: Vec<f32> = sine(660.0).take(25).flatten().collect();
+        let mixed: Vec<f32> = a.iter().zip(&b).map(|(x, y)| (x + y) / 2.0).collect();
+        assert_eq!(mixed.len(), n);
+
+        // Each tone is present at about a quarter (0.5 amplitude, halved by
+        // the mix), and a note nobody is playing is not.
+        assert!((amplitude_at(&mixed, 440.0) - 0.25).abs() < 0.02);
+        assert!((amplitude_at(&mixed, 660.0) - 0.25).abs() < 0.02);
+        assert!(amplitude_at(&mixed, 880.0) < 0.02, "nobody played an A");
     }
 
     #[test]

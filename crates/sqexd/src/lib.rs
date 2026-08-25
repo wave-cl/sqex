@@ -4,6 +4,7 @@ pub mod beacon;
 pub mod challenge;
 pub mod config;
 pub mod mailbox;
+pub mod room;
 pub mod server;
 pub mod session;
 pub mod state;

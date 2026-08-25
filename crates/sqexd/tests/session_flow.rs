@@ -559,3 +559,88 @@ async fn measure_carriage_latency() {
 
     handle.abort();
 }
+
+/// Two people who called each other before, and are calling again.
+///
+/// A session outlives a call by an hour, so the second call finds the first
+/// one still there. Answering that idempotently — which is what a *retry*
+/// deserves — would hand each side the ephemeral from last time, and their new
+/// secrets cannot pair with it: both would derive a key the other does not
+/// have, and the call would come up looking perfectly healthy and be completely
+/// deaf. A fresh ephemeral therefore replaces the session rather than resuming
+/// it.
+#[tokio::test]
+async fn calling_someone_again_does_not_resume_the_last_call_with_new_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = bare_server(dir.path()).await;
+
+    let (a_seed, a_id) = identity(141);
+    let (b_seed, b_id) = identity(142);
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+
+    // The first call. Nobody closes it — they crashed, or the lid shut.
+    let (a_eph1, a_pub1) = ephemeral();
+    let (b_eph1, b_pub1) = ephemeral();
+    open_session(&mut a, b_id, a_pub1).await;
+    let b_ack1 = open_session(&mut b, a_id, b_pub1).await;
+    let a_ack1 = open_session(&mut a, b_id, a_pub1).await;
+    assert_eq!(a_ack1.state, OpenState::Established);
+    let old = a_ack1.session_id;
+    // Sanity: those keys did agree with each other.
+    let a1 = Session::derive(&a_seed, &a_eph1, &b_id, &a_ack1.peer_ephemeral).unwrap();
+    let b1 = Session::derive(&b_seed, &b_eph1, &a_id, &b_ack1.peer_ephemeral).unwrap();
+    assert!(b1.open(0, &a1.seal(0, b"first call").unwrap()).is_ok());
+
+    // The second call: both sides restarted, so both offer fresh ephemerals.
+    let (a_eph2, a_pub2) = ephemeral();
+    let (b_eph2, b_pub2) = ephemeral();
+    open_session(&mut a, b_id, a_pub2).await;
+    let b_ack2 = open_session(&mut b, a_id, b_pub2).await;
+    let a_ack2 = open_session(&mut a, b_id, a_pub2).await;
+
+    assert_eq!(a_ack2.state, OpenState::Established);
+    assert_ne!(a_ack2.session_id, old, "the stale session was not reused");
+    assert_eq!(
+        a_ack2.peer_ephemeral, b_pub2,
+        "and the ephemeral is this call's, not last call's"
+    );
+
+    // The point of all of it: they can hear each other.
+    let a2 = Session::derive(&a_seed, &a_eph2, &b_id, &a_ack2.peer_ephemeral).unwrap();
+    let b2 = Session::derive(&b_seed, &b_eph2, &a_id, &b_ack2.peer_ephemeral).unwrap();
+    let sealed = a2.seal(0, b"second call").unwrap();
+    assert_eq!(
+        b2.open(0, &sealed).unwrap(),
+        b"second call",
+        "the second call must not be silently deaf"
+    );
+}
+
+/// The idempotency SIP-12 does require: the *same* ephemeral, offered again,
+/// resumes rather than restarting. This is what a retry or a lost ack looks
+/// like, and it must not tear a live call down.
+#[tokio::test]
+async fn re_offering_the_same_ephemeral_still_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = bare_server(dir.path()).await;
+
+    let (a_seed, a_id) = identity(151);
+    let (b_seed, b_id) = identity(152);
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+
+    let (_a_eph, a_pub) = ephemeral();
+    let (_b_eph, b_pub) = ephemeral();
+    open_session(&mut a, b_id, a_pub).await;
+    let _ = open_session(&mut b, a_id, b_pub).await;
+    let first = open_session(&mut a, b_id, a_pub).await;
+    assert_eq!(first.state, OpenState::Established);
+
+    for _ in 0..3 {
+        let again = open_session(&mut a, b_id, a_pub).await;
+        assert_eq!(again.session_id, first.session_id, "same session");
+        assert_eq!(again.peer_ephemeral, first.peer_ephemeral);
+        assert_eq!(again.state, OpenState::Established);
+    }
+}
