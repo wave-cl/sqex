@@ -76,6 +76,15 @@ echo "==> 6. Starting sqexd in the background"
 sqexd --config "$CONFIG" >"$SQEX_HOME/sqexd.log" 2>&1 &
 SQEXD_PID=$!
 sleep 1
+# Fail loudly if it didn't come up (most often: something else already on
+# $LISTEN). Otherwise step 7 would hit the wrong server and time out.
+if ! kill -0 "$SQEXD_PID" 2>/dev/null; then
+    echo "    sqexd failed to start — last log lines:"
+    tail -3 "$SQEX_HOME/sqexd.log" | sed 's/^/      /'
+    echo "    Is another sqexd already on $LISTEN? Stop it (e.g. pkill sqexd)"
+    echo "    or change LISTEN at the top of this script, then re-run."
+    exit 1
+fi
 echo "    sqexd pid $SQEXD_PID (log: $SQEX_HOME/sqexd.log)"
 
 echo "==> 7. Enabling the whitelist (enter your PIN, then touch the key)"
