@@ -1,0 +1,42 @@
+[package]
+name = "sqex-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal chat client for sqex: end-to-end encrypted direct messages over sQUIC."
+
+[[bin]]
+name = "sqex-chat"
+path = "src/main.rs"
+
+[lib]
+name = "sqex_chat"
+path = "src/lib.rs"
+
+[dependencies]
+sqex-proto = { workspace = true }
+sqnr = { workspace = true }
+sqnr-core = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+bs58 = { workspace = true }
+dirs = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+x25519-dalek = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+rpassword = "7"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The client's tests drive a real exchange, because a chat client that was only
+# ever tested against a mock has tested the mock. Direction is chat -> sqexd,
+# and sqexd does not depend on this.
+sqexd = { path = "../sqexd" }
+squic = { workspace = true }
+hex = { workspace = true }
+toml = { workspace = true }

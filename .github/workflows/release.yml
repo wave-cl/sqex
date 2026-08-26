@@ -65,14 +65,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release -p sqexd -p sqex-cli --target ${{ matrix.target }}
+        run: cargo build --release -p sqexd -p sqex-cli -p sqex-chat --target ${{ matrix.target }}
 
       - name: Package
         run: |
           VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           ARCHIVE="sqex-${VERSION}-${{ matrix.archive_target }}.tar.gz"
           BINDIR="target/${{ matrix.target }}/release"
-          tar -czf "${ARCHIVE}" -C "${BINDIR}" sqexd sqex
+          tar -czf "${ARCHIVE}" -C "${BINDIR}" sqexd sqex sqex-chat
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
       - uses: actions/upload-artifact@v4

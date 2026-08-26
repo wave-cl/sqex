@@ -428,6 +428,60 @@ impl Pool {
     pub fn fallback_id(&self) -> u32 {
         self.fallback.as_ref().map_or(0, |(id, _)| *id)
     }
+
+    /// Everything the pool would need to be rebuilt, secrets included.
+    ///
+    /// **This is the only way secrets leave a `Pool`, and it exists because a
+    /// client that cannot reload them has no forward secrecy to lose — it has a
+    /// conversation it can no longer read.** A caller that writes this anywhere
+    /// unencrypted has undone the mechanism as thoroughly as never deleting a
+    /// secret in the first place.
+    ///
+    /// `next_id` and `spent` are as load-bearing as the secrets. Without the
+    /// first, a reloaded pool re-mints ids it has already published and the
+    /// exchange refuses them. Without the second, a restart silently forgives a
+    /// replay that the pool had already refused.
+    pub fn save(&self) -> PoolState {
+        PoolState {
+            next_id: self.next_id,
+            one_time: self
+                .one_time
+                .iter()
+                .map(|(id, s)| (*id, s.to_bytes()))
+                .collect(),
+            fallback: self.fallback.as_ref().map(|(id, s)| (*id, s.to_bytes())),
+            spent: self.spent.iter().copied().collect(),
+        }
+    }
+
+    /// Rebuild a pool from `save`.
+    pub fn load(seed: &[u8; 32], state: PoolState) -> Pool {
+        Pool {
+            seed: *seed,
+            next_id: state.next_id.max(1),
+            one_time: state
+                .one_time
+                .into_iter()
+                .map(|(id, b)| (id, x25519_dalek::StaticSecret::from(b)))
+                .collect(),
+            fallback: state
+                .fallback
+                .map(|(id, b)| (id, x25519_dalek::StaticSecret::from(b))),
+            spent: state.spent.into_iter().collect(),
+        }
+    }
+}
+
+/// A pool's contents as plain data, for a client that has somewhere to put it.
+///
+/// Deliberately not `Debug` and deliberately not serialisable by this crate:
+/// `sqex-proto` has no filesystem and no serde, and choosing how these bytes
+/// are protected at rest is the caller's decision, not one to make for them.
+pub struct PoolState {
+    pub next_id: u32,
+    pub one_time: Vec<(u32, [u8; 32])>,
+    pub fallback: Option<(u32, [u8; 32])>,
+    pub spent: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -582,5 +636,74 @@ mod tests {
         pool.mint_one_time(2);
         assert!(pool.take(0).is_err());
         assert!(pool.take(999).is_err());
+    }
+
+    #[test]
+    fn a_reloaded_pool_still_refuses_a_spent_prekey() {
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        let published = pool.mint_one_time(3);
+        let spent = published[0].id;
+        pool.take(spent).unwrap();
+
+        let mut reloaded = Pool::load(&seed, pool.save());
+        // The spent set survives, or a restart quietly forgives a replay the
+        // pool had already refused.
+        assert!(reloaded.take(spent).is_err());
+    }
+
+    #[test]
+    fn a_reloaded_pool_opens_an_envelope_sealed_to_it() {
+        // The proof that the right bytes came back, not merely some bytes: seal
+        // against the published public key, reload, and open. A pool that
+        // round-tripped a secret incorrectly would still hand one over here and
+        // would still fail this.
+        use crate::channel_key::{ChannelKey, open_envelope, seal_envelope};
+
+        let (seed, key) = device(1);
+        let mut pool = Pool::new(&seed);
+        let published = pool.mint_one_time(2);
+        let target = published[1];
+
+        let epoch_key = ChannelKey::generate();
+        let envelope = seal_envelope(&key, target.id, &target.public, 1, &[epoch_key]).unwrap();
+
+        let mut reloaded = Pool::load(&seed, pool.save());
+        let secret = reloaded.take(target.id).expect("the secret survived");
+        assert_eq!(
+            open_envelope(&seed, &secret, &envelope).unwrap(),
+            vec![epoch_key]
+        );
+    }
+
+    #[test]
+    fn a_reloaded_pool_does_not_reissue_published_ids() {
+        // Pool::new starts at 1, so a client that reloaded by starting over
+        // would re-mint ids the exchange has already stored and be refused.
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        let first: Vec<u32> = pool.mint_one_time(4).iter().map(|p| p.id).collect();
+
+        let mut reloaded = Pool::load(&seed, pool.save());
+        let next: Vec<u32> = reloaded.mint_one_time(4).iter().map(|p| p.id).collect();
+        assert!(
+            next.iter().all(|id| !first.contains(id)),
+            "reloading reissued {first:?} as {next:?}"
+        );
+        assert_eq!(reloaded.fallback_id(), 0);
+    }
+
+    #[test]
+    fn a_reloaded_pool_keeps_its_fallback() {
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        let fallback = pool.mint_fallback();
+
+        let mut reloaded = Pool::load(&seed, pool.save());
+        assert_eq!(reloaded.fallback_id(), fallback.id);
+        // Still reusable, and still refused once replaced.
+        assert!(reloaded.take(fallback.id).is_ok());
+        reloaded.mint_fallback();
+        assert!(reloaded.take(fallback.id).is_err());
     }
 }
