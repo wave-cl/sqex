@@ -43,7 +43,8 @@ use sqex_proto::channel::{
     Visibility,
 };
 use sqex_proto::blob_store::{
-    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_CHANNEL_BLOB_BYTES, MAX_UPLOADS,
+    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS,
+    MAX_CHANNEL_BLOB_BYTES, MAX_UPLOADS,
     PutChunk as BlobPut, UPLOAD_TTL, blob_id,
 };
 use sqex_proto::channel_key::{
@@ -85,6 +86,8 @@ pub enum ChannelError {
     BadChunk,
     TooManyUploads,
     BlobQuota,
+    /// The blob is already attached to as many channels as SIP-18 allows.
+    BlobChannels,
     /// The invitee is already in as many channels they have never spoken in as
     /// SIP-16 allows. The anti-spam measure: without it a stranger can add an
     /// identity to unbounded numbers of channels.
@@ -115,6 +118,7 @@ impl ChannelError {
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
+            ChannelError::BlobChannels => "blob_channel_quota",
             ChannelError::InviteQuota => "invite_quota",
             ChannelError::BadRetention => "bad_retention",
             ChannelError::LastAdmin => "last_admin",
@@ -135,6 +139,7 @@ impl ChannelError {
             | ChannelError::TooManyChannels
             | ChannelError::TooManyUploads
             | ChannelError::BlobQuota
+            | ChannelError::BlobChannels
             | ChannelError::InviteQuota => 507,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
@@ -1979,6 +1984,21 @@ fn attach(
     expires_after: u32,
     now: u64,
 ) -> Result<(), ChannelError> {
+    // A blob attached to a new channel gains a fresh window, so without a cap
+    // re-forwarding keeps it alive forever. Re-attaching where it already is
+    // only refreshes the existing row and is not a new channel.
+    let (here, elsewhere): (i64, i64) = db
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE channel = ?2),
+                    COUNT(*) FILTER (WHERE channel <> ?2)
+             FROM attachment WHERE blob = ?1",
+            params![&blob[..], &channel[..]],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(storage("count attachments"))?;
+    if here == 0 && elsewhere as usize >= MAX_BLOB_CHANNELS {
+        return Err(ChannelError::BlobChannels);
+    }
     db.execute(
         "INSERT INTO attachment (channel, blob, attached, expires_after, uploader)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -2512,5 +2532,76 @@ mod tests {
         // Promoting them where they already are must not be refused.
         c.invite(&admin, &home.channel, &member, Role::Admin, &|_, _| false)
             .expect("a promotion is not an invitation");
+    }
+
+    fn channel_id(n: usize) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[0] = 0xb1;
+        id[1] = n as u8;
+        id[2] = (n >> 8) as u8;
+        id
+    }
+
+    #[test]
+    fn a_blob_cannot_be_forwarded_into_unbounded_channels() {
+        let c = Channels::open(None).unwrap();
+        let alice = key(1);
+        let blob = [0xcc; 32];
+
+        for n in 0..=MAX_BLOB_CHANNELS {
+            let mut req = channel_n(0, Visibility::Public);
+            req.channel = channel_id(n);
+            c.create(&alice, &req, &|_, _| false).unwrap();
+        }
+        // A blob already in the first channel, which is what makes alice able
+        // to fetch it and therefore able to forward it.
+        {
+            let db = c.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO blob (id, size, chunks) VALUES (?1, 10, 1)",
+                params![&blob[..]],
+            )
+            .unwrap();
+            attach(&db, &channel_id(0), &blob, &alice, 0, now_unix()).unwrap();
+        }
+
+        // Forwarding costs the reference and not the file — but each new
+        // attachment gets its own window, so without the cap re-forwarding
+        // keeps a blob alive forever.
+        for n in 1..MAX_BLOB_CHANNELS {
+            c.attach_blob(
+                &alice,
+                &ByChannelBlob {
+                    channel: channel_id(n),
+                    blob,
+                    expires_after: 0,
+                },
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            c.attach_blob(
+                &alice,
+                &ByChannelBlob {
+                    channel: channel_id(MAX_BLOB_CHANNELS),
+                    blob,
+                    expires_after: 0,
+                },
+            ),
+            Err(ChannelError::BlobChannels)
+        ));
+        assert_eq!(ChannelError::BlobChannels.status(), 507);
+
+        // Re-attaching where it already is refreshes the window and is not a
+        // new channel, so it is not refused at the cap.
+        c.attach_blob(
+            &alice,
+            &ByChannelBlob {
+                channel: channel_id(0),
+                blob,
+                expires_after: 0,
+            },
+        )
+        .expect("a refresh is not a new attachment");
     }
 }
