@@ -12,7 +12,7 @@ connection whitelist with **Ed25519-signed commands**, ready for a YubiKey.
 
 ## Install
 
-Admin client (`sqex`, and `sqexd`):
+Clients (`sqex`, `sqex-chat`) and the server (`sqexd`):
 
 ```
 curl -fsSL https://raw.githubusercontent.com/wave-cl/sqex/main/install.sh | sh
@@ -49,7 +49,7 @@ SQEX_SERVER=host:5400 SQEX_SERVER_KEY=<b58> sqex status   # environment
 | Store-and-forward mailbox | [5](https://github.com/wave-cl/sips/blob/main/sip-0005.md) | `sqex mail` |
 | Relayed session | [12](https://github.com/wave-cl/sips/blob/main/sip-0012.md) | `sqex session talk` |
 | Rooms and voice | [13](https://github.com/wave-cl/sips/blob/main/sip-0013.md), [15](https://github.com/wave-cl/sips/blob/main/sip-0015.md) | `sqex-voice call`, `sqex-voice room` |
-| Chat | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | library only — see below |
+| Chat (direct messages) | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | `sqex-chat` |
 
 ## Chat (v0.9.0)
 
@@ -66,7 +66,8 @@ ends, so a stored pile of envelopes does not become readable when an identity
 key later turns up.
 
 Two rules the exchange is structurally unable to check are implemented in
-`sqex-proto` as types a client uses rather than as advice:
+`sqex-proto` as types a client uses rather than as advice, and `sqex-chat`
+calls both:
 
 - `channel_key::Replay` refuses an entry whose `(device, epoch, msg_seq)` has
   been seen before.
@@ -75,11 +76,56 @@ Two rules the exchange is structurally unable to check are implemented in
   spent — which is how a recipient notices an exchange serving the same prekey
   twice.
 
-**There is no chat CLI.** `sqex-proto` has the wire formats and the client-side
-logic (sealing, opening, the timeline reader that folds edits, reactions and
-redactions into what a person sees), and `sqexd` serves the routes; the
-integration tests in `crates/sqexd/tests/` are currently the only thing that
-drives them end to end, and are the best worked example of a client.
+The client for it is `sqex-chat` — direct messages, in a terminal. Group
+channels are built in the exchange and have no client yet, for a reason worth
+knowing before relying on any of this: see **Who can find you**.
+
+```
+sqex-chat whoami             # your identity, to give to somebody
+sqex-chat add <their-key>    # discovery is this list; see below
+sqex-chat                    # the conversation
+```
+
+It ships from the release after v0.9.0; v0.9.0 itself packaged only `sqexd` and
+`sqex`, so until the next tag it is `cargo install --git
+https://github.com/wave-cl/sqex sqex-chat`.
+
+### The client keeps the keys, and has to
+
+This is the part of the design that surprises people, so it is worth stating
+before somebody loses a conversation to it.
+
+An epoch key reaches a device inside an envelope sealed against a **single-use**
+prekey, and opening that envelope spends the prekey. Ask the exchange for the
+same envelope tomorrow and it will hand over the same bytes to no effect,
+because the secret that opened them is gone. That is the forward secrecy
+working exactly as intended, and it means the copy `sqex-chat` writes to
+`~/.sqex/chat` is the only copy that will exist.
+
+So losing that directory loses the conversations in it, permanently, for
+everybody including you. The store is SQLite with every secret sealed under a
+key derived from your identity seed — per row rather than by encrypting the
+file, so the schema stays legible while holding no key material. Deriving from
+the seed is also why **a YubiKey identity cannot use `sqex-chat`**: a card never
+releases its seed, which is the same reason `sqex mail` and `sqex session`
+refuse one.
+
+The one piece of client state the exchange *can* return is the message counter,
+which it keeps per device per epoch independently of pruning precisely so a
+client that lost the number resumes rather than guesses — reusing one would cost
+the confidentiality of two messages.
+
+### Who can find you
+
+A direct message's identifier is derived from the two account keys, so starting
+one needs nothing from the exchange. **Being found does.** There is no route
+that answers *"which channels am I in"* — a private channel is invisible to the
+directory under any query, by design — so `sqex-chat` polls the conversations it
+knows about, and its contact list is the whole of discovery.
+
+The consequence is real and the client says so in its `--help`: a message from
+an account you have not added cannot be seen. Closing that properly means a new
+route and a change to SIP-16; nothing here works around it.
 
 ## How admin commands work
 
@@ -160,6 +206,8 @@ the tests use.
   prekey, profile and admission services.
 - `sqex-cli` — the `sqex` command-line tool (signs via sqnr).
 - `sqex-voice` — calls and rooms: capture, Opus, relay, mix, play.
+- `sqex-chat` — the terminal chat client, and the client-side key store the
+  chat stack needs and the exchange cannot provide.
 - `sqex-admin` — the desktop GUI (YubiKey), parked.
 
 ## Running

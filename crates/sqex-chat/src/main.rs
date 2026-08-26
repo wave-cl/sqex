@@ -86,6 +86,15 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), String> {
     let cfg = Config::load();
+
+    // Before anything is unlocked: printing your own identity does not need the
+    // seed, and asking for a passphrase to read a public key would be a poor
+    // trade for the one command somebody runs to tell a friend where to write.
+    if matches!(cli.cmd, Some(Cmd::Whoami)) {
+        println!("{}", identity::read_public(&identity_path(&cli, &cfg)?)?);
+        return Ok(());
+    }
+
     let (seed, me) = load_identity(&cli, &cfg)?;
     let store = Store::open(&seed, Some(&store_path(&me).map_err(|e| e.to_string())?))
         .map_err(|e| e.to_string())?;
@@ -94,10 +103,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     // connecting means `add` works while the exchange is down, which is when
     // somebody is most likely to be fiddling with their contact list.
     match &cli.cmd {
-        Some(Cmd::Whoami) => {
-            println!("{me}");
-            return Ok(());
-        }
+        // Whoami is handled above, before the identity is unlocked.
+        Some(Cmd::Whoami) => return Ok(()),
         Some(Cmd::List) => {
             let contacts = store.contacts().map_err(|e| e.to_string())?;
             if contacts.is_empty() {
@@ -499,7 +506,7 @@ fn endpoint(cli: &Cli, cfg: &Config) -> Result<(std::net::SocketAddr, PubKey), S
 /// the store key — which is why a YubiKey cannot be used here at all: it signs
 /// without ever releasing the seed, so there is nothing to bind either to.
 /// `sqex mail` and `sqex session` refuse one for the first reason alone.
-fn load_identity(cli: &Cli, cfg: &Config) -> Result<([u8; 32], PubKey), String> {
+fn identity_path(cli: &Cli, cfg: &Config) -> Result<PathBuf, String> {
     let path = match (&cli.identity, &cfg.identity) {
         (Some(p), _) => p.clone(),
         (None, Some(p)) => PathBuf::from(p),
@@ -511,13 +518,146 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<([u8; 32], PubKey), String> 
             path.display()
         ));
     }
+    Ok(path)
+}
+
+fn load_identity(cli: &Cli, cfg: &Config) -> Result<([u8; 32], PubKey), String> {
+    let path = identity_path(cli, cfg)?;
     let signer = if identity::is_encrypted(&path)? {
         let pass = rpassword::prompt_password(format!("Passphrase for {}: ", path.display()))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                format!(
+                    "{} is passphrase-protected and there is no terminal to ask on ({e}) — \
+                     run this from a terminal, or point --identity at an unencrypted one",
+                    path.display()
+                )
+            })?;
         identity::load(&path, Some(&pass))?
     } else {
         identity::load(&path, None)?
     };
     let seed = signer.seed();
     Ok((seed, PubKey::new(signer.public())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqex_proto::message::{Body, Post as SipPost};
+    use sqex_proto::timeline::Received;
+
+    fn conv(peer: u8, label: &str) -> Open {
+        Open {
+            peer: PubKey::new([peer; 32]),
+            label: label.to_string(),
+            channel: [7; 32],
+            timeline: Timeline::new(),
+            timeline_len: 0,
+            trouble: Trouble::default(),
+            typing: false,
+            unread: 0,
+            waiting: false,
+        }
+    }
+
+    fn say(conv: &mut Open, from: u8, seq: u64, text: &str) {
+        conv.timeline.apply(
+            &Received {
+                seq,
+                account: PubKey::new([from; 32]),
+                posted: 0,
+                kind: sqex_proto::channel::KIND_MEMBER,
+                body: Some(Body::Post(SipPost::text(text))),
+            },
+            &[],
+        );
+    }
+
+    #[test]
+    fn a_transcript_says_who_said_what() {
+        let mut bob = conv(2, "bob");
+        say(&mut bob, 2, 1, "from bob");
+        say(&mut bob, 1, 2, "from me");
+        let open = vec![bob];
+        let mut app = App {
+            rows: vec![Row {
+                account: PubKey::new([2; 32]),
+                label: "bob".into(),
+                unread: 0,
+                waiting: false,
+            }],
+            ..Default::default()
+        };
+        refresh(&mut app, &open);
+        assert_eq!(app.said.len(), 2);
+        assert_eq!(app.said[0].who, "bob");
+        assert!(!app.said[0].mine);
+        // Anything not from the peer is ours: a direct message has two members,
+        // so there is no third case to get wrong.
+        assert_eq!(app.said[1].who, "you");
+        assert!(app.said[1].mine);
+    }
+
+    #[test]
+    fn waiting_on_somebody_reads_as_waiting_and_not_as_a_fault() {
+        let mut c = conv(2, "bob");
+        c.waiting = true;
+        let open = vec![c];
+        let mut app = App {
+            rows: vec![Row {
+                account: PubKey::new([2; 32]),
+                label: "bob".into(),
+                unread: 0,
+                waiting: true,
+            }],
+            ..Default::default()
+        };
+        refresh(&mut app, &open);
+        let line = app.trouble.line();
+        assert!(line.contains("bob has not started their client"), "{line}");
+    }
+
+    #[test]
+    fn a_real_refusal_wins_over_the_waiting_note() {
+        // Both can be true at once; the specific failure is the useful one.
+        let mut c = conv(2, "bob");
+        c.waiting = true;
+        c.trouble.message = Some("the exchange refused (403): not_a_member".into());
+        let open = vec![c];
+        let mut app = App {
+            rows: vec![Row {
+                account: PubKey::new([2; 32]),
+                label: "bob".into(),
+                unread: 0,
+                waiting: true,
+            }],
+            ..Default::default()
+        };
+        refresh(&mut app, &open);
+        assert!(app.trouble.line().contains("403"));
+    }
+
+    #[test]
+    fn a_selection_past_the_end_is_pulled_back() {
+        // Contacts can go away underneath the cursor.
+        let open = vec![conv(2, "bob")];
+        let mut app = App {
+            selected: 7,
+            ..Default::default()
+        };
+        refresh(&mut app, &open);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.said.len(), 0);
+    }
+
+    #[test]
+    fn no_contacts_leaves_an_empty_transcript_rather_than_a_panic() {
+        let mut app = App {
+            selected: 0,
+            ..Default::default()
+        };
+        refresh(&mut app, &[]);
+        assert!(app.rows.is_empty());
+        assert!(app.said.is_empty());
+    }
 }
