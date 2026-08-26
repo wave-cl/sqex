@@ -28,9 +28,10 @@ use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::channel::{
-    Ack as ChannelAck, ByChannel, ByTarget, Cursor as ChannelCursor, Invitee, Role,
+    Ack as ChannelAck, ByChannel, ByTarget, Cursor as ChannelCursor, Invitee,
     SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
-    List as ChannelList, Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
+    ByAccount as ChannelByAccount, Invite as ChannelInvite, List as ChannelList, Mine as ChannelMine,
+    Post as ChannelPost, TYPE_REMOVE as CH_REMOVE, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
@@ -896,10 +897,11 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/invite") => match (account, decode_invite(body)) {
+        ("POST", "/channel/invite") => match (account, ChannelInvite::decode(body)) {
             (None, _) => no_identity("inviting to a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok((channel, who))) => {
+            (Some(me), Ok(req)) => {
+                let (channel, who) = (req.channel, Invitee { account: req.account, role: req.role });
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
                 match server
                     .channels
@@ -910,10 +912,10 @@ async fn route(
                 }
             }
         },
-        ("POST", "/channel/remove") => match (account, decode_remove(body)) {
+        ("POST", "/channel/remove") => match (account, ChannelByAccount::decode(body, CH_REMOVE)) {
             (None, _) => no_identity("removing from a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok((channel, who))) => match server.channels.remove(&me, &channel, &who) {
+            (Some(me), Ok(req)) => match server.channels.remove(&me, &req.channel, &req.account) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
             },
@@ -1396,42 +1398,7 @@ async fn fetch_waiting(
     }
 }
 
-/// SIP-16 `Invite`: a channel, an account and the role it is given.
-fn decode_invite(b: &[u8]) -> Result<([u8; 32], Invitee)> {
-    if b.len() != 66 {
-        return Err(Error::Malformed(format!(
-            "invite is {} bytes, want 66",
-            b.len()
-        )));
-    }
-    if b[0] != sqex_proto::channel::TYPE_INVITE {
-        return Err(Error::Malformed(format!("not an invite (type {:#x})", b[0])));
-    }
-    Ok((
-        b[1..33].try_into().unwrap(),
-        Invitee {
-            account: PubKey::new(b[33..65].try_into().unwrap()),
-            role: Role::from_u8(b[65])?,
-        },
-    ))
-}
 
-/// SIP-16 `Remove`: a channel and an account.
-fn decode_remove(b: &[u8]) -> Result<([u8; 32], PubKey)> {
-    if b.len() != 65 {
-        return Err(Error::Malformed(format!(
-            "remove is {} bytes, want 65",
-            b.len()
-        )));
-    }
-    if b[0] != sqex_proto::channel::TYPE_REMOVE {
-        return Err(Error::Malformed(format!("not a remove (type {:#x})", b[0])));
-    }
-    Ok((
-        b[1..33].try_into().unwrap(),
-        PubKey::new(b[33..65].try_into().unwrap()),
-    ))
-}
 
 fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
     (

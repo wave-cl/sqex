@@ -83,6 +83,19 @@ CREATE TABLE IF NOT EXISTS message (
     sealed  BLOB,
     PRIMARY KEY (channel, seq)
 );
+-- What we know about a channel between runs.
+--
+-- `admins` is here because `Timeline` needs it to judge a redaction or a
+-- metadata change, and a client that started offline would otherwise fold its
+-- own history wrongly — showing an admin's redaction as still-visible, and a
+-- channel with no name. `label` is the name from that sealed metadata, or a
+-- peer's name for a direct message.
+CREATE TABLE IF NOT EXISTS channel_meta (
+    channel BLOB PRIMARY KEY,
+    kind    INTEGER NOT NULL DEFAULT 0,   -- 0 direct message, 1 group
+    label   TEXT    NOT NULL DEFAULT '',
+    admins  BLOB    NOT NULL DEFAULT x''  -- concatenated 32-byte accounts
+);
 -- SIP-17's replay set. Not secret — it is a list of counters the exchange
 -- already published in entry headers — so it is stored in the clear.
 CREATE TABLE IF NOT EXISTS seen (
@@ -579,6 +592,86 @@ impl Store {
         Ok(out)
     }
 
+    // ---- what a channel is ----------------------------------------------
+
+    pub fn put_channel(
+        &self,
+        channel: &[u8; 32],
+        group: bool,
+        label: &str,
+        admins: &[PubKey],
+    ) -> Result<()> {
+        let mut flat = Vec::with_capacity(admins.len() * 32);
+        for a in admins {
+            flat.extend_from_slice(a.as_bytes());
+        }
+        self.db
+            .execute(
+                "INSERT INTO channel_meta (channel, kind, label, admins)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (channel) DO UPDATE SET kind = ?2, label = ?3, admins = ?4",
+                params![&channel[..], i64::from(group), label, flat],
+            )
+            .map_err(storage("store channel"))?;
+        Ok(())
+    }
+
+    /// Update only the label, leaving the membership alone.
+    ///
+    /// Separate because they arrive from different places: the name comes from
+    /// a sealed entry only members can read, and the admins from the exchange.
+    pub fn set_label(&self, channel: &[u8; 32], label: &str) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO channel_meta (channel, label) VALUES (?1, ?2)
+                 ON CONFLICT (channel) DO UPDATE SET label = ?2",
+                params![&channel[..], label],
+            )
+            .map_err(storage("set label"))?;
+        Ok(())
+    }
+
+    /// Every channel this client knows about: id, group, label, admins.
+    #[allow(clippy::type_complexity)]
+    pub fn channels(&self) -> Result<Vec<([u8; 32], bool, String, Vec<PubKey>)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT channel, kind, label, admins FROM channel_meta ORDER BY label, channel")
+            .map_err(storage("prepare channels"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(storage("query channels"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (channel, group, label, flat) = row.map_err(storage("read channel"))?;
+            let admins = flat
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|c| PubKey::new(*c))
+                .collect();
+            out.push((channel, group, label, admins));
+        }
+        Ok(out)
+    }
+
+    pub fn forget_channel(&self, channel: &[u8; 32]) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM channel_meta WHERE channel = ?1",
+                params![&channel[..]],
+            )
+            .map_err(storage("forget channel"))?;
+        Ok(())
+    }
+
     // ---- cursors --------------------------------------------------------
 
     pub fn cursor(&self, channel: &[u8; 32]) -> Result<(u64, u64, u32)> {
@@ -883,5 +976,46 @@ mod tests {
         let mut pool = s.pool(&seed(1)).unwrap();
         let next = pool.mint_one_time(1)[0].id;
         assert_eq!(next, first[3] + 1, "a reopen jumped its counter");
+    }
+
+    #[test]
+    fn a_channel_and_its_admins_survive_a_reopen() {
+        // Timeline needs the admins to judge a redaction or a name change, and
+        // a client starting offline would otherwise fold its own history
+        // wrongly — showing a redacted message and no channel name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        {
+            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            s.put_channel(&[7; 32], true, "the group", &[key(1), key(2)]).unwrap();
+            s.put_channel(&[8; 32], false, "bob", &[key(1), key(3)]).unwrap();
+        }
+        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let got = s.channels().unwrap();
+        assert_eq!(got.len(), 2);
+        let group = got.iter().find(|c| c.0 == [7; 32]).unwrap();
+        assert!(group.1, "the group lost its kind");
+        assert_eq!(group.2, "the group");
+        assert_eq!(group.3, vec![key(1), key(2)]);
+    }
+
+    #[test]
+    fn a_label_and_a_membership_are_set_independently() {
+        // They arrive from different places: the name from a sealed entry only
+        // members can read, the admins from the exchange.
+        let s = Store::open(&seed(1), None).unwrap();
+        s.put_channel(&[7; 32], true, "", &[key(1)]).unwrap();
+        s.set_label(&[7; 32], "renamed").unwrap();
+        let got = s.channels().unwrap();
+        assert_eq!(got[0].2, "renamed");
+        assert_eq!(got[0].3, vec![key(1)], "setting a label dropped the admins");
+    }
+
+    #[test]
+    fn forgetting_a_channel_removes_it() {
+        let s = Store::open(&seed(1), None).unwrap();
+        s.put_channel(&[7; 32], true, "gone", &[]).unwrap();
+        s.forget_channel(&[7; 32]).unwrap();
+        assert!(s.channels().unwrap().is_empty());
     }
 }
