@@ -303,3 +303,85 @@ async fn a_conversation_with_somebody_who_has_never_run_a_client_waits_rather_th
     let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["hello?"]);
 }
+
+#[tokio::test]
+async fn a_restarted_client_still_shows_the_conversation_it_already_read() {
+    // The bug a live trial found and the earlier restart test missed: that one
+    // never polled before restarting, so its cursor was still 0 and it fetched
+    // everything again. Once a client has actually read a message, the cursor
+    // has moved past it — and re-fetching cannot recover it, because SIP-17
+    // forbids decrypting a counter twice. So what was read must be kept.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let a_store = dir.path().join("alice.db");
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+
+    let channel;
+    {
+        let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
+        channel = alice.open_dm(&bob_key).await.unwrap();
+        alice.send(&channel, &bob_key, "first").await.unwrap();
+        bob.open_dm(&alice_key).await.unwrap();
+        bob.send(&channel, &alice_key, "second").await.unwrap();
+
+        // Alice reads them, which moves her cursor past both.
+        let mut t = Timeline::new();
+        let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+        assert_eq!(said(&got.timeline), vec!["first", "second"]);
+    }
+
+    // A fresh client over the same store, before any polling.
+    let alice = chat_at(addr, server_pub, 1, &a_store).await;
+    let history = alice.history(&channel, &bob_key).unwrap();
+    assert_eq!(
+        said(&history),
+        vec!["first", "second"],
+        "the conversation vanished on restart"
+    );
+
+    // And polling on top of it adds to the history rather than replacing it.
+    let mut alice = alice;
+    let mut t = history;
+    bob.send(&channel, &alice_key, "third").await.unwrap();
+    let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["first", "second", "third"]);
+}
+
+#[tokio::test]
+async fn a_client_that_lost_its_store_can_still_publish_prekeys() {
+    // Found by running the thing against a live exchange: delete the client's
+    // store, keep the identity, and every publish comes back 409 reused_id —
+    // the exchange remembers those ids forever, by SIP-23's rule, and the
+    // client used to start again at 1 and refuse to launch. An identity that
+    // survives its store must still be usable.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let (_, alice_key) = identity(1);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+
+    let channel;
+    {
+        let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+        channel = alice.open_dm(&bob_key).await.unwrap();
+        alice.send(&channel, &bob_key, "before the loss").await.unwrap();
+    }
+
+    // The store is gone. chat_at publishes prekeys on the way in, which is the
+    // call that used to fail outright.
+    let lost = dir.path().join("alice-again.db");
+    let mut alice = chat_at(addr, server_pub, 1, &lost).await;
+
+    // And she is not merely running — she can still hold a conversation. The
+    // old messages are gone with the store, which is the forward secrecy
+    // working; the identity is not.
+    alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, &bob_key, "after the loss").await.unwrap();
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["before the loss", "after the loss"]);
+}

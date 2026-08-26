@@ -68,6 +68,21 @@ CREATE TABLE IF NOT EXISTS prekey (
     sealed BLOB,
     spent  INTEGER NOT NULL DEFAULT 0
 );
+-- The conversation itself, decrypted once and kept.
+--
+-- Not a cache. SIP-17 forbids decrypting a counter twice, and the exchange
+-- serves an epoch key's envelope only once, so a message this client does not
+-- keep is one it can never read again — the entry stays on the exchange and
+-- stays shut. Sealed at rest like the keys, because this is the plaintext.
+CREATE TABLE IF NOT EXISTS message (
+    channel BLOB    NOT NULL,
+    seq     INTEGER NOT NULL,
+    account BLOB    NOT NULL,
+    posted  INTEGER NOT NULL,
+    kind    INTEGER NOT NULL,
+    sealed  BLOB,
+    PRIMARY KEY (channel, seq)
+);
 -- SIP-17's replay set. Not secret — it is a list of counters the exchange
 -- already published in entry headers — so it is stored in the clear.
 CREATE TABLE IF NOT EXISTS seen (
@@ -118,6 +133,17 @@ type Result<T> = std::result::Result<T, StoreError>;
 
 fn storage<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> StoreError + '_ {
     move |e| StoreError::Storage(format!("{what}: {e}"))
+}
+
+/// Seconds since the epoch, truncated to a prekey id's width.
+///
+/// u32 seconds runs out in 2106; a prekey id that stops being minted then is a
+/// smaller problem than the one this solves.
+fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(1)
 }
 
 /// One contact, and what we call them.
@@ -183,14 +209,14 @@ impl Store {
         Ok(Store { db, cipher })
     }
 
-    /// Seal 32 bytes with a fresh random nonce, which travels in front of them.
-    fn seal(&self, plain: &[u8; 32]) -> Result<Vec<u8>> {
+    /// Seal bytes with a fresh random nonce, which travels in front of them.
+    fn seal_bytes(&self, plain: &[u8]) -> Result<Vec<u8>> {
         use rand_core::RngCore;
         let mut nonce = [0u8; 12];
         rand_core::OsRng.fill_bytes(&mut nonce);
         let ct = self
             .cipher
-            .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
+            .encrypt(Nonce::from_slice(&nonce), plain)
             .map_err(|e| StoreError::Sealed(format!("seal: {e}")))?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
@@ -198,17 +224,25 @@ impl Store {
         Ok(out)
     }
 
-    fn unseal(&self, sealed: &[u8]) -> Result<[u8; 32]> {
+    fn unseal_bytes(&self, sealed: &[u8]) -> Result<Vec<u8>> {
         if sealed.len() < 12 {
             return Err(StoreError::Sealed("row is too short to hold a nonce".into()));
         }
-        let plain = self
-            .cipher
+        self.cipher
             .decrypt(Nonce::from_slice(&sealed[0..12]), &sealed[12..])
             .map_err(|_| {
-                StoreError::Sealed("a row would not open — wrong identity, or the file was altered".into())
-            })?;
-        plain
+                StoreError::Sealed(
+                    "a row would not open — wrong identity, or the file was altered".into(),
+                )
+            })
+    }
+
+    fn seal(&self, plain: &[u8; 32]) -> Result<Vec<u8>> {
+        self.seal_bytes(plain.as_slice())
+    }
+
+    fn unseal(&self, sealed: &[u8]) -> Result<[u8; 32]> {
+        self.unseal_bytes(sealed)?
             .try_into()
             .map_err(|_| StoreError::Sealed("a row held the wrong number of bytes".into()))
     }
@@ -321,7 +355,7 @@ impl Store {
             .map_err(storage("query prekeys"))?;
 
         let mut state = PoolState {
-            next_id: 1,
+            next_id: 0,
             one_time: Vec::new(),
             fallback: None,
             spent: Vec::new(),
@@ -340,6 +374,22 @@ impl Store {
             } else {
                 state.one_time.push((id, secret));
             }
+        }
+        if state.next_id == 0 {
+            // A store that holds no prekeys is either brand new or one that was
+            // lost, and those two are indistinguishable from here — while the
+            // exchange tells them apart perfectly, because it still holds the
+            // ids the lost store published and SIP-23 has it refuse every one
+            // of them forever. Starting again at 1 therefore does not fail
+            // gracefully: it fails completely, and the identity can never
+            // publish a prekey again.
+            //
+            // So a fresh pool starts its ids at the wall clock, which is
+            // monotonic across a store being lost in a way a counter kept only
+            // in the store can never be. It costs nothing — ids are u32 and
+            // spent at a few dozen per top-up — and it is why losing this file
+            // costs the conversations in it and not the identity itself.
+            state.next_id = now_secs().max(1);
         }
         Ok(Pool::load(seed, state))
     }
@@ -450,6 +500,83 @@ impl Store {
             )
             .map_err(storage("record seen"))?;
         Ok(())
+    }
+
+    // ---- the conversation -----------------------------------------------
+
+    /// Keep a message we have just opened.
+    ///
+    /// `plain` is `None` for an entry we could not open, which is recorded
+    /// rather than dropped so the reader can still be told something was there
+    /// — and so a later run does not go looking for it again.
+    pub fn put_message(
+        &self,
+        channel: &[u8; 32],
+        seq: u64,
+        account: &PubKey,
+        posted: u64,
+        kind: u8,
+        plain: Option<&[u8]>,
+    ) -> Result<()> {
+        let sealed = match plain {
+            Some(p) => Some(self.seal_bytes(p)?),
+            None => None,
+        };
+        self.db
+            .execute(
+                "INSERT INTO message (channel, seq, account, posted, kind, sealed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (channel, seq) DO NOTHING",
+                params![
+                    &channel[..],
+                    seq as i64,
+                    account.as_bytes(),
+                    posted as i64,
+                    kind as i64,
+                    sealed
+                ],
+            )
+            .map_err(storage("store message"))?;
+        Ok(())
+    }
+
+    /// Everything we have kept for a channel, oldest first.
+    ///
+    /// Returns the decrypted body bytes; decoding them is the caller's job,
+    /// because this module has no opinion about message structure.
+    #[allow(clippy::type_complexity)]
+    pub fn messages(
+        &self,
+        channel: &[u8; 32],
+    ) -> Result<Vec<(u64, PubKey, u64, u8, Option<Vec<u8>>)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT seq, account, posted, kind, sealed FROM message
+                 WHERE channel = ?1 ORDER BY seq ASC",
+            )
+            .map_err(storage("prepare messages"))?;
+        let rows = stmt
+            .query_map(params![&channel[..]], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    PubKey::new(r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u8,
+                    r.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })
+            .map_err(storage("query messages"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, account, posted, kind, sealed) = row.map_err(storage("read message"))?;
+            let plain = match sealed {
+                Some(s) => Some(self.unseal_bytes(&s)?),
+                None => None,
+            };
+            out.push((seq, account, posted, kind, plain));
+        }
+        Ok(out)
     }
 
     // ---- cursors --------------------------------------------------------
@@ -659,5 +786,102 @@ mod tests {
         assert_eq!(got.len(), 2, "re-adding renamed rather than duplicated");
         s.remove_contact(&key(3)).unwrap();
         assert_eq!(s.contacts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_conversation_survives_a_reopen() {
+        // The bug this exists for: the fetch cursor was persisted and the
+        // messages were not, so a restart showed an empty conversation while
+        // the entries sat on the exchange, unopenable a second time.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        {
+            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            s.put_message(&[7; 32], 3, &key(2), 100, 1, Some(b"hello")).unwrap();
+            s.put_message(&[7; 32], 4, &key(1), 101, 1, Some(b"hi back")).unwrap();
+            // One we could not open: recorded, so the reader can be told.
+            s.put_message(&[7; 32], 5, &key(2), 102, 1, None).unwrap();
+        }
+        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let got = s.messages(&[7; 32]).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].0, 3);
+        assert_eq!(got[0].4.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(got[1].4.as_deref(), Some(&b"hi back"[..]));
+        assert!(got[2].4.is_none(), "an unopenable entry should stay unopenable");
+    }
+
+    #[test]
+    fn a_message_is_not_stored_twice() {
+        let s = Store::open(&seed(1), None).unwrap();
+        s.put_message(&[7; 32], 3, &key(2), 100, 1, Some(b"once")).unwrap();
+        s.put_message(&[7; 32], 3, &key(2), 100, 1, Some(b"twice")).unwrap();
+        let got = s.messages(&[7; 32]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].4.as_deref(), Some(&b"once"[..]));
+    }
+
+    #[test]
+    fn message_text_is_not_on_disk_in_the_clear() {
+        // This is the plaintext of somebody's conversation; it is the most
+        // sensitive thing this file holds.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let secret = b"meet me at the usual place";
+        {
+            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            s.put_message(&[7; 32], 1, &key(2), 100, 1, Some(secret)).unwrap();
+            s.db.pragma_update(None, "wal_checkpoint", "TRUNCATE").unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes.windows(secret.len()).any(|w| w == secret),
+            "a message is on disk in the clear"
+        );
+    }
+
+    #[test]
+    fn a_fresh_store_does_not_start_its_ids_at_one() {
+        // Found by running the thing: wipe the client's store, keep the
+        // identity, and every publish is refused with reused_id — the exchange
+        // remembers the ids forever and the client would start again at 1.
+        let dir = tempfile::tempdir().unwrap();
+        let first: Vec<u32>;
+        {
+            let mut s = Store::open(&seed(1), Some(&dir.path().join("chat.db"))).unwrap();
+            let mut pool = s.pool(&seed(1)).unwrap();
+            first = pool.mint_one_time(64).iter().map(|p| p.id).collect();
+            s.save_pool(&pool).unwrap();
+        }
+        // The store is gone; the identity is not.
+        let mut fresh = Store::open(&seed(1), Some(&dir.path().join("new.db"))).unwrap();
+        let mut pool = fresh.pool(&seed(1)).unwrap();
+        let next: Vec<u32> = pool.mint_one_time(4).iter().map(|p| p.id).collect();
+        // The clock floor gets a lost store out of the range it has already
+        // used. It is not sufficient on its own — two stores made in the same
+        // second get the same ids — which is why the client also asks the
+        // exchange what it remembers; see the dm_flow integration test.
+        assert!(next[0] > 1_000_000, "ids restarted from the bottom");
+        assert_eq!(first.len(), 64);
+        let _ = &mut fresh;
+    }
+
+    #[test]
+    fn a_store_that_has_prekeys_keeps_counting_from_them() {
+        // The clock floor applies only to an empty pool: an ordinary reopen
+        // must carry on from what it holds, not jump to the wall clock.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let first: Vec<u32>;
+        {
+            let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+            let mut pool = s.pool(&seed(1)).unwrap();
+            first = pool.mint_one_time(4).iter().map(|p| p.id).collect();
+            s.save_pool(&pool).unwrap();
+        }
+        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let mut pool = s.pool(&seed(1)).unwrap();
+        let next = pool.mint_one_time(1)[0].id;
+        assert_eq!(next, first[3] + 1, "a reopen jumped its counter");
     }
 }

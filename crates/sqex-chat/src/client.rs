@@ -13,7 +13,9 @@ use sqex_proto::channel_key::{
     ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, open_envelope, seal_envelope,
 };
 use sqex_proto::message::{Body, Post as SipPost};
-use sqex_proto::prekey::{LOW_WATER, POOL, Prekey, Publish, Take, Taken};
+use sqex_proto::prekey::{
+    Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_COUNT, Take, Taken,
+};
 use sqex_proto::timeline::{Received, Timeline};
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -141,11 +143,17 @@ impl Chat {
     /// `LOW_WATER`. Called on startup, and again whenever we spend one.
     pub async fn top_up_prekeys(&mut self) -> Result<()> {
         let mut pool = self.store.pool(&self.seed)?;
+        if pool.one_time_left() == 0 && pool.fallback_id() == 0 {
+            pool = self.pool_above_what_the_exchange_remembers(pool).await?;
+        }
         let mut publish = Vec::new();
         if pool.one_time_left() < LOW_WATER {
             publish.extend(pool.mint_one_time(POOL - pool.one_time_left()));
         }
-        if pool.fallback_id() == 0 {
+        // A fallback after every batch, not only the first: its id is the only
+        // thing `Count` reports, so it is what a future client with a lost
+        // store will have to start above.
+        if pool.fallback_id() == 0 || !publish.is_empty() {
             publish.push(pool.mint_fallback());
         }
         if publish.is_empty() {
@@ -166,6 +174,25 @@ impl Chat {
             .await?;
         }
         Ok(())
+    }
+
+    /// Restart an empty pool's ids above everything the exchange still holds.
+    ///
+    /// An empty pool is a new client or a client whose store was lost, and the
+    /// two are indistinguishable from here — but not from the exchange, which
+    /// remembers every id this device ever published and refuses each one
+    /// forever. A lost store that began again at 1 would be refused on its
+    /// first publish and could never send another message under that identity.
+    ///
+    /// `Count` reports the current fallback's id, and ids only increase, so it
+    /// is a lower bound on what has been used. Minting a fallback after each
+    /// batch keeps that bound close to the truth.
+    async fn pool_above_what_the_exchange_remembers(&mut self, pool: Pool) -> Result<Pool> {
+        let body = self.post("/prekey/count", vec![TYPE_COUNT]).await?;
+        let counts = Counts::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let mut state = pool.save();
+        state.next_id = state.next_id.max(counts.fallback_id.saturating_add(1));
+        Ok(Pool::load(&self.seed, state))
     }
 
     /// Ask for a prekey for `them`, and check it ourselves.
@@ -242,9 +269,27 @@ impl Chat {
         if self.store.key(channel, info.epoch)?.is_none() {
             self.collect_keys(channel).await?;
             if self.store.key(channel, info.epoch)?.is_none() {
-                // Nobody sealed the current epoch to us. It happens when the
-                // other side minted while we had no prekeys published.
-                return Err(ChatError::NoKey(info.epoch));
+                // No key for the epoch in force. Either nobody sealed one to
+                // us, or we lost the store that held it — and the envelope
+                // will not open again, because the prekey it was sealed
+                // against is spent.
+                //
+                // Both parties to a direct message are admins, so the way out
+                // is the one SIP-17 already provides: mint the next epoch and
+                // seal it to both. What was said under the old one stays
+                // unreadable, which is the forward secrecy working; the
+                // conversation continues, which is the point.
+                //
+                // This is a direct-message move and not a general one. In a
+                // group, a member who was simply never given the key would be
+                // seizing an epoch they were deliberately left out of.
+                self.mint_epoch(channel, them, info.epoch + 1).await?;
+                let after = self.info(channel).await?.epoch;
+                return self
+                    .store
+                    .key(channel, after)?
+                    .map(|_| after)
+                    .ok_or(ChatError::NoKey(after));
             }
         }
         Ok(info.epoch)
@@ -339,6 +384,30 @@ impl Chat {
             self.top_up_prekeys().await?;
         }
         Ok(opened)
+    }
+
+    /// Rebuild a conversation from what this client kept.
+    ///
+    /// Needs no network and must not: the entries are still on the exchange but
+    /// they will not open a second time, so this store is the only place the
+    /// conversation exists. `them` and this account are the two admins of a
+    /// direct message, which is what `Timeline` needs to judge a redaction.
+    pub fn history(&self, channel: &[u8; 32], them: &PubKey) -> Result<Timeline> {
+        let admins = [self.me, *them];
+        let mut timeline = Timeline::new();
+        for (seq, account, posted, kind, plain) in self.store.messages(channel)? {
+            timeline.apply(
+                &Received {
+                    seq,
+                    account,
+                    posted,
+                    kind,
+                    body: plain.and_then(|p| Body::decode(&p).ok().flatten()),
+                },
+                &admins,
+            );
+        }
+        Ok(timeline)
     }
 
     // ---- talking --------------------------------------------------------
@@ -472,13 +541,24 @@ impl Chat {
                 }
                 self.store.record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
             }
-            let body = self
+            let plain = self
                 .store
                 .key(channel, e.epoch)
                 .ok()
                 .flatten()
-                .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok())
-                .and_then(|plain| Body::decode(&plain).ok().flatten());
+                .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok());
+            // Kept, not cached. The counter may not be decrypted twice and the
+            // exchange serves an epoch key's envelope once, so a message not
+            // written here is one this client can never read again.
+            self.store.put_message(
+                channel,
+                e.seq,
+                &e.account,
+                e.posted,
+                e.kind,
+                plain.as_deref(),
+            )?;
+            let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
             timeline.apply(
                 &Received {
                     seq: e.seq,
