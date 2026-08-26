@@ -15,6 +15,8 @@ pub mod blob;
 pub mod blob_store;
 pub mod channel;
 pub mod channel_key;
+pub mod credential;
+pub mod device;
 pub mod mailbox;
 pub mod message;
 pub mod prekey;

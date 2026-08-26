@@ -18,6 +18,7 @@ use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::Config;
+use crate::device::Registry;
 use crate::mailbox::Mailbox;
 use crate::prekey::Prekeys;
 use crate::room::Rooms;
@@ -39,6 +40,7 @@ use sqex_proto::blob_store::{
 use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
+use sqex_proto::device::{ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke};
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
@@ -135,6 +137,7 @@ pub struct Server {
     rooms: Rooms,
     channels: Channels,
     prekeys: Prekeys,
+    devices: Registry,
     sessions: Sessions,
     live_conns: Connections,
     started: Instant,
@@ -168,6 +171,10 @@ pub async fn bind(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("channels.db"));
+    let device_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("devices.db"));
 
     // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
     // transport whitelist stays off: anyone holding the server key may connect,
@@ -209,6 +216,11 @@ pub async fn bind(
         // serving it would only produce an envelope nobody can open. Losing
         // the pool costs a client one publish.
         prekeys: Prekeys::new(),
+        // Durable, unlike prekeys: a device should not have to re-register
+        // because a server bounced, and a revocation that evaporated on a
+        // restart would be worse than none at all.
+        devices: Registry::open(device_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open the device registry: {e}")))?,
         sessions: Sessions::new(),
         live_conns: Connections::default(),
         started: Instant::now(),
@@ -420,6 +432,14 @@ async fn route(
     body: &[u8],
     peer: Peer,
 ) -> (u16, &'static str, Vec<u8>) {
+    // A connection carries a *device* identity (SIP-3) and the chat services
+    // work in **accounts**, so resolve once and use the right one deliberately:
+    // membership, roles and display are per account; sealing subkeys, message
+    // counters and prekeys are per device. An account with no registered
+    // devices is its own device, which is the ordinary single-client case.
+    let device = peer.identity;
+    let account = device.map(|d| server.devices.account_for(&d));
+
     match (method, path) {
         ("GET", "/health") => (
             200,
@@ -483,6 +503,52 @@ async fn route(
         // carries. It relays each member's proof without checking it — checking
         // needs the secret it has deliberately not been told — and the members
         // verify each other.
+        // SIP-22 device registry. A credential is evidence and not authority:
+        // it tells the exchange which account vouches for a key, and does not
+        // entitle that key to anything.
+        ("POST", "/device/register") => match (device, DeviceRegister::decode(body)) {
+            (None, _) => no_identity("registering a device"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            // The caller is the delegate itself, or an already-registered
+            // device of the same account. The account is never required to
+            // connect, because a hardware-held one cannot.
+            (Some(me), Ok(req)) => match server.devices.register(&me, &req.credential) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+        ("POST", "/device/revoke") => match (device, DeviceRevoke::decode(body)) {
+            (None, _) => no_identity("revoking a device"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.devices.revoke(&me, &req.device) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+        // Answerable to anybody: the mapping is public by construction, since
+        // every credential carries both keys in the clear to whoever verifies
+        // one. Pretending otherwise would protect something already published
+        // while making a member list impossible to render.
+        ("POST", "/device/list") => match ListDevices::decode(body) {
+            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Ok(req) => match server.devices.list(&req.account) {
+                Ok(list) => (200, "application/octet-stream", list.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+
         // SIP-18 blobs. The exchange holds sealed chunks and no key that
         // opens one; every message here moves ciphertext, an identifier or a
         // channel, and none has a field for the key. A convenience endpoint
@@ -499,7 +565,7 @@ async fn route(
             }
             .encode(),
         ),
-        ("POST", "/blob/begin") => match (peer.identity, BlobBegin::decode(body)) {
+        ("POST", "/blob/begin") => match (account, BlobBegin::decode(body)) {
             (None, _) => no_identity("beginning an upload"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.begin_upload(&me, &req) {
@@ -511,7 +577,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/blob/put") => match (peer.identity, BlobPut::decode(body)) {
+        ("POST", "/blob/put") => match (account, BlobPut::decode(body)) {
             (None, _) => no_identity("uploading a chunk"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.put_chunk(&me, &req) {
@@ -519,7 +585,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/blob/commit") => match (peer.identity, BlobCommit::decode(body)) {
+        ("POST", "/blob/commit") => match (account, BlobCommit::decode(body)) {
             (None, _) => no_identity("committing an upload"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
@@ -533,7 +599,7 @@ async fn route(
                 }
             }
         },
-        ("POST", "/blob/abort") => match (peer.identity, ByUpload::decode(body, BL_ABORT)) {
+        ("POST", "/blob/abort") => match (account, ByUpload::decode(body, BL_ABORT)) {
             (None, _) => no_identity("aborting an upload"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.abort_upload(&me, req.upload) {
@@ -541,7 +607,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/blob/head") => match (peer.identity, ByBlob::decode(body, BL_HEAD)) {
+        ("POST", "/blob/head") => match (account, ByBlob::decode(body, BL_HEAD)) {
             (None, _) => no_identity("reading a blob"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.head_blob(&me, &req.blob) {
@@ -549,7 +615,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/blob/get") => match (peer.identity, GetChunk::decode(body)) {
+        ("POST", "/blob/get") => match (account, GetChunk::decode(body)) {
             (None, _) => no_identity("fetching a chunk"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.get_chunk(&me, &req.blob, req.index) {
@@ -558,7 +624,7 @@ async fn route(
             },
         },
         ("POST", "/blob/attach") => {
-            match (peer.identity, ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH)) {
+            match (account, ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH)) {
                 (None, _) => no_identity("attaching a blob"),
                 (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
                 (Some(me), Ok(req)) => match server.channels.attach_blob(&me, &req) {
@@ -567,7 +633,7 @@ async fn route(
                 },
             }
         }
-        ("POST", "/blob/detach") => match (peer.identity, ByChannelBlob::decode(body, BL_DETACH)) {
+        ("POST", "/blob/detach") => match (account, ByChannelBlob::decode(body, BL_DETACH)) {
             (None, _) => no_identity("detaching a blob"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
@@ -583,7 +649,7 @@ async fn route(
         // trusted to serve honestly either — a recipient rejects an envelope
         // naming an id it has already consumed. What it can do is not break
         // the property by accident.
-        ("POST", "/prekey/publish") => match (peer.identity, PrekeyPublish::decode(body)) {
+        ("POST", "/prekey/publish") => match (device, PrekeyPublish::decode(body)) {
             (None, _) => no_identity("publishing prekeys"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.prekeys.publish(&me, &req.prekeys) {
@@ -611,7 +677,7 @@ async fn route(
                 server.prekeys.take(&req.device).encode(),
             ),
         },
-        ("POST", "/prekey/count") => match peer.identity {
+        ("POST", "/prekey/count") => match device {
             None => no_identity("counting prekeys"),
             Some(me) => (
                 200,
@@ -624,7 +690,7 @@ async fn route(
         // membership or an admin role, and it is checked at the moment of the
         // call — a removed member's next fetch is refused, including one
         // already parked in a long poll.
-        ("POST", "/channel/create") => match (peer.identity, ChannelCreate::decode(body)) {
+        ("POST", "/channel/create") => match (account, ChannelCreate::decode(body)) {
             (None, _) => no_identity("creating a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.create(&me, &req) {
@@ -636,7 +702,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/join") => match (peer.identity, ByChannel::decode(body, CH_JOIN)) {
+        ("POST", "/channel/join") => match (account, ByChannel::decode(body, CH_JOIN)) {
             (None, _) => no_identity("joining a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.join(&me, &req.channel) {
@@ -644,7 +710,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/leave") => match (peer.identity, ByChannel::decode(body, CH_LEAVE)) {
+        ("POST", "/channel/leave") => match (account, ByChannel::decode(body, CH_LEAVE)) {
             (None, _) => no_identity("leaving a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.leave(&me, &req.channel) {
@@ -652,25 +718,29 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/post") => match (peer.identity, ChannelPost::decode(body)) {
+        ("POST", "/channel/post") => match (account, ChannelPost::decode(body)) {
             (None, _) => no_identity("posting to a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            // Until SIP-22 registration exists, an identity is its own device,
-            // which is what SIP-22 says of an account with none registered.
-            (Some(me), Ok(req)) => match server.channels.post(&me, &me, &req) {
+            (Some(me), Ok(req)) => match server.channels.post(
+                &me,
+                // The device is what SIP-17 derives the sealing subkey from and
+                // what counts its own messages, so it is carried separately.
+                &device.unwrap_or(me),
+                &req,
+            ) {
                 Ok(posted) => (200, "application/octet-stream", posted.encode()),
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/info") => match (peer.identity, ByChannel::decode(body, CH_INFO)) {
+        ("POST", "/channel/info") => match (account, ByChannel::decode(body, CH_INFO)) {
             (None, _) => no_identity("reading a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.info(&me, &me, &req.channel) {
+            (Some(me), Ok(req)) => match server.channels.info(&me, &device.unwrap_or(me), &req.channel) {
                 Ok(info) => (200, "application/octet-stream", info.encode()),
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/retain") => match (peer.identity, ChannelRetain::decode(body)) {
+        ("POST", "/channel/retain") => match (account, ChannelRetain::decode(body)) {
             (None, _) => no_identity("setting retention"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.retain(&me, &req) {
@@ -678,7 +748,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/close") => match (peer.identity, ByChannel::decode(body, CH_CLOSE)) {
+        ("POST", "/channel/close") => match (account, ByChannel::decode(body, CH_CLOSE)) {
             (None, _) => no_identity("closing a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.close(&me, &req.channel) {
@@ -693,7 +763,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/invite") => match (peer.identity, decode_invite(body)) {
+        ("POST", "/channel/invite") => match (account, decode_invite(body)) {
             (None, _) => no_identity("inviting to a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok((channel, who))) => {
@@ -703,7 +773,7 @@ async fn route(
                 }
             }
         },
-        ("POST", "/channel/remove") => match (peer.identity, decode_remove(body)) {
+        ("POST", "/channel/remove") => match (account, decode_remove(body)) {
             (None, _) => no_identity("removing from a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok((channel, who))) => match server.channels.remove(&me, &channel, &who) {
@@ -714,7 +784,7 @@ async fn route(
 
         // SIP-17 channel keys. The exchange stores envelopes opaquely, serves
         // each only to the recipient it names, and holds no key that opens one.
-        ("POST", "/channel/key/put") => match (peer.identity, KeyPut::decode(body)) {
+        ("POST", "/channel/key/put") => match (account, KeyPut::decode(body)) {
             (None, _) => no_identity("publishing channel keys"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.put_keys(&me, &req) {
@@ -722,7 +792,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/key/get") => match (peer.identity, KeyGet::decode(body)) {
+        ("POST", "/channel/key/get") => match (account, KeyGet::decode(body)) {
             (None, _) => no_identity("collecting channel keys"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
@@ -732,7 +802,7 @@ async fn route(
                 }
             }
         },
-        ("POST", "/channel/key/missing") => match (peer.identity, ByChannel::decode(body, CH_MISSING)) {
+        ("POST", "/channel/key/missing") => match (account, ByChannel::decode(body, CH_MISSING)) {
             (None, _) => no_identity("listing stranded devices"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
@@ -744,7 +814,7 @@ async fn route(
             }
         },
 
-        ("POST", "/channel/cursor") => match (peer.identity, ChannelCursor::decode(body)) {
+        ("POST", "/channel/cursor") => match (account, ChannelCursor::decode(body)) {
             (None, _) => no_identity("setting a read mark"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
@@ -757,7 +827,7 @@ async fn route(
                 }
             }
         },
-        ("POST", "/channel/cursors") => match (peer.identity, ByChannel::decode(body, CH_CURSORS)) {
+        ("POST", "/channel/cursors") => match (account, ByChannel::decode(body, CH_CURSORS)) {
             (None, _) => no_identity("reading marks"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.cursors(&me, &req.channel) {
@@ -765,7 +835,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/redact") => match (peer.identity, ByTarget::decode(body, CH_REDACT)) {
+        ("POST", "/channel/redact") => match (account, ByTarget::decode(body, CH_REDACT)) {
             (None, _) => no_identity("redacting an entry"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.redact(&me, &req.channel, req.target) {
@@ -775,7 +845,7 @@ async fn route(
         },
         // Relayed to the other members and stored nowhere. An exchange that
         // dropped every one of these would still conform.
-        ("POST", "/channel/signal") => match (peer.identity, SignalOut::decode(body)) {
+        ("POST", "/channel/signal") => match (account, SignalOut::decode(body)) {
             (None, _) => no_identity("signalling"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
@@ -786,7 +856,7 @@ async fn route(
             }
         },
 
-        ("POST", "/channel/fetch") => match (peer.identity, ChannelFetch::decode(body)) {
+        ("POST", "/channel/fetch") => match (account, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match fetch_waiting(server, &me, &req).await {

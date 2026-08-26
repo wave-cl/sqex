@@ -4,6 +4,7 @@ pub mod beacon;
 pub mod challenge;
 pub mod channel;
 pub mod config;
+pub mod device;
 pub mod mailbox;
 pub mod prekey;
 pub mod room;
