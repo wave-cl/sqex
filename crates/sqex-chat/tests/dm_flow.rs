@@ -522,3 +522,67 @@ async fn an_attachment_with_the_wrong_key_does_not_open() {
     attachment.key[0] ^= 1;
     assert!(alice.download(&attachment).await.is_err());
 }
+
+#[tokio::test]
+async fn a_conversation_from_a_stranger_can_be_found() {
+    // Before `Mine` this was impossible and the client said so in its --help:
+    // a direct message from an account you had not added could not be seen,
+    // because nothing would tell you it existed. The identifier derives from
+    // the two accounts, so Alice can compute it and Bob cannot guess it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    // Alice writes to Bob. Bob has never heard of Alice.
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, &bob_key, "you don't know me").await.unwrap();
+    assert!(
+        bob.store().contacts().unwrap().is_empty(),
+        "bob should not know alice yet"
+    );
+
+    // Bob asks what he is in, and finds her.
+    let mine = bob.mine().await.unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].channel, channel);
+
+    // The identifier is a hash and cannot be run backwards, so the peer comes
+    // from the member list — and is checked by re-deriving the identifier.
+    let info = bob.info(&channel).await.unwrap();
+    let other = info
+        .members
+        .iter()
+        .map(|m| m.account)
+        .find(|a| *a != bob.me)
+        .expect("no other member");
+    assert_eq!(other, alice_key);
+    assert_eq!(bob.dm_with(&other), channel, "the identifier does not hash back");
+
+    // Which is what the client does next: adding the contact and opening the
+    // conversation is what collects the epoch key Alice sealed to him.
+    bob.store().add_contact(&other, "alice", 0).unwrap();
+    bob.open_dm(&other).await.unwrap();
+
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["you don't know me"]);
+}
+
+#[tokio::test]
+async fn mine_does_not_leak_channels_we_are_not_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    alice.open_dm(&bob_key).await.unwrap();
+
+    // A third party is in nothing, and asking says so rather than saying who
+    // else is talking.
+    let mut mallory = chat_at(addr, server_pub, 9, &dir.path().join("m.db")).await;
+    assert!(mallory.mine().await.unwrap().is_empty());
+}

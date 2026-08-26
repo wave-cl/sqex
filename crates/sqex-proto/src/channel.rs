@@ -47,6 +47,7 @@ pub const TYPE_CURSOR: u8 = 0x0c;
 pub const TYPE_CURSORS: u8 = 0x0d;
 pub const TYPE_REDACT: u8 = 0x0e;
 pub const TYPE_CLOSE: u8 = 0x0f;
+pub const TYPE_MINE: u8 = 0x10;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.
@@ -137,6 +138,8 @@ pub const MAX_BATCH: usize = 64;
 pub const MAX_BATCH_BYTES: usize = 512 * 1024;
 /// Rows returned by one directory `List`.
 pub const MAX_DIRECTORY: usize = 64;
+/// Memberships returned by one `Mine`.
+pub const MAX_MINE: usize = 64;
 /// Longest a `Fetch` may be held open.
 pub const MAX_WAIT: u16 = 25;
 /// A public channel with no members and no entries for this long is closed by
@@ -503,6 +506,37 @@ impl Retain {
 pub struct List {
     pub offset: u32,
     pub query: String,
+}
+
+/// Ask which channels this account is in. It names no account, because the
+/// only one it can answer about is the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mine {
+    pub offset: u32,
+}
+
+impl Mine {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5);
+        out.push(TYPE_MINE);
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Mine> {
+        if b.len() != 5 {
+            return Err(Error::Malformed(format!(
+                "mine is {} bytes, want 5",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_MINE {
+            return Err(Error::Malformed(format!("not a mine (type {:#x})", b[0])));
+        }
+        Ok(Mine {
+            offset: u32::from_be_bytes(b[1..5].try_into().unwrap()),
+        })
+    }
 }
 
 impl List {
@@ -917,6 +951,84 @@ pub struct Public {
     pub topic: String,
 }
 
+/// One channel this account belongs to.
+///
+/// No `name` and no `topic`: for a private channel there is nothing the
+/// exchange could put there, since those are stored empty and travel as a
+/// sealed metadata entry (SIP-19). What it does carry is what the exchange
+/// holds and a client cannot compute — the epoch in force, the retained
+/// window, and this account's own read mark — so a channel list draws without
+/// a request per channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Membership {
+    pub channel: [u8; 32],
+    pub visibility: Visibility,
+    pub role: Role,
+    pub joined: u64,
+    pub epoch: u32,
+    pub first: u64,
+    pub last: u64,
+    pub read: u64,
+}
+
+/// The channels an account is in. Answerable about the caller and nobody else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mines {
+    pub now: u64,
+    pub total: u32,
+    pub channels: Vec<Membership>,
+}
+
+impl Mines {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(14 + self.channels.len() * 70);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&self.total.to_be_bytes());
+        out.extend_from_slice(&(self.channels.len() as u16).to_be_bytes());
+        for m in &self.channels {
+            out.extend_from_slice(&m.channel);
+            out.push(m.visibility as u8);
+            out.push(m.role as u8);
+            out.extend_from_slice(&m.joined.to_be_bytes());
+            out.extend_from_slice(&m.epoch.to_be_bytes());
+            out.extend_from_slice(&m.first.to_be_bytes());
+            out.extend_from_slice(&m.last.to_be_bytes());
+            out.extend_from_slice(&m.read.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Mines> {
+        want(b, 14, "mines")?;
+        let count = u16::from_be_bytes(b[12..14].try_into().unwrap()) as usize;
+        if count > MAX_MINE {
+            return Err(Error::Malformed(format!(
+                "mine holds {count}, limit is {MAX_MINE}"
+            )));
+        }
+        want(b, 14 + count * 70, "mines")?;
+        let mut channels = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = 14 + i * 70;
+            channels.push(Membership {
+                channel: b[at..at + 32].try_into().unwrap(),
+                visibility: Visibility::from_u8(b[at + 32])?,
+                role: Role::from_u8(b[at + 33])?,
+                joined: u64::from_be_bytes(b[at + 34..at + 42].try_into().unwrap()),
+                epoch: u32::from_be_bytes(b[at + 42..at + 46].try_into().unwrap()),
+                first: u64::from_be_bytes(b[at + 46..at + 54].try_into().unwrap()),
+                last: u64::from_be_bytes(b[at + 54..at + 62].try_into().unwrap()),
+                read: u64::from_be_bytes(b[at + 62..at + 70].try_into().unwrap()),
+            });
+        }
+        Ok(Mines {
+            now: u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            total: u32::from_be_bytes(b[8..12].try_into().unwrap()),
+            channels,
+        })
+    }
+}
+
 /// Answer to a directory search. `total` is how many matched, which may exceed
 /// what one reply carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1286,6 +1398,92 @@ mod tests {
         // A join decoded as a leave is a bug in the router, and should not
         // silently succeed just because the shapes match.
         assert!(ByChannel::decode(&bytes, TYPE_LEAVE).is_err());
+    }
+
+    #[test]
+    fn the_mine_request_round_trips() {
+        let m = Mine { offset: 64 };
+        assert_eq!(Mine::decode(&m.encode()).unwrap(), m);
+        assert!(Mine::decode(&[TYPE_LIST, 0, 0, 0, 0]).is_err());
+        assert!(Mine::decode(&[TYPE_MINE]).is_err());
+    }
+
+    #[test]
+    fn mine_round_trips() {
+        let m = Mines {
+            now: 99,
+            total: 130,
+            channels: vec![
+                Membership {
+                    channel: [7; 32],
+                    visibility: Visibility::Private,
+                    role: Role::Admin,
+                    joined: 100,
+                    epoch: 3,
+                    first: 4,
+                    last: 40,
+                    read: 12,
+                },
+                Membership {
+                    channel: [8; 32],
+                    visibility: Visibility::Public,
+                    role: Role::Member,
+                    joined: 200,
+                    epoch: 0,
+                    first: 1,
+                    last: 9,
+                    read: 0,
+                },
+            ],
+        };
+        assert_eq!(Mines::decode(&m.encode()).unwrap(), m);
+        // total may exceed what one reply carries; that is what paging is for.
+        assert!(m.total as usize > m.channels.len());
+    }
+
+    #[test]
+    fn mine_is_bounded_and_a_short_reply_is_refused() {
+        let many = Mines {
+            now: 0,
+            total: 0,
+            channels: vec![
+                Membership {
+                    channel: [1; 32],
+                    visibility: Visibility::Public,
+                    role: Role::Member,
+                    joined: 0,
+                    epoch: 0,
+                    first: 0,
+                    last: 0,
+                    read: 0,
+                };
+                MAX_MINE + 1
+            ],
+        };
+        assert!(Mines::decode(&many.encode()).is_err());
+
+        // Truncated mid-row rather than mid-header, which is the case a length
+        // check on the header alone would wave through.
+        let one = Mines {
+            now: 0,
+            total: 1,
+            channels: vec![many.channels[0]],
+        };
+        let mut bytes = one.encode();
+        bytes.truncate(bytes.len() - 4);
+        assert!(Mines::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn an_empty_mine_is_valid() {
+        // Somebody in no channels at all — a new account, and the first thing
+        // a fresh client sees.
+        let m = Mines {
+            now: 5,
+            total: 0,
+            channels: Vec::new(),
+        };
+        assert_eq!(Mines::decode(&m.encode()).unwrap(), m);
     }
 }
 
