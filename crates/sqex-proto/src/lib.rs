@@ -12,6 +12,7 @@
 
 pub mod beacon;
 pub mod channel;
+pub mod channel_key;
 pub mod mailbox;
 pub mod prekey;
 pub mod room;

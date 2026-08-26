@@ -34,8 +34,12 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::channel::{
     ABANDON_SECS, ChannelInfo, Create, Entries, Entry, KIND_MEMBER, Listing, MAX_BATCH,
+    direct_message_id,
     MAX_BATCH_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
     MAX_RETENTION, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role, Visibility,
+};
+use sqex_proto::channel_key::{
+    Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
 };
 use sqnr_core::PubKey;
 use tokio::sync::Notify;
@@ -57,6 +61,13 @@ pub enum ChannelError {
     /// A post to a private channel that has no epoch yet, or under an epoch
     /// that is not the channel's current one.
     WrongEpoch,
+    /// Key distribution against a public channel, which seals nothing.
+    NotPrivate,
+    /// Adding or removing a member of a direct message, whose membership can
+    /// only ever be the two identities it is named after.
+    DirectMessage,
+    /// An envelope naming prekey id 0. There is no static-only path.
+    NoPrekey,
     BadRetention,
     /// Removing the last admin while other members remain.
     LastAdmin,
@@ -73,6 +84,9 @@ impl ChannelError {
             ChannelError::Full => "channel_full",
             ChannelError::TooManyChannels => "too_many_channels",
             ChannelError::WrongEpoch => "wrong_epoch",
+            ChannelError::NotPrivate => "not_private",
+            ChannelError::DirectMessage => "direct_message",
+            ChannelError::NoPrekey => "no_prekey",
             ChannelError::BadRetention => "bad_retention",
             ChannelError::LastAdmin => "last_admin",
             ChannelError::Storage => "storage",
@@ -86,7 +100,12 @@ impl ChannelError {
             ChannelError::NoSuchChannel => 404,
             ChannelError::NotAMember | ChannelError::NotAnAdmin | ChannelError::NotPublic => 403,
             ChannelError::Full | ChannelError::TooManyChannels => 507,
-            ChannelError::WrongEpoch | ChannelError::BadRetention | ChannelError::LastAdmin => 409,
+            ChannelError::WrongEpoch
+            | ChannelError::BadRetention
+            | ChannelError::LastAdmin
+            | ChannelError::NotPrivate
+            | ChannelError::DirectMessage
+            | ChannelError::NoPrekey => 409,
             ChannelError::Storage => 500,
         }
     }
@@ -152,6 +171,20 @@ CREATE TABLE IF NOT EXISTS high_water (
     epoch   INTEGER NOT NULL,
     msg_seq INTEGER NOT NULL,
     PRIMARY KEY (channel, device, epoch)
+);
+CREATE TABLE IF NOT EXISTS envelope (
+    channel    BLOB    NOT NULL,
+    recipient  BLOB    NOT NULL,
+    epoch      INTEGER NOT NULL,
+    from_epoch INTEGER NOT NULL,
+    to_epoch   INTEGER NOT NULL,
+    prekey_id  INTEGER NOT NULL,
+    ephemeral  BLOB    NOT NULL,
+    ciphertext BLOB    NOT NULL,
+    -- One envelope per recipient per epoch. This is what settles the
+    -- direct-message creation race: both ends mint epoch 1 and publish, one
+    -- Put wins, and the loser is told so and collects instead.
+    PRIMARY KEY (channel, recipient, epoch)
 );
 CREATE INDEX IF NOT EXISTS entry_by_age ON entry (posted);
 "#;
@@ -608,6 +641,7 @@ fn counts(db: &Connection, channel: &[u8; 32]) -> Result<(i64, i64), ChannelErro
 fn destroy(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
     for sql in [
         "DELETE FROM entry WHERE channel = ?1",
+        "DELETE FROM envelope WHERE channel = ?1",
         "DELETE FROM member WHERE channel = ?1",
         "DELETE FROM high_water WHERE channel = ?1",
         "DELETE FROM channel WHERE id = ?1",
@@ -890,4 +924,310 @@ impl Channels {
         let _ = tx.commit();
         (pruned, closed)
     }
+}
+
+/// SIP-16 membership changes and SIP-17 key distribution.
+///
+/// These are the operations a private channel needs and a public one never
+/// uses: a public channel is joined rather than invited into, and seals
+/// nothing, so it has no epoch and no envelopes.
+impl Channels {
+    /// Add an account to a channel. Admins only, and never on a direct
+    /// message, where the membership can only ever be the two identities the
+    /// channel is named after.
+    pub fn invite(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        account: &PubKey,
+        role: Role,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin invite"))?;
+        visibility_of(&tx, channel)?;
+        if !is_admin(&tx, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        if is_direct_message(&tx, channel)? {
+            return Err(ChannelError::DirectMessage);
+        }
+        let (members, _) = counts(&tx, channel)?;
+        if role_of(&tx, channel, account).is_none() && members as usize >= MAX_MEMBERS {
+            return Err(ChannelError::Full);
+        }
+        tx.execute(
+            "INSERT INTO member (channel, account, role, joined, present)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT (channel, account) DO UPDATE SET present = 1, role = ?3",
+            params![
+                &channel[..],
+                account.as_bytes(),
+                role as u8 as i64,
+                now as i64
+            ],
+        )
+        .map_err(storage("insert invitee"))?;
+        tx.execute(
+            "UPDATE channel SET empty_since = NULL WHERE id = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("clear empty_since"))?;
+        tx.commit().map_err(storage("commit invite"))?;
+        Ok(())
+    }
+
+    /// Remove an account. A removal MUST be followed by a rotation, which the
+    /// exchange cannot enforce and does not pretend to — it holds no key and
+    /// cannot tell whether one changed.
+    pub fn remove(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        account: &PubKey,
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin remove"))?;
+        visibility_of(&tx, channel)?;
+        if !is_admin(&tx, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        if is_direct_message(&tx, channel)? {
+            return Err(ChannelError::DirectMessage);
+        }
+        let Some(their_role) = role_of(&tx, channel, account) else {
+            return Err(ChannelError::NotAMember);
+        };
+        let (members, admins) = counts(&tx, channel)?;
+        if their_role == Role::Admin && admins == 1 && members > 1 {
+            return Err(ChannelError::LastAdmin);
+        }
+        tx.execute(
+            "DELETE FROM member WHERE channel = ?1 AND account = ?2",
+            params![&channel[..], account.as_bytes()],
+        )
+        .map_err(storage("delete member"))?;
+        // Their envelopes go too. They keep whatever they already collected —
+        // revocation is prospective everywhere in this design — but the
+        // exchange stops handing them anything further.
+        tx.execute(
+            "DELETE FROM envelope WHERE channel = ?1 AND recipient = ?2",
+            params![&channel[..], account.as_bytes()],
+        )
+        .map_err(storage("delete envelopes"))?;
+        tx.commit().map_err(storage("commit remove"))?;
+        Ok(())
+    }
+
+    /// Publish envelopes for one epoch.
+    ///
+    /// `epoch` is the channel's current epoch — adding envelopes without
+    /// rotating, which is how a member is handed the key already in use — or
+    /// exactly one greater, which is a rotation and advances the channel.
+    pub fn put_keys(&self, caller: &PubKey, req: &KeyPut) -> Result<PutAck, ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin put"))?;
+        let (visibility, epoch, _, _) = channel_row(&tx, &req.channel)?;
+        if visibility != Visibility::Private {
+            // A public channel seals nothing, so there is no key to distribute.
+            return Err(ChannelError::NotPrivate);
+        }
+        if role_of(&tx, &req.channel, caller).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        if req.epoch != epoch && req.epoch != epoch + 1 {
+            return Err(ChannelError::WrongEpoch);
+        }
+        if req.epoch > MAX_EPOCH {
+            return Err(ChannelError::WrongEpoch);
+        }
+
+        // An admin may publish to any member. A plain member may publish only
+        // to devices of its own account — which, until a device registry
+        // exists, means itself.
+        let admin = is_admin(&tx, &req.channel, caller);
+        if !admin && req.envelopes.iter().any(|e| &e.recipient != caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        // Minting an epoch is an admin's act.
+        if !admin && req.epoch != epoch {
+            return Err(ChannelError::NotAnAdmin);
+        }
+
+        for e in &req.envelopes {
+            if e.prekey_id == 0 {
+                return Err(ChannelError::NoPrekey);
+            }
+            if role_of(&tx, &req.channel, &e.recipient).is_none() {
+                return Err(ChannelError::NotAMember);
+            }
+            let taken: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = ?3",
+                    params![&req.channel[..], e.recipient.as_bytes(), req.epoch as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("check envelope"))?;
+            if taken.is_some() {
+                // Somebody got there first. Not an error: the caller is told
+                // which epoch stands and collects instead, which is what
+                // settles the direct-message creation race.
+                return Ok(PutAck {
+                    accepted: false,
+                    epoch,
+                    now,
+                });
+            }
+        }
+
+        for e in &req.envelopes {
+            tx.execute(
+                "INSERT INTO envelope (channel, recipient, epoch, from_epoch, to_epoch,
+                                       prekey_id, ephemeral, ciphertext)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    &req.channel[..],
+                    e.recipient.as_bytes(),
+                    req.epoch as i64,
+                    e.from_epoch as i64,
+                    e.to_epoch as i64,
+                    e.prekey_id as i64,
+                    &e.ephemeral[..],
+                    &e.ciphertext,
+                ],
+            )
+            .map_err(storage("insert envelope"))?;
+        }
+        if req.epoch == epoch + 1 {
+            tx.execute(
+                "UPDATE channel SET epoch = ?2 WHERE id = ?1",
+                params![&req.channel[..], req.epoch as i64],
+            )
+            .map_err(storage("advance epoch"))?;
+        }
+        tx.commit().map_err(storage("commit put"))?;
+        Ok(PutAck {
+            accepted: true,
+            epoch: req.epoch,
+            now,
+        })
+    }
+
+    /// Collect the envelopes addressed to the caller. Served **only** to the
+    /// recipient each names; the exchange stores them opaquely and holds no key
+    /// that opens one.
+    pub fn get_keys(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        since_epoch: u32,
+    ) -> Result<Got, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if role_of(&db, channel, caller).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        let mut stmt = db
+            .prepare(
+                "SELECT from_epoch, to_epoch, prekey_id, ephemeral, ciphertext FROM envelope
+                 WHERE channel = ?1 AND recipient = ?2 AND to_epoch >= ?3
+                 ORDER BY epoch ASC",
+            )
+            .map_err(storage("prepare get"))?;
+        let envelopes = stmt
+            .query_map(
+                params![&channel[..], caller.as_bytes(), since_epoch as i64],
+                |r| {
+                    Ok(Envelope {
+                        recipient: PubKey::new([0; 32]),
+                        from_epoch: r.get::<_, i64>(0)? as u32,
+                        to_epoch: r.get::<_, i64>(1)? as u32,
+                        prekey_id: r.get::<_, i64>(2)? as u32,
+                        ephemeral: r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 32]),
+                        ciphertext: r.get(4)?,
+                    })
+                },
+            )
+            .map_err(storage("query get"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage("read envelopes"))?;
+        Ok(Got {
+            now: now_unix(),
+            envelopes,
+        })
+    }
+
+    /// Who holds no envelope for the current epoch, and whether they could be
+    /// sealed to at all.
+    ///
+    /// Without this a member can be stranded silently: they fetch entries
+    /// successfully, open none of them, and look exactly like somebody who is
+    /// not reading.
+    pub fn missing_keys(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        has_prekeys: &dyn Fn(&PubKey) -> bool,
+    ) -> Result<Absent, ChannelError> {
+        let db = self.db.lock().unwrap();
+        let (_, epoch, _, _) = channel_row(&db, channel)?;
+        let admin = is_admin(&db, channel, caller);
+        if !admin && role_of(&db, channel, caller).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        let mut stmt = db
+            .prepare(
+                "SELECT account FROM member WHERE channel = ?1 AND present = 1
+                 AND account NOT IN (
+                     SELECT recipient FROM envelope WHERE channel = ?1 AND epoch = ?2)
+                 ORDER BY account ASC",
+            )
+            .map_err(storage("prepare missing"))?;
+        let accounts: Vec<PubKey> = stmt
+            .query_map(params![&channel[..], epoch as i64], |r| {
+                Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            })
+            .map_err(storage("query missing"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage("read missing"))?;
+
+        Ok(Absent {
+            epoch,
+            now: now_unix(),
+            devices: accounts
+                .into_iter()
+                // A member may ask only about its own account.
+                .filter(|a| admin || a == caller)
+                .map(|a| Stranded {
+                    account: a,
+                    // No device registry yet, so an account is its own device,
+                    // which is what SIP-22 says of one with none registered.
+                    device: a,
+                    has_prekeys: has_prekeys(&a),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Whether a channel's identifier is the derivation over its two members.
+///
+/// Recomputed rather than recorded: a flag set at creation would have to be
+/// right at creation, and a create whose invitation was dropped leaves a
+/// one-member channel at a direct-message identifier. There is no state here to
+/// get wrong.
+fn is_direct_message(db: &Connection, channel: &[u8; 32]) -> Result<bool, ChannelError> {
+    let mut stmt = db
+        .prepare("SELECT account FROM member WHERE channel = ?1 ORDER BY account ASC")
+        .map_err(storage("prepare dm check"))?;
+    let members: Vec<PubKey> = stmt
+        .query_map(params![&channel[..]], |r| {
+            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+        })
+        .map_err(storage("query dm check"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(storage("read dm check"))?;
+    Ok(members.len() == 2 && direct_message_id(&members[0], &members[1]) == *channel)
 }

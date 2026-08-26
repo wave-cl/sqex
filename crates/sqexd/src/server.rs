@@ -25,11 +25,14 @@ use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::channel::{
-    Ack as ChannelAck, ByChannel, Create as ChannelCreate, Created, Fetch as ChannelFetch,
+    Ack as ChannelAck, ByChannel, Invitee, Role, Create as ChannelCreate, Created, Fetch as ChannelFetch,
     List as ChannelList, Post as ChannelPost, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
+use sqex_proto::channel_key::{
+    Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
+};
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
@@ -576,6 +579,57 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
+        ("POST", "/channel/invite") => match (peer.identity, decode_invite(body)) {
+            (None, _) => no_identity("inviting to a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok((channel, who))) => {
+                match server.channels.invite(&me, &channel, &who.account, who.role) {
+                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        ("POST", "/channel/remove") => match (peer.identity, decode_remove(body)) {
+            (None, _) => no_identity("removing from a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok((channel, who))) => match server.channels.remove(&me, &channel, &who) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+
+        // SIP-17 channel keys. The exchange stores envelopes opaquely, serves
+        // each only to the recipient it names, and holds no key that opens one.
+        ("POST", "/channel/key/put") => match (peer.identity, KeyPut::decode(body)) {
+            (None, _) => no_identity("publishing channel keys"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.put_keys(&me, &req) {
+                Ok(ack) => (200, "application/octet-stream", ack.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/key/get") => match (peer.identity, KeyGet::decode(body)) {
+            (None, _) => no_identity("collecting channel keys"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                match server.channels.get_keys(&me, &req.channel, req.since_epoch) {
+                    Ok(got) => (200, "application/octet-stream", got.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        ("POST", "/channel/key/missing") => match (peer.identity, ByChannel::decode(body, CH_MISSING)) {
+            (None, _) => no_identity("listing stranded devices"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                let has = |d: &PubKey| server.prekeys.has_any(d);
+                match server.channels.missing_keys(&me, &req.channel, &has) {
+                    Ok(absent) => (200, "application/octet-stream", absent.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+
         ("POST", "/channel/fetch") => match (peer.identity, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
@@ -932,6 +986,43 @@ async fn fetch_waiting(
             return Ok(again);
         }
     }
+}
+
+/// SIP-16 `Invite`: a channel, an account and the role it is given.
+fn decode_invite(b: &[u8]) -> Result<([u8; 32], Invitee)> {
+    if b.len() != 66 {
+        return Err(Error::Malformed(format!(
+            "invite is {} bytes, want 66",
+            b.len()
+        )));
+    }
+    if b[0] != sqex_proto::channel::TYPE_INVITE {
+        return Err(Error::Malformed(format!("not an invite (type {:#x})", b[0])));
+    }
+    Ok((
+        b[1..33].try_into().unwrap(),
+        Invitee {
+            account: PubKey::new(b[33..65].try_into().unwrap()),
+            role: Role::from_u8(b[65])?,
+        },
+    ))
+}
+
+/// SIP-16 `Remove`: a channel and an account.
+fn decode_remove(b: &[u8]) -> Result<([u8; 32], PubKey)> {
+    if b.len() != 65 {
+        return Err(Error::Malformed(format!(
+            "remove is {} bytes, want 65",
+            b.len()
+        )));
+    }
+    if b[0] != sqex_proto::channel::TYPE_REMOVE {
+        return Err(Error::Malformed(format!("not a remove (type {:#x})", b[0])));
+    }
+    Ok((
+        b[1..33].try_into().unwrap(),
+        PubKey::new(b[33..65].try_into().unwrap()),
+    ))
 }
 
 fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {

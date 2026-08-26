@@ -1,0 +1,757 @@
+//! SIP-17 channel keys: one ciphertext, one key, many readers.
+//!
+//! A private channel is sealed under a symmetric key every member holds and the
+//! exchange does not. The key belongs to an **epoch**; an admin mints a new one
+//! to rotate, which is what makes removing a member mean more than "cannot
+//! post".
+//!
+//! # Two things that look alike and are not
+//!
+//! **Rotation is revocation, not forward secrecy.** It stops a removed member
+//! reading what is said *next* and does nothing about what was said before —
+//! that member keeps every key it was given.
+//!
+//! **Forward secrecy is the envelope's**, and it comes from SIP-23: the second
+//! Diffie-Hellman term uses a prekey whose secret is destroyed on use, so an
+//! attacker who copied envelopes and later obtained an identity key gets
+//! nothing from them.
+//!
+//! # Why the subkey is per device and not per person
+//!
+//! A shared key with a per-sender counter is a nonce-reuse machine: two senders
+//! that both start at zero collide on their first message, and
+//! ChaCha20-Poly1305 answers that by leaking the XOR of both plaintexts and
+//! losing its authentication entirely. A *person* is the wrong unit of
+//! separation, because one person runs several clients. A **device** is the
+//! right one, because a device is the thing that holds a counter.
+
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use sha2::{Digest, Sha512};
+use sqnr_core::{Error, PubKey, Result};
+
+/// Domain separator for a sender's subkey.
+pub const KEY_CONTEXT: &[u8] = b"sqex-channel-key-v1";
+/// Domain separator for sealing an epoch key to a device.
+pub const ENVELOPE_CONTEXT: &[u8] = b"sqex-channel-envelope-v1";
+
+pub const TYPE_PUT: u8 = 0x01;
+pub const TYPE_GET: u8 = 0x02;
+pub const TYPE_MISSING: u8 = 0x03;
+
+/// Envelopes one `Put` may carry. Set by the 64 KiB request body: one envelope
+/// is 76 bytes of header plus 16 + 32 × range, so 256 at the current epoch come
+/// to 31 KiB, with margin.
+pub const MAX_ENVELOPES: usize = 256;
+/// Epochs one envelope may grant. A single envelope at this range is 32 KiB,
+/// which is where the number comes from rather than any property of epochs.
+pub const MAX_RANGE: u32 = 1024;
+/// Epochs one channel may reach.
+pub const MAX_EPOCH: u32 = 65_536;
+
+/// Bytes of envelope header before the ciphertext, inside a `Put`.
+const ENVELOPE_HEADER: usize = 32 + 4 + 4 + 4 + 32 + 4;
+
+/// A channel key: 32 bytes, uniformly random, one per epoch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ChannelKey([u8; 32]);
+
+impl ChannelKey {
+    pub fn new(bytes: [u8; 32]) -> ChannelKey {
+        ChannelKey(bytes)
+    }
+
+    pub fn generate() -> ChannelKey {
+        use rand_core::RngCore;
+        let mut b = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut b);
+        ChannelKey(b)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// The subkey a device seals with, derivable by every member from the
+    /// entry header alone — so there is no distribution cost beyond the
+    /// channel key and no lookup.
+    ///
+    /// A single hash truncated to 32 bytes, as SIP-12 and SIP-5 both derive:
+    /// consistency across the four constructions is worth more than the
+    /// marginal argument for extract-and-expand over inputs that are already
+    /// uniformly random.
+    pub fn sender_key(&self, channel: &[u8; 32], epoch: u32, device: &PubKey) -> [u8; 32] {
+        let mut h = Sha512::new();
+        h.update(KEY_CONTEXT);
+        h.update(channel);
+        h.update(epoch.to_be_bytes());
+        h.update(self.0);
+        h.update(device.as_bytes());
+        let okm = h.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&okm[..32]);
+        key
+    }
+
+    /// Seal one entry body. `msg_seq` is the sending device's own counter and
+    /// MUST NOT repeat within an epoch.
+    pub fn seal(
+        &self,
+        channel: &[u8; 32],
+        epoch: u32,
+        device: &PubKey,
+        msg_seq: u64,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>> {
+        cipher(&self.sender_key(channel, epoch, device))?
+            .encrypt(&nonce(msg_seq), plaintext)
+            .map_err(|e| Error::Key(format!("seal entry: {e}")))
+    }
+
+    /// Open one entry body, keyed on the device that sealed it.
+    pub fn open(
+        &self,
+        channel: &[u8; 32],
+        epoch: u32,
+        device: &PubKey,
+        msg_seq: u64,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>> {
+        cipher(&self.sender_key(channel, epoch, device))?
+            .decrypt(&nonce(msg_seq), ciphertext)
+            .map_err(|_| Error::Key("cannot open entry: wrong key, or altered".into()))
+    }
+}
+
+impl std::fmt::Debug for ChannelKey {
+    /// Never print the key. A channel key in a log is the whole channel.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChannelKey(<redacted>)")
+    }
+}
+
+fn nonce(msg_seq: u64) -> Nonce {
+    let mut n = [0u8; 12];
+    n[..8].copy_from_slice(&msg_seq.to_be_bytes());
+    *Nonce::from_slice(&n)
+}
+
+fn cipher(key: &[u8; 32]) -> Result<ChaCha20Poly1305> {
+    ChaCha20Poly1305::new_from_slice(key).map_err(|e| Error::Key(format!("cipher: {e}")))
+}
+
+/// One epoch key, or a run of them, sealed to one device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+    pub recipient: PubKey,
+    pub from_epoch: u32,
+    pub to_epoch: u32,
+    /// The SIP-23 prekey this was sealed against. **Zero is invalid**: there is
+    /// deliberately no static-only path, because an optional one is a downgrade
+    /// a dishonest exchange could force by reporting an empty pool.
+    pub prekey_id: u32,
+    pub ephemeral: [u8; 32],
+    pub ciphertext: Vec<u8>,
+}
+
+impl Envelope {
+    fn wire_len(&self) -> usize {
+        ENVELOPE_HEADER + self.ciphertext.len()
+    }
+}
+
+/// Seal a run of epoch keys to one device.
+///
+/// Two Diffie-Hellman terms, and both are load-bearing. DH1 binds the envelope
+/// to the recipient's identity — without that key it does not open. DH2 is the
+/// forward secrecy: the prekey secret is destroyed on use, so nobody can
+/// recompute the term afterwards. Keeping DH1 means this is strictly stronger
+/// than sealing to the identity alone, and degrades to that rather than to
+/// nothing if a prekey secret is somehow retained.
+pub fn seal_envelope(
+    recipient: &PubKey,
+    prekey_id: u32,
+    prekey_public: &[u8; 32],
+    from_epoch: u32,
+    keys: &[ChannelKey],
+) -> Result<Envelope> {
+    if prekey_id == 0 {
+        return Err(Error::Malformed(
+            "prekey id 0 is invalid: there is no static-only path".into(),
+        ));
+    }
+    if keys.is_empty() || keys.len() as u32 > MAX_RANGE {
+        return Err(Error::Malformed(format!(
+            "envelope carries {} keys, want 1..={MAX_RANGE}",
+            keys.len()
+        )));
+    }
+    let recipient_static = squic::crypto::ed25519_identity_to_x25519(recipient.as_bytes())
+        .map_err(|e| Error::Key(format!("recipient identity: {e}")))?;
+    let prekey = x25519_dalek::PublicKey::from(*prekey_public);
+
+    let ephemeral_secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral_secret);
+    let dh1 = squic::crypto::x25519(&ephemeral_secret, &recipient_static)
+        .map_err(|e| Error::Key(format!("envelope DH1: {e}")))?;
+    let dh2 = squic::crypto::x25519(&ephemeral_secret, &prekey)
+        .map_err(|e| Error::Key(format!("envelope DH2: {e}")))?;
+
+    let (key, n) = envelope_kdf(
+        &ephemeral_pub.to_bytes(),
+        recipient_static.as_bytes(),
+        prekey_public,
+        &dh1,
+        &dh2,
+    );
+    let mut plaintext = Vec::with_capacity(keys.len() * 32);
+    for k in keys {
+        plaintext.extend_from_slice(k.as_bytes());
+    }
+    let ciphertext = cipher(&key)?
+        .encrypt(Nonce::from_slice(&n), plaintext.as_slice())
+        .map_err(|e| Error::Key(format!("seal envelope: {e}")))?;
+
+    Ok(Envelope {
+        recipient: *recipient,
+        from_epoch,
+        to_epoch: from_epoch + keys.len() as u32 - 1,
+        prekey_id,
+        ephemeral: ephemeral_pub.to_bytes(),
+        ciphertext,
+    })
+}
+
+/// Open an envelope sealed to us, using the prekey secret it names.
+///
+/// The secret **MUST** be destroyed by the caller afterwards when the prekey
+/// was one-time. Deleting it is the entire mechanism; a client that keeps
+/// prekey secrets has implemented the wire format and none of the property.
+pub fn open_envelope(
+    my_seed: &[u8; 32],
+    prekey_secret: &x25519_dalek::StaticSecret,
+    envelope: &Envelope,
+) -> Result<Vec<ChannelKey>> {
+    if envelope.prekey_id == 0 {
+        return Err(Error::Malformed(
+            "envelope names prekey id 0, which is invalid".into(),
+        ));
+    }
+    let signing = ed25519_dalek::SigningKey::from_bytes(my_seed);
+    let my_static = squic::crypto::ed25519_private_to_x25519(&signing);
+    let my_static_pub = x25519_dalek::PublicKey::from(&my_static);
+    let prekey_public = x25519_dalek::PublicKey::from(prekey_secret);
+    let ephemeral = x25519_dalek::PublicKey::from(envelope.ephemeral);
+
+    let dh1 = squic::crypto::x25519(&my_static, &ephemeral)
+        .map_err(|e| Error::Key(format!("envelope DH1: {e}")))?;
+    let dh2 = squic::crypto::x25519(prekey_secret, &ephemeral)
+        .map_err(|e| Error::Key(format!("envelope DH2: {e}")))?;
+
+    let (key, n) = envelope_kdf(
+        &envelope.ephemeral,
+        my_static_pub.as_bytes(),
+        prekey_public.as_bytes(),
+        &dh1,
+        &dh2,
+    );
+    let plaintext = cipher(&key)?
+        .decrypt(Nonce::from_slice(&n), envelope.ciphertext.as_slice())
+        .map_err(|_| Error::Key("cannot open envelope: wrong key, or altered".into()))?;
+    if plaintext.len() % 32 != 0 || plaintext.is_empty() {
+        return Err(Error::Malformed(format!(
+            "envelope holds {} bytes, want a whole number of keys",
+            plaintext.len()
+        )));
+    }
+    Ok(plaintext
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|c| ChannelKey::new(*c))
+        .collect())
+}
+
+fn envelope_kdf(
+    ephemeral_pub: &[u8; 32],
+    recipient_static: &[u8; 32],
+    prekey_public: &[u8; 32],
+    dh1: &[u8; 32],
+    dh2: &[u8; 32],
+) -> ([u8; 32], [u8; 12]) {
+    let mut h = Sha512::new();
+    h.update(ENVELOPE_CONTEXT);
+    h.update(ephemeral_pub);
+    h.update(recipient_static);
+    h.update(prekey_public);
+    h.update(dh1);
+    h.update(dh2);
+    let okm = h.finalize();
+    let mut key = [0u8; 32];
+    let mut n = [0u8; 12];
+    key.copy_from_slice(&okm[..32]);
+    n.copy_from_slice(&okm[32..44]);
+    (key, n)
+}
+
+/// Publish envelopes for one epoch.
+///
+/// `epoch` is either the channel's current epoch — adding envelopes without
+/// rotating, which is how a new member is handed the key already in use — or
+/// exactly one greater, which is a rotation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Put {
+    pub channel: [u8; 32],
+    pub epoch: u32,
+    pub envelopes: Vec<Envelope>,
+}
+
+impl Put {
+    pub fn encode(&self) -> Vec<u8> {
+        let total: usize = self.envelopes.iter().map(|e| e.wire_len()).sum();
+        let mut out = Vec::with_capacity(39 + total);
+        out.push(TYPE_PUT);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&(self.envelopes.len() as u16).to_be_bytes());
+        for e in &self.envelopes {
+            out.extend_from_slice(e.recipient.as_bytes());
+            out.extend_from_slice(&e.from_epoch.to_be_bytes());
+            out.extend_from_slice(&e.to_epoch.to_be_bytes());
+            out.extend_from_slice(&e.prekey_id.to_be_bytes());
+            out.extend_from_slice(&e.ephemeral);
+            out.extend_from_slice(&(e.ciphertext.len() as u32).to_be_bytes());
+            out.extend_from_slice(&e.ciphertext);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Put> {
+        if b.len() < 39 {
+            return Err(Error::Malformed(format!(
+                "put is {} bytes, want at least 39",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_PUT {
+            return Err(Error::Malformed(format!("not a put (type {:#x})", b[0])));
+        }
+        let count = u16::from_be_bytes(b[37..39].try_into().unwrap()) as usize;
+        if count > MAX_ENVELOPES {
+            return Err(Error::Malformed(format!(
+                "put carries {count} envelopes, limit is {MAX_ENVELOPES}"
+            )));
+        }
+        let mut o = 39;
+        let mut envelopes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let e = read_envelope(b, &mut o, true)?;
+            envelopes.push(e);
+        }
+        if o != b.len() {
+            return Err(Error::Malformed(format!(
+                "put has {} trailing bytes",
+                b.len() - o
+            )));
+        }
+        Ok(Put {
+            channel: b[1..33].try_into().unwrap(),
+            epoch: u32::from_be_bytes(b[33..37].try_into().unwrap()),
+            envelopes,
+        })
+    }
+}
+
+fn read_envelope(b: &[u8], o: &mut usize, with_recipient: bool) -> Result<Envelope> {
+    let head = if with_recipient { ENVELOPE_HEADER } else { ENVELOPE_HEADER - 32 };
+    if b.len() < *o + head {
+        return Err(Error::Malformed("envelope is truncated".into()));
+    }
+    let at = *o;
+    let (recipient, at) = if with_recipient {
+        (PubKey::new(b[at..at + 32].try_into().unwrap()), at + 32)
+    } else {
+        (PubKey::new([0; 32]), at)
+    };
+    let from_epoch = u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+    let to_epoch = u32::from_be_bytes(b[at + 4..at + 8].try_into().unwrap());
+    let prekey_id = u32::from_be_bytes(b[at + 8..at + 12].try_into().unwrap());
+    let ephemeral: [u8; 32] = b[at + 12..at + 44].try_into().unwrap();
+    let len = u32::from_be_bytes(b[at + 44..at + 48].try_into().unwrap()) as usize;
+
+    if to_epoch < from_epoch || to_epoch - from_epoch + 1 > MAX_RANGE {
+        return Err(Error::Malformed(format!(
+            "envelope spans epochs {from_epoch}..={to_epoch}"
+        )));
+    }
+    let want = 16 + 32 * (to_epoch - from_epoch + 1) as usize;
+    if len != want {
+        return Err(Error::Malformed(format!(
+            "envelope ciphertext is {len} bytes, want {want} for its range"
+        )));
+    }
+    if b.len() < at + 48 + len {
+        return Err(Error::Malformed("envelope ciphertext is truncated".into()));
+    }
+    *o = at + 48 + len;
+    Ok(Envelope {
+        recipient,
+        from_epoch,
+        to_epoch,
+        prekey_id,
+        ephemeral,
+        ciphertext: b[at + 48..at + 48 + len].to_vec(),
+    })
+}
+
+/// Collect the envelopes addressed to us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Get {
+    pub channel: [u8; 32],
+    pub since_epoch: u32,
+}
+
+impl Get {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(37);
+        out.push(TYPE_GET);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.since_epoch.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Get> {
+        if b.len() != 37 {
+            return Err(Error::Malformed(format!("get is {} bytes, want 37", b.len())));
+        }
+        if b[0] != TYPE_GET {
+            return Err(Error::Malformed(format!("not a get (type {:#x})", b[0])));
+        }
+        Ok(Get {
+            channel: b[1..33].try_into().unwrap(),
+            since_epoch: u32::from_be_bytes(b[33..37].try_into().unwrap()),
+        })
+    }
+}
+
+/// Answer to a put. `accepted: 0` names the epoch that actually stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutAck {
+    pub accepted: bool,
+    pub epoch: u32,
+    pub now: u64,
+}
+
+impl PutAck {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(13);
+        out.push(u8::from(self.accepted));
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PutAck> {
+        if b.len() != 13 {
+            return Err(Error::Malformed(format!(
+                "put ack is {} bytes, want 13",
+                b.len()
+            )));
+        }
+        Ok(PutAck {
+            accepted: b[0] != 0,
+            epoch: u32::from_be_bytes(b[1..5].try_into().unwrap()),
+            now: u64::from_be_bytes(b[5..13].try_into().unwrap()),
+        })
+    }
+}
+
+/// The envelopes the exchange holds for the caller. It serves each only to the
+/// recipient it names, stores them opaquely, and holds no key that opens one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Got {
+    pub now: u64,
+    pub envelopes: Vec<Envelope>,
+}
+
+impl Got {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.envelopes.len() as u16).to_be_bytes());
+        for e in &self.envelopes {
+            out.extend_from_slice(&e.from_epoch.to_be_bytes());
+            out.extend_from_slice(&e.to_epoch.to_be_bytes());
+            out.extend_from_slice(&e.prekey_id.to_be_bytes());
+            out.extend_from_slice(&e.ephemeral);
+            out.extend_from_slice(&(e.ciphertext.len() as u32).to_be_bytes());
+            out.extend_from_slice(&e.ciphertext);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Got> {
+        if b.len() < 10 {
+            return Err(Error::Malformed(format!("got is {} bytes, want at least 10", b.len())));
+        }
+        let count = u16::from_be_bytes(b[8..10].try_into().unwrap()) as usize;
+        if count > MAX_ENVELOPES {
+            return Err(Error::Malformed(format!(
+                "got carries {count} envelopes, limit is {MAX_ENVELOPES}"
+            )));
+        }
+        let mut o = 10;
+        let mut envelopes = Vec::with_capacity(count);
+        for _ in 0..count {
+            envelopes.push(read_envelope(b, &mut o, false)?);
+        }
+        if o != b.len() {
+            return Err(Error::Malformed(format!("got has {} trailing bytes", b.len() - o)));
+        }
+        Ok(Got {
+            now: u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            envelopes,
+        })
+    }
+}
+
+/// A member device holding no envelope for the current epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stranded {
+    pub account: PubKey,
+    pub device: PubKey,
+    /// Whether it could be sealed to at all. A device that has published no
+    /// prekeys is waiting on itself, not on an admin.
+    pub has_prekeys: bool,
+}
+
+/// Who cannot read, so that somebody can do something about it.
+///
+/// Without this a device can be stranded with no way to say so: it fetches
+/// entries successfully, opens none of them, and looks exactly like a member
+/// who is not reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Absent {
+    pub epoch: u32,
+    pub now: u64,
+    pub devices: Vec<Stranded>,
+}
+
+impl Absent {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(14 + self.devices.len() * 65);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.devices.len() as u16).to_be_bytes());
+        for d in &self.devices {
+            out.extend_from_slice(d.account.as_bytes());
+            out.extend_from_slice(d.device.as_bytes());
+            out.push(u8::from(d.has_prekeys));
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Absent> {
+        if b.len() < 14 {
+            return Err(Error::Malformed(format!(
+                "absent is {} bytes, want at least 14",
+                b.len()
+            )));
+        }
+        let count = u16::from_be_bytes(b[12..14].try_into().unwrap()) as usize;
+        if b.len() != 14 + count * 65 {
+            return Err(Error::Malformed(format!(
+                "absent is {} bytes, want {}",
+                b.len(),
+                14 + count * 65
+            )));
+        }
+        Ok(Absent {
+            epoch: u32::from_be_bytes(b[0..4].try_into().unwrap()),
+            now: u64::from_be_bytes(b[4..12].try_into().unwrap()),
+            devices: (0..count)
+                .map(|i| {
+                    let at = 14 + i * 65;
+                    Stranded {
+                        account: PubKey::new(b[at..at + 32].try_into().unwrap()),
+                        device: PubKey::new(b[at + 32..at + 64].try_into().unwrap()),
+                        has_prekeys: b[at + 64] != 0,
+                    }
+                })
+                .collect(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prekey::{KIND_ONE_TIME, Prekey};
+    use ed25519_dalek::SigningKey;
+
+    fn device(b: u8) -> ([u8; 32], PubKey) {
+        let sk = SigningKey::from_bytes(&[b; 32]);
+        (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
+    }
+
+    #[test]
+    fn an_entry_round_trips_through_its_sender_subkey() {
+        let key = ChannelKey::generate();
+        let (_, alice) = device(1);
+        let channel = [9u8; 32];
+        let sealed = key.seal(&channel, 1, &alice, 0, b"hello").unwrap();
+        assert_eq!(key.open(&channel, 1, &alice, 0, &sealed).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn two_devices_of_one_person_do_not_collide_at_the_same_counter() {
+        // The defect this construction exists to prevent. Both start at zero,
+        // and a per-person subkey would have them share a key and a nonce.
+        let key = ChannelKey::generate();
+        let (_, phone) = device(1);
+        let (_, laptop) = device(2);
+        let channel = [9u8; 32];
+
+        assert_ne!(
+            key.sender_key(&channel, 1, &phone),
+            key.sender_key(&channel, 1, &laptop)
+        );
+        let a = key.seal(&channel, 1, &phone, 0, b"from the phone").unwrap();
+        let b = key.seal(&channel, 1, &laptop, 0, b"from the laptop").unwrap();
+        assert_eq!(key.open(&channel, 1, &phone, 0, &a).unwrap(), b"from the phone");
+        assert_eq!(key.open(&channel, 1, &laptop, 0, &b).unwrap(), b"from the laptop");
+        // And neither opens under the other's subkey.
+        assert!(key.open(&channel, 1, &laptop, 0, &a).is_err());
+    }
+
+    #[test]
+    fn a_subkey_is_bound_to_its_channel_and_epoch() {
+        let key = ChannelKey::generate();
+        let (_, alice) = device(1);
+        let sealed = key.seal(&[1u8; 32], 1, &alice, 0, b"scoped").unwrap();
+        assert!(key.open(&[2u8; 32], 1, &alice, 0, &sealed).is_err());
+        assert!(key.open(&[1u8; 32], 2, &alice, 0, &sealed).is_err());
+    }
+
+    #[test]
+    fn an_entry_does_not_open_at_a_different_counter() {
+        let key = ChannelKey::generate();
+        let (_, alice) = device(1);
+        let sealed = key.seal(&[1u8; 32], 1, &alice, 5, b"five").unwrap();
+        assert!(key.open(&[1u8; 32], 1, &alice, 6, &sealed).is_err());
+    }
+
+    #[test]
+    fn an_envelope_round_trips() {
+        let (seed, bob) = device(2);
+        let (prekey, secret) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
+        let keys = [ChannelKey::generate(), ChannelKey::generate()];
+
+        let env = seal_envelope(&bob, prekey.id, &prekey.public, 3, &keys).unwrap();
+        assert_eq!((env.from_epoch, env.to_epoch), (3, 4));
+
+        let out = open_envelope(&seed, &secret, &env).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].as_bytes(), keys[0].as_bytes());
+        assert_eq!(out[1].as_bytes(), keys[1].as_bytes());
+    }
+
+    #[test]
+    fn an_envelope_needs_both_the_identity_and_the_prekey() {
+        // DH1 is the identity's and DH2 is the prekey's, and losing either
+        // must lose the envelope. This is what makes the construction strictly
+        // stronger than sealing to a long-term key alone.
+        let (seed, bob) = device(2);
+        let (other_seed, _) = device(3);
+        let (prekey, secret) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
+        let (_, wrong_secret) = Prekey::generate(&seed, KIND_ONE_TIME, 8);
+        let keys = [ChannelKey::generate()];
+        let env = seal_envelope(&bob, prekey.id, &prekey.public, 1, &keys).unwrap();
+
+        // Right prekey, wrong identity.
+        assert!(open_envelope(&other_seed, &secret, &env).is_err());
+        // Right identity, wrong prekey — which is the case that matters, since
+        // it is what an attacker holding a stolen identity key has.
+        assert!(open_envelope(&seed, &wrong_secret, &env).is_err());
+    }
+
+    #[test]
+    fn a_static_only_envelope_cannot_be_built() {
+        let (seed, bob) = device(2);
+        let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
+        let keys = [ChannelKey::generate()];
+        assert!(seal_envelope(&bob, 0, &prekey.public, 1, &keys).is_err());
+    }
+
+    #[test]
+    fn put_and_got_round_trip() {
+        let (seed, bob) = device(2);
+        let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
+        let env = seal_envelope(&bob, prekey.id, &prekey.public, 1, &[ChannelKey::generate()])
+            .unwrap();
+
+        let put = Put {
+            channel: [4u8; 32],
+            epoch: 1,
+            envelopes: vec![env.clone()],
+        };
+        assert_eq!(Put::decode(&put.encode()).unwrap(), put);
+
+        // Got omits the recipient, since it only ever answers one.
+        let got = Got {
+            now: 5,
+            envelopes: vec![Envelope {
+                recipient: PubKey::new([0; 32]),
+                ..env
+            }],
+        };
+        assert_eq!(Got::decode(&got.encode()).unwrap(), got);
+    }
+
+    #[test]
+    fn an_envelope_whose_length_contradicts_its_range_is_refused() {
+        let (seed, bob) = device(2);
+        let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
+        let mut env =
+            seal_envelope(&bob, prekey.id, &prekey.public, 1, &[ChannelKey::generate()]).unwrap();
+        // Claim two epochs while carrying one key's worth of ciphertext.
+        env.to_epoch = 2;
+        let put = Put {
+            channel: [4u8; 32],
+            epoch: 1,
+            envelopes: vec![env],
+        };
+        assert!(Put::decode(&put.encode()).is_err());
+    }
+
+    #[test]
+    fn absent_round_trips() {
+        let (_, a) = device(1);
+        let (_, d) = device(2);
+        let absent = Absent {
+            epoch: 3,
+            now: 9,
+            devices: vec![Stranded {
+                account: a,
+                device: d,
+                has_prekeys: true,
+            }],
+        };
+        assert_eq!(Absent::decode(&absent.encode()).unwrap(), absent);
+    }
+
+    #[test]
+    fn get_and_put_ack_round_trip() {
+        let g = Get {
+            channel: [1u8; 32],
+            since_epoch: 2,
+        };
+        assert_eq!(Get::decode(&g.encode()).unwrap(), g);
+        let p = PutAck {
+            accepted: false,
+            epoch: 4,
+            now: 7,
+        };
+        assert_eq!(PutAck::decode(&p.encode()).unwrap(), p);
+    }
+}
