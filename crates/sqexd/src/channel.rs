@@ -37,8 +37,10 @@ use sqex_proto::channel::{
     EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
     EVENT_RETENTION, EVENT_ROTATED, MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled,
     System, direct_message_id,
-    MAX_BATCH_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
-    MAX_RETENTION, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role, Visibility,
+    ENTRY_HEADER, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
+    MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
+    MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role,
+    Visibility,
 };
 use sqex_proto::blob_store::{
     Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_CHANNEL_BLOB_BYTES, MAX_UPLOADS,
@@ -83,6 +85,10 @@ pub enum ChannelError {
     BadChunk,
     TooManyUploads,
     BlobQuota,
+    /// The invitee is already in as many channels they have never spoken in as
+    /// SIP-16 allows. The anti-spam measure: without it a stranger can add an
+    /// identity to unbounded numbers of channels.
+    InviteQuota,
     BadRetention,
     /// Removing the last admin while other members remain.
     LastAdmin,
@@ -109,6 +115,7 @@ impl ChannelError {
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
+            ChannelError::InviteQuota => "invite_quota",
             ChannelError::BadRetention => "bad_retention",
             ChannelError::LastAdmin => "last_admin",
             ChannelError::Storage => "storage",
@@ -127,7 +134,8 @@ impl ChannelError {
             ChannelError::Full
             | ChannelError::TooManyChannels
             | ChannelError::TooManyUploads
-            | ChannelError::BlobQuota => 507,
+            | ChannelError::BlobQuota
+            | ChannelError::InviteQuota => 507,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
@@ -141,6 +149,20 @@ impl ChannelError {
     }
 }
 
+/// Whether adding `account` to another channel would exceed the invitation
+/// quota. Counts memberships they are present in and have never posted in;
+/// posting in one, or leaving it, frees the budget again.
+fn unspoken_full(db: &Connection, account: &PubKey) -> Result<bool, ChannelError> {
+    let n: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM member WHERE account = ?1 AND present = 1 AND posted = 0",
+            params![account.as_bytes()],
+            |r| r.get(0),
+        )
+        .map_err(storage("count unspoken"))?;
+    Ok(n as usize >= MAX_UNSPOKEN)
+}
+
 fn storage<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> ChannelError + '_ {
     move |e| {
         tracing::error!(error = %e, "channel storage: {what}");
@@ -150,6 +172,13 @@ fn storage<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> ChannelError +
 
 pub struct Channels {
     db: Mutex<Connection>,
+    /// Stored entry bytes one channel may hold before the oldest are pruned.
+    ///
+    /// SIP-16 calls its numbers recommended values, and this one is the only
+    /// limit an operator plausibly wants lower — it is the one that decides how
+    /// much disk a busy channel can take. It is also the only way to exercise
+    /// the byte prune without writing 128 MiB.
+    max_channel_bytes: u64,
     /// One notifier per channel, so a parked `Fetch` wakes the moment an entry
     /// lands. Kept outside the database lock on purpose: a long poll must never
     /// hold the thing every other request needs.
@@ -188,6 +217,11 @@ CREATE TABLE IF NOT EXISTS member (
     -- and posting, being an admin is attached to the channel. A row with
     -- present = 0 is somebody who administers a room they are not in.
     present INTEGER NOT NULL DEFAULT 1,
+    -- Whether this member has ever posted here, which is what the invitation
+    -- quota counts. A flag rather than a query over `entry`, because pruning
+    -- removes entries and somebody whose only message aged out would look like
+    -- a fresh invitation again.
+    posted  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (channel, account)
 );
 CREATE TABLE IF NOT EXISTS entry (
@@ -294,9 +328,18 @@ impl Channels {
         db.execute_batch(SCHEMA)?;
         Ok(Channels {
             db: Mutex::new(db),
+            max_channel_bytes: MAX_CHANNEL_BYTES,
             waiters: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Lower the stored-bytes cap. An operator may want a smaller number than
+    /// SIP-16 recommends; a test needs one, or it must write 128 MiB to find
+    /// out whether the prune runs at all.
+    pub fn with_max_channel_bytes(mut self, bytes: u64) -> Channels {
+        self.max_channel_bytes = bytes;
+        self
     }
 
     /// The notifier for a channel, created on first use.
@@ -439,6 +482,14 @@ impl Channels {
         }
         if req.invites.len() + 1 > MAX_MEMBERS {
             return Err(ChannelError::Full);
+        }
+        // An identity named in a `Create`'s invites list counts the same way,
+        // or the quota would be one request away from meaningless. Checked
+        // before anything is written, so a refusal leaves no half-channel.
+        for i in &req.invites {
+            if !blocked(&i.account, caller) && unspoken_full(&tx, &i.account)? {
+                return Err(ChannelError::InviteQuota);
+            }
         }
 
         tx.execute(
@@ -658,7 +709,15 @@ impl Channels {
                 ],
             )
             .map_err(storage("bump high water"))?;
-            prune(&tx, &req.channel, now)?;
+            // Speaking here is what frees this membership from the invitation
+            // quota, and it is one-way: leaving and being re-invited starts the
+            // membership row over.
+            tx.execute(
+                "UPDATE member SET posted = 1 WHERE channel = ?1 AND account = ?2",
+                params![&req.channel[..], account.as_bytes()],
+            )
+            .map_err(storage("mark spoken"))?;
+            prune(&tx, &req.channel, now, self.max_channel_bytes)?;
             tx.commit().map_err(storage("commit post"))?;
         }
         self.wake(&req.channel);
@@ -817,7 +876,12 @@ fn destroy(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
 
 /// Drop what the channel's policy says it should no longer hold: too old, or
 /// too many. The per-message timer only ever shortens.
-fn prune(db: &Connection, channel: &[u8; 32], now: u64) -> Result<usize, ChannelError> {
+fn prune(
+    db: &Connection,
+    channel: &[u8; 32],
+    now: u64,
+    max_bytes: u64,
+) -> Result<usize, ChannelError> {
     let mut gone = db
         .execute(
             "DELETE FROM entry WHERE channel = ?1 AND ?2 - posted >= CASE
@@ -850,6 +914,24 @@ fn prune(db: &Connection, channel: &[u8; 32], now: u64) -> Result<usize, Channel
             params![&channel[..], cap],
         )
         .map_err(storage("prune by count"))?;
+
+    // And by stored bytes, which the entry count alone does not bound: 50 000
+    // entries is nothing at a few hundred bytes each and 1.6 GiB at the 32 KiB
+    // maximum. The running total is taken from the newest backwards, and
+    // everything from the first entry that breaches the cap downwards goes —
+    // the same oldest-first rule the count uses, for the same reason. A single
+    // entry can never breach it on its own, since MAX_ENTRY_BODY is 32 KiB.
+    gone += db
+        .execute(
+            "DELETE FROM entry WHERE channel = ?1 AND seq <= (
+                 SELECT COALESCE(MAX(seq), 0) FROM (
+                     SELECT seq,
+                            SUM(length(body) + ?3) OVER (ORDER BY seq DESC) AS running
+                     FROM entry WHERE channel = ?1)
+                 WHERE running > ?2)",
+            params![&channel[..], max_bytes as i64, ENTRY_HEADER as i64],
+        )
+        .map_err(storage("prune by bytes"))?;
     Ok(gone)
 }
 
@@ -953,7 +1035,7 @@ impl Channels {
         )
         .map_err(storage("update retention"))?;
         write_system(&tx, &req.channel, EVENT_RETENTION, caller, caller, now)?;
-        prune(&tx, &req.channel, now)?;
+        prune(&tx, &req.channel, now, self.max_channel_bytes)?;
         tx.commit().map_err(storage("commit retain"))?;
         self.wake(&req.channel);
         Ok(())
@@ -1064,7 +1146,7 @@ impl Channels {
 
         let (mut pruned, mut closed) = (0usize, 0usize);
         for id in ids {
-            pruned += prune(&tx, &id, now).unwrap_or(0);
+            pruned += prune(&tx, &id, now, self.max_channel_bytes).unwrap_or(0);
             let _ = prune_attachments(&tx, &id, now);
 
             // Abandonment is a condition, not a timer on the channel: a public
@@ -1145,10 +1227,19 @@ impl Channels {
             return Err(ChannelError::DirectMessage);
         }
         let (members, _) = counts(&tx, channel)?;
-        if role_of(&tx, channel, account).is_none() && members as usize >= MAX_MEMBERS {
-            return Err(ChannelError::Full);
-        }
         let was = role_of(&tx, channel, account);
+        if was.is_none() {
+            if members as usize >= MAX_MEMBERS {
+                return Err(ChannelError::Full);
+            }
+            // Refused, and refused distinguishably: a quota that dropped the
+            // invitation silently would leave the admin believing it landed.
+            // Changing an existing member's role is not an invitation and does
+            // not consult this.
+            if unspoken_full(&tx, account)? {
+                return Err(ChannelError::InviteQuota);
+            }
+        }
         tx.execute(
             "INSERT INTO member (channel, account, role, joined, present)
              VALUES (?1, ?2, ?3, ?4, 1)
@@ -2207,5 +2298,219 @@ impl Channels {
                 body,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqex_proto::channel::MAX_ENTRY_BODY;
+
+    fn key(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    fn public_channel(retention_secs: u32) -> Create {
+        Create {
+            channel: [7; 32],
+            visibility: Visibility::Public,
+            retention_secs,
+            max_entries: 0,
+            name: String::new(),
+            topic: String::new(),
+            invites: Vec::new(),
+        }
+    }
+
+    fn stored_bytes(c: &Channels) -> u64 {
+        let db = c.db.lock().unwrap();
+        db.query_row(
+            "SELECT COALESCE(SUM(length(body)), 0) FROM entry WHERE channel = ?1",
+            params![&[7u8; 32][..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as u64
+    }
+
+    #[test]
+    fn a_channel_is_pruned_to_its_byte_cap_oldest_first() {
+        // Ten entries at 32 KiB and room for four. The entry count alone would
+        // not bound this: 50 000 of them is 1.6 GiB.
+        let cap = 4 * (MAX_ENTRY_BODY + ENTRY_HEADER) as u64;
+        let c = Channels::open(None).unwrap().with_max_channel_bytes(cap);
+        let alice = key(1);
+        c.create(&alice, &public_channel(MAX_RETENTION), &|_, _| false)
+            .unwrap();
+
+        for i in 0..10u8 {
+            c.post(
+                &alice,
+                &alice,
+                &Post {
+                    channel: [7; 32],
+                    epoch: 0,
+                    msg_seq: i as u64,
+                    expires_after: 0,
+                    body: vec![i; MAX_ENTRY_BODY],
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(stored_bytes(&c) <= cap, "the cap is not enforced");
+        let got = c.fetch(&alice, &[7; 32], 0).unwrap();
+        let member: Vec<&Entry> = got.entries.iter().filter(|e| e.kind == KIND_MEMBER).collect();
+        assert_eq!(member.len(), 4, "want the four newest kept");
+        // Oldest first, exactly as the count prune does: what survives is the
+        // tail, and the sequence numbers are not reissued.
+        assert_eq!(member[0].body[0], 6);
+        assert_eq!(member[3].body[0], 9);
+    }
+
+    #[test]
+    fn the_byte_cap_does_not_bite_a_small_channel() {
+        let c = Channels::open(None).unwrap();
+        let alice = key(1);
+        c.create(&alice, &public_channel(MAX_RETENTION), &|_, _| false)
+            .unwrap();
+        for i in 0..20u8 {
+            c.post(
+                &alice,
+                &alice,
+                &Post {
+                    channel: [7; 32],
+                    epoch: 0,
+                    msg_seq: i as u64,
+                    expires_after: 0,
+                    body: b"a short message".to_vec(),
+                },
+            )
+            .unwrap();
+        }
+        let got = c.fetch(&alice, &[7; 32], 0).unwrap();
+        assert_eq!(got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(), 20);
+    }
+
+    fn channel_n(n: u8, visibility: Visibility) -> Create {
+        Create {
+            channel: [n; 32],
+            visibility,
+            retention_secs: MAX_RETENTION,
+            max_entries: 0,
+            name: String::new(),
+            topic: String::new(),
+            invites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_stranger_cannot_add_someone_to_unbounded_channels() {
+        let c = Channels::open(None).unwrap();
+        let spammer = key(1);
+        let victim = key(2);
+
+        // Fill the budget: MAX_UNSPOKEN channels the victim has been added to
+        // and never spoken in.
+        for n in 0..MAX_UNSPOKEN {
+            let mut req = channel_n(n as u8, Visibility::Public);
+            req.channel[31] = (n >> 8) as u8;
+            c.create(&spammer, &req, &|_, _| false).unwrap();
+            c.invite(&spammer, &req.channel, &victim, Role::Member, &|_, _| false)
+                .unwrap();
+        }
+
+        let one_more = channel_n(200, Visibility::Public);
+        c.create(&spammer, &one_more, &|_, _| false).unwrap();
+        assert!(matches!(
+            c.invite(&spammer, &one_more.channel, &victim, Role::Member, &|_, _| false),
+            Err(ChannelError::InviteQuota)
+        ));
+        // Refused distinguishably, and not silently: 507, not a malformed
+        // request and not a 200 the admin would read as success.
+        assert_eq!(ChannelError::InviteQuota.status(), 507);
+
+        // Named in a Create's invites list, the answer is the same — otherwise
+        // the quota is one request away from meaningless.
+        let mut with_invite = channel_n(201, Visibility::Private);
+        with_invite.invites = vec![Invitee {
+            account: victim,
+            role: Role::Member,
+        }];
+        assert!(matches!(
+            c.create(&spammer, &with_invite, &|_, _| false),
+            Err(ChannelError::InviteQuota)
+        ));
+    }
+
+    #[test]
+    fn speaking_in_one_channel_frees_the_budget_and_so_does_leaving() {
+        let c = Channels::open(None).unwrap();
+        let spammer = key(1);
+        let victim = key(2);
+        for n in 0..MAX_UNSPOKEN {
+            let mut req = channel_n(n as u8, Visibility::Public);
+            req.channel[31] = (n >> 8) as u8;
+            c.create(&spammer, &req, &|_, _| false).unwrap();
+            c.invite(&spammer, &req.channel, &victim, Role::Member, &|_, _| false)
+                .unwrap();
+        }
+        let next = channel_n(200, Visibility::Public);
+        c.create(&spammer, &next, &|_, _| false).unwrap();
+        assert!(c
+            .invite(&spammer, &next.channel, &victim, Role::Member, &|_, _| false)
+            .is_err());
+
+        // Post in one of them.
+        let mut spoken = [0u8; 32];
+        spoken[31] = 0;
+        c.post(
+            &victim,
+            &victim,
+            &Post {
+                channel: spoken,
+                epoch: 0,
+                msg_seq: 0,
+                expires_after: 0,
+                body: b"hello".to_vec(),
+            },
+        )
+        .unwrap();
+        c.invite(&spammer, &next.channel, &victim, Role::Member, &|_, _| false)
+            .expect("speaking in one frees the budget");
+
+        // And leaving frees it too.
+        let another = channel_n(202, Visibility::Public);
+        c.create(&spammer, &another, &|_, _| false).unwrap();
+        assert!(c
+            .invite(&spammer, &another.channel, &victim, Role::Member, &|_, _| false)
+            .is_err());
+        let mut quiet = [1u8; 32];
+        quiet[31] = 0;
+        c.leave(&victim, &quiet).unwrap();
+        c.invite(&spammer, &another.channel, &victim, Role::Member, &|_, _| false)
+            .expect("leaving frees the budget");
+    }
+
+    #[test]
+    fn changing_an_existing_members_role_is_not_an_invitation() {
+        let c = Channels::open(None).unwrap();
+        let admin = key(1);
+        let member = key(2);
+        let home = channel_n(9, Visibility::Private);
+        c.create(&admin, &home, &|_, _| false).unwrap();
+        c.invite(&admin, &home.channel, &member, Role::Member, &|_, _| false)
+            .unwrap();
+        // Fill the rest of the budget elsewhere.
+        for n in 0..(MAX_UNSPOKEN - 1) {
+            let mut req = channel_n(n as u8, Visibility::Public);
+            req.channel[31] = (n >> 8) as u8;
+            req.channel[30] = 0xaa;
+            c.create(&admin, &req, &|_, _| false).unwrap();
+            c.invite(&admin, &req.channel, &member, Role::Member, &|_, _| false)
+                .unwrap();
+        }
+        // Promoting them where they already are must not be refused.
+        c.invite(&admin, &home.channel, &member, Role::Admin, &|_, _| false)
+            .expect("a promotion is not an invitation");
     }
 }
