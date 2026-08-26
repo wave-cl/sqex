@@ -19,6 +19,7 @@ use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::Config;
 use crate::mailbox::Mailbox;
+use crate::prekey::Prekeys;
 use crate::room::Rooms;
 use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
@@ -29,6 +30,7 @@ use sqex_proto::channel::{
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
+use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
 
@@ -115,6 +117,7 @@ pub struct Server {
     mailbox: Mailbox,
     rooms: Rooms,
     channels: Channels,
+    prekeys: Prekeys,
     sessions: Sessions,
     live_conns: Connections,
     started: Instant,
@@ -184,6 +187,11 @@ pub async fn bind(
         // in production, and an operator choosing that is choosing it.
         channels: Channels::open(channel_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
+        // Prekeys are in memory on purpose: a one-time key that survived a
+        // restart the device did not is a key whose secret is gone, and
+        // serving it would only produce an envelope nobody can open. Losing
+        // the pool costs a client one publish.
+        prekeys: Prekeys::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
         started: Instant::now(),
@@ -453,6 +461,48 @@ async fn route(
         // carries. It relays each member's proof without checking it — checking
         // needs the secret it has deliberately not been told — and the members
         // verify each other.
+        // SIP-23 prekeys. The exchange hands each one-time key out at most
+        // once; it cannot enforce the deletion at the other end, and is not
+        // trusted to serve honestly either — a recipient rejects an envelope
+        // naming an id it has already consumed. What it can do is not break
+        // the property by accident.
+        ("POST", "/prekey/publish") => match (peer.identity, PrekeyPublish::decode(body)) {
+            (None, _) => no_identity("publishing prekeys"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.prekeys.publish(&me, &req.prekeys) {
+                Ok(accepted) => {
+                    let mut out = accepted.to_be_bytes().to_vec();
+                    out.extend_from_slice(&now_unix().to_be_bytes());
+                    (200, "application/octet-stream", out)
+                }
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+        // Unauthenticated by necessity: anybody who may seal to a device has
+        // to be able to fetch one. Draining a pool is therefore a denial of
+        // service anyone can cause, which the fallback turns into a loss of
+        // forward secrecy rather than a failure to rotate.
+        ("POST", "/prekey/take") => match PrekeyTake::decode(body) {
+            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Ok(req) => (
+                200,
+                "application/octet-stream",
+                server.prekeys.take(&req.device).encode(),
+            ),
+        },
+        ("POST", "/prekey/count") => match peer.identity {
+            None => no_identity("counting prekeys"),
+            Some(me) => (
+                200,
+                "application/octet-stream",
+                server.prekeys.count(&me).encode(),
+            ),
+        },
+
         // SIP-16 channels: a durable, ordered log. Every route here requires
         // membership or an admin role, and it is checked at the moment of the
         // call — a removed member's next fetch is refused, including one

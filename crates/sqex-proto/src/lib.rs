@@ -13,6 +13,7 @@
 pub mod beacon;
 pub mod channel;
 pub mod mailbox;
+pub mod prekey;
 pub mod room;
 pub mod session;
 
