@@ -21,7 +21,7 @@ use sqex_proto::timeline::{Received, Timeline};
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-use crate::store::{Store, StoreError};
+use crate::store::{Kept, Store, StoreError};
 
 /// A direct message's retention window, in seconds.
 ///
@@ -124,6 +124,9 @@ pub struct Conversation {
     /// have been away longer than the window and there is history we can never
     /// fill. It must be shown as a gap and not as the whole conversation.
     pub gap: bool,
+    /// Entries held under a superseded epoch we have no key for. Gone for
+    /// good, as against `unreadable`, which is something to wait for.
+    pub lost: usize,
     /// Somebody is typing (SIP-19's only signal).
     pub typing: bool,
     pub last: u64,
@@ -673,6 +676,31 @@ impl Chat {
         Ok(self.info(channel).await?.epoch)
     }
 
+    /// Add somebody without giving them the key.
+    ///
+    /// The exchange permits it and SIP-17 describes the result: a member who
+    /// can fetch entries and open none of them. Exposed for tests, because the
+    /// distinction between history that is gone and a key that has not arrived
+    /// is only worth having if both sides of it are checked.
+    #[doc(hidden)]
+    pub async fn post_invite_without_key(
+        &mut self,
+        channel: &[u8; 32],
+        who: &PubKey,
+    ) -> Result<()> {
+        self.post(
+            "/channel/invite",
+            Invite {
+                channel: *channel,
+                account: *who,
+                role: Role::Member,
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Remove somebody, and rotate so what follows is not theirs.
     ///
     /// The rotation is the point and it is not optional: the exchange refuses
@@ -859,11 +887,13 @@ impl Chat {
             // written here is one this client can never read again.
             self.store.put_message(
                 channel,
-                e.seq,
-                &e.account,
-                e.posted,
-                e.kind,
-                plain.as_deref(),
+                Kept {
+                    seq: e.seq,
+                    account: e.account,
+                    posted: e.posted,
+                    kind: e.kind,
+                    plain: plain.as_deref(),
+                },
             )?;
             let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
             timeline.apply(
@@ -887,9 +917,26 @@ impl Chat {
                 && matches!(Signal::decode(&s.body), Ok(Some(Signal::Typing(true))))
         });
 
+        // Everything the timeline could not open, minus what is gone for good:
+        // the two are counted apart because they deserve different words, and
+        // reporting a permanent loss every session as though it were a fault
+        // is how a status line stops being read.
+        // Whether an unopened entry is gone or merely late is one question
+        // about the channel, not one per message: if we hold the key for the
+        // epoch in force, anything still shut is under an older one, and a
+        // rotation hands out the next epoch and never a past one. If we do not
+        // hold it, the opposite — an admin can still send it.
+        //
+        // Derived rather than recorded, deliberately. An earlier version wrote
+        // the judgement onto each row as it arrived, which went stale the
+        // moment a rotation changed the answer and left rows nothing would
+        // ever revisit.
+        let have_current = self.store.key(channel, info.epoch)?.is_some();
+        let shut: Vec<u64> = timeline.unreadable().to_vec();
         Ok(Conversation {
+            lost: if have_current { shut.len() } else { 0 },
+            unreadable: if have_current { Vec::new() } else { shut },
             timeline: timeline.clone(),
-            unreadable: timeline.unreadable().to_vec(),
             gap,
             typing,
             last,

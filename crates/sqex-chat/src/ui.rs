@@ -53,8 +53,12 @@ pub struct Said {
 /// What the status line has to say, in the order it says it.
 #[derive(Default)]
 pub struct Trouble {
-    /// Entries held and not openable.
+    /// Entries held and not openable **yet** — under the epoch in force, so a
+    /// key could still arrive.
     pub unreadable: usize,
+    /// Entries under a superseded epoch we never held a key for. Gone, and
+    /// nothing that happens later brings them back.
+    pub lost: usize,
     /// The current epoch, when we hold no key for it.
     pub no_key: Option<u32>,
     /// History older than the retention window, gone for good.
@@ -64,6 +68,11 @@ pub struct Trouble {
 }
 
 impl Trouble {
+    /// Whether there is nothing to act on.
+    ///
+    /// `lost` is deliberately not counted: it is history that is gone, said
+    /// once in the transcript where the messages would have been, and not a
+    /// fault for somebody to chase every session.
     pub fn is_quiet(&self) -> bool {
         self.unreadable == 0 && self.no_key.is_none() && !self.gap && self.message.is_none()
     }
@@ -87,7 +96,7 @@ impl Trouble {
         }
         if self.unreadable > 0 {
             parts.push(format!(
-                "{} message{} could not be opened",
+                "{} message{} cannot be opened yet",
                 self.unreadable,
                 if self.unreadable == 1 { "" } else { "s" }
             ));
@@ -225,6 +234,20 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
 
 fn transcript(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
+    if app.trouble.lost > 0 {
+        // In the transcript, above the messages that did survive, because that
+        // is where the missing ones would have been. A status line would say
+        // it every session as though something were still going wrong.
+        lines.push(Line::from(Span::styled(
+            format!(
+                "─── {} earlier message{} {} lost with this client's keys ───",
+                app.trouble.lost,
+                if app.trouble.lost == 1 { "" } else { "s" },
+                if app.trouble.lost == 1 { "was" } else { "were" }
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     if app.trouble.gap {
         lines.push(Line::from(Span::styled(
             "─── older messages are past the retention window and cannot be recovered ───",
@@ -331,6 +354,7 @@ mod tests {
         // conversation and "no key" does.
         let t = Trouble {
             unreadable: 3,
+            lost: 0,
             no_key: Some(2),
             gap: true,
             message: None,
@@ -338,7 +362,7 @@ mod tests {
         let line = t.line();
         assert!(line.starts_with("no key for epoch 2"), "{line}");
         assert!(line.contains("retention window"));
-        assert!(line.contains("3 messages could not be opened"));
+        assert!(line.contains("3 messages cannot be opened yet"));
         assert!(!t.is_quiet());
     }
 
@@ -355,7 +379,7 @@ mod tests {
             unreadable: 1,
             ..Default::default()
         };
-        assert_eq!(t.line(), "1 message could not be opened");
+        assert_eq!(t.line(), "1 message cannot be opened yet");
     }
 
     #[test]
@@ -493,6 +517,31 @@ mod tests {
         assert!(out.contains("/save 3"), "the message number is not shown:\n{out}");
         // And not on the line that has no file to save.
         assert!(!out.contains("/save 4"));
+    }
+
+    #[test]
+    fn lost_history_is_stated_once_in_the_transcript_not_in_the_status() {
+        // It is permanent, so a status line repeating it every session is how
+        // a status line stops being read.
+        let mut app = sample();
+        app.trouble.lost = 17;
+        let out = render(&app, 100, 20);
+        assert!(out.contains("17 earlier messages were lost"), "{out}");
+        assert!(
+            out.contains("^C quit"),
+            "the status line should be free for things to act on"
+        );
+        assert!(app.trouble.is_quiet(), "lost history is not a fault to chase");
+    }
+
+    #[test]
+    fn something_to_wait_for_reads_differently_from_something_gone() {
+        let t = Trouble {
+            unreadable: 2,
+            ..Default::default()
+        };
+        assert_eq!(t.line(), "2 messages cannot be opened yet");
+        assert!(!t.is_quiet());
     }
 
     #[test]
