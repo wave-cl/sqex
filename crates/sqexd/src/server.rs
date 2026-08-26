@@ -30,6 +30,11 @@ use sqex_proto::channel::{
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
+use sqex_proto::blob_store::{
+    Begin as BlobBegin, ByBlob, ByChannelBlob, Begun, Commit as BlobCommit, Committed, GetChunk,
+    Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT, TYPE_DETACH as BL_DETACH,
+    TYPE_HEAD as BL_HEAD, ByUpload,
+};
 use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
@@ -48,6 +53,14 @@ const ALPN: &[u8] = b"h3";
 /// that a short retention window means what it says, rare enough to be
 /// invisible.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Largest body for the blob upload route, and only that route.
+///
+/// SIP-18's chunk is 256 KiB against a uniform 64 KiB cap, and it says an
+/// exchange adding the blob service raises the limit there and keeps it
+/// everywhere else. Uniformity is worth something — one number bounding every
+/// request is easy to reason about — so the exception is exactly one path.
+const MAX_CHUNK_BODY: usize = sqex_proto::blob_store::CHUNK + 1024;
 
 /// Largest admin-command body we will read.
 const MAX_BODY: usize = 64 * 1024;
@@ -372,6 +385,11 @@ async fn handle_stream(
     let path = req.uri().path().to_string();
 
     // Read the request body (bounded), if any.
+    let cap = if path == "/blob/put" {
+        MAX_CHUNK_BODY
+    } else {
+        MAX_BODY
+    };
     let mut body = Vec::new();
     while let Some(mut chunk) = stream
         .recv_data()
@@ -380,7 +398,7 @@ async fn handle_stream(
     {
         while chunk.remaining() > 0 {
             let n = chunk.chunk().len();
-            if body.len() + n > MAX_BODY {
+            if body.len() + n > cap {
                 return respond(&mut stream, 413, "text/plain", b"body too large".to_vec()).await;
             }
             body.extend_from_slice(chunk.chunk());
@@ -464,6 +482,101 @@ async fn route(
         // carries. It relays each member's proof without checking it — checking
         // needs the secret it has deliberately not been told — and the members
         // verify each other.
+        // SIP-18 blobs. The exchange holds sealed chunks and no key that
+        // opens one; every message here moves ciphertext, an identifier or a
+        // channel, and none has a field for the key. A convenience endpoint
+        // that accepted one — for thumbnailing, scanning, transcoding — would
+        // break the SIP while conforming to every other rule in it.
+        ("POST", "/blob/limits") => (
+            200,
+            "application/octet-stream",
+            Limits {
+                chunk: sqex_proto::blob_store::CHUNK as u32,
+                max_blob: sqex_proto::blob_store::MAX_BLOB,
+                max_chunks: sqex_proto::blob_store::MAX_CHUNKS,
+                now: now_unix(),
+            }
+            .encode(),
+        ),
+        ("POST", "/blob/begin") => match (peer.identity, BlobBegin::decode(body)) {
+            (None, _) => no_identity("beginning an upload"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.begin_upload(&me, &req) {
+                Ok(upload) => (
+                    200,
+                    "application/octet-stream",
+                    Begun { upload, now: now_unix() }.encode(),
+                ),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/blob/put") => match (peer.identity, BlobPut::decode(body)) {
+            (None, _) => no_identity("uploading a chunk"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.put_chunk(&me, &req) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/blob/commit") => match (peer.identity, BlobCommit::decode(body)) {
+            (None, _) => no_identity("committing an upload"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                match server.channels.commit_upload(&me, req.upload, &req.blob) {
+                    Ok(stored) => (
+                        200,
+                        "application/octet-stream",
+                        Committed { stored, blob: req.blob, now: now_unix() }.encode(),
+                    ),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        ("POST", "/blob/abort") => match (peer.identity, ByUpload::decode(body, BL_ABORT)) {
+            (None, _) => no_identity("aborting an upload"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.abort_upload(&me, req.upload) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/blob/head") => match (peer.identity, ByBlob::decode(body, BL_HEAD)) {
+            (None, _) => no_identity("reading a blob"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.head_blob(&me, &req.blob) {
+                Ok(h) => (200, "application/octet-stream", h.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/blob/get") => match (peer.identity, GetChunk::decode(body)) {
+            (None, _) => no_identity("fetching a chunk"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.get_chunk(&me, &req.blob, req.index) {
+                Ok(c) => (200, "application/octet-stream", c.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/blob/attach") => {
+            match (peer.identity, ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH)) {
+                (None, _) => no_identity("attaching a blob"),
+                (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+                (Some(me), Ok(req)) => match server.channels.attach_blob(&me, &req) {
+                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Err(e) => refused(e),
+                },
+            }
+        }
+        ("POST", "/blob/detach") => match (peer.identity, ByChannelBlob::decode(body, BL_DETACH)) {
+            (None, _) => no_identity("detaching a blob"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                match server.channels.detach_blob(&me, &req.channel, &req.blob) {
+                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+
         // SIP-23 prekeys. The exchange hands each one-time key out at most
         // once; it cannot enforce the deletion at the other end, and is not
         // trusted to serve honestly either — a recipient rejects an envelope

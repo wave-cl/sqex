@@ -38,6 +38,10 @@ use sqex_proto::channel::{
     MAX_BATCH_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
     MAX_RETENTION, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role, Visibility,
 };
+use sqex_proto::blob_store::{
+    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_CHANNEL_BLOB_BYTES, MAX_UPLOADS,
+    PutChunk as BlobPut, UPLOAD_TTL, blob_id,
+};
 use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
 };
@@ -68,6 +72,12 @@ pub enum ChannelError {
     DirectMessage,
     /// An envelope naming prekey id 0. There is no static-only path.
     NoPrekey,
+    NoSuchUpload,
+    NoSuchBlob,
+    /// A chunk index outside what the upload reserved.
+    BadChunk,
+    TooManyUploads,
+    BlobQuota,
     BadRetention,
     /// Removing the last admin while other members remain.
     LastAdmin,
@@ -87,6 +97,11 @@ impl ChannelError {
             ChannelError::NotPrivate => "not_private",
             ChannelError::DirectMessage => "direct_message",
             ChannelError::NoPrekey => "no_prekey",
+            ChannelError::NoSuchUpload => "no_such_upload",
+            ChannelError::NoSuchBlob => "no_such_blob",
+            ChannelError::BadChunk => "bad_chunk",
+            ChannelError::TooManyUploads => "too_many_uploads",
+            ChannelError::BlobQuota => "blob_quota",
             ChannelError::BadRetention => "bad_retention",
             ChannelError::LastAdmin => "last_admin",
             ChannelError::Storage => "storage",
@@ -97,15 +112,21 @@ impl ChannelError {
     /// request, as SIP-16 requires, and never silent.
     pub fn status(&self) -> u16 {
         match self {
-            ChannelError::NoSuchChannel => 404,
+            ChannelError::NoSuchChannel
+            | ChannelError::NoSuchUpload
+            | ChannelError::NoSuchBlob => 404,
             ChannelError::NotAMember | ChannelError::NotAnAdmin | ChannelError::NotPublic => 403,
-            ChannelError::Full | ChannelError::TooManyChannels => 507,
+            ChannelError::Full
+            | ChannelError::TooManyChannels
+            | ChannelError::TooManyUploads
+            | ChannelError::BlobQuota => 507,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
             | ChannelError::NotPrivate
             | ChannelError::DirectMessage
-            | ChannelError::NoPrekey => 409,
+            | ChannelError::NoPrekey
+            | ChannelError::BadChunk => 409,
             ChannelError::Storage => 500,
         }
     }
@@ -185,6 +206,44 @@ CREATE TABLE IF NOT EXISTS envelope (
     -- direct-message creation race: both ends mint epoch 1 and publish, one
     -- Put wins, and the loser is told so and collects instead.
     PRIMARY KEY (channel, recipient, epoch)
+);
+CREATE TABLE IF NOT EXISTS blob (
+    id     BLOB PRIMARY KEY,
+    size   INTEGER NOT NULL,
+    chunks INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS blob_chunk (
+    blob   BLOB    NOT NULL,
+    idx    INTEGER NOT NULL,
+    sealed BLOB    NOT NULL,
+    PRIMARY KEY (blob, idx)
+);
+-- A blob is attached to channels, never to a message: the exchange cannot read
+-- a reference, so it cannot count them. An attachment ages against the
+-- channel's window, or the message's own timer if that is shorter, and a blob
+-- with no attachments left is deleted.
+CREATE TABLE IF NOT EXISTS attachment (
+    channel       BLOB    NOT NULL,
+    blob          BLOB    NOT NULL,
+    attached      INTEGER NOT NULL,
+    expires_after INTEGER NOT NULL,
+    uploader      BLOB    NOT NULL,
+    PRIMARY KEY (channel, blob)
+);
+CREATE TABLE IF NOT EXISTS upload (
+    id            INTEGER PRIMARY KEY,
+    channel       BLOB    NOT NULL,
+    uploader      BLOB    NOT NULL,
+    size          INTEGER NOT NULL,
+    chunks        INTEGER NOT NULL,
+    expires_after INTEGER NOT NULL,
+    started       INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS upload_chunk (
+    upload INTEGER NOT NULL,
+    idx    INTEGER NOT NULL,
+    sealed BLOB    NOT NULL,
+    PRIMARY KEY (upload, idx)
 );
 CREATE INDEX IF NOT EXISTS entry_by_age ON entry (posted);
 "#;
@@ -642,6 +701,7 @@ fn destroy(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
     for sql in [
         "DELETE FROM entry WHERE channel = ?1",
         "DELETE FROM envelope WHERE channel = ?1",
+        "DELETE FROM attachment WHERE channel = ?1",
         "DELETE FROM member WHERE channel = ?1",
         "DELETE FROM high_water WHERE channel = ?1",
         "DELETE FROM channel WHERE id = ?1",
@@ -804,7 +864,23 @@ impl Channels {
         if !is_admin(&tx, channel, caller) {
             return Err(ChannelError::NotAnAdmin);
         }
+        let held: Vec<[u8; 32]> = {
+            let mut stmt = tx
+                .prepare("SELECT blob FROM attachment WHERE channel = ?1")
+                .map_err(storage("prepare held blobs"))?;
+            let rows = stmt
+                .query_map(params![&channel[..]], |r| {
+                    Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+                })
+                .map_err(storage("query held blobs"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
         destroy(&tx, channel)?;
+        // A blob attached elsewhere survives: closing one channel must not
+        // take a photograph out of another.
+        for blob in held {
+            collect_blob(&tx, &blob)?;
+        }
         tx.commit().map_err(storage("commit close"))?;
         Ok(())
     }
@@ -879,9 +955,12 @@ impl Channels {
             rows.filter_map(|r| r.ok()).collect()
         };
 
+        let _ = expire_uploads(&tx, now);
+
         let (mut pruned, mut closed) = (0usize, 0usize);
         for id in ids {
             pruned += prune(&tx, &id, now).unwrap_or(0);
+            let _ = prune_attachments(&tx, &id, now);
 
             // Abandonment is a condition, not a timer on the channel: a public
             // room holding nothing that nobody is in. One with a single old
@@ -1230,4 +1309,447 @@ fn is_direct_message(db: &Connection, channel: &[u8; 32]) -> Result<bool, Channe
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(storage("read dm check"))?;
     Ok(members.len() == 2 && direct_message_id(&members[0], &members[1]) == *channel)
+}
+
+/// SIP-18 blob storage.
+///
+/// Chunks live in the same database as the channel log, which is a deliberate
+/// choice and not the only reasonable one. Files on disk would be faster for
+/// bytes this size and would keep the database small; one store gives atomic
+/// deletion instead — a blob and its last attachment go in a single
+/// transaction, and there is no window in which a row points at a file that is
+/// no longer there or a file survives the row that named it. That matters more
+/// here than throughput, because the lifetime rules are the hard part.
+impl Channels {
+    /// Reserve an upload against a channel's blob quota.
+    pub fn begin_upload(
+        &self,
+        uploader: &PubKey,
+        req: &BlobBegin,
+    ) -> Result<u64, ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin upload"))?;
+        visibility_of(&tx, &req.channel)?;
+        if role_of(&tx, &req.channel, uploader).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        expire_uploads(&tx, now)?;
+
+        let open: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM upload WHERE uploader = ?1",
+                params![uploader.as_bytes()],
+                |r| r.get(0),
+            )
+            .map_err(storage("count uploads"))?;
+        if open as usize >= MAX_UPLOADS {
+            return Err(ChannelError::TooManyUploads);
+        }
+        if channel_blob_bytes(&tx, &req.channel)? + req.size > MAX_CHANNEL_BLOB_BYTES {
+            return Err(ChannelError::BlobQuota);
+        }
+
+        tx.execute(
+            "INSERT INTO upload (channel, uploader, size, chunks, expires_after, started)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &req.channel[..],
+                uploader.as_bytes(),
+                req.size as i64,
+                req.chunks as i64,
+                req.expires_after as i64,
+                now as i64,
+            ],
+        )
+        .map_err(storage("insert upload"))?;
+        let id = tx.last_insert_rowid() as u64;
+        tx.commit().map_err(storage("commit begin"))?;
+        Ok(id)
+    }
+
+    /// Write one chunk. Chunks may arrive in any order and a repeat overwrites,
+    /// so a client that lost a response retries rather than starting again.
+    pub fn put_chunk(
+        &self,
+        uploader: &PubKey,
+        req: &BlobPut,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        let (owner, chunks) = upload_row(&db, req.upload)?;
+        if &owner != uploader {
+            return Err(ChannelError::NotAMember);
+        }
+        if req.index >= chunks {
+            return Err(ChannelError::BadChunk);
+        }
+        db.execute(
+            "INSERT INTO upload_chunk (upload, idx, sealed) VALUES (?1, ?2, ?3)
+             ON CONFLICT (upload, idx) DO UPDATE SET sealed = excluded.sealed",
+            params![req.upload as i64, req.index as i64, &req.sealed],
+        )
+        .map_err(storage("insert chunk"))?;
+        Ok(())
+    }
+
+    /// Assemble, verify the name, and store.
+    ///
+    /// The exchange hashes what it received and refuses a result that does not
+    /// equal the claimed identifier — which is the whole reason the name is
+    /// over the ciphertext rather than the plaintext. It cannot read a byte of
+    /// this and can still tell it is being told the truth about it.
+    pub fn commit_upload(
+        &self,
+        uploader: &PubKey,
+        upload: u64,
+        claimed: &[u8; 32],
+    ) -> Result<bool, ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin commit"))?;
+        let (owner, chunks) = upload_row(&tx, upload)?;
+        if &owner != uploader {
+            return Err(ChannelError::NotAMember);
+        }
+        let (channel, size, expires_after): ([u8; 32], u64, u32) = tx
+            .query_row(
+                "SELECT channel, size, expires_after FROM upload WHERE id = ?1",
+                params![upload as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u32,
+                    ))
+                },
+            )
+            .map_err(storage("read upload"))?;
+
+        let mut sealed = Vec::with_capacity(chunks as usize);
+        for i in 0..chunks {
+            let got: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT sealed FROM upload_chunk WHERE upload = ?1 AND idx = ?2",
+                    params![upload as i64, i as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("read chunk"))?;
+            match got {
+                Some(c) => sealed.push(c),
+                // A missing chunk is refused the same way a wrong hash is: the
+                // upload did not come to what it said it would.
+                None => return Ok(false),
+            }
+        }
+        if blob_id(&sealed) != *claimed {
+            return Ok(false);
+        }
+
+        // A commit naming a blob already held stores no second copy. The
+        // uploader cannot tell whether the bytes were already there, which is
+        // bounded by their having needed the exact key to produce this name.
+        tx.execute(
+            "INSERT OR IGNORE INTO blob (id, size, chunks) VALUES (?1, ?2, ?3)",
+            params![&claimed[..], size as i64, chunks as i64],
+        )
+        .map_err(storage("insert blob"))?;
+        for (i, c) in sealed.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO blob_chunk (blob, idx, sealed) VALUES (?1, ?2, ?3)",
+                params![&claimed[..], i as i64, c],
+            )
+            .map_err(storage("insert blob chunk"))?;
+        }
+        attach(&tx, &channel, claimed, uploader, expires_after, now)?;
+        drop_upload(&tx, upload)?;
+        tx.commit().map_err(storage("commit upload"))?;
+        Ok(true)
+    }
+
+    pub fn abort_upload(&self, uploader: &PubKey, upload: u64) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        let (owner, _) = upload_row(&db, upload)?;
+        if &owner != uploader {
+            return Err(ChannelError::NotAMember);
+        }
+        drop_upload(&db, upload)
+    }
+
+    /// Whether the caller may fetch a blob: a member of any channel it is
+    /// attached to, or anybody at all if one of those channels is public.
+    fn may_fetch(db: &Connection, who: &PubKey, blob: &[u8; 32]) -> Result<bool, ChannelError> {
+        let mut stmt = db
+            .prepare("SELECT channel FROM attachment WHERE blob = ?1")
+            .map_err(storage("prepare fetch check"))?;
+        let channels: Vec<[u8; 32]> = stmt
+            .query_map(params![&blob[..]], |r| {
+                Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+            })
+            .map_err(storage("query fetch check"))?
+            .filter_map(|c| c.ok())
+            .collect();
+        for c in channels {
+            if visibility_of(db, &c) == Ok(Visibility::Public) || role_of(db, &c, who).is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn head_blob(&self, who: &PubKey, blob: &[u8; 32]) -> Result<Headed, ChannelError> {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        if !Self::may_fetch(&db, who, blob)? {
+            return Ok(Headed::none(now));
+        }
+        let row: Option<(u64, u32)> = db
+            .query_row(
+                "SELECT size, chunks FROM blob WHERE id = ?1",
+                params![&blob[..]],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u32)),
+            )
+            .optional()
+            .map_err(storage("read blob"))?;
+        let attached: u64 = db
+            .query_row(
+                "SELECT COALESCE(MAX(attached), 0) FROM attachment WHERE blob = ?1",
+                params![&blob[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage("read attached"))? as u64;
+        Ok(match row {
+            Some((size, chunks)) => Headed {
+                found: true,
+                size,
+                chunks,
+                attached,
+                now,
+            },
+            None => Headed::none(now),
+        })
+    }
+
+    pub fn get_chunk(
+        &self,
+        who: &PubKey,
+        blob: &[u8; 32],
+        index: u32,
+    ) -> Result<Chunk, ChannelError> {
+        let db = self.db.lock().unwrap();
+        if !Self::may_fetch(&db, who, blob)? {
+            return Ok(Chunk::none(index));
+        }
+        let sealed: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT sealed FROM blob_chunk WHERE blob = ?1 AND idx = ?2",
+                params![&blob[..], index as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read blob chunk"))?;
+        Ok(match sealed {
+            Some(sealed) => Chunk {
+                found: true,
+                index,
+                sealed,
+            },
+            None => Chunk::none(index),
+        })
+    }
+
+    /// Attach an existing blob to a second channel. This is what a forward
+    /// does: it costs the reference, not the file.
+    pub fn attach_blob(
+        &self,
+        who: &PubKey,
+        req: &ByChannelBlob,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin attach"))?;
+        visibility_of(&tx, &req.channel)?;
+        if role_of(&tx, &req.channel, who).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        if !Self::may_fetch(&tx, who, &req.blob)? {
+            return Err(ChannelError::NoSuchBlob);
+        }
+        attach(&tx, &req.channel, &req.blob, who, req.expires_after, now)?;
+        tx.commit().map_err(storage("commit attach"))?;
+        Ok(())
+    }
+
+    /// Remove an attachment, deleting the blob if it was the last.
+    ///
+    /// This is what a client issues alongside a redaction: the exchange cannot
+    /// read the reference, so it has no way to know a blob just lost its last
+    /// mention, and only the redacting client does.
+    pub fn detach_blob(
+        &self,
+        who: &PubKey,
+        channel: &[u8; 32],
+        blob: &[u8; 32],
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin detach"))?;
+        visibility_of(&tx, channel)?;
+        let uploader: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT uploader FROM attachment WHERE channel = ?1 AND blob = ?2",
+                params![&channel[..], &blob[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read attachment"))?;
+        let Some(uploader) = uploader else {
+            return Err(ChannelError::NoSuchBlob);
+        };
+        if uploader != who.as_bytes() && !is_admin(&tx, channel, who) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        tx.execute(
+            "DELETE FROM attachment WHERE channel = ?1 AND blob = ?2",
+            params![&channel[..], &blob[..]],
+        )
+        .map_err(storage("delete attachment"))?;
+        collect_blob(&tx, blob)?;
+        tx.commit().map_err(storage("commit detach"))?;
+        Ok(())
+    }
+}
+
+fn attach(
+    db: &Connection,
+    channel: &[u8; 32],
+    blob: &[u8; 32],
+    who: &PubKey,
+    expires_after: u32,
+    now: u64,
+) -> Result<(), ChannelError> {
+    db.execute(
+        "INSERT INTO attachment (channel, blob, attached, expires_after, uploader)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (channel, blob) DO UPDATE SET attached = ?3, expires_after = ?4",
+        params![
+            &channel[..],
+            &blob[..],
+            now as i64,
+            expires_after as i64,
+            who.as_bytes()
+        ],
+    )
+    .map_err(storage("insert attachment"))?;
+    Ok(())
+}
+
+/// Delete a blob that has no attachments left. A blob attached elsewhere
+/// survives; that is SIP-18's rule and it is why closing one channel does not
+/// take a photograph out of another.
+fn collect_blob(db: &Connection, blob: &[u8; 32]) -> Result<(), ChannelError> {
+    let remaining: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM attachment WHERE blob = ?1",
+            params![&blob[..]],
+            |r| r.get(0),
+        )
+        .map_err(storage("count attachments"))?;
+    if remaining == 0 {
+        db.execute("DELETE FROM blob_chunk WHERE blob = ?1", params![&blob[..]])
+            .map_err(storage("delete chunks"))?;
+        db.execute("DELETE FROM blob WHERE id = ?1", params![&blob[..]])
+            .map_err(storage("delete blob"))?;
+    }
+    Ok(())
+}
+
+/// Drop attachments past their window, and any blob that thereby has none.
+///
+/// The window is the shorter of the channel's retention and the attachment's
+/// own timer, which is how a disappearing message's photograph goes when the
+/// message does — without that, the entry would be pruned on schedule while the
+/// image stayed fetchable for the rest of the channel's window, which is the
+/// case people most want the feature for.
+fn prune_attachments(db: &Connection, channel: &[u8; 32], now: u64) -> Result<(), ChannelError> {
+    let orphans: Vec<[u8; 32]> = {
+        let mut stmt = db
+            .prepare(
+                "SELECT blob FROM attachment WHERE channel = ?1 AND ?2 - attached >= CASE
+                     WHEN expires_after > 0 AND expires_after < (
+                         SELECT retention_secs FROM channel WHERE id = ?1)
+                     THEN expires_after
+                     ELSE (SELECT retention_secs FROM channel WHERE id = ?1) END",
+            )
+            .map_err(storage("prepare attachment prune"))?;
+        let rows = stmt
+            .query_map(params![&channel[..], now as i64], |r| {
+                Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+            })
+            .map_err(storage("query attachment prune"))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for blob in orphans {
+        db.execute(
+            "DELETE FROM attachment WHERE channel = ?1 AND blob = ?2",
+            params![&channel[..], &blob[..]],
+        )
+        .map_err(storage("delete attachment"))?;
+        collect_blob(db, &blob)?;
+    }
+    Ok(())
+}
+
+fn channel_blob_bytes(db: &Connection, channel: &[u8; 32]) -> Result<u64, ChannelError> {
+    let n: i64 = db
+        .query_row(
+            "SELECT COALESCE(SUM(b.size), 0) FROM attachment a
+             JOIN blob b ON b.id = a.blob WHERE a.channel = ?1",
+            params![&channel[..]],
+            |r| r.get(0),
+        )
+        .map_err(storage("sum blob bytes"))?;
+    Ok(n as u64)
+}
+
+fn upload_row(db: &Connection, upload: u64) -> Result<(PubKey, u32), ChannelError> {
+    db.query_row(
+        "SELECT uploader, chunks FROM upload WHERE id = ?1",
+        params![upload as i64],
+        |r| {
+            Ok((
+                PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                r.get::<_, i64>(1)? as u32,
+            ))
+        },
+    )
+    .optional()
+    .map_err(storage("read upload"))?
+    .ok_or(ChannelError::NoSuchUpload)
+}
+
+fn drop_upload(db: &Connection, upload: u64) -> Result<(), ChannelError> {
+    db.execute(
+        "DELETE FROM upload_chunk WHERE upload = ?1",
+        params![upload as i64],
+    )
+    .map_err(storage("delete upload chunks"))?;
+    db.execute("DELETE FROM upload WHERE id = ?1", params![upload as i64])
+        .map_err(storage("delete upload"))?;
+    Ok(())
+}
+
+fn expire_uploads(db: &Connection, now: u64) -> Result<(), ChannelError> {
+    let stale: Vec<i64> = {
+        let mut stmt = db
+            .prepare("SELECT id FROM upload WHERE ?1 - started >= ?2")
+            .map_err(storage("prepare upload expiry"))?;
+        let rows = stmt
+            .query_map(params![now as i64, UPLOAD_TTL as i64], |r| r.get(0))
+            .map_err(storage("query upload expiry"))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for id in stale {
+        drop_upload(db, id as u64)?;
+    }
+    Ok(())
 }

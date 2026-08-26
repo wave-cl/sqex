@@ -12,6 +12,7 @@
 
 pub mod beacon;
 pub mod blob;
+pub mod blob_store;
 pub mod channel;
 pub mod channel_key;
 pub mod mailbox;
