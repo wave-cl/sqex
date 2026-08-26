@@ -11,6 +11,7 @@
 //! provably corresponds to what executes.
 
 pub mod beacon;
+pub mod channel;
 pub mod mailbox;
 pub mod room;
 pub mod session;

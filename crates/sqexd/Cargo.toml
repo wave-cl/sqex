@@ -30,6 +30,10 @@ rand = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
+# The channel log is the first sqex state that must survive a restart; a
+# whole-file rewrite is right for a whitelist and useless for a log. Bundled so
+# the three release targets, all native builds, need no system sqlite.
+rusqlite = { version = "0.32", features = ["bundled"] }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]

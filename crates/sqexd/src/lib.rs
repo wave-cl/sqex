@@ -2,6 +2,7 @@
 
 pub mod beacon;
 pub mod challenge;
+pub mod channel;
 pub mod config;
 pub mod mailbox;
 pub mod room;

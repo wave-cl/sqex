@@ -16,12 +16,18 @@ use squic::Config as SquicConfig;
 
 use crate::beacon::Beacons;
 use crate::challenge::Challenges;
+use crate::channel::{ChannelError, Channels};
 use crate::config::Config;
 use crate::mailbox::Mailbox;
 use crate::room::Rooms;
 use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
+use sqex_proto::channel::{
+    Ack as ChannelAck, ByChannel, Create as ChannelCreate, Created, Fetch as ChannelFetch,
+    List as ChannelList, Post as ChannelPost, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
+    TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
+};
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
@@ -32,6 +38,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// ALPN for sqex: plain HTTP/3.
 const ALPN: &[u8] = b"h3";
+
+/// How often channels are pruned and abandoned ones reclaimed. Frequent enough
+/// that a short retention window means what it says, rare enough to be
+/// invisible.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Largest admin-command body we will read.
 const MAX_BODY: usize = 64 * 1024;
@@ -103,6 +114,7 @@ pub struct Server {
     beacons: Beacons,
     mailbox: Mailbox,
     rooms: Rooms,
+    channels: Channels,
     sessions: Sessions,
     live_conns: Connections,
     started: Instant,
@@ -132,6 +144,10 @@ pub async fn bind(
 ) -> Result<Bound> {
     let public_key = PubKey::new(signing_key.verifying_key().to_bytes());
     let state = State::load(config.state_file.clone(), &config.seed_whitelist)?;
+    let channel_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("channels.db"));
 
     // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
     // transport whitelist stays off: anyone holding the server key may connect,
@@ -162,6 +178,12 @@ pub async fn bind(
         beacons: Beacons::new(),
         mailbox: Mailbox::new(),
         rooms: Rooms::new(),
+        // The channel log lives beside the state file, so a memory-only
+        // deployment gets a memory-only log and nothing has to be configured
+        // twice. This is the one service that cannot honestly be memory-only
+        // in production, and an operator choosing that is choosing it.
+        channels: Channels::open(channel_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
         sessions: Sessions::new(),
         live_conns: Connections::default(),
         started: Instant::now(),
@@ -220,8 +242,34 @@ pub async fn serve(bound: Bound) -> Result<()> {
         }
     };
 
+    // The daemon's first background sweep. Every other service expires lazily
+    // on the operation path, which is right when the state is soft and the
+    // window is seconds. A retention window measured in days cannot wait for
+    // somebody to touch the channel: a channel nobody has opened in weeks is
+    // exactly the case that matters.
+    let sweeper = {
+        let server = Arc::clone(&server);
+        async move {
+            let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let channels = Arc::clone(&server);
+                // The sweep is blocking work against SQLite, so it does not
+                // belong on a runtime thread that is also answering requests.
+                let done = tokio::task::spawn_blocking(move || channels.channels.sweep()).await;
+                if let Ok((pruned, closed)) = done
+                    && (pruned > 0 || closed > 0)
+                {
+                    tracing::info!(pruned, closed, "swept channels");
+                }
+            }
+        }
+    };
+
     tokio::select! {
         _ = accept_loop => tracing::warn!("listener stopped accepting"),
+        _ = sweeper => tracing::warn!("sweeper stopped"),
         _ = shutdown_signal() => {
             tracing::info!("shutting down");
             if let Err(e) = server.state.lock().unwrap().save() {
@@ -405,6 +453,88 @@ async fn route(
         // carries. It relays each member's proof without checking it — checking
         // needs the secret it has deliberately not been told — and the members
         // verify each other.
+        // SIP-16 channels: a durable, ordered log. Every route here requires
+        // membership or an admin role, and it is checked at the moment of the
+        // call — a removed member's next fetch is refused, including one
+        // already parked in a long poll.
+        ("POST", "/channel/create") => match (peer.identity, ChannelCreate::decode(body)) {
+            (None, _) => no_identity("creating a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.create(&me, &req) {
+                Ok((created, epoch)) => (
+                    200,
+                    "application/octet-stream",
+                    Created { created, epoch, now: now_unix() }.encode(),
+                ),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/join") => match (peer.identity, ByChannel::decode(body, CH_JOIN)) {
+            (None, _) => no_identity("joining a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.join(&me, &req.channel) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/leave") => match (peer.identity, ByChannel::decode(body, CH_LEAVE)) {
+            (None, _) => no_identity("leaving a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.leave(&me, &req.channel) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/post") => match (peer.identity, ChannelPost::decode(body)) {
+            (None, _) => no_identity("posting to a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            // Until SIP-22 registration exists, an identity is its own device,
+            // which is what SIP-22 says of an account with none registered.
+            (Some(me), Ok(req)) => match server.channels.post(&me, &me, &req) {
+                Ok(posted) => (200, "application/octet-stream", posted.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/info") => match (peer.identity, ByChannel::decode(body, CH_INFO)) {
+            (None, _) => no_identity("reading a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.info(&me, &me, &req.channel) {
+                Ok(info) => (200, "application/octet-stream", info.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/retain") => match (peer.identity, ChannelRetain::decode(body)) {
+            (None, _) => no_identity("setting retention"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.retain(&me, &req) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/close") => match (peer.identity, ByChannel::decode(body, CH_CLOSE)) {
+            (None, _) => no_identity("closing a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.close(&me, &req.channel) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/list") => match ChannelList::decode(body) {
+            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Ok(req) => match server.channels.list(&req.query, req.offset) {
+                Ok(listing) => (200, "application/octet-stream", listing.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/fetch") => match (peer.identity, ChannelFetch::decode(body)) {
+            (None, _) => no_identity("fetching entries"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match fetch_waiting(server, &me, &req).await {
+                Ok(entries) => (200, "application/octet-stream", entries.encode()),
+                Err(e) => refused(e),
+            },
+        },
+
         ("POST", "/room/join") => match (peer.identity, RoomJoin::decode(body)) {
             (None, _) => no_identity("joining a room"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
@@ -713,6 +843,47 @@ impl Server {
 /// The answer to an identity-bound request from a connection that carries no
 /// identity. There is nothing to act as, so this is a refusal, not an empty
 /// result.
+/// A refusal the bytes did not cause: the request was fine and the answer is
+/// no. Distinguishable from a malformed request, as SIP-16 requires, and never
+/// silent.
+fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
+    (
+        e.status(),
+        "application/json",
+        json!({ "error": e.as_str() }).to_string().into_bytes(),
+    )
+}
+
+/// A fetch that answers at once when there is something, and otherwise holds
+/// the request open until an entry lands or the wait runs out.
+///
+/// This is the first request in this daemon that does not answer immediately,
+/// and the shape matters: the notifier is taken before the first read, so an
+/// entry arriving in the gap between looking and waiting still wakes us, and
+/// nothing here holds the database lock across an await.
+async fn fetch_waiting(
+    server: &Arc<Server>,
+    me: &PubKey,
+    req: &ChannelFetch,
+) -> std::result::Result<sqex_proto::channel::Entries, ChannelError> {
+    let notify = server.channels.notifier(&req.channel);
+    let first = server.channels.fetch(me, &req.channel, req.since)?;
+    if !first.entries.is_empty() || req.wait_secs == 0 {
+        return Ok(first);
+    }
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(req.wait_secs as u64);
+    loop {
+        let waited = tokio::time::timeout_at(deadline, notify.notified()).await;
+        // Re-check membership as well as entries: an answer is owed to whoever
+        // the caller is *now*, not who they were when they parked.
+        let again = server.channels.fetch(me, &req.channel, req.since)?;
+        if !again.entries.is_empty() || waited.is_err() {
+            return Ok(again);
+        }
+    }
+}
+
 fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
     (
         403,
