@@ -785,6 +785,23 @@ async fn route(
                 server.prekeys.count(&me).encode(),
             ),
         },
+        // Discards the caller's own prekeys and says where to resume. For a
+        // device that has lost the secrets behind prekeys this exchange is
+        // still serving: until it publishes again `take` answers found: 0,
+        // which makes a peer decline to seal rather than seal to something
+        // that will never open. The body is ignored, as `count`'s is — the
+        // route is the whole request.
+        ("POST", "/prekey/clear") => match device {
+            None => no_identity("clearing prekeys"),
+            Some(me) => match server.prekeys.clear(&me) {
+                Ok(cleared) => (200, "application/octet-stream", cleared.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
 
         // SIP-16 channels: a durable, ordered log. Every route here requires
         // membership or an admin role, and it is checked at the moment of the

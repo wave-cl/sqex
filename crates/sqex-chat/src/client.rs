@@ -14,7 +14,7 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::message::{Body, Post as SipPost};
 use sqex_proto::prekey::{
-    Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_COUNT, Take, Taken,
+    Cleared, Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_CLEAR, TYPE_COUNT, Take, Taken,
 };
 use sqex_proto::timeline::{Received, Timeline};
 use sqnr::Client;
@@ -144,7 +144,7 @@ impl Chat {
     pub async fn top_up_prekeys(&mut self) -> Result<()> {
         let mut pool = self.store.pool(&self.seed)?;
         if pool.one_time_left() == 0 && pool.fallback_id() == 0 {
-            pool = self.pool_above_what_the_exchange_remembers(pool).await?;
+            pool = self.restart_pool(pool).await?;
         }
         let mut publish = Vec::new();
         if pool.one_time_left() < LOW_WATER {
@@ -176,22 +176,41 @@ impl Chat {
         Ok(())
     }
 
-    /// Restart an empty pool's ids above everything the exchange still holds.
+    /// Discard whatever the exchange still holds for us, and resume above it.
     ///
     /// An empty pool is a new client or a client whose store was lost, and the
     /// two are indistinguishable from here — but not from the exchange, which
-    /// remembers every id this device ever published and refuses each one
-    /// forever. A lost store that began again at 1 would be refused on its
-    /// first publish and could never send another message under that identity.
+    /// remembers every id this device published and refuses each one forever,
+    /// and which is still serving prekeys whose secrets went with the store.
+    /// Both halves of that are SIP-23's `Clear`: it discards the prekeys, so a
+    /// peer gets `found: 0` and declines to seal rather than sealing to
+    /// something that will never open, and it answers with `next_id`, which is
+    /// the only way a client whose own record is gone can publish again.
     ///
-    /// `Count` reports the current fallback's id, and ids only increase, so it
-    /// is a lower bound on what has been used. Minting a fallback after each
-    /// batch keeps that bound close to the truth.
-    async fn pool_above_what_the_exchange_remembers(&mut self, pool: Pool) -> Result<Pool> {
-        let body = self.post("/prekey/count", vec![TYPE_COUNT]).await?;
-        let counts = Counts::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+    /// A brand-new device clears nothing and gets `next_id` 1, so this is one
+    /// request on first run rather than a special case to detect.
+    async fn restart_pool(&mut self, pool: Pool) -> Result<Pool> {
         let mut state = pool.save();
-        state.next_id = state.next_id.max(counts.fallback_id.saturating_add(1));
+        match self.post("/prekey/clear", vec![TYPE_CLEAR]).await {
+            Ok(body) => {
+                let cleared =
+                    Cleared::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                state.next_id = state.next_id.max(cleared.next_id);
+            }
+            // An exchange without `Clear` predates the amendment. Fall back to
+            // what `Count` can say — the current fallback's id is a lower bound
+            // on what has been used — and to the clock floor beneath it. The
+            // stale prekeys stay, so sending may fail until they drain; that is
+            // the state this amendment exists to fix and it is not a reason to
+            // refuse to start.
+            Err(ChatError::Refused(..)) => {
+                let body = self.post("/prekey/count", vec![TYPE_COUNT]).await?;
+                let counts =
+                    Counts::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                state.next_id = state.next_id.max(counts.fallback_id.saturating_add(1));
+            }
+            Err(e) => return Err(e),
+        }
         Ok(Pool::load(&self.seed, state))
     }
 

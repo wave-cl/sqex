@@ -15,7 +15,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sqex_proto::prekey::{
-    Counts, KIND_FALLBACK, KIND_ONE_TIME, MAX_STORED, Prekey, Taken,
+    CLEAR_WINDOW, Cleared, Counts, KIND_FALLBACK, KIND_ONE_TIME, MAX_CLEAR, MAX_STORED, Prekey,
+    Taken,
 };
 use sqnr_core::PubKey;
 
@@ -31,6 +32,8 @@ pub enum PrekeyError {
     ReusedId,
     /// The device already holds as many one-time prekeys as it may.
     PoolFull,
+    /// More `Clear` calls than SIP-23 allows in the window.
+    ClearQuota,
 }
 
 impl PrekeyError {
@@ -39,6 +42,7 @@ impl PrekeyError {
             PrekeyError::BadSignature => "bad_signature",
             PrekeyError::ReusedId => "reused_id",
             PrekeyError::PoolFull => "pool_full",
+            PrekeyError::ClearQuota => "clear_quota",
         }
     }
 
@@ -47,6 +51,7 @@ impl PrekeyError {
             PrekeyError::BadSignature => 401,
             PrekeyError::ReusedId => 409,
             PrekeyError::PoolFull => 507,
+            PrekeyError::ClearQuota => 429,
         }
     }
 }
@@ -59,6 +64,13 @@ struct Pool {
     /// Every id this device has ever published, so none is reused. SIP-23 says
     /// ids MUST NEVER be reused, including across a fallback being replaced.
     seen: std::collections::HashSet<u32>,
+    /// The highest id ever seen, kept **apart from the prekeys themselves** so
+    /// that discarding them does not lower it. Same shape as SIP-16's `msg_seq`
+    /// mark and there for the same reason: the record exists to stop a counter
+    /// being reused, so pruning what it describes must not move it.
+    high_water: u32,
+    /// When this device's recent `Clear` calls landed, for the rate limit.
+    cleared_at: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -98,6 +110,7 @@ impl Prekeys {
         let mut accepted = 0u16;
         for p in prekeys {
             pool.seen.insert(p.id);
+            pool.high_water = pool.high_water.max(p.id);
             accepted += 1;
             match p.kind {
                 KIND_FALLBACK => pool.fallback = Some(*p),
@@ -146,6 +159,39 @@ impl Prekeys {
             fallback_id: pool.and_then(|p| p.fallback.map(|f| f.id)).unwrap_or(0),
             now: now_unix(),
         }
+    }
+
+    /// Discard everything this device has published, and say where to resume.
+    ///
+    /// For one situation: a device that has lost the secrets behind prekeys the
+    /// exchange is still serving. Until it publishes again `take` answers
+    /// `found: 0`, which is the point — a prekey whose secret is gone is worse
+    /// than no prekey, because absence makes a caller refuse to seal while a
+    /// stale one makes it seal to something that will never open.
+    ///
+    /// The ids are **not** forgotten. `next_id` is one above every id this
+    /// device has ever used, which is the only way a client whose own record
+    /// went with its secrets can publish again at all.
+    pub fn clear(&self, device: &PubKey) -> Result<Cleared, PrekeyError> {
+        let now = now_unix();
+        let mut pools = self.pools.lock().unwrap();
+        let pool = pools.entry(*device).or_default();
+
+        pool.cleared_at
+            .retain(|t| now.saturating_sub(*t) < CLEAR_WINDOW);
+        if pool.cleared_at.len() >= MAX_CLEAR {
+            return Err(PrekeyError::ClearQuota);
+        }
+        pool.cleared_at.push(now);
+
+        let discarded = pool.one_time.len() + usize::from(pool.fallback.is_some());
+        pool.one_time.clear();
+        pool.fallback = None;
+        Ok(Cleared {
+            discarded: discarded as u16,
+            next_id: pool.high_water.saturating_add(1),
+            now,
+        })
     }
 
     /// Whether a device could be sealed to at all. SIP-17's `Missing` reports
@@ -238,5 +284,87 @@ mod tests {
         let store = Prekeys::new();
         assert!(!store.has_any(&key));
         assert!(!store.take(&key).found);
+    }
+
+    #[test]
+    fn clearing_discards_the_prekeys_and_keeps_the_ids() {
+        let (seed, key) = device(9);
+        let store = Prekeys::new();
+        let one: Vec<Prekey> = (1..=3)
+            .map(|i| Prekey::generate(&seed, KIND_ONE_TIME, i).0)
+            .collect();
+        let (fb, _) = Prekey::generate(&seed, KIND_FALLBACK, 4);
+        store.publish(&key, &one).unwrap();
+        store.publish(&key, &[fb]).unwrap();
+
+        let cleared = store.clear(&key).unwrap();
+        assert_eq!(cleared.discarded, 4);
+        // One above everything ever seen — the value a device whose own record
+        // went with its secrets cannot obtain any other way.
+        assert_eq!(cleared.next_id, 5);
+
+        // Nothing left to serve, which is what makes a peer decline to seal
+        // rather than seal to something dead.
+        assert!(!store.take(&key).found);
+        assert!(!store.has_any(&key));
+        assert_eq!(store.count(&key).one_time, 0);
+        assert_eq!(store.count(&key).fallback_id, 0);
+    }
+
+    #[test]
+    fn clearing_does_not_forgive_a_reused_id() {
+        // The never-reuse rule outlives the prekeys. If clearing forgot the
+        // ids, an envelope naming id 1 could mean two different keys.
+        let (seed, key) = device(10);
+        let store = Prekeys::new();
+        let (p, _) = Prekey::generate(&seed, KIND_ONE_TIME, 1);
+        store.publish(&key, &[p]).unwrap();
+        store.clear(&key).unwrap();
+        let (again, _) = Prekey::generate(&seed, KIND_ONE_TIME, 1);
+        assert_eq!(store.publish(&key, &[again]), Err(PrekeyError::ReusedId));
+    }
+
+    #[test]
+    fn a_device_can_publish_again_from_next_id() {
+        let (seed, key) = device(11);
+        let store = Prekeys::new();
+        let first: Vec<Prekey> = (1..=4)
+            .map(|i| Prekey::generate(&seed, KIND_ONE_TIME, i).0)
+            .collect();
+        store.publish(&key, &first).unwrap();
+        let next = store.clear(&key).unwrap().next_id;
+
+        let fresh: Vec<Prekey> = (next..next + 4)
+            .map(|i| Prekey::generate(&seed, KIND_ONE_TIME, i).0)
+            .collect();
+        assert_eq!(store.publish(&key, &fresh).unwrap(), 4);
+        assert_eq!(store.take(&key).prekey.unwrap().id, next);
+    }
+
+    #[test]
+    fn clearing_a_device_that_published_nothing_is_not_an_error() {
+        // A brand-new client and one that lost its store are the same request
+        // from here, and both should get an answer they can act on.
+        let (_, key) = device(12);
+        let store = Prekeys::new();
+        let cleared = store.clear(&key).unwrap();
+        assert_eq!(cleared.discarded, 0);
+        assert_eq!(cleared.next_id, 1, "ids start at 1, since 0 is reserved");
+    }
+
+    #[test]
+    fn clearing_is_rate_limited() {
+        let (_, key) = device(13);
+        let store = Prekeys::new();
+        for _ in 0..MAX_CLEAR {
+            store.clear(&key).unwrap();
+        }
+        assert_eq!(store.clear(&key), Err(PrekeyError::ClearQuota));
+        // Refused distinguishably, as SIP-23 requires; there is nothing to
+        // conceal, since the caller is asking about its own state.
+        assert_eq!(PrekeyError::ClearQuota.status(), 429);
+        // And it is per device.
+        let (_, other) = device(14);
+        assert!(store.clear(&other).is_ok());
     }
 }
