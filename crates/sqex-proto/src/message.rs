@@ -129,6 +129,37 @@ pub struct Post {
 }
 
 impl Post {
+    /// Check the per-kind caps SIP-19 places on a post.
+    ///
+    /// Too many of a kind is **malformed**, not unknown: the ignore rules cover
+    /// a kind a reader has not heard of, and say nothing about a sender
+    /// exceeding a limit it was told. Collapsing those would let a post carry
+    /// eleven text parts and leave every client to guess which one to show.
+    pub fn validate(&self) -> Result<()> {
+        let mut text = 0usize;
+        let mut reply = 0usize;
+        let mut attachments = 0usize;
+        let mut links = 0usize;
+        let mut mentions = 0usize;
+        for p in &self.parts {
+            match p {
+                Part::Text(_) => text += 1,
+                Part::Reply(_) => reply += 1,
+                Part::Attachment(_) => attachments += 1,
+                Part::Link(_) => links += 1,
+                Part::Mention(_) => mentions += 1,
+            }
+        }
+        // The two "at most one" kinds are the ones whose excess has no sensible
+        // reading at all: a post with two bodies, or two things it replies to.
+        cap(text, 1, "text parts")?;
+        cap(reply, 1, "reply parts")?;
+        cap(attachments, MAX_ATTACHMENTS, "attachments")?;
+        cap(links, MAX_LINKS, "link previews")?;
+        cap(mentions, MAX_MENTIONS, "mentions")?;
+        Ok(())
+    }
+
     pub fn text(s: &str) -> Post {
         Post {
             parts: vec![Part::Text(s.into())],
@@ -165,6 +196,15 @@ impl Post {
             _ => None,
         })
     }
+}
+
+fn cap(have: usize, limit: usize, what: &str) -> Result<()> {
+    if have > limit {
+        return Err(Error::Malformed(format!(
+            "post has {have} {what}, limit is {limit}"
+        )));
+    }
+    Ok(())
 }
 
 fn write_part(part: &Part, out: &mut Vec<u8>) {
@@ -319,7 +359,11 @@ fn read_post(b: &[u8], o: &mut usize) -> Result<Post> {
         }
         *o += len;
     }
-    Ok(Post { parts, unknown })
+    // Unknown parts are skipped and do not count: a reader cannot tell what
+    // kind they were, so it cannot tell which cap they would have fallen under.
+    let post = Post { parts, unknown };
+    post.validate()?;
+    Ok(post)
 }
 
 impl Body {
@@ -709,6 +753,88 @@ mod tests {
         // ignored rather than misread.
         assert_eq!(Signal::decode(&[SIGNAL_RESERVED_READ, 0, 0]).unwrap(), None);
         assert!(Signal::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn a_post_may_carry_only_one_body_and_one_reply() {
+        // Two of either has no sensible reading: a client would have to guess
+        // which text to show, or which message this answers.
+        let two_texts = Body::Post(Post {
+            parts: vec![Part::Text("one".into()), Part::Text("two".into())],
+            unknown: 0,
+        });
+        assert!(Body::decode(&two_texts.encode()).is_err());
+
+        let two_replies = Body::Post(Post {
+            parts: vec![Part::Reply(1), Part::Reply(2)],
+            unknown: 0,
+        });
+        assert!(Body::decode(&two_replies.encode()).is_err());
+    }
+
+    #[test]
+    fn the_per_kind_caps_are_enforced_on_decode() {
+        let many = |p: Part, n: usize| {
+            Body::Post(Post {
+                parts: std::iter::repeat_n(p, n).collect(),
+                unknown: 0,
+            })
+        };
+        // At the limit, fine.
+        assert!(
+            Body::decode(&many(Part::Attachment(attachment()), MAX_ATTACHMENTS).encode()).is_ok()
+        );
+        assert!(Body::decode(&many(Part::Mention(key(1)), MAX_MENTIONS).encode()).is_ok());
+        // One over, refused.
+        assert!(
+            Body::decode(&many(Part::Attachment(attachment()), MAX_ATTACHMENTS + 1).encode())
+                .is_err()
+        );
+        assert!(Body::decode(&many(Part::Mention(key(1)), MAX_MENTIONS + 1).encode()).is_err());
+    }
+
+    #[test]
+    fn an_edit_is_held_to_the_same_caps_as_a_post() {
+        // An edit carries a post, so a rule the post obeys must survive being
+        // delivered as a correction to one.
+        let bad = Body::Edit {
+            target: 1,
+            post: Post {
+                parts: vec![Part::Text("one".into()), Part::Text("two".into())],
+                unknown: 0,
+            },
+        };
+        assert!(Body::decode(&bad.encode()).is_err());
+    }
+
+    #[test]
+    fn unknown_parts_do_not_count_against_any_cap() {
+        // A reader cannot tell what kind they were, so it cannot tell which
+        // cap they would have fallen under.
+        let mut out = vec![TYPE_POST, (MAX_PARTS) as u8];
+        write_part(&Part::Text("the only text".into()), &mut out);
+        for _ in 0..(MAX_PARTS - 1) {
+            out.push(0x6f);
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        let Body::Post(post) = Body::decode(&out).unwrap().unwrap() else {
+            panic!()
+        };
+        assert_eq!(post.body_text(), Some("the only text"));
+        assert_eq!(post.unknown, MAX_PARTS - 1);
+    }
+
+    #[test]
+    fn validate_lets_a_sender_check_before_encoding() {
+        assert!(Post::text("fine").validate().is_ok());
+        assert!(
+            Post {
+                parts: vec![Part::Text("a".into()), Part::Text("b".into())],
+                unknown: 0,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
