@@ -794,3 +794,51 @@ async fn a_member_without_the_role_cannot_seize_an_epoch() {
     assert!(!read.contains(&"still here".to_string()));
     assert!(!got.unreadable.is_empty(), "the gap should be reported");
 }
+
+#[tokio::test]
+async fn a_client_republishes_when_the_exchange_has_lost_its_prekeys() {
+    // The failure this closes was silent and total. Prekeys used to live only
+    // in the exchange's memory, so bouncing it made every device unsealable-to
+    // — and a client's own pool is untouched by that, so it saw a healthy
+    // count and published nothing. Group creation stopped at epoch 0 with
+    // nothing to say why, which is how it was found.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    // Bob's prekeys vanish from the exchange while his own store keeps its
+    // secrets — an exchange restored from a backup taken before he published.
+    let db = dir.path().join("prekeys.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "DELETE FROM prekey WHERE device = ?1",
+            [bob_key.as_bytes()],
+        )
+        .unwrap();
+    }
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    assert!(
+        matches!(
+            alice.send(&channel, "anyone there?").await,
+            Err(sqex_chat::ChatError::NotReady(_))
+        ),
+        "there should be nothing to seal to"
+    );
+
+    // Bob starts his client. It asks what the exchange holds rather than
+    // trusting its own count, finds nothing, and republishes.
+    let mut bob2 = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    alice
+        .send(&channel, "back in business")
+        .await
+        .expect("bob is sealable again");
+
+    bob2.open_dm(&alice.me).await.unwrap();
+    let mut t = Timeline::new();
+    let got = bob2.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["back in business"]);
+    let _ = &mut bob;
+}

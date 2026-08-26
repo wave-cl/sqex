@@ -196,9 +196,27 @@ impl Chat {
         if pool.one_time_left() == 0 && pool.fallback_id() == 0 {
             pool = self.restart_pool(pool).await?;
         }
+        // What the **exchange** holds, not what we remember publishing. They
+        // can differ, and the difference is invisible from here: an exchange
+        // restored from a backup, or one that lost its pool, leaves a client
+        // whose own count looks healthy with nothing published and no reason to
+        // notice. The failure that produces is silent and total — every seal to
+        // this device is refused, so no channel key reaches it.
+        //
+        // Our own count still matters and is not redundant: a secret we no
+        // longer hold is useless however many the exchange is serving, so the
+        // pool is topped up to satisfy whichever of the two is short.
+        let served = match self.post("/prekey/count", vec![TYPE_COUNT]).await {
+            Ok(body) => Counts::decode(&body)
+                .map(|c| c.one_time)
+                .unwrap_or(pool.one_time_left()),
+            Err(_) => pool.one_time_left(),
+        };
+        let have = pool.one_time_left().min(served);
+
         let mut publish = Vec::new();
-        if pool.one_time_left() < LOW_WATER {
-            publish.extend(pool.mint_one_time(POOL - pool.one_time_left()));
+        if have < LOW_WATER {
+            publish.extend(pool.mint_one_time(POOL - have));
         }
         // A fallback after every batch, not only the first: its id is the only
         // thing `Count` reports, so it is what a future client with a lost

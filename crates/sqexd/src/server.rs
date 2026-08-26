@@ -189,6 +189,14 @@ pub async fn bind(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("profiles.db"));
+    // Prekeys persist for the same reason the device registry does: a registry
+    // of devices nothing can be sealed to is not a registry, and a restart that
+    // emptied them would be silent — a client whose own pool looks healthy has
+    // no reason to publish again.
+    let prekey_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("prekeys.db"));
 
     // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
     // transport whitelist stays off: anyone holding the server key may connect,
@@ -225,11 +233,24 @@ pub async fn bind(
         // in production, and an operator choosing that is choosing it.
         channels: Channels::open(channel_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
-        // Prekeys are in memory on purpose: a one-time key that survived a
-        // restart the device did not is a key whose secret is gone, and
-        // serving it would only produce an envelope nobody can open. Losing
-        // the pool costs a client one publish.
-        prekeys: Prekeys::new(),
+        // Durable, and it was not always. The argument for keeping prekeys in
+        // memory was that a key surviving a restart the device did not is a key
+        // whose secret is gone, so serving it produces an envelope nobody can
+        // open — and that losing the pool costs a client one publish.
+        //
+        // Both halves are wrong. A server bounce does not restart its clients;
+        // those are independent events, and the common one by far is the server
+        // restarting while every device is fine. And it does not cost one
+        // publish, because a client cannot tell: its own pool is untouched, so
+        // `top_up_prekeys` sees a healthy count and republishes nothing. The
+        // exchange simply stops being able to distribute a channel key to
+        // anybody, silently, until something forces the issue.
+        //
+        // The case the old reasoning worried about is real and is now handled
+        // where it belongs: SIP-23's `Clear` lets a device that has lost its
+        // secrets discard what the exchange still holds.
+        prekeys: Prekeys::open(prekey_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open the prekey store: {e}")))?,
         // Durable, unlike prekeys: a device should not have to re-register
         // because a server bounced, and a revocation that evaporated on a
         // restart would be worse than none at all.
