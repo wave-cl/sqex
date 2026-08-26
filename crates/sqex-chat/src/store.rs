@@ -83,6 +83,11 @@ CREATE TABLE IF NOT EXISTS message (
     sealed  BLOB,
     PRIMARY KEY (channel, seq)
 );
+-- Note for whoever adds a column here next: this store is on people's
+-- machines, so `CREATE TABLE IF NOT EXISTS` is no longer enough. It creates
+-- tables and never alters one that already exists, so a new column needs an
+-- explicit ALTER guarded by PRAGMA table_info. A new table is still free.
+--
 -- What we know about a channel between runs.
 --
 -- `admins` is here because `Timeline` needs it to judge a redaction or a
@@ -157,6 +162,18 @@ fn now_secs() -> u32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(1)
+}
+
+/// One message, as it goes into the store.
+///
+/// A struct rather than eight arguments, which is what it had grown into.
+pub struct Kept<'a> {
+    pub seq: u64,
+    pub account: PubKey,
+    pub posted: u64,
+    pub kind: u8,
+    /// The opened body, or `None` for an entry we hold and could not open.
+    pub plain: Option<&'a [u8]>,
 }
 
 /// One contact, and what we call them.
@@ -522,15 +539,8 @@ impl Store {
     /// `plain` is `None` for an entry we could not open, which is recorded
     /// rather than dropped so the reader can still be told something was there
     /// — and so a later run does not go looking for it again.
-    pub fn put_message(
-        &self,
-        channel: &[u8; 32],
-        seq: u64,
-        account: &PubKey,
-        posted: u64,
-        kind: u8,
-        plain: Option<&[u8]>,
-    ) -> Result<()> {
+    pub fn put_message(&self, channel: &[u8; 32], m: Kept<'_>) -> Result<()> {
+        let (seq, account, posted, kind, plain) = (m.seq, m.account, m.posted, m.kind, m.plain);
         let sealed = match plain {
             Some(p) => Some(self.seal_bytes(p)?),
             None => None,
@@ -881,6 +891,7 @@ mod tests {
         assert_eq!(s.contacts().unwrap().len(), 1);
     }
 
+
     #[test]
     fn a_conversation_survives_a_reopen() {
         // The bug this exists for: the fetch cursor was persisted and the
@@ -890,10 +901,10 @@ mod tests {
         let path = dir.path().join("chat.db");
         {
             let s = Store::open(&seed(1), Some(&path)).unwrap();
-            s.put_message(&[7; 32], 3, &key(2), 100, 1, Some(b"hello")).unwrap();
-            s.put_message(&[7; 32], 4, &key(1), 101, 1, Some(b"hi back")).unwrap();
+            s.put_message(&[7; 32], Kept { seq: 3, account: key(2), posted: 100, kind: 1, plain: Some(b"hello") }).unwrap();
+            s.put_message(&[7; 32], Kept { seq: 4, account: key(1), posted: 101, kind: 1, plain: Some(b"hi back") }).unwrap();
             // One we could not open: recorded, so the reader can be told.
-            s.put_message(&[7; 32], 5, &key(2), 102, 1, None).unwrap();
+            s.put_message(&[7; 32], Kept { seq: 5, account: key(2), posted: 102, kind: 1, plain: None }).unwrap();
         }
         let s = Store::open(&seed(1), Some(&path)).unwrap();
         let got = s.messages(&[7; 32]).unwrap();
@@ -904,11 +915,13 @@ mod tests {
         assert!(got[2].4.is_none(), "an unopenable entry should stay unopenable");
     }
 
+
+
     #[test]
     fn a_message_is_not_stored_twice() {
         let s = Store::open(&seed(1), None).unwrap();
-        s.put_message(&[7; 32], 3, &key(2), 100, 1, Some(b"once")).unwrap();
-        s.put_message(&[7; 32], 3, &key(2), 100, 1, Some(b"twice")).unwrap();
+        s.put_message(&[7; 32], Kept { seq: 3, account: key(2), posted: 100, kind: 1, plain: Some(b"once") }).unwrap();
+        s.put_message(&[7; 32], Kept { seq: 3, account: key(2), posted: 100, kind: 1, plain: Some(b"twice") }).unwrap();
         let got = s.messages(&[7; 32]).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].4.as_deref(), Some(&b"once"[..]));
@@ -923,7 +936,7 @@ mod tests {
         let secret = b"meet me at the usual place";
         {
             let s = Store::open(&seed(1), Some(&path)).unwrap();
-            s.put_message(&[7; 32], 1, &key(2), 100, 1, Some(secret)).unwrap();
+            s.put_message(&[7; 32], Kept { seq: 1, account: key(2), posted: 100, kind: 1, plain: Some(secret) }).unwrap();
             s.db.pragma_update(None, "wal_checkpoint", "TRUNCATE").unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();

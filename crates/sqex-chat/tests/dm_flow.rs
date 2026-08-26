@@ -792,7 +792,10 @@ async fn a_member_without_the_role_cannot_seize_an_epoch() {
     // the next epoch, never the last one — that is the forward secrecy doing
     // its job rather than a gap in the recovery.
     assert!(!read.contains(&"still here".to_string()));
-    assert!(!got.unreadable.is_empty(), "the gap should be reported");
+    // Reported as gone rather than as late: those epochs are superseded, and
+    // a rotation hands out the next one and never an old one.
+    assert!(got.lost > 0, "the gap should be reported");
+    assert!(got.unreadable.is_empty(), "and not as something still coming");
 }
 
 #[tokio::test]
@@ -840,5 +843,89 @@ async fn a_client_republishes_when_the_exchange_has_lost_its_prekeys() {
     let mut t = Timeline::new();
     let got = bob2.poll(&channel, &mut t, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["back in business"]);
+    let _ = &mut bob;
+}
+
+#[tokio::test]
+async fn history_lost_with_the_keys_is_told_apart_from_history_still_coming() {
+    // Your situation, reduced. A client whose store went with its keys can
+    // rotate and carry on, but the older entries stay shut — and reporting
+    // that every session as "could not be opened", alongside live faults, is
+    // how a status line stops being read.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let a_store = dir.path().join("alice.db");
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+
+    let channel;
+    {
+        let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
+        channel = alice.open_dm(&bob_key).await.unwrap();
+        alice.send(&channel, "one").await.unwrap();
+        alice.send(&channel, "two").await.unwrap();
+        bob.open_dm(&alice_key).await.unwrap();
+        bob.send(&channel, "three").await.unwrap();
+    }
+
+    // Alice loses everything and comes back. Both parties to a direct message
+    // are admins, so her next send rotates and the conversation continues.
+    std::fs::remove_file(&a_store).ok();
+    let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
+    alice.send(&channel, "still here").await.unwrap();
+    bob.send(&channel, "so are we").await.unwrap();
+
+    let mut t = Timeline::new();
+    let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(
+        said(&got.timeline),
+        vec!["still here", "so are we"],
+        "the new epoch should read normally"
+    );
+    // The three from before are gone, and counted as gone.
+    assert_eq!(got.lost, 3, "old entries should be counted as lost");
+    assert!(
+        got.unreadable.is_empty(),
+        "nothing is merely late: {:?}",
+        got.unreadable
+    );
+
+    // And it stays that way across a restart. The judgement is derived from
+    // whether we hold the epoch in force, so it is re-made correctly each time
+    // rather than remembered and going stale.
+    let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
+    let mut t = alice.history(&channel, &[alice_key, bob_key]).unwrap();
+    let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(got.lost, 3);
+    assert!(got.unreadable.is_empty());
+}
+
+#[tokio::test]
+async fn a_key_that_has_not_arrived_yet_is_not_called_lost() {
+    // The distinction has to hold in both directions, or it is just a nicer
+    // word for the same thing. Under the epoch in force an admin can still
+    // send a key, so those entries are late rather than gone.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice.create_group("waiting room", &[bob_key]).await.unwrap();
+    alice.send(&channel, "before carol").await.unwrap();
+
+    // Carol is added to the channel but not given the key — the exchange lets
+    // an admin do that, and SIP-17 says a client should say so plainly.
+    alice
+        .post_invite_without_key(&channel, &carol_key)
+        .await
+        .unwrap();
+    let mut t = Timeline::new();
+    let got = carol.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(got.lost, 0, "nothing is gone; the key simply has not come");
+    assert!(!got.unreadable.is_empty(), "and it should say something is waiting");
     let _ = &mut bob;
 }

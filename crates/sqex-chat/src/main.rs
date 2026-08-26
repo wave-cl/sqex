@@ -400,6 +400,7 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             let before = conv.timeline_len;
             conv.timeline = got.timeline;
             conv.trouble.unreadable = got.unreadable.len();
+            conv.trouble.lost = got.lost;
             conv.trouble.gap = got.gap;
             conv.trouble.message = None;
             conv.typing = got.typing;
@@ -890,6 +891,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
     app.peer_typing = conv.typing;
     app.trouble = Trouble {
         unreadable: conv.trouble.unreadable,
+        lost: conv.trouble.lost,
         no_key: conv.trouble.no_key,
         gap: conv.trouble.gap,
         message: conv.trouble.message.clone().or_else(|| {
