@@ -426,3 +426,99 @@ async fn a_lost_store_does_not_leave_stale_prekeys_for_peers_to_seal_to() {
     let got = alice.poll(&channel, &mut alices, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["after we both lost it", "so did i"]);
 }
+
+#[tokio::test]
+async fn a_file_travels_end_to_end_and_the_exchange_cannot_open_it() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    // Big enough to be several chunks, so the chunking is exercised rather
+    // than assumed. Compressible content would hide a chunk-order bug, so the
+    // bytes vary.
+    let path = dir.path().join("notes.md");
+    let secret: Vec<u8> = (0..(CHUNK * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &secret).unwrap();
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let limits = alice.blob_limits().await.unwrap();
+    let prepared = alice.prepare_file(&path, limits.chunk as usize).unwrap();
+    assert_eq!(prepared.chunks(), 3, "expected three chunks at this size");
+
+    let attachment = alice.upload(&channel, &prepared).await.unwrap();
+    let mut post = SipPost::text("the notes");
+    post.parts.push(Part::Attachment(attachment));
+    alice.send_post(&channel, &bob_key, post).await.unwrap();
+
+    // Bob reads the message and pulls the file down.
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let msg = got.timeline.messages().next().unwrap();
+    assert_eq!(msg.post.body_text(), Some("the notes"));
+    let a = msg.post.attachments().next().expect("no attachment arrived");
+    assert_eq!(a.size, secret.len() as u64);
+    assert_eq!(sqex_chat::file_name(a).as_deref(), Some("notes.md"));
+
+    let opened = bob.download(a).await.unwrap();
+    assert_eq!(opened, secret, "the file did not survive the round trip");
+
+    // And the exchange holds it without being able to read it.
+    let stored = std::fs::read(dir.path().join("channels.db")).unwrap();
+    assert!(
+        !stored.windows(64).any(|w| w == &secret[0..64]),
+        "the plaintext reached the exchange's disk"
+    );
+}
+
+#[tokio::test]
+async fn a_blob_served_wrong_is_refused_before_it_is_decrypted() {
+    // The id is the hash of the ciphertext, which is what lets a client tell it
+    // got the bytes it asked for without trusting the exchange to be honest.
+    use sqex_proto::blob_store::CHUNK;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let path = dir.path().join("small.txt");
+    std::fs::write(&path, b"a short file").unwrap();
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    let mut attachment = alice.upload(&channel, &prepared).await.unwrap();
+
+    // Name a blob the exchange does not have: the fetch fails rather than
+    // handing back something that will not open.
+    attachment.blob[0] ^= 1;
+    assert!(alice.download(&attachment).await.is_err());
+}
+
+#[tokio::test]
+async fn an_attachment_with_the_wrong_key_does_not_open() {
+    use sqex_proto::blob_store::CHUNK;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let path = dir.path().join("small.txt");
+    std::fs::write(&path, b"a short file").unwrap();
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    let mut attachment = alice.upload(&channel, &prepared).await.unwrap();
+
+    // The key rides inside the sealed message, so this is what a reader with
+    // the wrong one sees — a refusal, not silent rubbish.
+    attachment.key[0] ^= 1;
+    assert!(alice.download(&attachment).await.is_err());
+}

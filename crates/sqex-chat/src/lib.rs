@@ -24,8 +24,10 @@
 //! person will meet it: a message from an account not in the contact list
 //! cannot be seen, because nothing tells the client to look for it.
 
+pub mod attach;
 pub mod client;
 pub mod store;
 
+pub use attach::{Prepared, describe, file_name, kind_of};
 pub use client::{Chat, ChatError, Conversation};
 pub use store::{Contact, Store, StoreError};

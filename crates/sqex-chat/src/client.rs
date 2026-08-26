@@ -129,6 +129,13 @@ impl Chat {
         &self.store
     }
 
+    /// One request, with the exchange's refusals turned into something a
+    /// person can act on. `pub(crate)` so the blob module shares exactly this
+    /// handling rather than growing a second, laxer copy of it.
+    pub(crate) async fn post_raw(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+        self.post(path, body).await
+    }
+
     async fn post(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
         let (code, body) = self
             .client
@@ -462,6 +469,27 @@ impl Chat {
     /// key for yet is how most first messages go, and minting needs to know who
     /// to seal to.
     pub async fn send(&mut self, channel: &[u8; 32], them: &PubKey, text: &str) -> Result<Posted> {
+        self.send_post(channel, them, SipPost::text(text)).await
+    }
+
+    /// Send a message built by the caller — text, attachments, a reply, or a
+    /// combination. `send` is this with one text part.
+    pub async fn send_post(
+        &mut self,
+        channel: &[u8; 32],
+        them: &PubKey,
+        post: SipPost,
+    ) -> Result<Posted> {
+        post.validate().map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.send_body(channel, them, Body::Post(post)).await
+    }
+
+    async fn send_body(
+        &mut self,
+        channel: &[u8; 32],
+        them: &PubKey,
+        body: Body,
+    ) -> Result<Posted> {
         let epoch = self.ensure_epoch(channel, them).await?;
         let info = self.info(channel).await?;
         let key = self
@@ -477,7 +505,6 @@ impl Chat {
         let local = if seen_epoch == epoch { mine } else { 0 };
         let msg_seq = local.max(info.my_msg_seq) + 1;
 
-        let body = Body::Post(SipPost::text(text));
         let sealed = key
             .seal(channel, epoch, &self.me, msg_seq, &body.encode())
             .map_err(|e| ChatError::Protocol(e.to_string()))?;

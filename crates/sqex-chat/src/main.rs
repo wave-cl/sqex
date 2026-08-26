@@ -16,6 +16,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use sqex_chat::attach::describe;
 use sqex_chat::client::{Chat, ChatError};
 use sqex_chat::store::{Store, store_path};
 use sqex_proto::timeline::Timeline;
@@ -342,15 +343,151 @@ async fn handle_key(
                 return;
             };
             let (channel, peer) = (open[i].channel, open[i].peer);
-            match chat.send(&channel, &peer, &text).await {
-                Ok(_) => open[i].trouble.message = None,
+            let outcome = match Command::parse(&text) {
+                Command::Send(text) => chat.send(&channel, &peer, &text).await.map(|_| None),
+                Command::File(path) => send_file(chat, &channel, &peer, &path).await.map(Some),
+                Command::Save(seq, path) => save_file(chat, &open[i], seq, &path).await.map(Some),
+                Command::Unknown(word) => Err(ChatError::Protocol(format!(
+                    "no such command {word:?} — /file <path> sends one, \
+                     /save <n> <path> keeps one"
+                ))),
+            };
+            // Poll first, then say what happened. The other order loses both
+            // the confirmation and the error: a successful poll clears stale
+            // trouble, and anything set beforehand is exactly what it clears.
+            poll_one(chat, &mut open[i], app).await;
+            match outcome {
+                Ok(note) => open[i].trouble.message = note,
                 Err(ChatError::NotReady(_)) => open[i].waiting = true,
                 Err(e) => open[i].trouble.message = Some(e.to_string()),
             }
-            poll_one(chat, &mut open[i], app).await;
         }
         _ => {}
     }
+}
+
+/// What a line typed into the message box means.
+///
+/// A leading slash is a command and everything else is a message. There is no
+/// escape for a message that begins with a slash, which is a real limitation
+/// and a smaller one than a file-sending client without a way to send files.
+enum Command {
+    Send(String),
+    File(std::path::PathBuf),
+    Save(u64, std::path::PathBuf),
+    Unknown(String),
+}
+
+impl Command {
+    fn parse(line: &str) -> Command {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('/') {
+            return Command::Send(line.to_string());
+        }
+        let mut words = trimmed.splitn(3, char::is_whitespace);
+        let verb = words.next().unwrap_or("");
+        match verb {
+            "/file" => match words.next() {
+                Some(rest) => {
+                    // The rest of the line, so a path with spaces in it works
+                    // without anybody having to think about quoting.
+                    let mut path = rest.to_string();
+                    if let Some(more) = words.next() {
+                        path.push(' ');
+                        path.push_str(more);
+                    }
+                    Command::File(expand(path.trim()))
+                }
+                None => Command::Unknown("/file needs a path".into()),
+            },
+            "/save" => match (words.next(), words.next()) {
+                (Some(n), Some(path)) => match n.parse::<u64>() {
+                    Ok(seq) => Command::Save(seq, expand(path.trim())),
+                    Err(_) => Command::Unknown(format!("{n} is not a message number")),
+                },
+                _ => Command::Unknown("/save needs a message number and a path".into()),
+            },
+            other => Command::Unknown(other.to_string()),
+        }
+    }
+}
+
+/// `~` on the front of a path, because typing it is reflex.
+fn expand(path: &str) -> std::path::PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(path)),
+        None => std::path::PathBuf::from(path),
+    }
+}
+
+/// Seal a file, upload it, and send a message referencing it.
+async fn send_file(
+    chat: &mut Chat,
+    channel: &[u8; 32],
+    peer: &PubKey,
+    path: &std::path::Path,
+) -> std::result::Result<String, ChatError> {
+    use sqex_chat::attach::describe;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    // Asked, not assumed: an exchange that has not raised its request cap
+    // conforms by choosing a smaller chunk, and guessing fails on the first
+    // Put with nothing to say why.
+    let limits = chat.blob_limits().await?;
+    let prepared = chat.prepare_file(path, limits.chunk as usize)?;
+    let chunks = prepared.chunks();
+    let attachment = chat.upload(channel, &prepared).await?;
+    let note = format!("sent {} in {chunks} chunk(s)", describe(&attachment));
+
+    let mut post = SipPost::default();
+    post.parts.push(Part::Attachment(attachment));
+    chat.send_post(channel, peer, post).await?;
+    Ok(note)
+}
+
+/// Fetch the attachment on message `seq` and write it out.
+async fn save_file(
+    chat: &mut Chat,
+    conv: &Open,
+    seq: u64,
+    path: &std::path::Path,
+) -> std::result::Result<String, ChatError> {
+    let message = conv
+        .timeline
+        .get(seq)
+        .ok_or_else(|| ChatError::Protocol(format!("no message {seq} here")))?;
+    let attachment = message
+        .post
+        .attachments()
+        .next()
+        .ok_or_else(|| ChatError::Protocol(format!("message {seq} has no attachment")))?
+        .clone();
+
+    let bytes = chat.download(&attachment).await?;
+    // A directory means "in here, under the name it came with" — the common
+    // case, and the one where the sender's name is least dangerous, since it
+    // is only ever a leaf.
+    let target = if path.is_dir() {
+        let name = sqex_chat::file_name(&attachment).unwrap_or_else(|| format!("blob-{seq}"));
+        let leaf = std::path::Path::new(&name)
+            .file_name()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("blob-{seq}")));
+        path.join(leaf)
+    } else {
+        path.to_path_buf()
+    };
+    if target.exists() {
+        return Err(ChatError::Protocol(format!(
+            "{} already exists — nothing was overwritten",
+            target.display()
+        )));
+    }
+    std::fs::write(&target, &bytes)
+        .map_err(|e| ChatError::Protocol(format!("{}: {e}", target.display())))?;
+    Ok(format!("saved {} bytes to {}", bytes.len(), target.display()))
 }
 
 async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed: &str) {
@@ -426,16 +563,32 @@ fn refresh(app: &mut App, open: &[Open]) {
         .timeline
         .messages()
         .filter(|m| m.is_visible())
-        .map(|m| Said {
-            who: if m.account == conv.peer {
-                conv.label.clone()
-            } else {
-                "you".to_string()
-            },
-            mine: m.account != conv.peer,
-            text: m.post.body_text().unwrap_or("(nothing to show)").to_string(),
-            at: m.posted,
-            edited: m.edited.is_some(),
+        .map(|m| {
+            // An attachment is described on the line rather than fetched: a
+            // transcript should not pull megabytes to draw itself, and the
+            // sender's `mime` is a claim this client must not act on beyond
+            // choosing words. `/save` is what actually fetches.
+            let files: Vec<String> = m.post.attachments().map(describe).collect();
+            let has_file = !files.is_empty();
+            let text = match (m.post.body_text(), files.is_empty()) {
+                (Some(t), true) => t.to_string(),
+                (Some(t), false) => format!("{t}  {}", files.join(" ")),
+                (None, false) => files.join(" "),
+                (None, true) => "(nothing to show)".to_string(),
+            };
+            Said {
+                who: if m.account == conv.peer {
+                    conv.label.clone()
+                } else {
+                    "you".to_string()
+                },
+                mine: m.account != conv.peer,
+                text,
+                seq: m.seq,
+                has_file,
+                at: m.posted,
+                edited: m.edited.is_some(),
+            }
         })
         .collect();
     app.peer_typing = conv.typing;
@@ -670,5 +823,45 @@ mod tests {
         refresh(&mut app, &[]);
         assert!(app.rows.is_empty());
         assert!(app.said.is_empty());
+    }
+
+    #[test]
+    fn a_leading_slash_is_a_command_and_nothing_else_is() {
+        assert!(matches!(Command::parse("hello"), Command::Send(_)));
+        // Including a message that merely contains one.
+        assert!(matches!(Command::parse("and/or"), Command::Send(_)));
+        assert!(matches!(Command::parse("/file x"), Command::File(_)));
+        assert!(matches!(Command::parse("/nonsense"), Command::Unknown(_)));
+    }
+
+    #[test]
+    fn a_path_with_spaces_does_not_need_quoting() {
+        match Command::parse("/file /tmp/my holiday photo.png") {
+            Command::File(p) => assert_eq!(p, std::path::PathBuf::from("/tmp/my holiday photo.png")),
+            _ => panic!("not parsed as a file"),
+        }
+    }
+
+    #[test]
+    fn save_needs_a_number_and_says_so_when_it_does_not_get_one() {
+        match Command::parse("/save 12 /tmp/out.bin") {
+            Command::Save(seq, p) => {
+                assert_eq!(seq, 12);
+                assert_eq!(p, std::path::PathBuf::from("/tmp/out.bin"));
+            }
+            _ => panic!("not parsed as a save"),
+        }
+        assert!(matches!(Command::parse("/save notanumber /tmp/x"), Command::Unknown(_)));
+        assert!(matches!(Command::parse("/save 12"), Command::Unknown(_)));
+        assert!(matches!(Command::parse("/file"), Command::Unknown(_)));
+    }
+
+    #[test]
+    fn a_tilde_is_expanded_because_typing_it_is_reflex() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand("~/notes.md"), home.join("notes.md"));
+        // Only at the front, and only as a path component.
+        assert_eq!(expand("/tmp/~x"), std::path::PathBuf::from("/tmp/~x"));
+        assert_eq!(expand("~notuser/x"), std::path::PathBuf::from("~notuser/x"));
     }
 }
