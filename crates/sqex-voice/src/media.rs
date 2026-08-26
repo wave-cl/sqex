@@ -336,9 +336,169 @@ mod tests {
     }
 }
 
+/// Measurements, not assertions.
+///
+/// Everything here answers a question about how the codec actually behaves that
+/// its documentation does not, and each one is cited by SIP-14 — including the
+/// two that rejected a design. They are `#[ignore]`d so they never gate CI, and
+/// kept so that nobody has to re-derive the answers:
+///
+/// ```text
+/// cargo test -p sqex-voice -- --ignored --nocapture
+/// ```
 #[cfg(test)]
 mod probe {
     use crate::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
+
+    /// The viable shape: our own detector decides what goes out, and the
+    /// keepalive carries a *real* frame of the room so the far end's comfort
+    /// noise describes something true. Opus's own DTX is not involved.
+    ///
+    /// `cargo test -p sqex-voice -- --ignored --nocapture gate_design`
+    #[test]
+    #[ignore = "reports numbers; run explicitly"]
+    fn gate_design_own_vad() {
+        use crate::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+
+        for keepalive in [50usize, 25, 10] {
+            let mut enc =
+                opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                    .unwrap();
+            enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+            // Deliberately off: we are deciding, not the codec.
+            enc.set_dtx(false).unwrap();
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut phase = 0.0f32;
+            let step = std::f32::consts::TAU * 440.0 / SAMPLE_RATE as f32;
+            let mut since_sent = 0usize;
+
+            let mut slots: Vec<Option<Vec<u8>>> = Vec::new();
+            for i in 0..250 {
+                let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
+                        let s = if i < 50 { phase.sin() * 0.5 + noise } else { noise };
+                        phase = (phase + step) % std::f32::consts::TAU;
+                        s
+                    })
+                    .collect();
+                // Our detector: is this speech? (A real one adapts; this is the
+                // shape, not the tuning.)
+                let speech = rms(&pcm) > 0.02;
+                since_sent += 1;
+                let send = speech || since_sent >= keepalive;
+                if send {
+                    since_sent = 0;
+                    // The room's *actual* audio, so comfort noise is truthful.
+                    slots.push(Some(enc.encode_vec_float(&pcm, 1024).unwrap()));
+                } else {
+                    slots.push(None);
+                }
+            }
+
+            let pause = &slots[60..];
+            let sent = pause.iter().filter(|s| s.is_some()).count();
+
+            let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+            let mut pcm = vec![0f32; FRAME_SAMPLES];
+            let levels: Vec<f32> = slots
+                .iter()
+                .map(|slot| {
+                    dec.decode_float(slot.as_deref().unwrap_or(&[]), &mut pcm, false)
+                        .unwrap();
+                    rms(&pcm)
+                })
+                .collect();
+            let heard = &levels[80..];
+            let dead = heard.iter().filter(|x| **x < 0.0005).count();
+            let (lo, hi) = heard.iter().fold((f32::MAX, 0.0f32), |(l, h), x| (l.min(*x), h.max(*x)));
+            println!(
+                "  keepalive {keepalive:>2} frames  sent {sent:>3}/{:<3}   \
+                 heard: mean {:.4} range {lo:.4}-{hi:.4}, dead {dead}/{}",
+                pause.len(),
+                heard.iter().sum::<f32>() / heard.len() as f32,
+                heard.len()
+            );
+        }
+        println!();
+    }
+
+    /// Does attenuating a room's noise floor make Opus's DTX engage?
+    ///
+    /// The gate design depends on the answer: if the encoder keeps emitting
+    /// full-size frames however quiet the input, gating has to suppress
+    /// transmission itself rather than persuade the codec to.
+    ///
+    /// `cargo test -p sqex-voice -- --ignored --nocapture gate_probe`
+    #[test]
+    #[ignore = "reports numbers; run explicitly"]
+    fn gate_probe_attenuation_versus_dtx() {
+        use crate::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
+        use crate::media::{DTX_MAX, Sender};
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+
+        for gate in [1.0f32, 0.5, 0.25, 0.1, 0.0] {
+            let mut enc =
+                opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                    .unwrap();
+            enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+            enc.set_dtx(true).unwrap();
+            let mut sender = Sender::new(50, true);
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut phase = 0.0f32;
+            let step = std::f32::consts::TAU * 440.0 / SAMPLE_RATE as f32;
+
+            let mut slots: Vec<Option<Vec<u8>>> = Vec::new();
+            for i in 0..250 {
+                let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
+                        let s = if i < 50 {
+                            phase.sin() * 0.5 + noise
+                        } else {
+                            noise * gate // the gate, closed
+                        };
+                        phase = (phase + step) % std::f32::consts::TAU;
+                        s
+                    })
+                    .collect();
+                let packet = enc.encode_vec_float(&pcm, 1024).unwrap();
+                slots.push(sender.offer(packet).map(|f| f.payload));
+            }
+
+            let pause = &slots[60..];
+            let sent = pause.iter().filter(|s| s.is_some()).count();
+            let big = pause
+                .iter()
+                .filter(|s| s.as_ref().is_some_and(|p| p.len() > DTX_MAX))
+                .count();
+
+            // What the far end hears through the pause.
+            let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+            let mut pcm = vec![0f32; FRAME_SAMPLES];
+            let levels: Vec<f32> = slots
+                .iter()
+                .map(|slot| {
+                    dec.decode_float(slot.as_deref().unwrap_or(&[]), &mut pcm, false)
+                        .unwrap();
+                    rms(&pcm)
+                })
+                .collect();
+            let heard = &levels[80..];
+            let dead = heard.iter().filter(|x| **x < 0.0005).count();
+            println!(
+                "  gate x{gate:<4}  sent {sent:>3}/{:<3} ({big:>3} full-size)   \
+                 heard: mean {:.4}, dead frames {dead}/{}",
+                pause.len(),
+                heard.iter().sum::<f32>() / heard.len() as f32,
+                heard.len()
+            );
+        }
+        println!();
+    }
 
     /// The real thing: a speech-then-silence stream put through the actual
     /// transmit policy, decoded two ways, so the envelopes can be compared.
