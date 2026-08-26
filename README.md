@@ -86,9 +86,7 @@ sqex-chat add <their-key>    # discovery is this list; see below
 sqex-chat                    # the conversation
 ```
 
-It ships from the release after v0.9.0; v0.9.0 itself packaged only `sqexd` and
-`sqex`, so until the next tag it is `cargo install --git
-https://github.com/wave-cl/sqex sqex-chat`.
+Packaged from v0.9.1. The v0.9.0 archives held only `sqexd` and `sqex`.
 
 ### The client keeps the keys, and has to
 
