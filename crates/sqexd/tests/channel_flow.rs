@@ -11,9 +11,10 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{
-    ByChannel, ByTarget, ChannelInfo, Create, Cursor, Entries, Fetch, List, Listing, Mark, Marks,
-    MIN_RETENTION, Post, Posted, Role, SignalOut, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
-    TYPE_LEAVE, TYPE_REDACT, Visibility,
+    ByChannel, ByTarget, ChannelInfo, Create, Cursor, EVENT_JOINED, Entries, Fetch,
+    KIND_MEMBER, KIND_SYSTEM, List, Listing, MIN_RETENTION, Mark, Marks, Post, Posted, Role,
+    SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT,
+    Visibility,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -120,8 +121,24 @@ async fn info(client: &mut Client, channel: [u8; 32]) -> (u16, Vec<u8>) {
         .unwrap()
 }
 
+/// The entries a member posted, which is what a client shows as messages.
+/// The exchange's own entries share the sequence space and are folded into the
+/// timeline separately.
+fn messages(e: &Entries) -> Vec<&sqex_proto::channel::Entry> {
+    e.entries.iter().filter(|x| x.kind == KIND_MEMBER).collect()
+}
+
 fn bodies(e: &Entries) -> Vec<Vec<u8>> {
-    e.entries.iter().map(|x| x.body.clone()).collect()
+    messages(e).iter().map(|x| x.body.clone()).collect()
+}
+
+/// The exchange's own entries: who did what to whom.
+fn events(e: &Entries) -> Vec<System> {
+    e.entries
+        .iter()
+        .filter(|x| x.kind == KIND_SYSTEM)
+        .filter_map(|x| System::decode(&x.body).ok().flatten())
+        .collect()
 }
 
 #[tokio::test]
@@ -151,10 +168,14 @@ async fn two_members_hold_a_conversation_in_one_order() {
         bodies(&seen),
         vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec(), b"four".to_vec()]
     );
+    // Bob's join is entry 1, so the messages start at 2 — the exchange's own
+    // entries share the sequence space, which is what makes interleaving free.
     assert_eq!(
-        seen.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        vec![1, 2, 3, 4]
+        messages(&seen).iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![2, 3, 4, 5]
     );
+    assert_eq!(events(&seen).len(), 1);
+    assert_eq!(events(&seen)[0].event, EVENT_JOINED);
 
     let (_, body) = fetch(&mut a, channel, 0, 0).await;
     assert_eq!(bodies(&Entries::decode(&body).unwrap()), bodies(&seen));
@@ -207,9 +228,14 @@ async fn a_parked_fetch_is_answered_by_a_post() {
     assert_eq!(create(&mut a, &public(channel, "waiting")).await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
 
+    // Bob's join is itself an entry, so catch up first: a fetch only parks
+    // when there is genuinely nothing waiting.
+    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let caught_up = Entries::decode(&body).unwrap().last;
+
     let waiter = tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let (code, body) = fetch(&mut b, channel, 0, 20).await;
+        let (code, body) = fetch(&mut b, channel, caught_up, 20).await;
         (code, body, started.elapsed())
     });
 
@@ -455,25 +481,29 @@ async fn delivery_is_observed_and_reading_is_asserted() {
     // Bob collects everything. He never says so — asking for what comes after 0
     // and being handed three entries is the exchange watching him do it.
     let (_, body) = fetch(&mut b, channel, 0, 0).await;
-    assert_eq!(Entries::decode(&body).unwrap().entries.len(), 3);
-    let (_, _) = fetch(&mut b, channel, 3, 0).await;
+    let seen = Entries::decode(&body).unwrap();
+    assert_eq!(messages(&seen).len(), 3);
+    // Four entries in all: Bob's join, then three messages.
+    assert_eq!(seen.entries.len(), 4);
+    let last = seen.last;
 
     let m = marks(&mut b, channel).await;
-    assert_eq!(mark_of(&m, &bob).delivered, 3);
+    assert_eq!(mark_of(&m, &bob).delivered, last);
     assert_eq!(mark_of(&m, &bob).read, 0, "collected is not read");
 
     assert_eq!(cursor(&mut b, channel, 2, true).await, 200);
     let m = marks(&mut a, channel).await;
     assert_eq!(mark_of(&m, &bob).read, 2);
+    let delivered = mark_of(&m, &bob).delivered;
 
     // A mark cannot run ahead of what was delivered: a client may not claim to
     // have read further than it collected.
     assert_eq!(cursor(&mut b, channel, 99, true).await, 200);
-    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, 3);
+    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, delivered);
 
     // Nor backwards.
     assert_eq!(cursor(&mut b, channel, 1, true).await, 200);
-    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, 3);
+    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, delivered);
     assert_eq!(mark_of(&marks(&mut a, channel).await, &alice).delivered, 0);
 }
 
@@ -494,19 +524,20 @@ async fn opting_out_of_receipts_withholds_others_reading_but_not_their_delivery(
     assert_eq!(join(&mut b, channel).await, 200);
     assert_eq!(post(&mut a, channel, b"hello").await.0, 200);
 
-    fetch(&mut a, channel, 0, 0).await;
-    assert_eq!(cursor(&mut a, channel, 1, true).await, 200);
+    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let last = Entries::decode(&body).unwrap().last;
+    assert_eq!(cursor(&mut a, channel, last, true).await, 200);
 
     // Bob reads, and opts out.
     fetch(&mut b, channel, 0, 0).await;
-    assert_eq!(cursor(&mut b, channel, 1, false).await, 200);
+    assert_eq!(cursor(&mut b, channel, last, false).await, 200);
 
     let seen = marks(&mut b, channel).await;
     assert_eq!(mark_of(&seen, &alice).read, 0, "he gave nothing, he sees nothing");
-    assert_eq!(mark_of(&seen, &alice).delivered, 1, "delivery is never withheld");
+    assert!(mark_of(&seen, &alice).delivered > 0, "delivery is never withheld");
 
     // Alice still gave hers, so she still sees his.
-    assert_eq!(mark_of(&marks(&mut a, channel).await, &alice).read, 1);
+    assert!(mark_of(&marks(&mut a, channel).await, &alice).read > 0);
 }
 
 #[tokio::test]
@@ -521,7 +552,8 @@ async fn a_redaction_leaves_a_tombstone_and_a_stranger_cannot_make_one() {
 
     assert_eq!(create(&mut a, &public(channel, "regrets")).await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
-    assert_eq!(post(&mut b, channel, b"said too much").await.0, 200);
+    let (_, body) = post(&mut b, channel, b"said too much").await;
+    let bobs = Posted::decode(&body).unwrap().seq;
 
     let redact = |c: [u8; 32], t: u64| ByTarget { channel: c, target: t }.encode(TYPE_REDACT);
 
@@ -529,23 +561,29 @@ async fn a_redaction_leaves_a_tombstone_and_a_stranger_cannot_make_one() {
     let (mallory_seed, _) = identity(143);
     let mut m = as_identity(addr, pubkey, mallory_seed).await;
     assert_eq!(join(&mut m, channel).await, 200);
-    let (code, _) = m.post("/channel/redact", redact(channel, 1)).await.unwrap();
+    let (code, _) = m.post("/channel/redact", redact(channel, bobs)).await.unwrap();
     assert_eq!(code, 403);
 
+    // Nor may an admin reach the exchange's own record of who did what: an
+    // audit trail its subject can erase is not one.
+    let (code, _) = a.post("/channel/redact", redact(channel, 1)).await.unwrap();
+    assert_eq!(code, 409, "a system entry is never redactable");
+
     // Its author may.
-    let (code, _) = b.post("/channel/redact", redact(channel, 1)).await.unwrap();
+    let (code, _) = b.post("/channel/redact", redact(channel, bobs)).await.unwrap();
     assert_eq!(code, 200);
 
     // The entry survives as a gap, which is the record.
     let (_, body) = fetch(&mut a, channel, 0, 0).await;
     let seen = Entries::decode(&body).unwrap();
-    assert_eq!(seen.entries.len(), 1, "the entry is still there");
-    assert!(seen.entries[0].body.is_empty(), "and its body is not");
-    assert_eq!(seen.first, 1);
+    let mine: Vec<_> = messages(&seen).into_iter().filter(|e| e.seq == bobs).collect();
+    assert_eq!(mine.len(), 1, "the entry is still there");
+    assert!(mine[0].body.is_empty(), "and its body is not");
 
     // An admin may redact somebody else's, which is the moderation path.
-    assert_eq!(post(&mut b, channel, b"again").await.0, 200);
-    let (code, _) = a.post("/channel/redact", redact(channel, 2)).await.unwrap();
+    let (_, body) = post(&mut b, channel, b"again").await;
+    let again = Posted::decode(&body).unwrap().seq;
+    let (code, _) = a.post("/channel/redact", redact(channel, again)).await.unwrap();
     assert_eq!(code, 200);
 
     let (code, _) = a.post("/channel/redact", redact(channel, 99)).await.unwrap();
@@ -584,7 +622,7 @@ async fn a_signal_reaches_the_others_once_and_is_never_stored() {
     assert_eq!(seen.signals.len(), 1);
     assert_eq!(seen.signals[0].account, alice);
     assert_eq!(seen.signals[0].kind, 0x01);
-    assert!(seen.entries.is_empty(), "a signal is not an entry");
+    assert!(messages(&seen).is_empty(), "a signal is not an entry");
 
     // Delivered at most once, and it left nothing behind.
     let (_, body) = fetch(&mut b, channel, 0, 0).await;
@@ -609,9 +647,12 @@ async fn a_parked_fetch_is_answered_by_a_signal_too() {
     assert_eq!(create(&mut a, &public(channel, "waiting")).await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
 
+    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let caught_up = Entries::decode(&body).unwrap().last;
+
     let waiter = tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let (code, body) = fetch(&mut b, channel, 0, 20).await;
+        let (code, body) = fetch(&mut b, channel, caught_up, 20).await;
         (code, body, started.elapsed())
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

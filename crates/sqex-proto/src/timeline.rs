@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 
 use sqnr_core::PubKey;
 
+use crate::channel::KIND_SYSTEM;
 use crate::message::{Body, EDIT_WINDOW, Post};
 
 /// One entry as it reached us, with its body already opened if we could.
@@ -119,6 +120,13 @@ impl Timeline {
     }
 
     pub fn apply(&mut self, e: &Received, admins: &[PubKey]) {
+        // An entry the exchange wrote is not a message and never carried a
+        // SIP-19 body. It is a membership or rotation event, rendered from
+        // SIP-16's own `System` layout, and counting it as something we failed
+        // to read would tell a client a gap exists where none does.
+        if e.kind == KIND_SYSTEM {
+            return;
+        }
         let Some(body) = &e.body else {
             // Well formed and not understood, or sealed under a key we lack.
             // Either way it happened, and the reader is told.
@@ -470,6 +478,27 @@ mod tests {
 
         let t = Timeline::fold(&[meta(1, 9, "planning"), meta(2, 9, "renamed")], &[key(9)]);
         assert_eq!(t.name, "renamed");
+    }
+
+    #[test]
+    fn an_exchange_written_entry_is_not_a_message_and_not_a_gap() {
+        // It never carried a SIP-19 body, so reporting it as unreadable would
+        // tell a client something is missing when nothing is.
+        let t = Timeline::fold(
+            &[
+                post(1, 1, 100, "a message"),
+                Received {
+                    seq: 2,
+                    account: PubKey::new([0; 32]),
+                    posted: 101,
+                    kind: KIND_SYSTEM,
+                    body: None,
+                },
+            ],
+            &[],
+        );
+        assert_eq!(t.messages().count(), 1);
+        assert!(t.unreadable().is_empty());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use sqex_proto::channel::{
     Ack, ByChannel, Create, Entries, Fetch, Invitee, Post, Role, TYPE_INVITE, TYPE_REMOVE,
     Visibility,
 };
+use sqex_proto::channel::Posted;
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
     open_envelope, seal_envelope,
@@ -267,8 +268,15 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
         .await
         .unwrap();
     let entries = Entries::decode(&body).unwrap();
-    assert_eq!(entries.entries.len(), 1);
-    let e = &entries.entries[0];
+    // Creating with an invitee and minting an epoch are both recorded, so the
+    // log holds the exchange's entries as well as the one message.
+    let mine: Vec<_> = entries
+        .entries
+        .iter()
+        .filter(|e| e.kind == sqex_proto::channel::KIND_MEMBER)
+        .collect();
+    assert_eq!(mine.len(), 1);
+    let e = mine[0];
     let opened = bobs_key
         .open(&channel, e.epoch, &e.device, e.msg_seq, &e.body)
         .unwrap();
@@ -691,36 +699,46 @@ async fn a_real_conversation_renders_end_to_end() {
         post.encode()
     };
 
+    // Sequence numbers are the exchange's, and the exchange's own entries share
+    // the space, so a client works from what it was told rather than counting.
     let a1 = send(Body::Post(SipPost::text("has anyone seen the report")), &alice.key, &mut alice_seq);
-    assert_eq!(alice.client.post("/channel/post", a1).await.unwrap().0, 200);
+    let (code, body) = alice.client.post("/channel/post", a1).await.unwrap();
+    assert_eq!(code, 200);
+    let question = Posted::decode(&body).unwrap().seq;
 
     let b1 = send(
         Body::Post(SipPost {
-            parts: vec![Part::Reply(1), Part::Text("I have it here".into()), Part::Mention(alice.key)],
+            parts: vec![
+                Part::Reply(question),
+                Part::Text("I have it here".into()),
+                Part::Mention(alice.key),
+            ],
             unknown: 0,
         }),
         &bob.key,
         &mut bob_seq,
     );
-    assert_eq!(bob.client.post("/channel/post", b1).await.unwrap().0, 200);
+    let (_, body) = bob.client.post("/channel/post", b1).await.unwrap();
+    let reply = Posted::decode(&body).unwrap().seq;
 
     let a2 = send(
-        Body::Reaction { target: 2, add: true, emoji: "🙏".into() },
+        Body::Reaction { target: reply, add: true, emoji: "🙏".into() },
         &alice.key,
         &mut alice_seq,
     );
     assert_eq!(alice.client.post("/channel/post", a2).await.unwrap().0, 200);
 
     let b2 = send(
-        Body::Edit { target: 2, post: SipPost::text("I have it here — sending now") },
+        Body::Edit { target: reply, post: SipPost::text("I have it here — sending now") },
         &bob.key,
         &mut bob_seq,
     );
     assert_eq!(bob.client.post("/channel/post", b2).await.unwrap().0, 200);
 
     let a3 = send(Body::Post(SipPost::text("ignore that")), &alice.key, &mut alice_seq);
-    assert_eq!(alice.client.post("/channel/post", a3).await.unwrap().0, 200);
-    let a4 = send(Body::Redact { target: 5 }, &alice.key, &mut alice_seq);
+    let (_, body) = alice.client.post("/channel/post", a3).await.unwrap();
+    let regretted = Posted::decode(&body).unwrap().seq;
+    let a4 = send(Body::Redact { target: regretted }, &alice.key, &mut alice_seq);
     assert_eq!(alice.client.post("/channel/post", a4).await.unwrap().0, 200);
 
     // Bob fetches the lot and folds it.
@@ -731,7 +749,14 @@ async fn a_real_conversation_renders_end_to_end() {
         .unwrap();
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let entries = Entries::decode(&body).unwrap();
-    assert_eq!(entries.entries.len(), 6);
+    assert_eq!(
+        entries
+            .entries
+            .iter()
+            .filter(|e| e.kind == sqex_proto::channel::KIND_MEMBER)
+            .count(),
+        6
+    );
 
     let t = timeline_of(&entries.entries, &epoch1, channel, &[alice.key]);
     let shown: Vec<&sqex_proto::timeline::Message> = t.messages().collect();
@@ -797,12 +822,14 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
     };
 
     let a = seal(Body::Post(SipPost::text("what I actually said")), &alice.key, 0);
-    assert_eq!(alice.client.post("/channel/post", a).await.unwrap().0, 200);
+    let (code, body) = alice.client.post("/channel/post", a).await.unwrap();
+    assert_eq!(code, 200);
+    let target = Posted::decode(&body).unwrap().seq;
 
     // Bob is a member, so he holds the channel key and can seal a well-formed
     // edit of somebody else's message. The exchange takes it.
     let forged = seal(
-        Body::Edit { target: 1, post: SipPost::text("what Bob wishes I had said") },
+        Body::Edit { target, post: SipPost::text("what Bob wishes I had said") },
         &bob.key,
         0,
     );
@@ -818,14 +845,198 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
         .await
         .unwrap();
     let entries = Entries::decode(&body).unwrap();
-    assert_eq!(entries.entries.len(), 2, "both entries are stored");
+    assert_eq!(
+        entries
+            .entries
+            .iter()
+            .filter(|e| e.kind == sqex_proto::channel::KIND_MEMBER)
+            .count(),
+        2,
+        "both entries are stored"
+    );
 
     let t = timeline_of(&entries.entries, &epoch1, channel, &[alice.key]);
-    let m = t.get(1).unwrap();
+    let m = t.get(target).unwrap();
     assert_eq!(
         m.post.body_text(),
         Some("what I actually said"),
         "the reader refuses what the exchange could not"
     );
     assert_eq!(m.edited, None);
+}
+
+#[tokio::test]
+async fn a_removal_leaves_a_record_of_who_did_it() {
+    // The reason system entries exist. Without them a member simply vanishes
+    // from the roster and nothing says why or at whose hand.
+    use sqex_proto::channel::{EVENT_ADDED, EVENT_REMOVED, KIND_SYSTEM, System};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 121).await;
+    let bob = Peer::new(addr, pubkey, 122).await;
+    let channel = [30u8; 32];
+
+    alice
+        .client
+        .post(
+            "/channel/create",
+            private(channel, vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+        )
+        .await
+        .unwrap();
+
+    let mut rm = vec![TYPE_REMOVE];
+    rm.extend_from_slice(&channel);
+    rm.extend_from_slice(bob.key.as_bytes());
+    assert_eq!(alice.client.post("/channel/remove", rm).await.unwrap().0, 200);
+
+    let (_, body) = alice
+        .client
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    let seen = Entries::decode(&body).unwrap();
+    let events: Vec<System> = seen
+        .entries
+        .iter()
+        .filter(|e| e.kind == KIND_SYSTEM)
+        .filter_map(|e| System::decode(&e.body).ok().flatten())
+        .collect();
+
+    assert_eq!(events.len(), 2, "added at creation, then removed");
+    assert_eq!(events[0].event, EVENT_ADDED);
+    assert_eq!(events[0].subject, bob.key);
+    assert_eq!(events[1].event, EVENT_REMOVED);
+    assert_eq!(events[1].subject, bob.key);
+    assert_eq!(events[1].actor, alice.key, "and by whom");
+
+    // The exchange wrote these, so they carry no member's name as author.
+    let system = seen.entries.iter().find(|e| e.kind == KIND_SYSTEM).unwrap();
+    assert_eq!(system.account, PubKey::new([0; 32]));
+    assert_eq!(system.epoch, 0);
+}
+
+#[tokio::test]
+async fn a_squatter_cannot_deny_two_people_a_direct_message() {
+    // A direct-message identifier is a hash of two public keys, so anybody can
+    // compute it. Without a rule, one request from a stranger would sit in that
+    // channel forever and deny two people the ability to ever talk.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 131).await;
+    let bob = Peer::new(addr, pubkey, 132).await;
+    let mut mallory = Peer::new(addr, pubkey, 133).await;
+
+    let dm = sqex_proto::channel::direct_message_id(&alice.key, &bob.key);
+
+    // Mallory gets there first, knowing nothing but two public keys.
+    let (code, _) = mallory
+        .client
+        .post("/channel/create", private(dm, vec![]).encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    // Alice claims it by showing it is the derivation over herself and Bob,
+    // which nobody but those two can do. The squatter's channel is discarded.
+    let (code, body) = alice
+        .client
+        .post(
+            "/channel/create",
+            private(dm, vec![Invitee { account: bob.key, role: Role::Admin }]).encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+
+    let (code, body) = alice
+        .client
+        .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let info = sqex_proto::channel::ChannelInfo::decode(&body).unwrap();
+    let members: Vec<PubKey> = info.members.iter().map(|m| m.account).collect();
+    assert!(members.contains(&alice.key) && members.contains(&bob.key));
+    assert!(!members.contains(&mallory.key), "the squatter has no claim");
+
+    // And Mallory cannot take it back, having none.
+    let (code, _) = mallory
+        .client
+        .post("/channel/create", private(dm, vec![]).encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let (_, body) = alice
+        .client
+        .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+        .await
+        .unwrap();
+    assert_eq!(
+        sqex_proto::channel::ChannelInfo::decode(&body).unwrap().members.len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_party_who_left_a_direct_message_may_return_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 141).await;
+    let bob = Peer::new(addr, pubkey, 142).await;
+    let dm = sqex_proto::channel::direct_message_id(&alice.key, &bob.key);
+
+    alice
+        .client
+        .post(
+            "/channel/create",
+            private(dm, vec![Invitee { account: bob.key, role: Role::Admin }]).encode(),
+        )
+        .await
+        .unwrap();
+
+    let (code, _) = alice
+        .client
+        .post(
+            "/channel/leave",
+            ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_LEAVE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    // Bob keeps the conversation; leaving must not delete the other person's
+    // copy of it.
+    assert_eq!(
+        alice
+            .client
+            .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+            .await
+            .unwrap()
+            .0,
+        403,
+        "she is no longer a member"
+    );
+
+    // Returning is a create, permitted because the derivation proves she is
+    // one of the two the channel is named after.
+    let (code, _) = alice
+        .client
+        .post(
+            "/channel/create",
+            private(dm, vec![Invitee { account: bob.key, role: Role::Admin }]).encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let (code, body) = alice
+        .client
+        .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        sqex_proto::channel::ChannelInfo::decode(&body).unwrap().members.len(),
+        2
+    );
 }

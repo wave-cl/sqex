@@ -54,6 +54,59 @@ pub const KIND_SYSTEM: u8 = 0x00;
 /// An entry a member posted.
 pub const KIND_MEMBER: u8 = 0x01;
 
+pub const EVENT_ADDED: u8 = 0x01;
+pub const EVENT_REMOVED: u8 = 0x02;
+pub const EVENT_LEFT: u8 = 0x03;
+pub const EVENT_JOINED: u8 = 0x04;
+pub const EVENT_PROMOTED: u8 = 0x05;
+pub const EVENT_DEMOTED: u8 = 0x06;
+pub const EVENT_ROTATED: u8 = 0x07;
+pub const EVENT_RETENTION: u8 = 0x08;
+
+/// The body of an entry the exchange wrote itself.
+///
+/// These are the exchange's record and a client MUST NOT post one. Two reasons,
+/// and both matter: the exchange cannot seal, so it could not write into a
+/// private channel's sealed stream even if it wanted to — and a client-posted
+/// membership event would be a claim by the very admin whose action it
+/// describes, which is no record at all. It is already the sole authority on
+/// membership and already holds every one of these facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct System {
+    pub event: u8,
+    pub subject: PubKey,
+    pub actor: PubKey,
+}
+
+impl System {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(65);
+        out.push(self.event);
+        out.extend_from_slice(self.subject.as_bytes());
+        out.extend_from_slice(self.actor.as_bytes());
+        out
+    }
+
+    /// `Ok(None)` for an event we do not know, which a reader ignores — the
+    /// same rule SIP-19 applies to its own body types.
+    pub fn decode(b: &[u8]) -> Result<Option<System>> {
+        if b.len() != 65 {
+            return Err(Error::Malformed(format!(
+                "system entry is {} bytes, want 65",
+                b.len()
+            )));
+        }
+        if b[0] == 0 || b[0] > EVENT_RETENTION {
+            return Ok(None);
+        }
+        Ok(Some(System {
+            event: b[0],
+            subject: key_at(b, 1),
+            actor: key_at(b, 33),
+        }))
+    }
+}
+
 /// Members one channel may hold.
 pub const MAX_MEMBERS: usize = 256;
 /// Bytes of entry body. Bounded by the 64 KiB request cap: a `Post` must fit
@@ -1145,6 +1198,22 @@ mod tests {
         };
         assert_eq!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_REDACT).unwrap(), t);
         assert!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_CURSOR).is_err());
+    }
+
+    #[test]
+    fn a_system_entry_round_trips_and_ignores_what_it_does_not_know() {
+        let e = System {
+            event: EVENT_REMOVED,
+            subject: key(1),
+            actor: key(2),
+        };
+        assert_eq!(System::decode(&e.encode()).unwrap(), Some(e));
+
+        let mut later = e.encode();
+        later[0] = 0x7f;
+        assert_eq!(System::decode(&later).unwrap(), None, "a later event is ignored");
+
+        assert!(System::decode(&e.encode()[..64]).is_err(), "truncation is not");
     }
 
     #[test]

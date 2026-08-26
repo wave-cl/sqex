@@ -33,8 +33,10 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::channel::{
-    ABANDON_SECS, ChannelInfo, Create, Entries, Entry, KIND_MEMBER, KIND_SYSTEM, Listing,
-    MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled, direct_message_id,
+    ABANDON_SECS, Invitee, ChannelInfo, Create, Entries, Entry, KIND_MEMBER, KIND_SYSTEM, Listing,
+    EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
+    EVENT_RETENTION, EVENT_ROTATED, MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled,
+    System, direct_message_id,
     MAX_BATCH_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
     MAX_RETENTION, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role, Visibility,
 };
@@ -378,8 +380,46 @@ impl Channels {
             .map(|e| e as u32);
 
         if let Some(epoch) = existing {
-            let mine = role_of(&tx, &req.channel, caller).is_some();
-            return Ok((false, if mine { epoch } else { 0 }));
+            if role_of(&tx, &req.channel, caller).is_some() {
+                return Ok((false, epoch));
+            }
+            // A direct message is the one case where a create may touch a
+            // channel the caller is not in, and it has to be: the identifier is
+            // the derivation over two accounts, so anybody can compute it. Left
+            // alone, one request would let a stranger sit in the channel
+            // forever and deny two people the ability to ever talk.
+            match dm_claim(&tx, &req.channel, caller, &req.invites)? {
+                DmClaim::None => return Ok((false, 0)),
+                // Returning after leaving: re-add them and keep the history.
+                DmClaim::Returning => {
+                    tx.execute(
+                        "INSERT INTO member (channel, account, role, joined, present)
+                         VALUES (?1, ?2, ?3, ?4, 1)
+                         ON CONFLICT (channel, account) DO UPDATE SET present = 1",
+                        params![
+                            &req.channel[..],
+                            caller.as_bytes(),
+                            Role::Admin as u8 as i64,
+                            now as i64
+                        ],
+                    )
+                    .map_err(storage("rejoin direct message"))?;
+                    write_system(&tx, &req.channel, EVENT_JOINED, caller, caller, now)?;
+                    tx.commit().map_err(storage("commit rejoin"))?;
+                    return Ok((false, epoch));
+                }
+                // Somebody with no claim to this identifier is occupying it.
+                // Discarding is safe because the claim is provable and
+                // exclusive — only these two can produce it — and what goes is
+                // only whatever the squatter put there.
+                DmClaim::Squatted => {
+                    let held = attached_blobs(&tx, &req.channel)?;
+                    destroy(&tx, &req.channel)?;
+                    for blob in held {
+                        collect_blob(&tx, &blob)?;
+                    }
+                }
+            }
         }
 
         let mine: i64 = tx
@@ -440,6 +480,7 @@ impl Channels {
                 ],
             )
             .map_err(storage("insert invitee"))?;
+            write_system(&tx, &req.channel, EVENT_ADDED, &i.account, caller, now)?;
         }
         tx.commit().map_err(storage("commit create"))?;
         Ok((true, 0))
@@ -456,7 +497,8 @@ impl Channels {
             return Err(ChannelError::NotPublic);
         }
         let (members, _) = counts(&tx, channel)?;
-        if role_of(&tx, channel, caller).is_none() && members as usize >= MAX_MEMBERS {
+        let already = role_of(&tx, channel, caller).is_some();
+        if !already && members as usize >= MAX_MEMBERS {
             return Err(ChannelError::Full);
         }
         // An admin returning to a room they administer keeps the role.
@@ -467,12 +509,16 @@ impl Channels {
             params![&channel[..], caller.as_bytes(), now as i64],
         )
         .map_err(storage("insert member"))?;
+        if !already {
+            write_system(&tx, channel, EVENT_JOINED, caller, caller, now)?;
+        }
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
             params![&channel[..]],
         )
         .map_err(storage("clear empty_since"))?;
         tx.commit().map_err(storage("commit join"))?;
+        self.wake(channel);
         Ok(())
     }
 
@@ -518,6 +564,7 @@ impl Channels {
             .map_err(storage("delete member"))?;
         }
 
+        write_system(&tx, channel, EVENT_LEFT, caller, caller, now)?;
         if members == 1 {
             if visibility == Visibility::Public {
                 tx.execute(
@@ -530,6 +577,7 @@ impl Channels {
             }
         }
         tx.commit().map_err(storage("commit leave"))?;
+        self.wake(channel);
         Ok(())
     }
 
@@ -893,8 +941,10 @@ impl Channels {
             ],
         )
         .map_err(storage("update retention"))?;
+        write_system(&tx, &req.channel, EVENT_RETENTION, caller, caller, now)?;
         prune(&tx, &req.channel, now)?;
         tx.commit().map_err(storage("commit retain"))?;
+        self.wake(&req.channel);
         Ok(())
     }
 
@@ -1079,6 +1129,7 @@ impl Channels {
         if role_of(&tx, channel, account).is_none() && members as usize >= MAX_MEMBERS {
             return Err(ChannelError::Full);
         }
+        let was = role_of(&tx, channel, account);
         tx.execute(
             "INSERT INTO member (channel, account, role, joined, present)
              VALUES (?1, ?2, ?3, ?4, 1)
@@ -1091,12 +1142,22 @@ impl Channels {
             ],
         )
         .map_err(storage("insert invitee"))?;
+        // Inviting somebody already present is how a role changes, so the
+        // record says which of the two happened.
+        let event = match was {
+            None => EVENT_ADDED,
+            Some(had) if had == role => EVENT_ADDED,
+            Some(_) if role == Role::Admin => EVENT_PROMOTED,
+            Some(_) => EVENT_DEMOTED,
+        };
+        write_system(&tx, channel, event, account, caller, now)?;
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
             params![&channel[..]],
         )
         .map_err(storage("clear empty_since"))?;
         tx.commit().map_err(storage("commit invite"))?;
+        self.wake(channel);
         Ok(())
     }
 
@@ -1138,7 +1199,11 @@ impl Channels {
             params![&channel[..], account.as_bytes()],
         )
         .map_err(storage("delete envelopes"))?;
+        // The record of who did this is the whole reason system entries exist,
+        // and is why an admin cannot redact one.
+        write_system(&tx, channel, EVENT_REMOVED, account, caller, now_unix())?;
         tx.commit().map_err(storage("commit remove"))?;
+        self.wake(channel);
         Ok(())
     }
 
@@ -1229,6 +1294,7 @@ impl Channels {
                 params![&req.channel[..], req.epoch as i64],
             )
             .map_err(storage("advance epoch"))?;
+            write_system(&tx, &req.channel, EVENT_ROTATED, caller, caller, now)?;
         }
         tx.commit().map_err(storage("commit put"))?;
         Ok(PutAck {
@@ -1333,6 +1399,63 @@ impl Channels {
                 .collect(),
         })
     }
+}
+
+/// What a create by a non-member may claim about a direct-message identifier.
+enum DmClaim {
+    /// Not a direct message, or the caller cannot show it is one of its two.
+    None,
+    /// The caller is one of the two and everybody present is as well.
+    Returning,
+    /// The caller is one of the two and somebody else is sitting there.
+    Squatted,
+}
+
+/// Test a caller's claim to a direct-message identifier.
+///
+/// The claim is provable and exclusive: to make it you must show that the
+/// channel is the derivation over yourself and one other account, which nobody
+/// but those two can do.
+fn dm_claim(
+    db: &Connection,
+    channel: &[u8; 32],
+    caller: &PubKey,
+    invites: &[Invitee],
+) -> Result<DmClaim, ChannelError> {
+    if invites.len() != 1 {
+        return Ok(DmClaim::None);
+    }
+    let other = invites[0].account;
+    if direct_message_id(caller, &other) != *channel {
+        return Ok(DmClaim::None);
+    }
+    let mut stmt = db
+        .prepare("SELECT account FROM member WHERE channel = ?1")
+        .map_err(storage("prepare dm claim"))?;
+    let present: Vec<PubKey> = stmt
+        .query_map(params![&channel[..]], |r| {
+            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+        })
+        .map_err(storage("query dm claim"))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(if present.iter().all(|m| m == caller || m == &other) {
+        DmClaim::Returning
+    } else {
+        DmClaim::Squatted
+    })
+}
+
+fn attached_blobs(db: &Connection, channel: &[u8; 32]) -> Result<Vec<[u8; 32]>, ChannelError> {
+    let mut stmt = db
+        .prepare("SELECT blob FROM attachment WHERE channel = ?1")
+        .map_err(storage("prepare attached blobs"))?;
+    let rows = stmt
+        .query_map(params![&channel[..]], |r| {
+            Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+        })
+        .map_err(storage("query attached blobs"))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
 /// Whether a channel's identifier is the derivation over its two members.
@@ -1661,6 +1784,58 @@ impl Channels {
         tx.commit().map_err(storage("commit detach"))?;
         Ok(())
     }
+}
+
+/// Write one of the exchange's own entries into the log.
+///
+/// It shares the channel's sequence space, so a client fetching a range gets
+/// messages and events already interleaved, in the order they happened, with
+/// nothing to merge. `account`, `device`, `msg_seq` and `expires_after` are all
+/// zero: the exchange wrote it and no member did.
+fn write_system(
+    db: &Connection,
+    channel: &[u8; 32],
+    event: u8,
+    subject: &PubKey,
+    actor: &PubKey,
+    now: u64,
+) -> Result<(), ChannelError> {
+    let seq: u64 = db
+        .query_row(
+            "SELECT next_seq FROM channel WHERE id = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(storage("read next_seq"))?
+        .ok_or(ChannelError::NoSuchChannel)? as u64;
+
+    let body = System {
+        event,
+        subject: *subject,
+        actor: *actor,
+    }
+    .encode();
+    db.execute(
+        "INSERT INTO entry (channel, seq, kind, account, device, posted,
+                            expires_after, epoch, msg_seq, body)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, ?6)",
+        params![
+            &channel[..],
+            seq as i64,
+            KIND_SYSTEM as i64,
+            &[0u8; 32][..],
+            now as i64,
+            &body,
+        ],
+    )
+    .map_err(storage("insert system entry"))?;
+    db.execute(
+        "UPDATE channel SET next_seq = ?2, empty_since = NULL WHERE id = ?1",
+        params![&channel[..], (seq + 1) as i64],
+    )
+    .map_err(storage("bump next_seq"))?;
+    Ok(())
 }
 
 fn attach(
