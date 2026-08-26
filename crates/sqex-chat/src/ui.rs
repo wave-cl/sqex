@@ -24,8 +24,12 @@ use sqnr_core::PubKey;
 
 /// One row in the conversation list.
 pub struct Row {
-    pub account: PubKey,
+    pub channel: [u8; 32],
     pub label: String,
+    /// A group rather than a direct message. Marked, because "who am I talking
+    /// to" and "who can read this" are the same question in one and not in the
+    /// other.
+    pub group: bool,
     pub unread: usize,
     /// They have never run a client, so nothing can be sealed to them yet.
     pub waiting: bool,
@@ -183,7 +187,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, r)| {
             let selected = i == app.selected;
             let mut spans = vec![Span::styled(
-                format!("{:<16}", truncate(&r.label, 16)),
+                format!("{}{:<15}", if r.group { "#" } else { " " }, truncate(&r.label, 15)),
                 if selected {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
@@ -286,7 +290,7 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 fn status(f: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if app.trouble.is_quiet() {
         (
-            " ^C quit · Tab next · ^N add · /file <path> · /save <n> <path>".to_string(),
+            " ^C quit · Tab · ^N add · /new /invite /kick /rotate /who · /file /save".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
@@ -359,8 +363,9 @@ mod tests {
         let mut app = App {
             rows: (0..3)
                 .map(|i| Row {
-                    account: PubKey::new([i; 32]),
+                    channel: [i; 32],
                     label: format!("p{i}"),
+                    group: false,
                     unread: 0,
                     waiting: false,
                 })
@@ -420,8 +425,9 @@ mod tests {
         App {
             me: "9hSR6S7W".into(),
             rows: vec![Row {
-                account: PubKey::new([2; 32]),
+                channel: [2; 32],
                 label: "bob".into(),
+                group: false,
                 unread: 2,
                 waiting: false,
             }],
@@ -462,6 +468,7 @@ mod tests {
         assert!(out.contains("^C quit"));
         assert!(out.contains("^N add"));
         assert!(out.contains("/file"));
+        assert!(out.contains("/new"));
     }
 
     #[test]

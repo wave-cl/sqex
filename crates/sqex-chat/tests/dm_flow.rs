@@ -92,7 +92,7 @@ async fn two_people_hold_a_direct_message_the_exchange_cannot_read() {
     let channel = alice.open_dm(&bob_key).await.unwrap();
     assert_eq!(channel, bob.dm_with(&alice_key), "both ends derive the same id");
 
-    alice.send(&channel, &bob_key, "are you there?").await.unwrap();
+    alice.send(&channel, "are you there?").await.unwrap();
 
     // Bob opens his side, collects the key Alice sealed to him, and reads.
     let same = bob.open_dm(&alice_key).await.unwrap();
@@ -103,7 +103,7 @@ async fn two_people_hold_a_direct_message_the_exchange_cannot_read() {
     assert!(!got.gap);
     assert!(got.unreadable.is_empty(), "bob could not open something");
 
-    bob.send(&channel, &alice_key, "i am").await.unwrap();
+    bob.send(&channel, "i am").await.unwrap();
     let mut alices = Timeline::new();
     let got = alice.poll(&channel, &mut alices, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["are you there?", "i am"]);
@@ -120,7 +120,7 @@ async fn the_exchange_stores_ciphertext_and_nothing_else() {
 
     let channel = alice.open_dm(&bob_key).await.unwrap();
     let secret = "the exchange must never see this";
-    alice.send(&channel, &bob_key, secret).await.unwrap();
+    alice.send(&channel, secret).await.unwrap();
     bob.open_dm(&alice_key).await.unwrap();
 
     // Read the raw entry the exchange is holding, not our own copy of it.
@@ -155,11 +155,11 @@ async fn a_client_that_restarts_can_still_read_and_still_write() {
     {
         let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
         channel = alice.open_dm(&bob_key).await.unwrap();
-        alice.send(&channel, &bob_key, "before the restart").await.unwrap();
+        alice.send(&channel, "before the restart").await.unwrap();
     } // Alice's client is dropped: connection, pool, keys, counters, all gone.
 
     bob.open_dm(&alice_key).await.unwrap();
-    bob.send(&channel, &alice_key, "while she was away").await.unwrap();
+    bob.send(&channel, "while she was away").await.unwrap();
 
     // A completely fresh client over the same store.
     let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
@@ -173,7 +173,7 @@ async fn a_client_that_restarts_can_still_read_and_still_write() {
 
     // And she can still send. The counter must not collide with the one she
     // used before the restart, or ChaCha20-Poly1305 leaks both messages.
-    alice.send(&channel, &bob_key, "after the restart").await.unwrap();
+    alice.send(&channel, "after the restart").await.unwrap();
     let mut bobs = Timeline::new();
     let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
     assert_eq!(
@@ -202,12 +202,12 @@ async fn a_restart_does_not_reuse_a_message_counter() {
     {
         let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
         channel = alice.open_dm(&bob_key).await.unwrap();
-        alice.send(&channel, &bob_key, "one").await.unwrap();
-        alice.send(&channel, &bob_key, "two").await.unwrap();
+        alice.send(&channel, "one").await.unwrap();
+        alice.send(&channel, "two").await.unwrap();
     }
     for _ in 0..3 {
         let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
-        alice.send(&channel, &bob_key, "again").await.unwrap();
+        alice.send(&channel, "again").await.unwrap();
     }
 
     bob.open_dm(&alice_key).await.unwrap();
@@ -234,7 +234,7 @@ async fn a_replayed_entry_is_refused_by_the_reader() {
     let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
     let mut bob = chat_at(addr, server_pub, 2, &b_store).await;
     let channel = alice.open_dm(&bob_key).await.unwrap();
-    alice.send(&channel, &bob_key, "said once").await.unwrap();
+    alice.send(&channel, "said once").await.unwrap();
     bob.open_dm(&alice_key).await.unwrap();
 
     let mut bobs = Timeline::new();
@@ -259,7 +259,7 @@ async fn a_stranger_cannot_read_the_conversation() {
     let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
     let (_, bob_key) = identity(2);
     let channel = alice.open_dm(&bob_key).await.unwrap();
-    alice.send(&channel, &bob_key, "private").await.unwrap();
+    alice.send(&channel, "private").await.unwrap();
 
     // Mallory knows the channel identifier — it is derivable from two public
     // keys, so this is not a secret — and is refused on membership alone.
@@ -290,13 +290,13 @@ async fn a_conversation_with_somebody_who_has_never_run_a_client_waits_rather_th
         .await
         .expect("the channel opens even though Bob has never connected");
     assert!(matches!(
-        alice.send(&channel, &bob_key, "hello?").await,
+        alice.send(&channel, "hello?").await,
         Err(sqex_chat::ChatError::NotReady(_))
     ));
 
     // Bob starts up, and the same call now works with nothing else changed.
     let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
-    alice.send(&channel, &bob_key, "hello?").await.unwrap();
+    alice.send(&channel, "hello?").await.unwrap();
 
     bob.open_dm(&alice_key).await.unwrap();
     let mut bobs = Timeline::new();
@@ -322,9 +322,9 @@ async fn a_restarted_client_still_shows_the_conversation_it_already_read() {
     {
         let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
         channel = alice.open_dm(&bob_key).await.unwrap();
-        alice.send(&channel, &bob_key, "first").await.unwrap();
+        alice.send(&channel, "first").await.unwrap();
         bob.open_dm(&alice_key).await.unwrap();
-        bob.send(&channel, &alice_key, "second").await.unwrap();
+        bob.send(&channel, "second").await.unwrap();
 
         // Alice reads them, which moves her cursor past both.
         let mut t = Timeline::new();
@@ -334,7 +334,7 @@ async fn a_restarted_client_still_shows_the_conversation_it_already_read() {
 
     // A fresh client over the same store, before any polling.
     let alice = chat_at(addr, server_pub, 1, &a_store).await;
-    let history = alice.history(&channel, &bob_key).unwrap();
+    let history = alice.history(&channel, &[alice_key, bob_key]).unwrap();
     assert_eq!(
         said(&history),
         vec!["first", "second"],
@@ -344,7 +344,7 @@ async fn a_restarted_client_still_shows_the_conversation_it_already_read() {
     // And polling on top of it adds to the history rather than replacing it.
     let mut alice = alice;
     let mut t = history;
-    bob.send(&channel, &alice_key, "third").await.unwrap();
+    bob.send(&channel, "third").await.unwrap();
     let got = alice.poll(&channel, &mut t, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["first", "second", "third"]);
 }
@@ -366,7 +366,7 @@ async fn a_client_that_lost_its_store_can_still_publish_prekeys() {
     {
         let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
         channel = alice.open_dm(&bob_key).await.unwrap();
-        alice.send(&channel, &bob_key, "before the loss").await.unwrap();
+        alice.send(&channel, "before the loss").await.unwrap();
     }
 
     // The store is gone. chat_at publishes prekeys on the way in, which is the
@@ -378,7 +378,7 @@ async fn a_client_that_lost_its_store_can_still_publish_prekeys() {
     // old messages are gone with the store, which is the forward secrecy
     // working; the identity is not.
     alice.open_dm(&bob_key).await.unwrap();
-    alice.send(&channel, &bob_key, "after the loss").await.unwrap();
+    alice.send(&channel, "after the loss").await.unwrap();
 
     bob.open_dm(&alice_key).await.unwrap();
     let mut bobs = Timeline::new();
@@ -409,7 +409,7 @@ async fn a_lost_store_does_not_leave_stale_prekeys_for_peers_to_seal_to() {
     // Whatever either of them is served now must be a prekey the holder can
     // actually open — the stale ones are gone rather than queued in front.
     let channel = alice.open_dm(&bob_key).await.unwrap();
-    alice.send(&channel, &bob_key, "after we both lost it").await.unwrap();
+    alice.send(&channel, "after we both lost it").await.unwrap();
 
     bob.open_dm(&alice_key).await.unwrap();
     let mut bobs = Timeline::new();
@@ -421,7 +421,7 @@ async fn a_lost_store_does_not_leave_stale_prekeys_for_peers_to_seal_to() {
     );
 
     // And it is a conversation, not one lucky message.
-    bob.send(&channel, &alice_key, "so did i").await.unwrap();
+    bob.send(&channel, "so did i").await.unwrap();
     let mut alices = Timeline::new();
     let got = alice.poll(&channel, &mut alices, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["after we both lost it", "so did i"]);
@@ -454,7 +454,7 @@ async fn a_file_travels_end_to_end_and_the_exchange_cannot_open_it() {
     let attachment = alice.upload(&channel, &prepared).await.unwrap();
     let mut post = SipPost::text("the notes");
     post.parts.push(Part::Attachment(attachment));
-    alice.send_post(&channel, &bob_key, post).await.unwrap();
+    alice.send_post(&channel, post).await.unwrap();
 
     // Bob reads the message and pulls the file down.
     bob.open_dm(&alice_key).await.unwrap();
@@ -539,7 +539,7 @@ async fn a_conversation_from_a_stranger_can_be_found() {
 
     // Alice writes to Bob. Bob has never heard of Alice.
     let channel = alice.open_dm(&bob_key).await.unwrap();
-    alice.send(&channel, &bob_key, "you don't know me").await.unwrap();
+    alice.send(&channel, "you don't know me").await.unwrap();
     assert!(
         bob.store().contacts().unwrap().is_empty(),
         "bob should not know alice yet"
@@ -585,4 +585,212 @@ async fn mine_does_not_leak_channels_we_are_not_in() {
     // else is talking.
     let mut mallory = chat_at(addr, server_pub, 9, &dir.path().join("m.db")).await;
     assert!(mallory.mine().await.unwrap().is_empty());
+}
+
+// ---- group channels -------------------------------------------------------
+
+#[tokio::test]
+async fn three_people_hold_a_group_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+
+    // Everybody has to have published prekeys before a key can be sealed to
+    // them, which for a group means everybody invited at creation.
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice
+        .create_group("the thing", &[bob_key, carol_key])
+        .await
+        .unwrap();
+    alice.send(&channel, "we are all here").await.unwrap();
+
+    // Neither of them was told the identifier: a group's is random, not
+    // derived, so `Mine` is the only way to find it.
+    for (who, key) in [(&mut bob, bob_key), (&mut carol, carol_key)] {
+        let mine = who.mine().await.unwrap();
+        assert_eq!(mine.len(), 1, "{key} did not find the group");
+        assert_eq!(mine[0].channel, channel);
+        who.collect_keys(&channel).await.unwrap();
+        let mut t = Timeline::new();
+        let got = who.poll(&channel, &mut t, 0).await.unwrap();
+        assert_eq!(said(&got.timeline), vec!["we are all here"]);
+        // The name travels sealed, so it is known only to members.
+        assert_eq!(got.timeline.name, "the thing");
+    }
+
+    // And everybody can speak, not just the one who made it.
+    bob.send(&channel, "so we are").await.unwrap();
+    carol.send(&channel, "hello both").await.unwrap();
+    let mut t = Timeline::new();
+    let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(
+        said(&got.timeline),
+        vec!["we are all here", "so we are", "hello both"]
+    );
+    assert_eq!(alice_key, alice.me);
+}
+
+#[tokio::test]
+async fn the_exchange_never_learns_what_a_group_is_called() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let name = "the very secret committee";
+    let channel = alice.create_group(name, &[bob_key]).await.unwrap();
+
+    // Not in the channel row, and not in any entry: a private channel's name is
+    // stored empty at the exchange and travels as a sealed metadata entry,
+    // because a membership graph plus a name says far more than the graph.
+    let info = alice.info(&channel).await.unwrap();
+    assert_eq!(info.name, "");
+    let stored = std::fs::read(dir.path().join("channels.db")).unwrap();
+    assert!(
+        !stored.windows(name.len()).any(|w| w == name.as_bytes()),
+        "the group's name reached the exchange"
+    );
+}
+
+#[tokio::test]
+async fn somebody_invited_later_can_read_what_came_before() {
+    // Inviting does not rotate, and that is a decision rather than an omission:
+    // SIP-17 leaves it to the inviter whether a new member gets the history,
+    // and sealing them the current epoch grants it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice.create_group("early", &[bob_key]).await.unwrap();
+    alice.send(&channel, "before carol").await.unwrap();
+
+    alice.invite(&channel, &carol_key).await.unwrap();
+    alice.send(&channel, "after carol").await.unwrap();
+
+    carol.collect_keys(&channel).await.unwrap();
+    let mut t = Timeline::new();
+    let got = carol.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["before carol", "after carol"]);
+    let _ = bob.mine().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_removed_member_cannot_read_what_follows() {
+    // The rotation is the point and it is not optional. The exchange refuses
+    // them further entries, but a removed member keeps every key it was ever
+    // given — so without a new epoch they could still read what came after,
+    // from the exchange's own copy or from anyone who forwards it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice
+        .create_group("the thing", &[bob_key, carol_key])
+        .await
+        .unwrap();
+    alice.send(&channel, "while bob was here").await.unwrap();
+    bob.collect_keys(&channel).await.unwrap();
+    let mut bobs = Timeline::new();
+    assert_eq!(
+        said(&bob.poll(&channel, &mut bobs, 0).await.unwrap().timeline),
+        vec!["while bob was here"]
+    );
+    let bob_epoch = alice.info(&channel).await.unwrap().epoch;
+
+    alice.remove(&channel, &bob_key).await.unwrap();
+    assert!(
+        alice.info(&channel).await.unwrap().epoch > bob_epoch,
+        "removal did not rotate"
+    );
+    alice.send(&channel, "after bob left").await.unwrap();
+
+    // Carol, who stayed, reads it.
+    carol.collect_keys(&channel).await.unwrap();
+    let mut ct = Timeline::new();
+    assert!(
+        said(&carol.poll(&channel, &mut ct, 0).await.unwrap().timeline)
+            .contains(&"after bob left".to_string())
+    );
+
+    // Bob is refused outright, and would hold no key for the new epoch even if
+    // he were not.
+    assert!(bob.poll(&channel, &mut bobs, 0).await.is_err());
+    assert!(bob.store().key(&channel, bob_epoch + 1).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_member_without_the_role_cannot_seize_an_epoch() {
+    // A direct message's parties are both admins, so a client with no key
+    // rotates to recover. In a group that would be a member taking an epoch
+    // they were deliberately left out of, so they are told instead.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice.create_group("closed", &[bob_key]).await.unwrap();
+    alice.send(&channel, "members only").await.unwrap();
+    bob.collect_keys(&channel).await.unwrap();
+    drop(bob);
+
+    // Bob loses his store. In a direct message he would rotate and carry on;
+    // here he is an ordinary member, so he is told he has no key rather than
+    // taking an epoch the admin did not give him.
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob-again.db")).await;
+    assert!(matches!(
+        bob.ensure_epoch(&channel).await,
+        Err(sqex_chat::ChatError::NoKey(_))
+    ));
+
+    // The channel is undisturbed: Alice can still post and the epoch has not
+    // moved under her.
+    let before = alice.info(&channel).await.unwrap().epoch;
+    alice.send(&channel, "still here").await.unwrap();
+    assert_eq!(alice.info(&channel).await.unwrap().epoch, before);
+    let _ = before;
+
+    // Re-inviting him cannot fix it: an envelope for him at this epoch already
+    // exists — the one sealed to the prekey he lost — and the exchange refuses
+    // a second, which is the rule that settles the creation race.
+    assert!(matches!(
+        alice.invite(&channel, &bob_key).await,
+        Err(sqex_chat::ChatError::AlreadyKeyed(_))
+    ));
+
+    // The remedy is a rotation, and it is an admin's to apply. Bob cannot.
+    assert!(matches!(
+        bob.rotate(&channel).await,
+        Err(sqex_chat::ChatError::NotAnAdmin)
+    ));
+    alice.rotate(&channel).await.unwrap();
+    assert!(bob.ensure_epoch(&channel).await.is_ok());
+    alice.send(&channel, "and now bob is back").await.unwrap();
+
+    let mut t = Timeline::new();
+    let got = bob.poll(&channel, &mut t, 0).await.unwrap();
+    let read = said(&got.timeline);
+    assert!(
+        read.contains(&"and now bob is back".to_string()),
+        "the rotation did not reach him: {read:?}"
+    );
+    // And what was said while he had no key stays shut. A rotation hands out
+    // the next epoch, never the last one — that is the forward secrecy doing
+    // its job rather than a gap in the recovery.
+    assert!(!read.contains(&"still here".to_string()));
+    assert!(!got.unreadable.is_empty(), "the gap should be reported");
 }

@@ -6,8 +6,9 @@
 //! because the exchange is either unable or is the party being constrained.
 
 use sqex_proto::channel::{
-    Ack, ByChannel, ChannelInfo, Create, Entries, Fetch, Invitee, KIND_MEMBER, MAX_MINE,
-    Membership, Mine, Mines, Post, Posted, Role, TYPE_INFO, Visibility, direct_message_id,
+    Ack, ByAccount, ByChannel, ChannelInfo, Create, Entries, Fetch, Invite, Invitee, KIND_MEMBER,
+    MAX_MINE, Membership, Mine, Mines, Post, Posted, Role, TYPE_INFO, TYPE_LEAVE, TYPE_REMOVE,
+    Visibility, direct_message_id,
 };
 use sqex_proto::channel_key::{
     ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, open_envelope, seal_envelope,
@@ -47,6 +48,11 @@ pub enum ChatError {
     /// The exchange answered a chat route with the router's own 404. It is
     /// running, and it does not implement chat at all.
     NoChatHere(String),
+    /// An envelope for that recipient and epoch already exists. SIP-17 has the
+    /// exchange refuse a second, so re-keying somebody means a new epoch.
+    AlreadyKeyed(u32),
+    /// The operation is an admin's and this account is not one.
+    NotAnAdmin,
     /// The other party has published no prekeys, so SIP-23 forbids sealing to
     /// them at all. Not an error in the conversation — the channel exists and
     /// they are in it — but nothing can be said until they start their client.
@@ -71,6 +77,12 @@ impl std::fmt::Display for ChatError {
                  chat services (SIPs 16-24, sqex 0.9.0). Upgrade it, or point at one \
                  that has them"
             ),
+            ChatError::AlreadyKeyed(epoch) => write!(
+                f,
+                "they already have an envelope for epoch {epoch} and the exchange will not \
+                 replace it — if they cannot open it, rotate to hand out a new key"
+            ),
+            ChatError::NotAnAdmin => write!(f, "that is an admin's to do, and you are not one"),
             ChatError::NotReady(who) => write!(
                 f,
                 "{who} has not started their client yet, so there is nowhere to send a \
@@ -90,6 +102,18 @@ impl From<StoreError> for ChatError {
 
 type Result<T> = std::result::Result<T, ChatError>;
 
+/// Everybody a channel key must reach.
+fn members_of(info: &ChannelInfo) -> Vec<PubKey> {
+    info.members.iter().map(|m| m.account).collect()
+}
+
+/// Whether an account may mint an epoch here.
+fn is_admin(info: &ChannelInfo, who: &PubKey) -> bool {
+    info.members
+        .iter()
+        .any(|m| m.account == *who && m.role == Role::Admin)
+}
+
 /// What a fetch turned up, and everything the reader must be told about it.
 pub struct Conversation {
     pub timeline: Timeline,
@@ -103,6 +127,10 @@ pub struct Conversation {
     /// Somebody is typing (SIP-19's only signal).
     pub typing: bool,
     pub last: u64,
+    /// Who may redact and rename, as of this fetch. Returned so a caller can
+    /// keep its own copy current: the next start may be offline, and folding a
+    /// history without it shows a redacted message and an unnamed channel.
+    pub admins: Vec<PubKey>,
 }
 
 pub struct Chat {
@@ -326,10 +354,10 @@ impl Chat {
     /// published no prekeys, so there is nothing to mint *to* yet. That is a
     /// conversation waiting to start, not a failure to open one, and the
     /// difference is what a person sees on the screen.
-    pub async fn ensure_epoch(&mut self, channel: &[u8; 32], them: &PubKey) -> Result<u32> {
+    pub async fn ensure_epoch(&mut self, channel: &[u8; 32]) -> Result<u32> {
         let info = self.info(channel).await?;
         if info.epoch == 0 {
-            self.mint_epoch(channel, them, 1).await?;
+            self.mint_epoch(channel, 1, &members_of(&info)).await?;
             return Ok(self.info(channel).await?.epoch);
         }
         if self.store.key(channel, info.epoch)?.is_none() {
@@ -340,16 +368,17 @@ impl Chat {
                 // will not open again, because the prekey it was sealed
                 // against is spent.
                 //
-                // Both parties to a direct message are admins, so the way out
-                // is the one SIP-17 already provides: mint the next epoch and
-                // seal it to both. What was said under the old one stays
-                // unreadable, which is the forward secrecy working; the
-                // conversation continues, which is the point.
-                //
-                // This is a direct-message move and not a general one. In a
-                // group, a member who was simply never given the key would be
-                // seizing an epoch they were deliberately left out of.
-                self.mint_epoch(channel, them, info.epoch + 1).await?;
+                // Minting the next epoch is the way out that SIP-17 already
+                // provides, and it is an **admin's** move. In a direct message
+                // both parties are admins so it always applies; in a group, a
+                // member who was simply never given the key would be seizing an
+                // epoch they were deliberately left out of, so a member without
+                // the role is told plainly instead.
+                if !is_admin(&info, &self.me) {
+                    return Err(ChatError::NoKey(info.epoch));
+                }
+                self.mint_epoch(channel, info.epoch + 1, &members_of(&info))
+                    .await?;
                 let after = self.info(channel).await?.epoch;
                 return self
                     .store
@@ -361,19 +390,42 @@ impl Chat {
         Ok(info.epoch)
     }
 
-    /// Mint an epoch key and seal it to both parties.
+    /// Mint an epoch key and seal it to every member.
     ///
-    /// To *both*, including ourselves: our own other devices need it, and the
-    /// exchange keeps the envelope for collection rather than for storage.
-    async fn mint_epoch(&mut self, channel: &[u8; 32], them: &PubKey, epoch: u32) -> Result<()> {
+    /// Including ourselves: our own other devices need it, and the exchange
+    /// keeps the envelope for collection rather than for storage.
+    ///
+    /// A member who has published no prekeys is **skipped rather than fatal**.
+    /// SIP-17 says a rotation must not be blocked by one member being
+    /// unreachable — a security mechanism able to prevent a revocation is a
+    /// poor trade — and SIP-23 says a device that has published nothing cannot
+    /// be sealed to at all. They heal it themselves by publishing prekeys and
+    /// collecting, which is why `Missing` exists. The one case where being
+    /// unreachable *is* fatal is a two-party conversation, where skipping the
+    /// other party leaves nobody to talk to.
+    async fn mint_epoch(
+        &mut self,
+        channel: &[u8; 32],
+        epoch: u32,
+        members: &[PubKey],
+    ) -> Result<()> {
         let key = ChannelKey::generate();
         let mut envelopes = Vec::new();
-        for who in [self.me, *them] {
-            let p = self.take_prekey_for(who).await?;
-            envelopes.push(
-                seal_envelope(&who, p.id, &p.public, epoch, &[key])
-                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
-            );
+        let mut skipped = Vec::new();
+        for who in members {
+            match self.take_prekey_for(*who).await {
+                Ok(p) => envelopes.push(
+                    seal_envelope(who, p.id, &p.public, epoch, &[key])
+                        .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                ),
+                Err(ChatError::NotReady(w)) if members.len() > 2 => skipped.push(w),
+                Err(e) => return Err(e),
+            }
+        }
+        if envelopes.is_empty() {
+            return Err(ChatError::NotReady(
+                skipped.first().copied().unwrap_or(self.me),
+            ));
         }
         let body = self
             .post(
@@ -390,12 +442,13 @@ impl Chat {
         if ack.accepted {
             self.store.put_key(channel, epoch, &key)?;
         } else {
-            // The other end minted the same epoch first. One `Put` wins and the
-            // loser collects instead — this is the direct-message creation race
-            // settling, not an error.
+            // Somebody else minted the same epoch first. One `Put` wins and the
+            // loser collects instead — this is the creation race settling, not
+            // an error, and in a direct message it is the ordinary outcome of
+            // both ends starting at once.
             self.collect_keys(channel).await?;
         }
-        // We spent two prekeys of our own getting here.
+        // We spent one prekey per member getting here, our own included.
         self.top_up_prekeys().await?;
         Ok(())
     }
@@ -456,10 +509,10 @@ impl Chat {
     ///
     /// Needs no network and must not: the entries are still on the exchange but
     /// they will not open a second time, so this store is the only place the
-    /// conversation exists. `them` and this account are the two admins of a
-    /// direct message, which is what `Timeline` needs to judge a redaction.
-    pub fn history(&self, channel: &[u8; 32], them: &PubKey) -> Result<Timeline> {
-        let admins = [self.me, *them];
+    /// conversation exists. `admins` is what `Timeline` needs to judge a
+    /// redaction or a metadata change, and it is remembered from the last poll
+    /// so that a client starting offline still folds correctly.
+    pub fn history(&self, channel: &[u8; 32], admins: &[PubKey]) -> Result<Timeline> {
         let mut timeline = Timeline::new();
         for (seq, account, posted, kind, plain) in self.store.messages(channel)? {
             timeline.apply(
@@ -470,10 +523,169 @@ impl Chat {
                     kind,
                     body: plain.and_then(|p| Body::decode(&p).ok().flatten()),
                 },
-                &admins,
+                admins,
             );
         }
         Ok(timeline)
+    }
+
+    // ---- groups ---------------------------------------------------------
+
+    /// Create a private group and invite its first members.
+    ///
+    /// The identifier is random, not derived: a group has no two accounts to
+    /// derive from, which is exactly why it cannot be found without SIP-16's
+    /// `Mine` and why that amendment exists. The name is **not** given to the
+    /// exchange — a private channel's name is stored empty there, because a
+    /// membership graph plus a name says considerably more than the graph — so
+    /// it is posted as a sealed metadata entry once the epoch exists.
+    pub async fn create_group(&mut self, name: &str, invite: &[PubKey]) -> Result<[u8; 32]> {
+        let mut channel = [0u8; 32];
+        {
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut channel);
+        }
+        self.post(
+            "/channel/create",
+            Create {
+                channel,
+                visibility: Visibility::Private,
+                retention_secs: RETENTION_SECS,
+                max_entries: 0,
+                name: String::new(),
+                topic: String::new(),
+                invites: invite
+                    .iter()
+                    .map(|a| Invitee {
+                        account: *a,
+                        role: Role::Member,
+                    })
+                    .collect(),
+            }
+            .encode(),
+        )
+        .await?;
+        self.ensure_epoch(&channel).await?;
+        if !name.is_empty() {
+            self.set_name(&channel, name).await?;
+        }
+        Ok(channel)
+    }
+
+    /// Name a channel, for everyone who can read it.
+    ///
+    /// A sealed entry rather than a field, so the exchange never learns what a
+    /// private channel is called. Only an admin's is honoured by a reader.
+    pub async fn set_name(&mut self, channel: &[u8; 32], name: &str) -> Result<Posted> {
+        self.send_body(
+            channel,
+            Body::Metadata {
+                name: name.to_string(),
+                topic: String::new(),
+                avatar: None,
+            },
+        )
+        .await
+    }
+
+    /// Add somebody, and give them the key.
+    ///
+    /// Inviting does **not** rotate: SIP-17 leaves it to the inviter whether a
+    /// new member gets the history, and sealing them the current epoch grants
+    /// it. Rotating instead would deny it, which is a different decision and
+    /// not one to make silently on somebody's behalf.
+    pub async fn invite(&mut self, channel: &[u8; 32], who: &PubKey) -> Result<()> {
+        self.post(
+            "/channel/invite",
+            Invite {
+                channel: *channel,
+                account: *who,
+                role: Role::Member,
+            }
+            .encode(),
+        )
+        .await?;
+        let info = self.info(channel).await?;
+        let key = self
+            .store
+            .key(channel, info.epoch)?
+            .ok_or(ChatError::NoKey(info.epoch))?;
+        let p = self.take_prekey_for(*who).await?;
+        let envelope = seal_envelope(who, p.id, &p.public, info.epoch, &[key])
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let body = self
+            .post(
+                "/channel/key/put",
+                KeyPut {
+                    channel: *channel,
+                    epoch: info.epoch,
+                    envelopes: vec![envelope],
+                }
+                .encode(),
+            )
+            .await?;
+        let ack = PutAck::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.top_up_prekeys().await?;
+        if !ack.accepted {
+            // An envelope for this recipient at this epoch already exists, and
+            // SIP-17 has the exchange refuse a second — that one-per-recipient
+            // rule is what settles the creation race. So a re-invite cannot
+            // re-key somebody: if they cannot open the envelope that is already
+            // there, the only way to hand them a key is a new epoch.
+            return Err(ChatError::AlreadyKeyed(info.epoch));
+        }
+        Ok(())
+    }
+
+    /// Mint the next epoch and seal it to everyone currently in the channel.
+    ///
+    /// The general remedy an admin has. It is what `remove` does implicitly,
+    /// and it is the only way to re-key a member whose envelope for the epoch
+    /// in force is one they can no longer open — a lost store, most often.
+    /// What was said under the old epoch stays readable to whoever already
+    /// holds its key and unreadable to whoever does not; this hands out the
+    /// next one, not the last.
+    pub async fn rotate(&mut self, channel: &[u8; 32]) -> Result<u32> {
+        let info = self.info(channel).await?;
+        if !is_admin(&info, &self.me) {
+            return Err(ChatError::NotAnAdmin);
+        }
+        self.mint_epoch(channel, info.epoch + 1, &members_of(&info))
+            .await?;
+        Ok(self.info(channel).await?.epoch)
+    }
+
+    /// Remove somebody, and rotate so what follows is not theirs.
+    ///
+    /// The rotation is the point and it is not optional: the exchange refuses
+    /// them further entries, but a removed member keeps every key it was ever
+    /// given (SIP-17 says so plainly), so without a new epoch they can still
+    /// read everything posted after they left from the exchange's own copy —
+    /// or from anyone who forwards it.
+    pub async fn remove(&mut self, channel: &[u8; 32], who: &PubKey) -> Result<()> {
+        self.post(
+            "/channel/remove",
+            ByAccount {
+                channel: *channel,
+                account: *who,
+            }
+            .encode(TYPE_REMOVE),
+        )
+        .await?;
+        let info = self.info(channel).await?;
+        self.mint_epoch(channel, info.epoch + 1, &members_of(&info))
+            .await?;
+        Ok(())
+    }
+
+    /// Leave a channel.
+    pub async fn leave(&mut self, channel: &[u8; 32]) -> Result<()> {
+        self.post(
+            "/channel/leave",
+            ByChannel { channel: *channel }.encode(TYPE_LEAVE),
+        )
+        .await?;
+        Ok(())
     }
 
     // ---- talking --------------------------------------------------------
@@ -490,32 +702,23 @@ impl Chat {
 
     /// Seal a message and post it.
     ///
-    /// `them` is needed because sending into a conversation nobody has minted a
-    /// key for yet is how most first messages go, and minting needs to know who
-    /// to seal to.
-    pub async fn send(&mut self, channel: &[u8; 32], them: &PubKey, text: &str) -> Result<Posted> {
-        self.send_post(channel, them, SipPost::text(text)).await
+    /// Minting on demand is how most first messages go, so this may distribute
+    /// a key before it posts anything.
+    pub async fn send(&mut self, channel: &[u8; 32], text: &str) -> Result<Posted> {
+        self.send_post(channel, SipPost::text(text)).await
     }
 
     /// Send a message built by the caller — text, attachments, a reply, or a
     /// combination. `send` is this with one text part.
-    pub async fn send_post(
-        &mut self,
-        channel: &[u8; 32],
-        them: &PubKey,
-        post: SipPost,
-    ) -> Result<Posted> {
+    pub async fn send_post(&mut self, channel: &[u8; 32], post: SipPost) -> Result<Posted> {
         post.validate().map_err(|e| ChatError::Protocol(e.to_string()))?;
-        self.send_body(channel, them, Body::Post(post)).await
+        self.send_body(channel, Body::Post(post)).await
     }
 
-    async fn send_body(
-        &mut self,
-        channel: &[u8; 32],
-        them: &PubKey,
-        body: Body,
-    ) -> Result<Posted> {
-        let epoch = self.ensure_epoch(channel, them).await?;
+    /// Seal and post any SIP-19 body — a message, an edit, a reaction, or the
+    /// channel's own metadata.
+    pub async fn send_body(&mut self, channel: &[u8; 32], body: Body) -> Result<Posted> {
+        let epoch = self.ensure_epoch(channel).await?;
         let info = self.info(channel).await?;
         let key = self
             .store
@@ -672,6 +875,7 @@ impl Chat {
             gap,
             typing,
             last,
+            admins,
         })
     }
 

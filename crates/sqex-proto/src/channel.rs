@@ -508,6 +508,78 @@ pub struct List {
     pub query: String,
 }
 
+/// Add an account to a channel, or change the role of one already in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Invite {
+    pub channel: [u8; 32],
+    pub account: PubKey,
+    pub role: Role,
+}
+
+impl Invite {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(66);
+        out.push(TYPE_INVITE);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(self.account.as_bytes());
+        out.push(self.role as u8);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Invite> {
+        if b.len() != 66 {
+            return Err(Error::Malformed(format!(
+                "invite is {} bytes, want 66",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_INVITE {
+            return Err(Error::Malformed(format!("not an invite (type {:#x})", b[0])));
+        }
+        Ok(Invite {
+            channel: b[1..33].try_into().unwrap(),
+            account: PubKey::new(b[33..65].try_into().unwrap()),
+            role: Role::from_u8(b[65])?,
+        })
+    }
+}
+
+/// A channel and an account, for the operations that name one: `Remove`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByAccount {
+    pub channel: [u8; 32],
+    pub account: PubKey,
+}
+
+impl ByAccount {
+    pub fn encode(&self, type_byte: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(65);
+        out.push(type_byte);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8], type_byte: u8) -> Result<ByAccount> {
+        if b.len() != 65 {
+            return Err(Error::Malformed(format!(
+                "request is {} bytes, want 65",
+                b.len()
+            )));
+        }
+        if b[0] != type_byte {
+            return Err(Error::Malformed(format!(
+                "wrong type {:#x}, want {type_byte:#x}",
+                b[0]
+            )));
+        }
+        Ok(ByAccount {
+            channel: b[1..33].try_into().unwrap(),
+            account: PubKey::new(b[33..65].try_into().unwrap()),
+        })
+    }
+}
+
 /// Ask which channels this account is in. It names no account, because the
 /// only one it can answer about is the caller's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1398,6 +1470,25 @@ mod tests {
         // A join decoded as a leave is a bug in the router, and should not
         // silently succeed just because the shapes match.
         assert!(ByChannel::decode(&bytes, TYPE_LEAVE).is_err());
+    }
+
+    #[test]
+    fn invite_and_remove_round_trip() {
+        let i = Invite {
+            channel: [3; 32],
+            account: PubKey::new([4; 32]),
+            role: Role::Admin,
+        };
+        assert_eq!(Invite::decode(&i.encode()).unwrap(), i);
+        assert_eq!(i.encode().len(), 66);
+
+        let r = ByAccount {
+            channel: [3; 32],
+            account: PubKey::new([4; 32]),
+        };
+        assert_eq!(ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_REMOVE).unwrap(), r);
+        // The type byte is checked, so a remove cannot be read as anything else.
+        assert!(ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_INVITE).is_err());
     }
 
     #[test]
