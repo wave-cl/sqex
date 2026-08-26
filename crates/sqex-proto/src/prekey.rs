@@ -309,6 +309,127 @@ impl Counts {
     }
 }
 
+/// The secrets behind a device's published prekeys, and the rule for spending
+/// them.
+///
+/// SIP-23 puts four cases on a recipient opening an envelope, and only one of
+/// them is the happy path:
+///
+/// - a one-time prekey it holds: use it, and **destroy the secret**;
+/// - a one-time prekey it has already consumed: **reject the envelope**;
+/// - its current fallback: use it and keep the secret, since a fallback is
+///   reusable by construction;
+/// - a fallback it has already replaced: reject.
+///
+/// The two rejections matter more than they look. An exchange that hands one
+/// one-time prekey out twice has quietly removed the forward secrecy from both
+/// envelopes, and the recipient is the only party positioned to notice — the
+/// same shape as SIP-17's `(device, epoch, msg_seq)` rule and there for a
+/// related reason. Spent ids are therefore remembered, so that a replay is
+/// refused *as a replay* rather than mistaken for an id we never held.
+///
+/// Minting goes through here too, because ids **MUST NEVER be reused**, and a
+/// counter kept anywhere else is a counter that can disagree with the secrets.
+pub struct Pool {
+    seed: [u8; 32],
+    next_id: u32,
+    one_time: std::collections::HashMap<u32, x25519_dalek::StaticSecret>,
+    fallback: Option<(u32, x25519_dalek::StaticSecret)>,
+    spent: std::collections::HashSet<u32>,
+}
+
+/// Counts only. `StaticSecret` deliberately has no `Debug`, and a pool that
+/// printed its secrets would undo the point of deleting them.
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pool")
+            .field("one_time", &self.one_time.len())
+            .field("fallback_id", &self.fallback_id())
+            .field("spent", &self.spent.len())
+            .finish()
+    }
+}
+
+impl Pool {
+    /// An empty pool for the device holding `seed`. Ids start at 1, since 0 is
+    /// reserved.
+    pub fn new(seed: &[u8; 32]) -> Pool {
+        Pool {
+            seed: *seed,
+            next_id: 1,
+            one_time: std::collections::HashMap::new(),
+            fallback: None,
+            spent: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Mint `n` one-time prekeys, keeping the secrets. The returned prekeys are
+    /// what goes in a `Publish`.
+    pub fn mint_one_time(&mut self, n: u16) -> Vec<Prekey> {
+        (0..n)
+            .map(|_| {
+                let id = self.next_id;
+                self.next_id += 1;
+                let (p, secret) = Prekey::generate(&self.seed, KIND_ONE_TIME, id);
+                self.one_time.insert(id, secret);
+                p
+            })
+            .collect()
+    }
+
+    /// Mint a fallback, retiring the one it replaces.
+    ///
+    /// The retired id goes to `spent`: an envelope sealed against a fallback we
+    /// have already replaced is refused, which is what makes ageing a fallback
+    /// out on a schedule mean anything.
+    pub fn mint_fallback(&mut self) -> Prekey {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (p, secret) = Prekey::generate(&self.seed, KIND_FALLBACK, id);
+        if let Some((old, _)) = self.fallback.replace((id, secret)) {
+            self.spent.insert(old);
+        }
+        p
+    }
+
+    /// The secret for `id`, applying the rule above.
+    ///
+    /// A one-time secret is removed here rather than after the envelope opens.
+    /// The id is spent the moment the exchange served it, so a failed open is
+    /// not grounds to keep the secret for a second attempt — that would be the
+    /// replay window this check exists to close.
+    pub fn take(&mut self, id: u32) -> Result<x25519_dalek::StaticSecret> {
+        if id == 0 {
+            return Err(Error::Malformed(
+                "envelope names prekey id 0, which is invalid".into(),
+            ));
+        }
+        if self.spent.contains(&id) {
+            return Err(Error::Key(format!(
+                "prekey {id} is spent: the exchange served it twice, or this is a replay"
+            )));
+        }
+        if let Some(secret) = self.one_time.remove(&id) {
+            self.spent.insert(id);
+            return Ok(secret);
+        }
+        match &self.fallback {
+            Some((f, secret)) if *f == id => Ok(secret.clone()),
+            _ => Err(Error::Key(format!("prekey {id} was never published by us"))),
+        }
+    }
+
+    /// One-time prekeys still unspent, for deciding whether to top up.
+    pub fn one_time_left(&self) -> u16 {
+        self.one_time.len() as u16
+    }
+
+    /// The current fallback's id, or 0 if there is none.
+    pub fn fallback_id(&self) -> u32 {
+        self.fallback.as_ref().map_or(0, |(id, _)| *id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +526,61 @@ mod tests {
             now: 99,
         };
         assert_eq!(Counts::decode(&c.encode()).unwrap(), c);
+    }
+
+    #[test]
+    fn a_one_time_prekey_opens_once_and_a_replay_is_refused() {
+        let (seed, key) = device(1);
+        let mut pool = Pool::new(&seed);
+        let published = pool.mint_one_time(3);
+        assert_eq!(published.len(), 3);
+        assert!(published[0].verify(&key).is_ok());
+
+        let id = published[0].id;
+        assert!(pool.take(id).is_ok());
+        // An exchange serving the same one-time prekey twice has removed the
+        // forward secrecy from both envelopes, and we are the only party who
+        // can see it.
+        assert!(pool.take(id).is_err());
+        assert_eq!(pool.one_time_left(), 2);
+    }
+
+    #[test]
+    fn ids_are_never_reused_across_kinds() {
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        let mut ids: Vec<u32> = pool.mint_one_time(4).iter().map(|p| p.id).collect();
+        ids.push(pool.mint_fallback().id);
+        ids.extend(pool.mint_one_time(2).iter().map(|p| p.id));
+        ids.push(pool.mint_fallback().id);
+        let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len());
+        assert!(!ids.contains(&0), "id 0 is reserved");
+    }
+
+    #[test]
+    fn a_fallback_is_reusable_until_it_is_replaced() {
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        let first = pool.mint_fallback();
+        assert_eq!(pool.fallback_id(), first.id);
+        // Reusable by construction, which is why it is aged out on a schedule.
+        assert!(pool.take(first.id).is_ok());
+        assert!(pool.take(first.id).is_ok());
+
+        let second = pool.mint_fallback();
+        assert_eq!(pool.fallback_id(), second.id);
+        assert!(pool.take(second.id).is_ok());
+        // Replacing it is what makes the schedule mean anything.
+        assert!(pool.take(first.id).is_err());
+    }
+
+    #[test]
+    fn an_id_we_never_published_is_refused_and_so_is_zero() {
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        pool.mint_one_time(2);
+        assert!(pool.take(0).is_err());
+        assert!(pool.take(999).is_err());
     }
 }

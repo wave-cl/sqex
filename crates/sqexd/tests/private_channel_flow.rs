@@ -5,7 +5,6 @@
 //! open in this file is done by the test acting as a client, which is the point
 //! — if any of it could be done by the server, the design would be wrong.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -20,7 +19,7 @@ use sqex_proto::channel_key::{
     open_envelope, seal_envelope,
 };
 use sqex_proto::message::{Body, Part, Post as SipPost};
-use sqex_proto::prekey::{KIND_ONE_TIME, Prekey, Publish, Take, Taken};
+use sqex_proto::prekey::{Pool, Prekey, Publish, Take, Taken};
 use sqex_proto::timeline::{Received, Timeline};
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -53,12 +52,16 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
 }
 
 /// One person's client: an identity, and the prekey secrets it must destroy.
+///
+/// The secrets live in SIP-23's `Pool` rather than a bare map, so that the
+/// receiver rules — spend a one-time key once, refuse a replay, keep a
+/// fallback until it is replaced — are the ones the shipped type enforces and
+/// not ones this file re-implements more leniently.
 struct Peer {
     seed: [u8; 32],
     key: PubKey,
     client: Client,
-    secrets: HashMap<u32, x25519_dalek::StaticSecret>,
-    next_prekey: u32,
+    pool: Pool,
 }
 
 impl Peer {
@@ -69,21 +72,13 @@ impl Peer {
             seed,
             key: PubKey::new(sk.verifying_key().to_bytes()),
             client: Client::connect_as(addr, &server_pub, &seed).await.unwrap(),
-            secrets: HashMap::new(),
-            next_prekey: 1,
+            pool: Pool::new(&seed),
         }
     }
 
     /// Mint and publish some one-time prekeys, keeping the secrets.
-    async fn publish_prekeys(&mut self, n: u32) {
-        let mut prekeys = Vec::new();
-        for _ in 0..n {
-            let id = self.next_prekey;
-            self.next_prekey += 1;
-            let (p, secret) = Prekey::generate(&self.seed, KIND_ONE_TIME, id);
-            self.secrets.insert(id, secret);
-            prekeys.push(p);
-        }
+    async fn publish_prekeys(&mut self, n: u16) {
+        let prekeys = self.pool.mint_one_time(n);
         let (code, _) = self
             .client
             .post("/prekey/publish", Publish { prekeys }.encode())
@@ -126,15 +121,14 @@ impl Peer {
         let got = Got::decode(&body).unwrap();
         let mut out = Vec::new();
         for env in got.envelopes {
+            // The pool spends the secret here. Deleting is the mechanism: a
+            // client that keeps these has the wire format and none of the
+            // property.
             let secret = self
-                .secrets
-                .get(&env.prekey_id)
-                .expect("an envelope naming a prekey we never had, or already consumed")
-                .clone();
+                .pool
+                .take(env.prekey_id)
+                .expect("an envelope naming a prekey we never had, or already spent");
             let keys = open_envelope(&self.seed, &secret, &env).unwrap();
-            // Deleting is the mechanism. A client that keeps these has the
-            // wire format and none of the property.
-            self.secrets.remove(&env.prekey_id);
             for (i, k) in keys.into_iter().enumerate() {
                 out.push((env.from_epoch + i as u32, k));
             }
