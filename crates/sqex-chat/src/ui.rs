@@ -201,7 +201,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
 
     let list = if items.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
-            "no contacts yet — press a",
+            "no contacts yet — press ^N",
             Style::default().fg(Color::DarkGray),
         )))])
     } else {
@@ -274,7 +274,7 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 fn status(f: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if app.trouble.is_quiet() {
         (
-            " ^C quit · Tab next · a add someone · Enter send".to_string(),
+            " ^C quit · Tab next · ^N add someone · Enter send".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
@@ -444,6 +444,7 @@ mod tests {
         assert!(out.contains("(edited)"));
         // A quiet status shows the keys, not a warning.
         assert!(out.contains("^C quit"));
+        assert!(out.contains("^N add"));
     }
 
     #[test]

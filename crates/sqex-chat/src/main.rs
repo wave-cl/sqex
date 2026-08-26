@@ -170,12 +170,16 @@ async fn interface(mut chat: Chat) -> Result<(), String> {
     let mut open: Vec<Open> = Vec::new();
     for c in &contacts {
         let channel = chat.dm_with(&c.account);
+        // What this client kept last time. Not a cache: the entries are still
+        // on the exchange and will not open again, so this is the conversation.
+        let timeline = chat.history(&channel, &c.account).unwrap_or_default();
+        let timeline_len = timeline.messages().count();
         open.push(Open {
             peer: c.account,
             label: c.label.clone(),
             channel,
-            timeline: Timeline::new(),
-            timeline_len: 0,
+            timeline,
+            timeline_len,
             trouble: Trouble::default(),
             typing: false,
             unread: 0,
@@ -286,8 +290,16 @@ async fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) {
-    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
-        app.should_quit = true;
+    if mods.contains(KeyModifiers::CONTROL) {
+        match code {
+            KeyCode::Char('c') => app.should_quit = true,
+            // Adding somebody is Ctrl-N and not a bare letter. A bare binding
+            // that only applies while the input is empty means a message
+            // cannot begin with that letter, and nothing tells you why —
+            // the keystroke is simply swallowed.
+            KeyCode::Char('n') => app.adding = Some(String::new()),
+            _ => {}
+        }
         return;
     }
 
@@ -317,7 +329,6 @@ async fn handle_key(
             app.select_previous();
             clear_unread(open, app);
         }
-        KeyCode::Char('a') if app.input.is_empty() => app.adding = Some(String::new()),
         KeyCode::Backspace => {
             app.input.pop();
         }
