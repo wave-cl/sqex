@@ -11,12 +11,15 @@
 //! provably corresponds to what executes.
 
 pub mod beacon;
+pub mod blob;
 pub mod channel;
 pub mod channel_key;
 pub mod mailbox;
+pub mod message;
 pub mod prekey;
 pub mod room;
 pub mod session;
+pub mod timeline;
 
 use sqnr_core::{Error, Operation, PubKey, Result};
 

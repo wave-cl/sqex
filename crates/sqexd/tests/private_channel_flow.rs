@@ -18,7 +18,9 @@ use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
     open_envelope, seal_envelope,
 };
+use sqex_proto::message::{Body, Part, Post as SipPost};
 use sqex_proto::prekey::{KIND_ONE_TIME, Prekey, Publish, Take, Taken};
+use sqex_proto::timeline::{Received, Timeline};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -617,4 +619,213 @@ async fn an_ack_is_still_an_ack() {
         .unwrap();
     assert_eq!(code, 200);
     assert!(Ack::decode(&body).is_ok());
+}
+
+/// Fold a fetched, decrypted channel into what a person would see.
+fn timeline_of(entries: &[sqex_proto::channel::Entry], key: &ChannelKey, channel: [u8; 32], admins: &[PubKey]) -> Timeline {
+    let received: Vec<Received> = entries
+        .iter()
+        .map(|e| Received {
+            seq: e.seq,
+            account: e.account,
+            posted: e.posted,
+            kind: e.kind,
+            body: key
+                .open(&channel, e.epoch, &e.device, e.msg_seq, &e.body)
+                .ok()
+                .and_then(|plain| Body::decode(&plain).ok().flatten()),
+        })
+        .collect();
+    Timeline::fold(&received, admins)
+}
+
+#[tokio::test]
+async fn a_real_conversation_renders_end_to_end() {
+    // Everything above the byte level, through a live exchange that can read
+    // none of it: text, a reply, a reaction, an edit and a redaction.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 101).await;
+    let mut bob = Peer::new(addr, pubkey, 102).await;
+    let channel = [8u8; 32];
+
+    alice.publish_prekeys(4).await;
+    bob.publish_prekeys(4).await;
+    alice
+        .client
+        .post(
+            "/channel/create",
+            private(channel, vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+        )
+        .await
+        .unwrap();
+
+    let epoch1 = ChannelKey::generate();
+    let mut envelopes = Vec::new();
+    for who in [alice.key, bob.key] {
+        let p = alice.take_prekey_for(who).await;
+        envelopes.push(seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap());
+    }
+    alice
+        .client
+        .post("/channel/key/put", KeyPut { channel, epoch: 1, envelopes }.encode())
+        .await
+        .unwrap();
+    assert_eq!(bob.collect_keys(channel).await.len(), 1);
+
+    // Each side seals under its own device subkey and counts its own messages.
+    let mut alice_seq = 0u64;
+    let mut bob_seq = 0u64;
+    let send = |body: Body, who: &PubKey, seq: &mut u64| {
+        let sealed = epoch1
+            .seal(&channel, 1, who, *seq, &body.encode())
+            .unwrap();
+        let post = Post {
+            channel,
+            epoch: 1,
+            msg_seq: *seq,
+            expires_after: 0,
+            body: sealed,
+        };
+        *seq += 1;
+        post.encode()
+    };
+
+    let a1 = send(Body::Post(SipPost::text("has anyone seen the report")), &alice.key, &mut alice_seq);
+    assert_eq!(alice.client.post("/channel/post", a1).await.unwrap().0, 200);
+
+    let b1 = send(
+        Body::Post(SipPost {
+            parts: vec![Part::Reply(1), Part::Text("I have it here".into()), Part::Mention(alice.key)],
+            unknown: 0,
+        }),
+        &bob.key,
+        &mut bob_seq,
+    );
+    assert_eq!(bob.client.post("/channel/post", b1).await.unwrap().0, 200);
+
+    let a2 = send(
+        Body::Reaction { target: 2, add: true, emoji: "🙏".into() },
+        &alice.key,
+        &mut alice_seq,
+    );
+    assert_eq!(alice.client.post("/channel/post", a2).await.unwrap().0, 200);
+
+    let b2 = send(
+        Body::Edit { target: 2, post: SipPost::text("I have it here — sending now") },
+        &bob.key,
+        &mut bob_seq,
+    );
+    assert_eq!(bob.client.post("/channel/post", b2).await.unwrap().0, 200);
+
+    let a3 = send(Body::Post(SipPost::text("ignore that")), &alice.key, &mut alice_seq);
+    assert_eq!(alice.client.post("/channel/post", a3).await.unwrap().0, 200);
+    let a4 = send(Body::Redact { target: 5 }, &alice.key, &mut alice_seq);
+    assert_eq!(alice.client.post("/channel/post", a4).await.unwrap().0, 200);
+
+    // Bob fetches the lot and folds it.
+    let (code, body) = bob
+        .client
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let entries = Entries::decode(&body).unwrap();
+    assert_eq!(entries.entries.len(), 6);
+
+    let t = timeline_of(&entries.entries, &epoch1, channel, &[alice.key]);
+    let shown: Vec<&sqex_proto::timeline::Message> = t.messages().collect();
+    assert_eq!(shown.len(), 3, "three posts; the rest act on them");
+
+    assert_eq!(shown[0].post.body_text(), Some("has anyone seen the report"));
+    assert!(shown[0].reactions.is_empty());
+
+    // Alice thanked Bob's reply, and Bob then edited it. The reply target
+    // survives the fold, so a client can still draw the thread.
+    assert_eq!(shown[1].post.body_text(), Some("I have it here — sending now"));
+    assert_eq!(shown[1].reactions["🙏"], vec![alice.key]);
+    assert!(shown[1].edited.is_some());
+
+    // Alice redacted her own, and it shows as a gap rather than vanishing.
+    assert!(!shown[2].is_visible());
+    assert_eq!(t.unreadable(), &[] as &[u64]);
+}
+
+#[tokio::test]
+async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_check_it() {
+    // The exchange sees ciphertext, so it cannot tell that this edit came from
+    // somebody other than the author. It accepts the entry, as it must. The
+    // reader is what refuses it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 111).await;
+    let mut bob = Peer::new(addr, pubkey, 112).await;
+    let channel = [9u8; 32];
+
+    alice.publish_prekeys(4).await;
+    bob.publish_prekeys(4).await;
+    alice
+        .client
+        .post(
+            "/channel/create",
+            private(channel, vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+        )
+        .await
+        .unwrap();
+    let epoch1 = ChannelKey::generate();
+    let mut envelopes = Vec::new();
+    for who in [alice.key, bob.key] {
+        let p = alice.take_prekey_for(who).await;
+        envelopes.push(seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap());
+    }
+    alice
+        .client
+        .post("/channel/key/put", KeyPut { channel, epoch: 1, envelopes }.encode())
+        .await
+        .unwrap();
+    bob.collect_keys(channel).await;
+
+    let seal = |body: Body, who: &PubKey, seq: u64| {
+        Post {
+            channel,
+            epoch: 1,
+            msg_seq: seq,
+            expires_after: 0,
+            body: epoch1.seal(&channel, 1, who, seq, &body.encode()).unwrap(),
+        }
+        .encode()
+    };
+
+    let a = seal(Body::Post(SipPost::text("what I actually said")), &alice.key, 0);
+    assert_eq!(alice.client.post("/channel/post", a).await.unwrap().0, 200);
+
+    // Bob is a member, so he holds the channel key and can seal a well-formed
+    // edit of somebody else's message. The exchange takes it.
+    let forged = seal(
+        Body::Edit { target: 1, post: SipPost::text("what Bob wishes I had said") },
+        &bob.key,
+        0,
+    );
+    assert_eq!(
+        bob.client.post("/channel/post", forged).await.unwrap().0,
+        200,
+        "the exchange cannot read it, so it must accept it"
+    );
+
+    let (_, body) = alice
+        .client
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    let entries = Entries::decode(&body).unwrap();
+    assert_eq!(entries.entries.len(), 2, "both entries are stored");
+
+    let t = timeline_of(&entries.entries, &epoch1, channel, &[alice.key]);
+    let m = t.get(1).unwrap();
+    assert_eq!(
+        m.post.body_text(),
+        Some("what I actually said"),
+        "the reader refuses what the exchange could not"
+    );
+    assert_eq!(m.edited, None);
 }
