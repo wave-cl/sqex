@@ -2,8 +2,13 @@
 
 sqex is a service that identities already authenticated by their sQUIC
 connection can use without signing anything further. It speaks **HTTP/3 over
-sQUIC** and, as its first capability, lets administrators manage its connection
-whitelist by **Ed25519-signed commands** — ready for a YubiKey.
+sQUIC**, and the connection's verified Ed25519 identity (SIP-3) is the caller —
+there is no login, no session token and no account to create.
+
+On that foundation it runs several services: a liveness beacon, a
+store-and-forward mailbox, relayed sessions with real-time voice, rooms, and —
+as of v0.9.0 — an **end-to-end encrypted chat stack**. Administrators manage the
+connection whitelist with **Ed25519-signed commands**, ready for a YubiKey.
 
 ## Install
 
@@ -35,20 +40,46 @@ SQEX_SERVER=host:5400 SQEX_SERVER_KEY=<b58> sqex status   # environment
 
 `SQEXD_LOG` sets the server's log filter (`RUST_LOG`-style; default `info`).
 
-## Why
+## Services
 
-sQUIC proves a caller's key during the handshake, so a service need not
-re-authenticate the connection. But some authority cannot ride on the
-connection at all: a **YubiKey** signs with an Ed25519 key and never releases
-the seed, and sQUIC's transport identity needs that seed to derive its X25519
-key. So an administrator authenticated by a YubiKey cannot be recognised by the
-transport `peer_key`.
+| Service | SIP | Client |
+|---|---|---|
+| Signed administration | [10](https://github.com/wave-cl/sips/blob/main/sip-0010.md) | `sqex admin` |
+| Liveness beacon | [4](https://github.com/wave-cl/sips/blob/main/sip-0004.md) | `sqex beacon` |
+| Store-and-forward mailbox | [5](https://github.com/wave-cl/sips/blob/main/sip-0005.md) | `sqex mail` |
+| Relayed session | [12](https://github.com/wave-cl/sips/blob/main/sip-0012.md) | `sqex session talk` |
+| Rooms and voice | [13](https://github.com/wave-cl/sips/blob/main/sip-0013.md), [15](https://github.com/wave-cl/sips/blob/main/sip-0015.md) | `sqex-voice call`, `sqex-voice room` |
+| Chat | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | library only — see below |
 
-sqex therefore takes authority from an **application-layer Ed25519 signature on
-the command itself**, verified against a list of admin public keys in the config
-file — independent of the connection's transport key. A software signer and a
-YubiKey are interchangeable behind one trait, so the protocol is hardware-ready
-from the start.
+## Chat (v0.9.0)
+
+Nine SIPs, 38 routes: channels with a durable ordered log, per-epoch channel
+keys, chunked blobs, message structure, portable delegation credentials,
+profiles and blocking, a device registry, X3DH prekeys, and admission requests.
+
+What the exchange can see is ordering, membership and retention. What it cannot
+see is a channel key, a message, a file, or a private channel's name — those are
+sealed by the members, and `sqexd` has no module that would open them. Forward
+secrecy comes from single-use prekeys: a device publishes them in advance, the
+exchange serves each once, and the sender's envelope carries a fresh key at both
+ends, so a stored pile of envelopes does not become readable when an identity
+key later turns up.
+
+Two rules the exchange is structurally unable to check are implemented in
+`sqex-proto` as types a client uses rather than as advice:
+
+- `channel_key::Replay` refuses an entry whose `(device, epoch, msg_seq)` has
+  been seen before.
+- `prekey::Pool` owns a device's prekey secrets and the id counter, spends a
+  one-time secret exactly once, and refuses an envelope naming one already
+  spent — which is how a recipient notices an exchange serving the same prekey
+  twice.
+
+**There is no chat CLI.** `sqex-proto` has the wire formats and the client-side
+logic (sealing, opening, the timeline reader that folds edits, reactions and
+redactions into what a person sees), and `sqexd` serves the routes; the
+integration tests in `crates/sqexd/tests/` are currently the only thing that
+drives them end to end, and are the best worked example of a client.
 
 ## How admin commands work
 
@@ -68,8 +99,29 @@ the command vocabulary (`sqex-proto`); the signer never parses a payload.
    **atomically** (all ops, or none).
 
 Ops: enable/disable the whitelist, add/remove a peer key, list it, read status,
-reload the admin list, and read the audit tail. Every mutation is recorded to a
+reload the admin list, read the audit tail, and — since v0.9.0 — list, admit and
+deny pending SIP-24 admission requests. Every mutation is recorded to a
 persisted audit log (who, what, when).
+
+The three admission ops are in the vocabulary and executed by the server, but
+`sqex admin` does not expose them yet: it covers `whitelist`, `audit` and
+`reload-admins`. Deciding on a request today means building the op through
+`sqex-proto`.
+
+## Why signed commands
+
+sQUIC proves a caller's key during the handshake, so a service need not
+re-authenticate the connection. But some authority cannot ride on the
+connection at all: a **YubiKey** signs with an Ed25519 key and never releases
+the seed, and sQUIC's transport identity needs that seed to derive its X25519
+key. So an administrator authenticated by a YubiKey cannot be recognised by the
+transport `peer_key`.
+
+sqex therefore takes authority from an **application-layer Ed25519 signature on
+the command itself**, verified against a list of admin public keys in the config
+file — independent of the connection's transport key. A software signer and a
+YubiKey are interchangeable behind one trait, so the protocol is hardware-ready
+from the start.
 
 ## Whitelist enforcement
 
@@ -81,12 +133,33 @@ stable transport key. So sQUIC accepts anyone holding the server key, and sqex
 answers `403` on protected endpoints for a peer whose key is not whitelisted.
 Admin commands are signature-gated and always reachable.
 
+Which routes are protected is an operator's policy, and today only
+`/exchange/ping` is — it is there to demonstrate the mechanism. The chat routes
+are open to any advertised identity. SIP-24 covers the case where they should
+not be, and the queue and the admin ops for it are implemented; wiring
+enforcement onto a chosen set of routes is not.
+
+## Storage
+
+With `state_file` set, `sqexd` keeps the whitelist and audit log in that file
+and puts three SQLite databases beside it: `channels.db`, `devices.db` and
+`profiles.db`. SQLite is bundled (no system library), and the channel log runs
+in WAL mode with `synchronous = FULL` — this is the service that promised to
+remember, so an entry is on the disk before the exchange says it accepted it.
+
+Omit `state_file` and everything is in memory and lost on restart, which is what
+the tests use.
+
 ## Layout
 
-- `sqex-proto` — the admin command vocabulary: opaque op payloads + human
-  summaries, over [sqnr](https://github.com/wave-cl/sqnr) transactions.
-- `sqexd` — the HTTP/3 server, whitelist store, audit log, transaction execution.
-- `sqex-cli` — the `sqex` command-line admin tool (signs via sqnr).
+- `sqex-proto` — every wire format, and the client-side logic for the ones the
+  exchange must not be able to perform: sealing, opening, the prekey pool, the
+  replay check, the timeline reader.
+- `sqexd` — the HTTP/3 server: whitelist store, audit log, transaction
+  execution, and the beacon, mailbox, session, room, channel, blob, device,
+  prekey, profile and admission services.
+- `sqex-cli` — the `sqex` command-line tool (signs via sqnr).
+- `sqex-voice` — calls and rooms: capture, Opus, relay, mix, play.
 - `sqex-admin` — the desktop GUI (YubiKey), parked.
 
 ## Running
