@@ -241,6 +241,67 @@ mod tests {
         }
     }
 
+    /// The bug a live ear caught and the tests did not: rendering a pause as
+    /// digital zeros chops the room's noise floor in and out fifty times a
+    /// second. A microphone is never digitally silent, so a pause is a low
+    /// noise floor — and cutting that to nothing and back is what "choppy"
+    /// sounds like.
+    ///
+    /// Measured against a real encoder and decoder, so it fails if either the
+    /// rendering or the codec's behaviour changes.
+    #[test]
+    fn a_pause_is_rendered_without_cutting_the_noise_floor() {
+        use crate::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+
+        let mut enc =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+        enc.set_dtx(true).unwrap();
+        let mut sender = Sender::new(50, true);
+
+        // Speech, then a quiet room — not digital silence, which is the whole
+        // point: a real pause has a noise floor.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut phase = 0.0f32;
+        let step = std::f32::consts::TAU * 440.0 / SAMPLE_RATE as f32;
+        let mut slots: Vec<Option<Vec<u8>>> = Vec::new();
+        for i in 0..200 {
+            let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
+                    let s = if i < 50 { phase.sin() * 0.5 + noise } else { noise };
+                    phase = (phase + step) % std::f32::consts::TAU;
+                    s
+                })
+                .collect();
+            let packet = enc.encode_vec_float(&pcm, 1024).unwrap();
+            slots.push(sender.offer(packet).map(|f| f.payload));
+        }
+
+        // Render the way the call loop does: every slot reaches the decoder.
+        let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+        let mut pcm = vec![0f32; FRAME_SAMPLES];
+        let levels: Vec<f32> = slots
+            .iter()
+            .map(|slot| {
+                dec.decode_float(slot.as_deref().unwrap_or(&[]), &mut pcm, false)
+                    .unwrap();
+                rms(&pcm)
+            })
+            .collect();
+
+        let pause = &levels[60..190];
+        let dead = pause.iter().filter(|x| **x < 0.0005).count();
+        assert_eq!(
+            dead, 0,
+            "a pause must not contain digitally dead frames; {dead} of {} were silent, \
+             which is the chop",
+            pause.len()
+        );
+    }
+
     #[test]
     fn a_continuous_stream_has_no_gap_at_all() {
         assert_eq!(classify((5, 100), (6, 101)), Gap { lost: 0, silent: 0 });
@@ -272,5 +333,183 @@ mod tests {
     fn the_timestamp_wrapping_does_not_produce_a_two_year_gap() {
         let g = classify((5, u32::MAX - 1), (6, 1));
         assert_eq!(g, Gap { lost: 0, silent: 2 });
+    }
+}
+
+#[cfg(test)]
+mod probe {
+    use crate::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
+
+    /// The real thing: a speech-then-silence stream put through the actual
+    /// transmit policy, decoded two ways, so the envelopes can be compared.
+    ///
+    /// `cargo test -p sqex-voice -- --ignored --nocapture envelope`
+    #[test]
+    #[ignore = "reports numbers; run explicitly"]
+    fn silence_envelope_zeros_versus_decoding() {
+        use crate::media::{DTX_MAX, Sender};
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+
+        let mut enc =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+        enc.set_dtx(true).unwrap();
+        let mut sender = Sender::new(50, true);
+
+        // 1 s of tone, then 3 s of a quiet room.
+        const NOISE: f32 = 0.006;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut phase = 0.0f32;
+        let step = std::f32::consts::TAU * 440.0 / SAMPLE_RATE as f32;
+        let mut slots: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut sizes: Vec<usize> = Vec::new();
+        for i in 0..200 {
+            // A real microphone is never digitally silent. "As silent as
+            // possible" is a room's noise floor: breathing, a fan, the
+            // preamp's own hiss. This is what the encoder actually sees.
+            let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * NOISE;
+                    let s = if i < 50 { phase.sin() * 0.5 + noise } else { noise };
+                    phase = (phase + step) % std::f32::consts::TAU;
+                    s
+                })
+                .collect();
+            let packet = enc.encode_vec_float(&pcm, 1024).unwrap();
+            match sender.offer(packet) {
+                Some(f) => {
+                    sizes.push(f.payload.len());
+                    slots.push(Some(f.payload));
+                }
+                None => slots.push(None),
+            }
+        }
+        let sent_in_pause = slots[60..].iter().filter(|s| s.is_some()).count();
+        let big_in_pause = slots[60..]
+            .iter()
+            .filter(|s| s.as_ref().is_some_and(|p| p.len() > DTX_MAX))
+            .count();
+        println!(
+            "\n  during the pause: {sent_in_pause} packets sent, of which {big_in_pause} \
+             were full-size comfort-noise updates"
+        );
+
+        let envelope = |zeros_on_silence: bool| -> Vec<f32> {
+            let mut d = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+            let mut pcm = vec![0f32; FRAME_SAMPLES];
+            slots
+                .iter()
+                .map(|slot| match slot {
+                    Some(p) => {
+                        d.decode_float(p, &mut pcm, false).unwrap();
+                        rms(&pcm)
+                    }
+                    None if zeros_on_silence => 0.0,
+                    None => {
+                        d.decode_float(&[], &mut pcm, false).unwrap();
+                        rms(&pcm)
+                    }
+                })
+                .collect()
+        };
+        // "Choppy" is exactly frame-to-frame jumps in level, so measure that.
+        let report = |label: &str, v: &[f32]| {
+            let pause = &v[60..190];
+            let mean = pause.iter().sum::<f32>() / pause.len() as f32;
+            let jump: f32 = pause.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>()
+                / (pause.len() - 1) as f32;
+            let silent_frames = pause.iter().filter(|x| **x < 0.0005).count();
+            println!(
+                "  {label}  mean {mean:.4}  mean frame-to-frame jump {jump:.4}  \
+                 dead-silent frames {silent_frames}/{}",
+                pause.len()
+            );
+            let s: Vec<String> = v[60..85].iter().map(|x| format!("{x:.3}")).collect();
+            println!("      first 25 of the pause: {}", s.join(" "));
+        };
+        report("zeros on silence (ships now):", &envelope(true));
+        report("decode every slot:          ", &envelope(false));
+        println!();
+    }
+
+    /// What does a decoder produce for a slot with no packet, and does it
+    /// depend on what it last heard?
+    ///
+    /// This decides how silence should be rendered. Reports rather than
+    /// asserts: `cargo test -p sqex-voice -- --ignored --nocapture cng`
+    #[test]
+    #[ignore = "reports numbers; run explicitly"]
+    fn cng_after_speech_versus_after_dtx() {
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+
+        let mut enc =
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
+        enc.set_dtx(true).unwrap();
+        let mut phase = 0.0f32;
+        let step = std::f32::consts::TAU * 440.0 / SAMPLE_RATE as f32;
+        let mut speech = |n: usize| -> Vec<Vec<u8>> {
+            (0..n)
+                .map(|_| {
+                    let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                        .map(|_| {
+                            let s = phase.sin() * 0.5;
+                            phase = (phase + step) % std::f32::consts::TAU;
+                            s
+                        })
+                        .collect();
+                    enc.encode_vec_float(&pcm, 1024).unwrap()
+                })
+                .collect()
+        };
+        let talk = speech(30);
+        // Now feed it silence until it starts emitting DTX packets.
+        let mut cn = Vec::new();
+        for _ in 0..40 {
+            cn.push(enc.encode_vec_float(&vec![0.0; FRAME_SAMPLES], 1024).unwrap());
+        }
+        let cn_packet = cn.iter().rev().find(|p| p.len() <= super::DTX_MAX).cloned();
+        println!("\n  a DTX packet was produced: {}", cn_packet.is_some());
+
+        let mut pcm = vec![0f32; FRAME_SAMPLES];
+
+        // A: null-decode straight after speech — this is packet loss.
+        let mut d = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+        for p in &talk {
+            d.decode_float(p, &mut pcm, false).unwrap();
+        }
+        let mut after_speech = Vec::new();
+        for _ in 0..25 {
+            d.decode_float(&[], &mut pcm, false).unwrap();
+            after_speech.push(rms(&pcm));
+        }
+
+        // B: null-decode after a DTX packet — this is a pause.
+        let mut d = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+        for p in &talk {
+            d.decode_float(p, &mut pcm, false).unwrap();
+        }
+        if let Some(p) = &cn_packet {
+            d.decode_float(p, &mut pcm, false).unwrap();
+            println!("  decoding the DTX packet itself gives rms {:.4}", rms(&pcm));
+        }
+        let mut after_dtx = Vec::new();
+        for _ in 0..25 {
+            d.decode_float(&[], &mut pcm, false).unwrap();
+            after_dtx.push(rms(&pcm));
+        }
+
+        let show = |label: &str, v: &[f32]| {
+            let head: Vec<String> = v[..8].iter().map(|x| format!("{x:.4}")).collect();
+            println!(
+                "  {label}: first 8 {:?}  … last {:.4}",
+                head,
+                v.last().unwrap()
+            );
+        };
+        show("null-decode after SPEECH (loss) ", &after_speech);
+        show("null-decode after DTX    (pause)", &after_dtx);
+        println!("  digital zeros would be     : 0.0000\n");
     }
 }

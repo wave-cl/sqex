@@ -25,7 +25,7 @@ use sqnr::{Client, config::Config, identity};
 use sqnr_core::{PubKey, Signer};
 
 use sqex_voice::audio::{self, Rate, Sink, Source};
-use sqex_voice::jitter::{FRAME_MS, Jitter, Playout, Rtt};
+use sqex_voice::jitter::{FRAME_MS, Jitter, Rtt};
 use sqex_voice::media;
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{self, Event as RoomEvent, Membership};
@@ -503,28 +503,14 @@ async fn call(
                 if let Some(stale) = buffer.trim() {
                     decoder.decode_float(&stale, &mut pcm, false).map_err(|e| format!("decode: {e}"))?;
                 }
-                match buffer.pop() {
-                    Playout::Frame(packet) => {
-                        decoder.decode_float(&packet, &mut pcm, false).map_err(|e| format!("decode: {e}"))?;
-                        out.play(&pcm);
-                    }
-                    // Opus invents a plausible continuation of what it last
-                    // heard. Better than a hole, and much better than a click.
-                    Playout::Conceal => {
-                        decoder.decode_float(&[], &mut pcm, false).map_err(|e| format!("conceal: {e}"))?;
-                        out.play(&pcm);
-                    }
-                    // The peer chose not to speak. Opus already played its
-                    // comfort noise from the packet that opened the run, so
-                    // hold that rather than conceal — concealing would put
-                    // words in their mouth.
-                    Playout::Silence => {
-                        pcm.fill(0.0);
-                        out.play(&pcm);
-                    }
-                    // Nothing to play. Write nothing: the device fills silence
-                    // on its own, and a file should not be padded with it.
-                    Playout::Idle => {}
+                // A frame, a concealed slot and a silent slot are all just
+                // "decode this" — see `Playout::to_decode`. Idle alone plays
+                // nothing: the device fills its own silence, and a file should
+                // not be padded with it.
+                let slot = buffer.pop();
+                if let Some(packet) = slot.to_decode() {
+                    decoder.decode_float(packet, &mut pcm, false).map_err(|e| format!("decode: {e}"))?;
+                    out.play(&pcm);
                 }
                 if hangup.is_some_and(|at| Instant::now() >= at) {
                     break;
@@ -732,21 +718,15 @@ async fn room_call(
                     if let Some(stale) = peer.jitter.trim() {
                         let _ = peer.decoder.decode_float(&stale, &mut pcm, false);
                     }
-                    let decoded = match peer.jitter.pop() {
-                        Playout::Frame(packet) => {
-                            peer.decoder.decode_float(&packet, &mut pcm, false).is_ok()
+                    // Silence decodes like loss and counts as an active stream:
+                    // their noise floor stays continuous, and the mix gain does
+                    // not lurch every time somebody pauses for breath.
+                    let slot = peer.jitter.pop();
+                    let decoded = match slot.to_decode() {
+                        Some(packet) => {
+                            peer.decoder.decode_float(packet, &mut pcm, false).is_ok()
                         }
-                        Playout::Conceal => {
-                            peer.decoder.decode_float(&[], &mut pcm, false).is_ok()
-                        }
-                        // They are not talking. Contribute silence to the mix —
-                        // still an active stream, so the gain does not lurch
-                        // every time somebody pauses.
-                        Playout::Silence => {
-                            pcm.fill(0.0);
-                            true
-                        }
-                        Playout::Idle => false,
+                        None => false,
                     };
                     if decoded {
                         peer.note_level(audio::rms(&pcm));

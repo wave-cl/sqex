@@ -14,7 +14,14 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::media::classify;
+use crate::media::{DTX_MAX, classify};
+
+/// How long playout will coast through an empty buffer on the strength of the
+/// peer having last said it was silent.
+///
+/// Two seconds, against a keepalive of one: long enough that an ordinary pause
+/// never rebuffers, short enough that a peer which died mid-sentence is noticed.
+const COAST_LIMIT: u64 = 100;
 
 /// One arrived frame: the packet that carried it, and what it holds.
 struct Media {
@@ -38,13 +45,46 @@ pub enum Playout {
     Frame(Vec<u8>),
     /// The packet for this slot is not coming. Ask Opus to invent one.
     Conceal,
-    /// The sender deliberately said nothing here (SIP-14). **Never conceal
-    /// this** — concealment extrapolates from what was last heard, so it would
-    /// invent speech out of a silence nobody spoke.
+    /// The sender deliberately said nothing here (SIP-14).
+    ///
+    /// Hand this to the decoder with no packet, exactly as [`Playout::Conceal`]
+    /// — but it is **not** concealment, and the distinction is the point. After
+    /// a comfort-noise packet the decoder continues the room's noise floor;
+    /// after speech it would extrapolate words. Which one happens is decided by
+    /// what the sender last transmitted, which is why silence must never be
+    /// reached from a speech frame.
+    ///
+    /// What it must *not* be is digital zeros. Writing silence here cuts the
+    /// noise floor off at a cliff every time, and cutting a room's ambience in
+    /// and out fifty times a second is audibly choppy — measurably so: it
+    /// leaves most of a pause dead-silent between bursts.
     Silence,
     /// Nothing is in flight, or the buffer is still filling. Play silence and
     /// do not advance — an idle line is not a lost packet.
     Idle,
+}
+
+impl Playout {
+    /// The packet to hand the decoder for this slot, or `None` if there is no
+    /// slot to play at all.
+    ///
+    /// Loss and silence deliberately return **the same thing** — an empty
+    /// packet. The difference between them is in the decoder's state, not in
+    /// what it is handed: after speech an empty packet extrapolates words,
+    /// after comfort noise it continues the room. Deciding *which* state the
+    /// decoder is in is what SIP-14's timestamp is for, and it has already been
+    /// decided by the time a slot gets here.
+    ///
+    /// This exists so that a call site cannot render silence as zeros. Doing
+    /// that cuts the noise floor in and out fifty times a second, which is
+    /// inaudible in a synthetic test and unmistakable through a microphone.
+    pub fn to_decode(&self) -> Option<&[u8]> {
+        match self {
+            Playout::Frame(packet) => Some(packet),
+            Playout::Conceal | Playout::Silence => Some(&[]),
+            Playout::Idle => None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -93,6 +133,12 @@ pub struct Jitter {
     /// Sequence and timestamp of the last frame handed to playout, so a gap can
     /// be split into loss and silence.
     last_played: Option<(u64, u32)>,
+    /// Was the last frame played a comfort-noise packet? If so an empty buffer
+    /// means the peer is still not talking, not that the path has stalled.
+    in_pause: bool,
+    /// Slots spent coasting on that assumption, so a peer that dies mid-pause
+    /// is not covered for ever.
+    coasted: u64,
     /// Slots in the gap we are crossing that were lost, and slots that were
     /// somebody not talking. Computed once on entering the gap.
     conceal_run: u64,
@@ -111,6 +157,8 @@ impl Jitter {
             lowest: None,
             highest: 0,
             last_played: None,
+            in_pause: false,
+            coasted: 0,
             conceal_run: 0,
             silent_run: 0,
             depth,
@@ -204,6 +252,8 @@ impl Jitter {
 
         if let Some(media) = self.frames.remove(&self.cursor) {
             self.last_played = Some((media.seq, self.cursor as u32));
+            self.in_pause = media.packet.len() <= DTX_MAX;
+            self.coasted = 0;
             self.cursor += 1;
             // The gap, if there was one, is behind us now.
             self.conceal_run = 0;
@@ -212,11 +262,23 @@ impl Jitter {
         }
 
         if self.frames.is_empty() {
-            // Nothing behind this gap either: the peer has gone quiet, or the
-            // path has stalled. Concealing indefinitely would invent speech out
-            // of silence, so stop and refill instead.
+            // An empty buffer in the middle of a pause is not a stall: a silent
+            // peer sends about once a second, so most slots have nothing behind
+            // them and that is correct. Refilling here is what makes a pause
+            // chop — playout stops, waits for `depth` frames that will not
+            // arrive while nobody is talking, then bursts.
+            if self.in_pause && self.coasted < COAST_LIMIT {
+                self.coasted += 1;
+                self.cursor += 1;
+                self.stats.silent += 1;
+                return Playout::Silence;
+            }
+            // Otherwise the peer has gone, or the path has stalled. Concealing
+            // indefinitely would invent speech out of nothing, so stop and
+            // refill instead.
             self.stats.underruns += 1;
             self.playing = false;
+            self.in_pause = false;
             self.conceal_run = 0;
             self.silent_run = 0;
             return Playout::Idle;
@@ -309,6 +371,16 @@ mod tests {
             j.push(from + i, (from + i) as u32, packet(i as u8));
         }
         j
+    }
+
+    #[test]
+    fn silence_and_loss_are_decoded_the_same_way_and_idle_is_not_decoded() {
+        assert_eq!(Playout::Frame(packet(1)).to_decode(), Some(&packet(1)[..]));
+        // The pair that must not diverge: both feed the decoder nothing, and
+        // its own state decides whether that is concealment or a quiet room.
+        assert_eq!(Playout::Conceal.to_decode(), Some(&[][..]));
+        assert_eq!(Playout::Silence.to_decode(), Some(&[][..]));
+        assert_eq!(Playout::Idle.to_decode(), None, "nothing to play at all");
     }
 
     #[test]

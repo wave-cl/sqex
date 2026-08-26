@@ -17,7 +17,7 @@ use sqex_proto::room::RoomId;
 use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME};
 use sqexd::config::FileConfig;
 use sqex_voice::audio::{Rate, amplitude_at, tone_at};
-use sqex_voice::jitter::{FRAME_SAMPLES, Playout, SAMPLE_RATE};
+use sqex_voice::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
 use sqex_voice::media;
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{Event, Membership};
@@ -178,14 +178,10 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
         loop {
             mixer.start();
             for peer in m.room.peers.values_mut() {
-                let decoded = match peer.jitter.pop() {
-                    Playout::Frame(p) => peer.decoder.decode_float(&p, &mut pcm, false).is_ok(),
-                    Playout::Conceal => peer.decoder.decode_float(&[], &mut pcm, false).is_ok(),
-                    Playout::Silence => {
-                        pcm.fill(0.0);
-                        true
-                    }
-                    Playout::Idle => false,
+                let slot = peer.jitter.pop();
+                let decoded = match slot.to_decode() {
+                    Some(p) => peer.decoder.decode_float(p, &mut pcm, false).is_ok(),
+                    None => false,
                 };
                 if decoded {
                     mixer.add(&pcm);

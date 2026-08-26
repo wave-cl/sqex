@@ -169,12 +169,17 @@ numbers are its own.
 ## Silence is free-ish (SIP-14)
 
 A speaker who is not talking stops transmitting. Measured on a live exchange,
-two seconds of speech followed by ten of silence:
+two seconds of speech followed by ten of pause:
 
 | | packets |
 |---|---|
 | `--no-dtx` (continuous) | 600 |
-| default | **157** |
+| default, pause is a quiet room | **182** |
+| default, pause is digital silence | 157 |
+
+Quote the middle row. The bottom one is what a synthetic test measures, and no
+microphone produces it — a real pause is a room's noise floor, which the encoder
+has something to do with. A noisier room saves less again.
 
 In a room that saving applies to every one of the N(N−1) streams, which is what
 makes eight people affordable.
@@ -191,6 +196,12 @@ Two things Opus does that are worth knowing, both measured rather than
 documented: DTX takes about **ten frames to engage**, so short pauses save less
 than long ones; and it **refreshes its comfort noise** every few hundred
 milliseconds, so a settled pause is not literally one keepalive per second.
+
+A silent slot is handed to the decoder with no packet, exactly like a lost one —
+the decoder's state decides whether that comes out as comfort noise or as
+concealment. It is emphatically **not** rendered as digital zeros: that cuts the
+room's noise floor in and out fifty times a second, which is inaudible in a test
+and sounds like the line breaking up through a microphone.
 
 `--no-dtx` restores continuous transmission. That is a **privacy** switch, not a
 quality one: with DTX, packet timing tells anyone watching — the exchange

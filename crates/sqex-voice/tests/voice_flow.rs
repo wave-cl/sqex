@@ -16,7 +16,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME, Open, OpenAck, OpenState, Session};
 use sqexd::config::FileConfig;
 use sqex_voice::audio::{TONE_HZ, dominant_hz, rms, tone};
-use sqex_voice::jitter::{FRAME_SAMPLES, Jitter, Playout, SAMPLE_RATE};
+use sqex_voice::jitter::{FRAME_SAMPLES, Jitter, SAMPLE_RATE};
 use sqex_voice::media;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -184,18 +184,10 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
     let mut pcm = vec![0f32; FRAME_SAMPLES];
     let mut played = Vec::new();
     loop {
-        match buffer.pop() {
-            Playout::Frame(packet) => {
-                dec.decode_float(&packet, &mut pcm, false).unwrap();
-                played.push(pcm.clone());
-            }
-            Playout::Conceal => {
-                dec.decode_float(&[], &mut pcm, false).unwrap();
-                played.push(pcm.clone());
-            }
-            Playout::Silence => played.push(vec![0.0; FRAME_SAMPLES]),
-            Playout::Idle => break,
-        }
+        let slot = buffer.pop();
+        let Some(packet) = slot.to_decode() else { break };
+        dec.decode_float(packet, &mut pcm, false).unwrap();
+        played.push(pcm.clone());
     }
     assert_eq!(
         buffer.stats.received as usize,
@@ -350,19 +342,11 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
     let mut pcm = vec![0f32; FRAME_SAMPLES];
     let mut played: Vec<f32> = Vec::new();
     loop {
-        match buffer.pop() {
-            Playout::Frame(p) => {
-                let n = dec.decode_float(&p, &mut pcm, false).unwrap();
-                assert_eq!(n, FRAME_SAMPLES, "decoded at 48 kHz regardless of the sender");
-                played.extend_from_slice(&pcm[..n]);
-            }
-            Playout::Conceal => {
-                dec.decode_float(&[], &mut pcm, false).unwrap();
-                played.extend_from_slice(&pcm);
-            }
-            Playout::Silence => played.extend(std::iter::repeat_n(0.0, FRAME_SAMPLES)),
-            Playout::Idle => break,
-        }
+        let slot = buffer.pop();
+        let Some(p) = slot.to_decode() else { break };
+        let n = dec.decode_float(p, &mut pcm, false).unwrap();
+        assert_eq!(n, FRAME_SAMPLES, "decoded at 48 kHz regardless of the sender");
+        played.extend_from_slice(&pcm[..n]);
     }
 
     // A second in at 16 kHz is a second out at 48 kHz, and still a 440 Hz tone.
@@ -463,18 +447,10 @@ async fn a_pause_is_heard_as_silence_and_costs_almost_nothing() {
     let mut pcm = vec![0f32; FRAME_SAMPLES];
     let mut played: Vec<Vec<f32>> = Vec::new();
     loop {
-        match buffer.pop() {
-            Playout::Frame(p) => {
-                dec.decode_float(&p, &mut pcm, false).unwrap();
-                played.push(pcm.clone());
-            }
-            Playout::Conceal => {
-                dec.decode_float(&[], &mut pcm, false).unwrap();
-                played.push(pcm.clone());
-            }
-            Playout::Silence => played.push(vec![0.0; FRAME_SAMPLES]),
-            Playout::Idle => break,
-        }
+        let slot = buffer.pop();
+        let Some(p) = slot.to_decode() else { break };
+        dec.decode_float(p, &mut pcm, false).unwrap();
+        played.push(pcm.clone());
     }
 
     // The pause is still a pause: the timeline did not shorten by the frames
