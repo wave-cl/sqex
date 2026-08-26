@@ -50,6 +50,17 @@ pub enum Op {
     ReloadAdmins,
     /// Read the last `n` audit entries.
     AuditTail(u32),
+    /// Read the pending SIP-24 admission requests.
+    ///
+    /// A credential is evidence and not authority: it tells an administrator
+    /// which account vouches for a key, and does not entitle that key to
+    /// anything. That is why admission is a decision rather than a rule.
+    AdmissionList,
+    /// Admit a device to the whitelist, with an optional label of the
+    /// administrator's own.
+    AdmissionApprove { device: PubKey, label: Option<String> },
+    /// Decline one, and remember the decision so it does not requeue.
+    AdmissionDeny(PubKey),
 }
 
 impl Op {
@@ -63,6 +74,9 @@ impl Op {
             Op::Status => 0x06,
             Op::ReloadAdmins => 0x07,
             Op::AuditTail(_) => 0x08,
+            Op::AdmissionList => 0x09,
+            Op::AdmissionApprove { .. } => 0x0a,
+            Op::AdmissionDeny(_) => 0x0b,
         }
     }
 
@@ -82,7 +96,18 @@ impl Op {
                     None => out.push(0),
                 }
             }
-            Op::WhitelistRemove(k) => out.extend_from_slice(k.as_bytes()),
+            Op::AdmissionApprove { device, label } => {
+                out.extend_from_slice(device.as_bytes());
+                match label {
+                    Some(s) => {
+                        out.push(1);
+                        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
+            Op::WhitelistRemove(k) | Op::AdmissionDeny(k) => out.extend_from_slice(k.as_bytes()),
             Op::AuditTail(n) => out.extend_from_slice(&n.to_be_bytes()),
             _ => {}
         }
@@ -104,6 +129,9 @@ impl Op {
             0x06 => Op::Status,
             0x07 => Op::ReloadAdmins,
             0x08 => Op::AuditTail(u32_arg(rest)?),
+            0x09 => Op::AdmissionList,
+            0x0a => decode_approve(rest)?,
+            0x0b => Op::AdmissionDeny(key(rest)?),
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
         // Every op consumes its payload exactly; reject trailing bytes.
@@ -124,6 +152,9 @@ impl Op {
             Op::Status => "status",
             Op::ReloadAdmins => "reload-admins",
             Op::AuditTail(_) => "audit-tail",
+            Op::AdmissionList => "admission-list",
+            Op::AdmissionApprove { .. } => "admission-approve",
+            Op::AdmissionDeny(_) => "admission-deny",
         }
     }
 
@@ -138,6 +169,9 @@ impl Op {
             Op::Status => "Read server status".into(),
             Op::ReloadAdmins => "Reload the admin list from config".into(),
             Op::AuditTail(n) => format!("Read the last {n} audit entries"),
+            Op::AdmissionList => "Read pending admission requests".into(),
+            Op::AdmissionApprove { .. } => "Admit a device to the whitelist".into(),
+            Op::AdmissionDeny(_) => "Decline an admission request".into(),
         }
     }
 
@@ -152,6 +186,17 @@ impl Op {
                 d
             }
             Op::WhitelistRemove(k) => vec![format!("peer: {}", k.to_base58())],
+            // The verifiable fact is the key. A requester's own label is
+            // evidence shown to an administrator and is not carried over
+            // unless they repeat it here as their own.
+            Op::AdmissionApprove { device, label } => {
+                let mut d = vec![format!("device: {}", device.to_base58())];
+                if let Some(s) = label {
+                    d.push(format!("label: {s}"));
+                }
+                d
+            }
+            Op::AdmissionDeny(k) => vec![format!("device: {}", k.to_base58())],
             _ => vec![],
         }
     }
@@ -173,6 +218,8 @@ impl Op {
         match self {
             Op::WhitelistAdd { key, .. } => Some(key.to_base58()),
             Op::WhitelistRemove(k) => Some(k.to_base58()),
+            Op::AdmissionApprove { device, .. } => Some(device.to_base58()),
+            Op::AdmissionDeny(k) => Some(k.to_base58()),
             _ => None,
         }
     }
@@ -184,6 +231,13 @@ impl Op {
             detail: self.detail(),
             payload: self.payload(),
         }
+    }
+}
+
+fn decode_approve(rest: &[u8]) -> Result<Op> {
+    match decode_add(rest)? {
+        Op::WhitelistAdd { key, label } => Ok(Op::AdmissionApprove { device: key, label }),
+        _ => unreachable!("decode_add returns a whitelist add"),
     }
 }
 

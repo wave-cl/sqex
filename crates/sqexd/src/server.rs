@@ -15,6 +15,7 @@ use sqex_proto::Op;
 use squic::Config as SquicConfig;
 
 use crate::beacon::Beacons;
+use crate::admission::Admissions;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::Config;
@@ -41,7 +42,9 @@ use sqex_proto::blob_store::{
 use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
-use sqex_proto::device::{ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke};
+use sqex_proto::device::{
+    AdmissionRequest, ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke,
+};
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
     Block as ProfileBlock, ByAccount, Put as ProfilePut, TYPE_GET as PR_GET,
@@ -143,6 +146,7 @@ pub struct Server {
     prekeys: Prekeys,
     devices: Registry,
     profiles: Profiles,
+    admissions: Admissions,
     sessions: Sessions,
     live_conns: Connections,
     started: Instant,
@@ -232,6 +236,10 @@ pub async fn bind(
             .map_err(|e| Error::Malformed(format!("cannot open the device registry: {e}")))?,
         profiles: Profiles::open(profile_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open profiles: {e}")))?,
+        // In memory: a pending request is a question somebody asked once, and
+        // a queue that survived a restart would be a backlog of decisions
+        // nobody remembers being asked to make. Asking again costs a request.
+        admissions: Admissions::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
         started: Instant::now(),
@@ -514,6 +522,30 @@ async fn route(
         // carries. It relays each member's proof without checking it — checking
         // needs the secret it has deliberately not been told — and the members
         // verify each other.
+        // SIP-24 admission. The one route a peer the exchange will not serve
+        // can reach, which is why the reply never varies: if it did, submitting
+        // a credential would tell a caller whether that account is admitted
+        // here. Every limit is enforced silently — an overrun changes what is
+        // stored and never what is answered.
+        ("POST", "/admission/request") => match (device, AdmissionRequest::decode(body)) {
+            (None, _) => no_identity("requesting admission"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                let siblings = server
+                    .devices
+                    .list(&req.credential.account)
+                    .map(|d| d.devices.len())
+                    .unwrap_or(0);
+                server
+                    .admissions
+                    .request(&me, &req.credential, &req.label, siblings);
+                // `now` is the only field, and it is here for the reason SIP-4
+                // gives: a client with a wrong clock has something to notice it
+                // against. It is identical for every caller.
+                (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+            }
+        },
+
         // SIP-21 profiles and blocking. Every field is a claim its subject
         // makes; nothing here is attested, and a client must show the key
         // alongside a name wherever the distinction could matter.
@@ -1229,6 +1261,49 @@ impl Server {
             Op::AuditTail(n) => {
                 let entries = state.audit_tail(*n as usize);
                 json!({ "entries": entries })
+            }
+            Op::AdmissionList => {
+                let pending: Vec<serde_json::Value> = self
+                    .admissions
+                    .list()
+                    .into_iter()
+                    .map(|p| {
+                        json!({
+                            // The verifiable fact, first. The label is what
+                            // somebody typed and an interface must not let it
+                            // stand in for this.
+                            "device": p.device.to_base58(),
+                            "account": p.account.to_base58(),
+                            "not_after": p.not_after,
+                            "label": p.label,
+                            "first_seen": p.first_seen,
+                            "admitted_siblings": p.siblings,
+                        })
+                    })
+                    .collect();
+                json!({ "pending": pending })
+            }
+            Op::AdmissionApprove { device, label } => {
+                // Provenance records the account the credential named, so a
+                // whitelist entry says whose device it was admitted as.
+                let claimed = self.admissions.take(device);
+                let changed = state.add(
+                    *device,
+                    WhitelistEntry {
+                        added_by: Some(admin.to_base58()),
+                        label: label.clone().or_else(|| {
+                            claimed
+                                .as_ref()
+                                .map(|p| format!("device of {}", p.account.to_base58()))
+                        }),
+                        added_at: now_unix(),
+                    },
+                );
+                json!({ "ok": true, "changed": changed })
+            }
+            Op::AdmissionDeny(device) => {
+                self.admissions.deny(device);
+                json!({ "ok": true })
             }
         }
     }

@@ -16,6 +16,8 @@ use crate::credential::Credential;
 pub const TYPE_REGISTER: u8 = 0x01;
 pub const TYPE_REVOKE: u8 = 0x02;
 pub const TYPE_LIST: u8 = 0x03;
+/// SIP-24: ask to be admitted to a whitelisted exchange.
+pub const TYPE_ADMISSION: u8 = 0x04;
 
 /// Devices one account may have registered.
 ///
@@ -228,5 +230,86 @@ mod tests {
             .collect(),
         };
         assert!(Devices::decode(&too_many.encode()).is_err());
+    }
+}
+
+/// SIP-24: ask an exchange that will not serve you to admit you.
+///
+/// Nothing here is signed by the requester and nothing needs to be. The
+/// connection already proves possession of the device key — MAC1 verified it
+/// and SIP-2 exposes it — and the credential already proves the account
+/// vouched for that key. A third signature would authenticate nothing that is
+/// not authenticated, and would be one more thing to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRequest {
+    pub credential: Credential,
+    /// Offered for an administrator to read. Attacker-chosen text shown at the
+    /// moment of a security decision: the verifiable fact is the account key in
+    /// the credential, and an interface MUST display that rather than let a
+    /// label stand in for it.
+    pub label: String,
+}
+
+impl AdmissionRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.credential.wire_len() + self.label.len());
+        out.push(TYPE_ADMISSION);
+        let c = self.credential.encode();
+        out.extend_from_slice(&(c.len() as u16).to_be_bytes());
+        out.extend_from_slice(&c);
+        out.push(self.label.len() as u8);
+        out.extend_from_slice(self.label.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<AdmissionRequest> {
+        if b.len() < 4 || b[0] != TYPE_ADMISSION {
+            return Err(Error::Malformed("not an admission request".into()));
+        }
+        let n = u16::from_be_bytes(b[1..3].try_into().unwrap()) as usize;
+        if b.len() < 3 + n + 1 {
+            return Err(Error::Malformed("admission request is truncated".into()));
+        }
+        let credential = Credential::decode(&b[3..3 + n])?;
+        let label_len = b[3 + n] as usize;
+        if b.len() != 4 + n + label_len {
+            return Err(Error::Malformed(format!(
+                "admission request is {} bytes, want {}",
+                b.len(),
+                4 + n + label_len
+            )));
+        }
+        Ok(AdmissionRequest {
+            credential,
+            label: String::from_utf8(b[4 + n..].to_vec())
+                .map_err(|_| Error::Malformed("label is not UTF-8".into()))?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::credential::SCOPE_CHAT;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn an_admission_request_round_trips() {
+        let sk = SigningKey::from_bytes(&[1; 32]);
+        let (_, device) = {
+            let d = SigningKey::from_bytes(&[2; 32]);
+            (d.to_bytes(), PubKey::new(d.verifying_key().to_bytes()))
+        };
+        let r = AdmissionRequest {
+            credential: Credential::issue(&sk.to_bytes(), &device, SCOPE_CHAT, 1, 2).unwrap(),
+            label: "Colin's laptop".into(),
+        };
+        assert_eq!(AdmissionRequest::decode(&r.encode()).unwrap(), r);
+
+        let empty = AdmissionRequest {
+            label: String::new(),
+            ..r
+        };
+        assert_eq!(AdmissionRequest::decode(&empty.encode()).unwrap(), empty);
     }
 }

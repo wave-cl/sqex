@@ -354,3 +354,79 @@ async fn the_registry_survives_a_restart() {
     // A device should not have to re-register because a server bounced.
     assert_eq!(devices_of(&mut c, &account).await.devices.len(), 1);
 }
+
+#[tokio::test]
+async fn an_admission_request_answers_identically_whatever_it_decides() {
+    // The rule the rest of SIP-24 exists to protect. This is the one route a
+    // peer the exchange will not otherwise serve can reach, so a reply that
+    // varied would let anybody probe which accounts a deployment admits.
+    use sqex_proto::device::AdmissionRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (account_seed, _) = keys(151);
+    let (device_seed, device) = keys(152);
+    let (other_seed, _) = keys(153);
+    let mut c = connect(addr, pubkey, device_seed).await;
+
+    let n = now();
+    let good = Credential::issue(&account_seed, &device, SCOPE_CHAT, n - 1, n + 3600).unwrap();
+    let mut forged = good.clone();
+    forged.signature[0] ^= 1;
+    // A credential naming somebody else's device: forwarding one you found.
+    let (_, elsewhere) = keys(154);
+    let not_mine =
+        Credential::issue(&account_seed, &elsewhere, SCOPE_CHAT, n - 1, n + 3600).unwrap();
+    // An account the exchange has never heard of.
+    let (_, unknown_device) = keys(155);
+    let unknown =
+        Credential::issue(&other_seed, &unknown_device, SCOPE_CHAT, n - 1, n + 3600).unwrap();
+
+    let mut lengths = Vec::new();
+    for credential in [good.clone(), forged, not_mine, unknown] {
+        let (code, body) = c
+            .post(
+                "/admission/request",
+                AdmissionRequest {
+                    credential,
+                    label: "a laptop".into(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "every well-formed request is acknowledged");
+        lengths.push(body.len());
+    }
+    assert!(
+        lengths.windows(2).all(|w| w[0] == w[1]),
+        "the reply must not vary with what the exchange decided: {lengths:?}"
+    );
+
+    // Asking again after being queued is also just an acknowledgement.
+    let (code, _) = c
+        .post(
+            "/admission/request",
+            AdmissionRequest {
+                credential: good,
+                label: "a laptop".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+}
+
+#[tokio::test]
+async fn a_malformed_request_is_still_a_malformed_request() {
+    // "I do not know this" and "this is broken" are different facts, and the
+    // constant reply covers the first, not the second.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (device_seed, _) = keys(161);
+    let mut c = connect(addr, pubkey, device_seed).await;
+
+    let (code, _) = c.post("/admission/request", vec![0x04, 0, 0]).await.unwrap();
+    assert_eq!(code, 400);
+}
