@@ -140,6 +140,48 @@ fn cipher(key: &[u8; 32]) -> Result<ChaCha20Poly1305> {
     ChaCha20Poly1305::new_from_slice(key).map_err(|e| Error::Key(format!("cipher: {e}")))
 }
 
+/// What a receiver has already accepted, so a repeat is refused.
+///
+/// SIP-17 requires this and it is free: the counter is in the entry header the
+/// exchange already stores, so nothing has to be decrypted to check it. A
+/// repeat is a **nonce reuse** — the same `(device, epoch, msg_seq)` means the
+/// same subkey and the same nonce, which costs ChaCha20-Poly1305 the
+/// confidentiality of both plaintexts and its authentication.
+///
+/// The realistic cause is not an attacker but a client that lost its counter
+/// and guessed, which is why SIP-17 tells a device to recover its high-water
+/// mark from the exchange rather than start again.
+#[derive(Debug, Default)]
+pub struct Replay {
+    seen: std::collections::HashSet<(PubKey, u32, u64)>,
+}
+
+impl Replay {
+    pub fn new() -> Replay {
+        Replay::default()
+    }
+
+    /// Record an entry, returning `false` if this exact counter has been seen
+    /// before. A receiver **MUST** reject the entry when this is false, and
+    /// MUST NOT decrypt it.
+    pub fn accept(&mut self, device: &PubKey, epoch: u32, msg_seq: u64) -> bool {
+        self.seen.insert((*device, epoch, msg_seq))
+    }
+
+    /// Forget an epoch once it is rotated past and nothing under it can arrive.
+    pub fn forget_epoch(&mut self, epoch: u32) {
+        self.seen.retain(|(_, e, _)| *e != epoch);
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
 /// One epoch key, or a run of them, sealed to one device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
@@ -639,6 +681,36 @@ mod tests {
         let (_, alice) = device(1);
         let sealed = key.seal(&[1u8; 32], 1, &alice, 5, b"five").unwrap();
         assert!(key.open(&[1u8; 32], 1, &alice, 6, &sealed).is_err());
+    }
+
+    #[test]
+    fn a_repeated_counter_is_refused_and_the_first_is_not() {
+        // The check SIP-17 names as the failure mode to test for. It is free,
+        // because the counter is in the header and nothing needs decrypting.
+        let (_, phone) = device(1);
+        let (_, laptop) = device(2);
+        let mut seen = Replay::new();
+
+        assert!(seen.accept(&phone, 1, 0));
+        assert!(!seen.accept(&phone, 1, 0), "a repeat is a nonce reuse");
+        assert!(seen.accept(&phone, 1, 1), "the next counter is fine");
+        // Two devices of one person both start at zero and must not collide.
+        assert!(seen.accept(&laptop, 1, 0));
+        // Nor do epochs: a counter restarts at zero on a rotation.
+        assert!(seen.accept(&phone, 2, 0));
+    }
+
+    #[test]
+    fn a_rotated_epoch_can_be_forgotten() {
+        let (_, phone) = device(1);
+        let mut seen = Replay::new();
+        seen.accept(&phone, 1, 0);
+        seen.accept(&phone, 2, 0);
+        seen.forget_epoch(1);
+        assert_eq!(seen.len(), 1);
+        // And what was forgotten is accepted again, which is safe only because
+        // nothing under a rotated epoch can still arrive.
+        assert!(seen.accept(&phone, 1, 0));
     }
 
     #[test]
