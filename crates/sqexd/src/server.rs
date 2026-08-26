@@ -25,7 +25,8 @@ use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::channel::{
-    Ack as ChannelAck, ByChannel, Invitee, Role, Create as ChannelCreate, Created, Fetch as ChannelFetch,
+    Ack as ChannelAck, ByChannel, ByTarget, Cursor as ChannelCursor, Invitee, Role,
+    SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
     List as ChannelList, Post as ChannelPost, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
@@ -743,6 +744,48 @@ async fn route(
             }
         },
 
+        ("POST", "/channel/cursor") => match (peer.identity, ChannelCursor::decode(body)) {
+            (None, _) => no_identity("setting a read mark"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                match server
+                    .channels
+                    .set_cursor(&me, &req.channel, req.read, req.receipts)
+                {
+                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        ("POST", "/channel/cursors") => match (peer.identity, ByChannel::decode(body, CH_CURSORS)) {
+            (None, _) => no_identity("reading marks"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.cursors(&me, &req.channel) {
+                Ok(marks) => (200, "application/octet-stream", marks.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/redact") => match (peer.identity, ByTarget::decode(body, CH_REDACT)) {
+            (None, _) => no_identity("redacting an entry"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.redact(&me, &req.channel, req.target) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        // Relayed to the other members and stored nowhere. An exchange that
+        // dropped every one of these would still conform.
+        ("POST", "/channel/signal") => match (peer.identity, SignalOut::decode(body)) {
+            (None, _) => no_identity("signalling"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                match server.channels.signal(&me, &req.channel, req.kind, &req.body) {
+                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+
         ("POST", "/channel/fetch") => match (peer.identity, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
@@ -1085,7 +1128,7 @@ async fn fetch_waiting(
 ) -> std::result::Result<sqex_proto::channel::Entries, ChannelError> {
     let notify = server.channels.notifier(&req.channel);
     let first = server.channels.fetch(me, &req.channel, req.since)?;
-    if !first.entries.is_empty() || req.wait_secs == 0 {
+    if !first.entries.is_empty() || !first.signals.is_empty() || req.wait_secs == 0 {
         return Ok(first);
     }
     let deadline =
@@ -1095,7 +1138,9 @@ async fn fetch_waiting(
         // Re-check membership as well as entries: an answer is owed to whoever
         // the caller is *now*, not who they were when they parked.
         let again = server.channels.fetch(me, &req.channel, req.since)?;
-        if !again.entries.is_empty() || waited.is_err() {
+        // A signal is as good a reason to answer as an entry: SIP-16 says a
+        // held request returns as soon as either arrives for the caller.
+        if !again.entries.is_empty() || !again.signals.is_empty() || waited.is_err() {
             return Ok(again);
         }
     }

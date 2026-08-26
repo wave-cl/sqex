@@ -646,7 +646,27 @@ pub struct Entries {
     pub first: u64,
     pub last: u64,
     pub entries: Vec<Entry>,
+    /// Relayed, never stored, and delivered at most once. An exchange that
+    /// dropped every one of these would still conform: signals are a courtesy
+    /// and nothing may depend on one arriving.
+    pub signals: Vec<Signalled>,
 }
+
+/// One signal, as it reached us. The body is SIP-19's; nothing here reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signalled {
+    pub account: PubKey,
+    pub kind: u8,
+    pub body: Vec<u8>,
+}
+
+/// Bytes a signal body may carry. Small on purpose — a signal that needed more
+/// than this would be a message, and a message belongs in the log.
+pub const MAX_SIGNAL_BODY: usize = 256;
+/// Signals held for one member of one channel before the oldest are dropped.
+pub const MAX_SIGNALS: usize = 32;
+/// How long an undelivered signal is kept.
+pub const SIGNAL_TTL: u64 = 30;
 
 impl Entries {
     pub fn encode(&self) -> Vec<u8> {
@@ -658,10 +678,13 @@ impl Entries {
         for e in &self.entries {
             e.write(&mut out);
         }
-        // Signals are relayed, never stored, and are not implemented in this
-        // slice — the section is present and empty so the format does not
-        // change when they arrive.
-        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(self.signals.len() as u16).to_be_bytes());
+        for s in &self.signals {
+            out.extend_from_slice(s.account.as_bytes());
+            out.push(s.kind);
+            out.extend_from_slice(&(s.body.len() as u16).to_be_bytes());
+            out.extend_from_slice(&s.body);
+        }
         out
     }
 
@@ -679,12 +702,29 @@ impl Entries {
             entries.push(Entry::read(b, &mut o)?);
         }
         want(b, o + 2, "entries")?;
-        let signals = u16at(b, o) as usize;
+        let count = u16at(b, o) as usize;
         o += 2;
-        if signals != 0 {
+        if count > MAX_SIGNALS {
             return Err(Error::Malformed(format!(
-                "entries carries {signals} signals, which this implementation does not send"
+                "entries carries {count} signals, limit is {MAX_SIGNALS}"
             )));
+        }
+        let mut signals = Vec::with_capacity(count);
+        for _ in 0..count {
+            want(b, o + 35, "signal")?;
+            let len = u16at(b, o + 33) as usize;
+            if len > MAX_SIGNAL_BODY {
+                return Err(Error::Malformed(format!(
+                    "signal body is {len} bytes, limit is {MAX_SIGNAL_BODY}"
+                )));
+            }
+            want(b, o + 35 + len, "signal")?;
+            signals.push(Signalled {
+                account: key_at(b, o),
+                kind: b[o + 32],
+                body: b[o + 35..o + 35 + len].to_vec(),
+            });
+            o += 35 + len;
         }
         if o != b.len() {
             return Err(Error::Malformed(format!(
@@ -697,6 +737,7 @@ impl Entries {
             first: u64at(b, 8),
             last: u64at(b, 16),
             entries,
+            signals,
         })
     }
 }
@@ -1018,6 +1059,7 @@ mod tests {
             first: 1,
             last: 3,
             entries: vec![e(1, b"one"), e(2, b""), e(3, b"three")],
+            signals: vec![],
         };
         assert_eq!(Entries::decode(&got.encode()).unwrap(), got);
     }
@@ -1031,9 +1073,78 @@ mod tests {
             first: 40,
             last: 91,
             entries: vec![],
+            signals: vec![],
         };
         let back = Entries::decode(&got.encode()).unwrap();
         assert_eq!((back.first, back.last), (40, 91));
+    }
+
+    #[test]
+    fn entries_carry_signals_alongside_the_log() {
+        let got = Entries {
+            now: 1,
+            first: 0,
+            last: 0,
+            entries: vec![],
+            signals: vec![
+                Signalled {
+                    account: key(3),
+                    kind: 0x01,
+                    body: vec![1],
+                },
+                Signalled {
+                    account: key(4),
+                    kind: 0x01,
+                    body: vec![],
+                },
+            ],
+        };
+        assert_eq!(Entries::decode(&got.encode()).unwrap(), got);
+    }
+
+    #[test]
+    fn cursor_and_marks_round_trip() {
+        let c = Cursor {
+            channel: [2; 32],
+            read: 17,
+            receipts: false,
+        };
+        assert_eq!(Cursor::decode(&c.encode()).unwrap(), c);
+
+        let m = Marks {
+            now: 5,
+            marks: vec![Mark {
+                account: key(1),
+                delivered: 9,
+                read: 7,
+            }],
+        };
+        assert_eq!(Marks::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn a_signal_bounds_its_body() {
+        let s = SignalOut {
+            channel: [1; 32],
+            kind: 0x01,
+            body: vec![1],
+        };
+        assert_eq!(SignalOut::decode(&s.encode()).unwrap(), s);
+        let big = SignalOut {
+            body: vec![0; MAX_SIGNAL_BODY + 1],
+            ..s
+        };
+        assert!(SignalOut::decode(&big.encode()).is_err());
+    }
+
+    #[test]
+    fn by_target_round_trips() {
+        let t = ByTarget {
+            channel: [5; 32],
+            target: 12,
+        };
+        assert_eq!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_REDACT).unwrap(), t);
+        assert!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_CURSOR).is_err());
     }
 
     #[test]
@@ -1098,5 +1209,173 @@ mod tests {
         // A join decoded as a leave is a bug in the router, and should not
         // silently succeed just because the shapes match.
         assert!(ByChannel::decode(&bytes, TYPE_LEAVE).is_err());
+    }
+}
+
+/// Set the caller's read mark, and say whether it wants others'.
+///
+/// `receipts` of 0 opts out, and the exchange then withholds every other
+/// account's `read` from this caller while continuing to report `delivered`.
+/// The reciprocity is enforced there rather than left to each client's good
+/// manners, which is what stops somebody taking the signal without giving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub channel: [u8; 32],
+    pub read: u64,
+    pub receipts: bool,
+}
+
+impl Cursor {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(42);
+        out.push(TYPE_CURSOR);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.read.to_be_bytes());
+        out.push(u8::from(self.receipts));
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Cursor> {
+        if b.len() != 42 || b[0] != TYPE_CURSOR {
+            return Err(Error::Malformed(format!(
+                "cursor is {} bytes, want 42",
+                b.len()
+            )));
+        }
+        Ok(Cursor {
+            channel: b[1..33].try_into().unwrap(),
+            read: u64at(b, 33),
+            receipts: b[41] != 0,
+        })
+    }
+}
+
+/// How far one account has got.
+///
+/// `delivered` is **observed** rather than asserted: the exchange learns it
+/// from the `since` on every fetch. `read` is the one thing only a client
+/// knows, so it is the one thing a client states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    pub account: PubKey,
+    pub delivered: u64,
+    pub read: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Marks {
+    pub now: u64,
+    pub marks: Vec<Mark>,
+}
+
+impl Marks {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.marks.len() * 48);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.marks.len() as u16).to_be_bytes());
+        for m in &self.marks {
+            out.extend_from_slice(m.account.as_bytes());
+            out.extend_from_slice(&m.delivered.to_be_bytes());
+            out.extend_from_slice(&m.read.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Marks> {
+        want(b, 10, "marks")?;
+        let count = u16at(b, 8) as usize;
+        if count > MAX_MEMBERS {
+            return Err(Error::Malformed(format!(
+                "marks holds {count}, limit is {MAX_MEMBERS}"
+            )));
+        }
+        if b.len() != 10 + count * 48 {
+            return Err(Error::Malformed(format!(
+                "marks is {} bytes, want {}",
+                b.len(),
+                10 + count * 48
+            )));
+        }
+        Ok(Marks {
+            now: u64at(b, 0),
+            marks: (0..count)
+                .map(|i| {
+                    let at = 10 + i * 48;
+                    Mark {
+                        account: key_at(b, at),
+                        delivered: u64at(b, at + 32),
+                        read: u64at(b, at + 40),
+                    }
+                })
+                .collect(),
+        })
+    }
+}
+
+/// A request naming a channel and an entry: redact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByTarget {
+    pub channel: [u8; 32],
+    pub target: u64,
+}
+
+impl ByTarget {
+    pub fn encode(&self, type_byte: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(type_byte);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.target.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8], type_byte: u8) -> Result<ByTarget> {
+        if b.len() != 41 || b[0] != type_byte {
+            return Err(Error::Malformed(format!(
+                "request is {} bytes, want 41",
+                b.len()
+            )));
+        }
+        Ok(ByTarget {
+            channel: b[1..33].try_into().unwrap(),
+            target: u64at(b, 33),
+        })
+    }
+}
+
+/// Relay a signal to the channel's other members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalOut {
+    pub channel: [u8; 32],
+    pub kind: u8,
+    pub body: Vec<u8>,
+}
+
+impl SignalOut {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(34 + self.body.len());
+        out.push(TYPE_SIGNAL);
+        out.extend_from_slice(&self.channel);
+        out.push(self.kind);
+        out.extend_from_slice(&self.body);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<SignalOut> {
+        want(b, 34, "signal")?;
+        if b[0] != TYPE_SIGNAL {
+            return Err(Error::Malformed(format!("not a signal (type {:#x})", b[0])));
+        }
+        let body = b[34..].to_vec();
+        if body.len() > MAX_SIGNAL_BODY {
+            return Err(Error::Malformed(format!(
+                "signal body is {} bytes, limit is {MAX_SIGNAL_BODY}",
+                body.len()
+            )));
+        }
+        Ok(SignalOut {
+            channel: b[1..33].try_into().unwrap(),
+            kind: b[33],
+            body,
+        })
     }
 }

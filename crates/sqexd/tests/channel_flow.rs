@@ -11,8 +11,9 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{
-    ByChannel, ChannelInfo, Create, Entries, Fetch, List, Listing, MIN_RETENTION, Post, Posted,
-    Role, TYPE_CLOSE, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, Visibility,
+    ByChannel, ByTarget, ChannelInfo, Create, Cursor, Entries, Fetch, List, Listing, Mark, Marks,
+    MIN_RETENTION, Post, Posted, Role, SignalOut, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
+    TYPE_LEAVE, TYPE_REDACT, Visibility,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -404,4 +405,230 @@ async fn an_anonymous_connection_has_no_membership() {
     let mut anon = Client::connect(addr, &pubkey).await.unwrap();
     assert_eq!(fetch(&mut anon, channel, 0, 0).await.0, 403);
     assert_eq!(join(&mut anon, channel).await, 403);
+}
+
+async fn cursor(client: &mut Client, channel: [u8; 32], read: u64, receipts: bool) -> u16 {
+    let (code, _) = client
+        .post(
+            "/channel/cursor",
+            Cursor {
+                channel,
+                read,
+                receipts,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    code
+}
+
+async fn marks(client: &mut Client, channel: [u8; 32]) -> Marks {
+    let (code, body) = client
+        .post("/channel/cursors", ByChannel { channel }.encode(TYPE_CURSORS))
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    Marks::decode(&body).unwrap()
+}
+
+fn mark_of(m: &Marks, who: &PubKey) -> Mark {
+    *m.marks.iter().find(|x| &x.account == who).unwrap()
+}
+
+#[tokio::test]
+async fn delivery_is_observed_and_reading_is_asserted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(121);
+    let (bob_seed, bob) = identity(122);
+    let channel = [20u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    let mut b = as_identity(addr, pubkey, bob_seed).await;
+
+    assert_eq!(create(&mut a, &public(channel, "receipts")).await, 200);
+    assert_eq!(join(&mut b, channel).await, 200);
+    for t in [&b"one"[..], b"two", b"three"] {
+        assert_eq!(post(&mut a, channel, t).await.0, 200);
+    }
+
+    // Bob collects everything. He never says so — asking for what comes after 0
+    // and being handed three entries is the exchange watching him do it.
+    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    assert_eq!(Entries::decode(&body).unwrap().entries.len(), 3);
+    let (_, _) = fetch(&mut b, channel, 3, 0).await;
+
+    let m = marks(&mut b, channel).await;
+    assert_eq!(mark_of(&m, &bob).delivered, 3);
+    assert_eq!(mark_of(&m, &bob).read, 0, "collected is not read");
+
+    assert_eq!(cursor(&mut b, channel, 2, true).await, 200);
+    let m = marks(&mut a, channel).await;
+    assert_eq!(mark_of(&m, &bob).read, 2);
+
+    // A mark cannot run ahead of what was delivered: a client may not claim to
+    // have read further than it collected.
+    assert_eq!(cursor(&mut b, channel, 99, true).await, 200);
+    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, 3);
+
+    // Nor backwards.
+    assert_eq!(cursor(&mut b, channel, 1, true).await, 200);
+    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, 3);
+    assert_eq!(mark_of(&marks(&mut a, channel).await, &alice).delivered, 0);
+}
+
+#[tokio::test]
+async fn opting_out_of_receipts_withholds_others_reading_but_not_their_delivery() {
+    // The reciprocity is enforced at the exchange rather than left to a client
+    // that might simply not honour it — which is what stops somebody taking
+    // the signal without giving it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(131);
+    let (bob_seed, _bob) = identity(132);
+    let channel = [21u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    let mut b = as_identity(addr, pubkey, bob_seed).await;
+
+    assert_eq!(create(&mut a, &public(channel, "quiet reader")).await, 200);
+    assert_eq!(join(&mut b, channel).await, 200);
+    assert_eq!(post(&mut a, channel, b"hello").await.0, 200);
+
+    fetch(&mut a, channel, 0, 0).await;
+    assert_eq!(cursor(&mut a, channel, 1, true).await, 200);
+
+    // Bob reads, and opts out.
+    fetch(&mut b, channel, 0, 0).await;
+    assert_eq!(cursor(&mut b, channel, 1, false).await, 200);
+
+    let seen = marks(&mut b, channel).await;
+    assert_eq!(mark_of(&seen, &alice).read, 0, "he gave nothing, he sees nothing");
+    assert_eq!(mark_of(&seen, &alice).delivered, 1, "delivery is never withheld");
+
+    // Alice still gave hers, so she still sees his.
+    assert_eq!(mark_of(&marks(&mut a, channel).await, &alice).read, 1);
+}
+
+#[tokio::test]
+async fn a_redaction_leaves_a_tombstone_and_a_stranger_cannot_make_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(141);
+    let (bob_seed, _) = identity(142);
+    let channel = [22u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    let mut b = as_identity(addr, pubkey, bob_seed).await;
+
+    assert_eq!(create(&mut a, &public(channel, "regrets")).await, 200);
+    assert_eq!(join(&mut b, channel).await, 200);
+    assert_eq!(post(&mut b, channel, b"said too much").await.0, 200);
+
+    let redact = |c: [u8; 32], t: u64| ByTarget { channel: c, target: t }.encode(TYPE_REDACT);
+
+    // Neither a stranger to the entry nor a plain member may redact it.
+    let (mallory_seed, _) = identity(143);
+    let mut m = as_identity(addr, pubkey, mallory_seed).await;
+    assert_eq!(join(&mut m, channel).await, 200);
+    let (code, _) = m.post("/channel/redact", redact(channel, 1)).await.unwrap();
+    assert_eq!(code, 403);
+
+    // Its author may.
+    let (code, _) = b.post("/channel/redact", redact(channel, 1)).await.unwrap();
+    assert_eq!(code, 200);
+
+    // The entry survives as a gap, which is the record.
+    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let seen = Entries::decode(&body).unwrap();
+    assert_eq!(seen.entries.len(), 1, "the entry is still there");
+    assert!(seen.entries[0].body.is_empty(), "and its body is not");
+    assert_eq!(seen.first, 1);
+
+    // An admin may redact somebody else's, which is the moderation path.
+    assert_eq!(post(&mut b, channel, b"again").await.0, 200);
+    let (code, _) = a.post("/channel/redact", redact(channel, 2)).await.unwrap();
+    assert_eq!(code, 200);
+
+    let (code, _) = a.post("/channel/redact", redact(channel, 99)).await.unwrap();
+    assert_eq!(code, 404, "nothing to redact");
+}
+
+#[tokio::test]
+async fn a_signal_reaches_the_others_once_and_is_never_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(151);
+    let (bob_seed, _) = identity(152);
+    let channel = [23u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    let mut b = as_identity(addr, pubkey, bob_seed).await;
+
+    assert_eq!(create(&mut a, &public(channel, "typing")).await, 200);
+    assert_eq!(join(&mut b, channel).await, 200);
+
+    let (code, _) = a
+        .post(
+            "/channel/signal",
+            SignalOut {
+                channel,
+                kind: 0x01,
+                body: vec![1],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let seen = Entries::decode(&body).unwrap();
+    assert_eq!(seen.signals.len(), 1);
+    assert_eq!(seen.signals[0].account, alice);
+    assert_eq!(seen.signals[0].kind, 0x01);
+    assert!(seen.entries.is_empty(), "a signal is not an entry");
+
+    // Delivered at most once, and it left nothing behind.
+    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    assert!(Entries::decode(&body).unwrap().signals.is_empty());
+
+    // The sender does not receive their own.
+    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    assert!(Entries::decode(&body).unwrap().signals.is_empty());
+}
+
+#[tokio::test]
+async fn a_parked_fetch_is_answered_by_a_signal_too() {
+    // SIP-16: a held request returns as soon as an entry is accepted *or* a
+    // signal arrives for the caller.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(161);
+    let (bob_seed, _) = identity(162);
+    let channel = [24u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    let mut b = as_identity(addr, pubkey, bob_seed).await;
+    assert_eq!(create(&mut a, &public(channel, "waiting")).await, 200);
+    assert_eq!(join(&mut b, channel).await, 200);
+
+    let waiter = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let (code, body) = fetch(&mut b, channel, 0, 20).await;
+        (code, body, started.elapsed())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    a.post(
+        "/channel/signal",
+        SignalOut {
+            channel,
+            kind: 0x01,
+            body: vec![1],
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+
+    let (code, body, elapsed) = waiter.await.unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(Entries::decode(&body).unwrap().signals.len(), 1);
+    assert!(elapsed < std::time::Duration::from_secs(5), "waited {elapsed:?}");
 }

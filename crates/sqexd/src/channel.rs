@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::channel::{
-    ABANDON_SECS, ChannelInfo, Create, Entries, Entry, KIND_MEMBER, Listing, MAX_BATCH,
-    direct_message_id,
+    ABANDON_SECS, ChannelInfo, Create, Entries, Entry, KIND_MEMBER, KIND_SYSTEM, Listing,
+    MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled, direct_message_id,
     MAX_BATCH_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
     MAX_RETENTION, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role, Visibility,
 };
@@ -74,6 +74,9 @@ pub enum ChannelError {
     NoPrekey,
     NoSuchUpload,
     NoSuchBlob,
+    NoSuchEntry,
+    /// A redaction naming an entry the exchange wrote itself.
+    SystemEntry,
     /// A chunk index outside what the upload reserved.
     BadChunk,
     TooManyUploads,
@@ -99,6 +102,8 @@ impl ChannelError {
             ChannelError::NoPrekey => "no_prekey",
             ChannelError::NoSuchUpload => "no_such_upload",
             ChannelError::NoSuchBlob => "no_such_blob",
+            ChannelError::NoSuchEntry => "no_such_entry",
+            ChannelError::SystemEntry => "system_entry",
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
@@ -114,7 +119,8 @@ impl ChannelError {
         match self {
             ChannelError::NoSuchChannel
             | ChannelError::NoSuchUpload
-            | ChannelError::NoSuchBlob => 404,
+            | ChannelError::NoSuchBlob
+            | ChannelError::NoSuchEntry => 404,
             ChannelError::NotAMember | ChannelError::NotAnAdmin | ChannelError::NotPublic => 403,
             ChannelError::Full
             | ChannelError::TooManyChannels
@@ -126,7 +132,8 @@ impl ChannelError {
             | ChannelError::NotPrivate
             | ChannelError::DirectMessage
             | ChannelError::NoPrekey
-            | ChannelError::BadChunk => 409,
+            | ChannelError::BadChunk
+            | ChannelError::SystemEntry => 409,
             ChannelError::Storage => 500,
         }
     }
@@ -145,6 +152,14 @@ pub struct Channels {
     /// lands. Kept outside the database lock on purpose: a long poll must never
     /// hold the thing every other request needs.
     waiters: Mutex<HashMap<[u8; 32], Arc<Notify>>>,
+    /// Signals waiting for a member, by channel and recipient.
+    ///
+    /// In memory, and that is principled rather than unfinished: a typing
+    /// indicator that survived a restart would be describing a keyboard nobody
+    /// is at. SIP-16 forbids storing these at all, and an exchange that dropped
+    /// every one of them would still conform.
+    #[allow(clippy::type_complexity)]
+    signals: Mutex<HashMap<([u8; 32], PubKey), Vec<(PubKey, u8, Vec<u8>, u64)>>>,
 }
 
 const SCHEMA: &str = r#"
@@ -245,6 +260,19 @@ CREATE TABLE IF NOT EXISTS upload_chunk (
     sealed BLOB    NOT NULL,
     PRIMARY KEY (upload, idx)
 );
+-- Two integers per member rather than an entry per read. A receipt per reader
+-- per message is the obvious model and does not survive a group: 256 members
+-- reading 100 messages would be 25 600 rows describing 100. Reading is
+-- monotonic, so a high-water mark loses nothing anybody wanted, and receipts
+-- cost nothing against retention.
+CREATE TABLE IF NOT EXISTS cursor (
+    channel   BLOB    NOT NULL,
+    account   BLOB    NOT NULL,
+    delivered INTEGER NOT NULL DEFAULT 0,
+    read      INTEGER NOT NULL DEFAULT 0,
+    receipts  INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (channel, account)
+);
 CREATE INDEX IF NOT EXISTS entry_by_age ON entry (posted);
 "#;
 
@@ -265,6 +293,7 @@ impl Channels {
         Ok(Channels {
             db: Mutex::new(db),
             waiters: Mutex::new(HashMap::new()),
+            signals: Mutex::new(HashMap::new()),
         })
     }
 
@@ -634,11 +663,25 @@ impl Channels {
             bytes += e.wire_len();
             entries.push(e);
         }
+        // `delivered` is observed rather than asserted, and what is observed is
+        // what was *handed over* — not `since`, which is only what the caller
+        // already had. Recording it costs one integer and discloses nothing the
+        // exchange did not just watch itself do.
+        let delivered = entries.last().map(|e| e.seq).unwrap_or(since).max(since);
+        db.execute(
+            "INSERT INTO cursor (channel, account, delivered) VALUES (?1, ?2, ?3)
+             ON CONFLICT (channel, account)
+             DO UPDATE SET delivered = MAX(delivered, excluded.delivered)",
+            params![&channel[..], caller.as_bytes(), delivered as i64],
+        )
+        .map_err(storage("record delivery"))?;
+
         Ok(Entries {
             now: now_unix(),
             first,
             last,
             entries,
+            signals: self.take_signals(channel, caller),
         })
     }
 }
@@ -702,6 +745,7 @@ fn destroy(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
         "DELETE FROM entry WHERE channel = ?1",
         "DELETE FROM envelope WHERE channel = ?1",
         "DELETE FROM attachment WHERE channel = ?1",
+        "DELETE FROM cursor WHERE channel = ?1",
         "DELETE FROM member WHERE channel = ?1",
         "DELETE FROM high_water WHERE channel = ?1",
         "DELETE FROM channel WHERE id = ?1",
@@ -1752,4 +1796,199 @@ fn expire_uploads(db: &Connection, now: u64) -> Result<(), ChannelError> {
         drop_upload(db, id as u64)?;
     }
     Ok(())
+}
+
+/// SIP-16 receipts, redaction, and the relay that stores nothing.
+impl Channels {
+    /// Set the caller's read mark.
+    ///
+    /// Monotonic, and never past what was delivered: a client cannot claim to
+    /// have read further than it collected.
+    pub fn set_cursor(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        read: u64,
+        receipts: bool,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if role_of(&db, channel, caller).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        db.execute(
+            "INSERT INTO cursor (channel, account, delivered, read, receipts)
+             VALUES (?1, ?2, ?3, ?3, ?4)
+             ON CONFLICT (channel, account) DO UPDATE SET
+                 read = MIN(MAX(read, excluded.read), delivered),
+                 receipts = excluded.receipts",
+            params![
+                &channel[..],
+                caller.as_bytes(),
+                read as i64,
+                i64::from(receipts)
+            ],
+        )
+        .map_err(storage("set cursor"))?;
+        Ok(())
+    }
+
+    /// Everyone's marks.
+    ///
+    /// A caller that has opted out of receipts is not shown anybody else's
+    /// `read`. Delivery is never withheld, because the exchange observes it
+    /// whether or not anyone asks and pretending otherwise would be theatre.
+    pub fn cursors(&self, caller: &PubKey, channel: &[u8; 32]) -> Result<Marks, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if role_of(&db, channel, caller).is_none() {
+            return Err(ChannelError::NotAMember);
+        }
+        let mine: bool = db
+            .query_row(
+                "SELECT receipts FROM cursor WHERE channel = ?1 AND account = ?2",
+                params![&channel[..], caller.as_bytes()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage("read own receipts"))?
+            .map(|r| r != 0)
+            // A member that has never set a cursor has not opted out; the
+            // default is on, as SIP-16 chose.
+            .unwrap_or(true);
+
+        let mut stmt = db
+            .prepare(
+                "SELECT m.account, COALESCE(c.delivered, 0), COALESCE(c.read, 0)
+                 FROM member m
+                 LEFT JOIN cursor c ON c.channel = m.channel AND c.account = m.account
+                 WHERE m.channel = ?1 AND m.present = 1 ORDER BY m.account ASC",
+            )
+            .map_err(storage("prepare cursors"))?;
+        let marks = stmt
+            .query_map(params![&channel[..]], |r| {
+                let account = PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]));
+                let read = r.get::<_, i64>(2)? as u64;
+                Ok(Mark {
+                    account,
+                    delivered: r.get::<_, i64>(1)? as u64,
+                    // Reciprocity, enforced here rather than left to a client
+                    // that might simply not honour it.
+                    read: if mine || account == *caller { read } else { 0 },
+                })
+            })
+            .map_err(storage("query cursors"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage("read cursors"))?;
+
+        Ok(Marks {
+            now: now_unix(),
+            marks,
+        })
+    }
+
+    /// Remove an entry's body, keeping the entry as a tombstone.
+    ///
+    /// The gap is the record: a reader should be able to see that something was
+    /// deleted rather than find a conversation that silently does not follow.
+    /// That is the opposite of pruning, which leaves nothing, and the reason is
+    /// that a shadow index of who spoke and when — long after the words are
+    /// gone — would be a worse disclosure than the gap it filled.
+    pub fn redact(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        target: u64,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        let row: Option<(Vec<u8>, i64)> = db
+            .query_row(
+                "SELECT account, kind FROM entry WHERE channel = ?1 AND seq = ?2",
+                params![&channel[..], target as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage("read target"))?;
+        let Some((author, kind)) = row else {
+            return Err(ChannelError::NoSuchEntry);
+        };
+        // A system entry was written by the exchange and has no posting
+        // account, so only the admin clause could reach it — which would let an
+        // admin remove somebody and then delete the record saying they had. An
+        // audit trail its subject can erase is not one.
+        if kind as u8 == KIND_SYSTEM {
+            return Err(ChannelError::SystemEntry);
+        }
+        if author != caller.as_bytes() && !is_admin(&db, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        db.execute(
+            "UPDATE entry SET body = x'' WHERE channel = ?1 AND seq = ?2",
+            params![&channel[..], target as i64],
+        )
+        .map_err(storage("redact entry"))?;
+        Ok(())
+    }
+
+    /// Relay a signal to the channel's other members.
+    ///
+    /// Never stored, never sequenced, never returned by a fetch by sequence
+    /// number. Held only until collected, and dropped on a timer or when a
+    /// recipient has more outstanding than it should.
+    pub fn signal(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        kind: u8,
+        body: &[u8],
+    ) -> Result<(), ChannelError> {
+        let recipients: Vec<PubKey> = {
+            let db = self.db.lock().unwrap();
+            visibility_of(&db, channel)?;
+            if role_of(&db, channel, caller).is_none() {
+                return Err(ChannelError::NotAMember);
+            }
+            let mut stmt = db
+                .prepare("SELECT account FROM member WHERE channel = ?1 AND present = 1")
+                .map_err(storage("prepare signal recipients"))?;
+            let rows = stmt
+                .query_map(params![&channel[..]], |r| {
+                    Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+                })
+                .map_err(storage("query signal recipients"))?;
+            rows.filter_map(|r| r.ok()).filter(|a| a != caller).collect()
+        };
+
+        let now = now_unix();
+        let mut pending = self.signals.lock().unwrap();
+        for who in recipients {
+            let q = pending.entry((*channel, who)).or_default();
+            q.retain(|(_, _, _, at)| now.saturating_sub(*at) < SIGNAL_TTL);
+            while q.len() >= MAX_SIGNALS {
+                q.remove(0);
+            }
+            q.push((*caller, kind, body.to_vec(), now));
+        }
+        drop(pending);
+        self.wake(channel);
+        Ok(())
+    }
+
+    /// Collect and discard whatever is waiting. Delivered at most once.
+    fn take_signals(&self, channel: &[u8; 32], who: &PubKey) -> Vec<Signalled> {
+        let now = now_unix();
+        let mut pending = self.signals.lock().unwrap();
+        let Some(q) = pending.remove(&(*channel, *who)) else {
+            return Vec::new();
+        };
+        q.into_iter()
+            .filter(|(_, _, _, at)| now.saturating_sub(*at) < SIGNAL_TTL)
+            .map(|(account, kind, body, _)| Signalled {
+                account,
+                kind,
+                body,
+            })
+            .collect()
+    }
 }
