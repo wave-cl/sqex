@@ -6,9 +6,9 @@ sQUIC**, and the connection's verified Ed25519 identity (SIP-3) is the caller �
 there is no login, no session token and no account to create.
 
 On that foundation it runs several services: a liveness beacon, a
-store-and-forward mailbox, relayed sessions with real-time voice, rooms, and —
-as of v0.9.0 — an **end-to-end encrypted chat stack**. Administrators manage the
-connection whitelist with **Ed25519-signed commands**, ready for a YubiKey.
+store-and-forward mailbox, relayed sessions with real-time voice, rooms, and an
+**end-to-end encrypted chat stack**. Administrators manage the connection
+whitelist with **Ed25519-signed commands**, ready for a YubiKey.
 
 ## Install
 
@@ -49,11 +49,11 @@ SQEX_SERVER=host:5400 SQEX_SERVER_KEY=<b58> sqex status   # environment
 | Store-and-forward mailbox | [5](https://github.com/wave-cl/sips/blob/main/sip-0005.md) | `sqex mail` |
 | Relayed session | [12](https://github.com/wave-cl/sips/blob/main/sip-0012.md) | `sqex session talk` |
 | Rooms and voice | [13](https://github.com/wave-cl/sips/blob/main/sip-0013.md), [15](https://github.com/wave-cl/sips/blob/main/sip-0015.md) | `sqex-voice call`, `sqex-voice room` |
-| Chat (direct messages) | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | `sqex-chat` |
+| Chat: direct messages, groups, files | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | `sqex-chat` |
 
-## Chat (v0.9.0)
+## Chat
 
-Nine SIPs, 38 routes: channels with a durable ordered log, per-epoch channel
+Nine SIPs, 40 routes: channels with a durable ordered log, per-epoch channel
 keys, chunked blobs, message structure, portable delegation credentials,
 profiles and blocking, a device registry, X3DH prekeys, and admission requests.
 
@@ -86,11 +86,16 @@ sqex-chat                    # the conversations
 ```
 
 Inside: `/new <name>` makes a private group, `/invite` and `/kick` change who is
-in it, `/rotate` hands everyone a new key, `/file` and `/save` move files, and
-`^N` adds a contact. A group's name is a sealed entry, so the exchange never
-learns what it is called.
+in it, `/rotate` hands everyone a new key, `/who` lists the members, `/file` and
+`/save` move files, and `^N` adds a contact. A group's name is a sealed entry,
+so the exchange never learns what it is called.
 
-Packaged from v0.9.1. The v0.9.0 archives held only `sqexd` and `sqex`.
+`/kick` rotates, and that is not optional: the exchange refuses a removed member
+further entries, but they keep every key they were ever given, so without a new
+epoch they could still read what follows from the exchange's own copy. `/rotate`
+is also the way to re-key somebody who cannot open what they were sent — an
+envelope is one per recipient per epoch and the exchange will not replace it, so
+re-inviting them does nothing.
 
 ### The client keeps the keys, and has to
 
@@ -112,10 +117,19 @@ the seed is also why **a YubiKey identity cannot use `sqex-chat`**: a card never
 releases its seed, which is the same reason `sqex mail` and `sqex session`
 refuse one.
 
-The one piece of client state the exchange *can* return is the message counter,
-which it keeps per device per epoch independently of pruning precisely so a
-client that lost the number resumes rather than guesses — reusing one would cost
-the confidentiality of two messages.
+Two things soften that, and neither recovers a message. The exchange returns the
+**message counter** — kept per device per epoch, independently of pruning,
+precisely so a client that lost the number resumes rather than guesses, since
+reusing one would cost the confidentiality of two messages. And SIP-23's
+`Clear` lets a device discard the prekeys the exchange is still serving on its
+behalf, whose secrets went with the store; without it, peers keep sealing to
+keys that will never open and two such clients rotate past each other
+indefinitely.
+
+So a client that loses its store keeps its identity and its conversations, and
+loses their history. `sqex-chat` says so where it happened — a line in the
+transcript, once, rather than a permanent count of failures in the status bar,
+because the one is history and the other is a fault to chase.
 
 ### Who can find you
 
@@ -153,8 +167,8 @@ the command vocabulary (`sqex-proto`); the signer never parses a payload.
    **atomically** (all ops, or none).
 
 Ops: enable/disable the whitelist, add/remove a peer key, list it, read status,
-reload the admin list, read the audit tail, and — since v0.9.0 — list, admit and
-deny pending SIP-24 admission requests. Every mutation is recorded to a
+reload the admin list, read the audit tail, and list, admit and deny pending
+SIP-24 admission requests. Every mutation is recorded to a
 persisted audit log (who, what, when).
 
 The three admission ops are in the vocabulary and executed by the server, but
@@ -196,10 +210,19 @@ enforcement onto a chosen set of routes is not.
 ## Storage
 
 With `state_file` set, `sqexd` keeps the whitelist and audit log in that file
-and puts three SQLite databases beside it: `channels.db`, `devices.db` and
-`profiles.db`. SQLite is bundled (no system library), and the channel log runs
-in WAL mode with `synchronous = FULL` — this is the service that promised to
-remember, so an entry is on the disk before the exchange says it accepted it.
+and puts four SQLite databases beside it: `channels.db`, `devices.db`,
+`profiles.db` and `prekeys.db`. SQLite is bundled (no system library), and the
+channel log runs in WAL mode with `synchronous = FULL` — this is the service
+that promised to remember, so an entry is on the disk before the exchange says
+it accepted it.
+
+`prekeys.db` is there because of a bug worth knowing about if you are building
+something similar. Prekeys were held in memory on the argument that one
+outliving the device that made it is a key whose secret is gone. But a server
+bounce does not restart its clients, and a client whose own pool looks healthy
+has no reason to publish again — so restarting the exchange quietly made every
+registered device unsealable-to, and no channel key could reach anybody. A
+client now asks what the exchange holds rather than trusting its own count.
 
 Omit `state_file` and everything is in memory and lost on restart, which is what
 the tests use.
