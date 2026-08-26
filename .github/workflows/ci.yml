@@ -3,6 +3,12 @@ name: CI
 on:
   push:
   pull_request:
+  # Runners were unavailable on 2026-08-26: one push produced no run at all,
+  # another was marked startup_failure with the job stuck queued, and a retry
+  # concluded "success" having executed zero jobs — a green tick that meant
+  # nothing had been compiled or tested. Without a manual trigger there was no
+  # way to ask for a real run short of pushing a fresh commit.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
