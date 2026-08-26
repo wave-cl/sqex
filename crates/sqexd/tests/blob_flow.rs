@@ -476,3 +476,122 @@ async fn an_attachment_reference_describes_what_was_uploaded() {
     assert_eq!(open_file(&reference.key, &got), original);
     assert_eq!(reference.dimensions(), Some((64, 64)));
 }
+
+#[tokio::test]
+async fn the_last_member_leaving_takes_the_blobs_with_them() {
+    // Found by tidying up a development server and counting: one blob, no
+    // attachments. Three of destroy's four callers gathered the attached
+    // blobs and collected them afterwards, and `leave` did not — so the last
+    // member walking out of a private channel orphaned its files for good.
+    // The collection lives inside `destroy` now, because a rule every caller
+    // must remember is a rule one of them will not.
+    use sqex_proto::channel::{ByChannel, Invitee, Role, TYPE_LEAVE};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (mut alice, alice_key) = client_for(addr, server_pub, 1).await;
+    let (mut bob, bob_key) = client_for(addr, server_pub, 2).await;
+
+    let channel = [0x71; 32];
+    let (code, _) = alice
+        .post(
+            "/channel/create",
+            Create {
+                channel,
+                visibility: Visibility::Private,
+                retention_secs: 3600,
+                max_entries: 0,
+                name: String::new(),
+                topic: String::new(),
+                invites: vec![Invitee {
+                    account: bob_key,
+                    role: Role::Member,
+                }],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    let (_, sealed, id) = seal_file(b"a file nobody will want afterwards", sqex_proto::blob_store::CHUNK);
+    assert!(upload(&mut alice, channel, &sealed, id, 34, 0).await);
+
+    let held = |label: &str| {
+        let db = rusqlite::Connection::open(dir.path().join("channels.db")).unwrap();
+        let blobs: i64 = db
+            .query_row("SELECT COUNT(*) FROM blob", [], |r| r.get(0))
+            .unwrap();
+        let chunks: i64 = db
+            .query_row("SELECT COUNT(*) FROM blob_chunk", [], |r| r.get(0))
+            .unwrap();
+        println!("{label}: {blobs} blob(s), {chunks} chunk(s)");
+        (blobs, chunks)
+    };
+    assert_eq!(held("uploaded").0, 1);
+
+    // Both leave. The channel is destroyed with the last of them.
+    for c in [&mut bob, &mut alice] {
+        let (code, _) = c
+            .post("/channel/leave", ByChannel { channel }.encode(TYPE_LEAVE))
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+
+    assert_eq!(
+        held("after everyone left"),
+        (0, 0),
+        "the blob outlived the channel that held it"
+    );
+    let _ = alice_key;
+}
+
+#[tokio::test]
+async fn a_blob_attached_twice_survives_one_channel_ending() {
+    // The other half of the same rule, and the reason destroy collects rather
+    // than deletes: forwarding costs the reference and not the file, so a
+    // photograph in two conversations does not go when one of them does.
+    use sqex_proto::blob_store::{ByChannelBlob, TYPE_ATTACH};
+    use sqex_proto::channel::{ByChannel, TYPE_LEAVE};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (mut alice, _) = client_for(addr, server_pub, 1).await;
+
+    let first = [0x81; 32];
+    let second = [0x82; 32];
+    for c in [first, second] {
+        let (code, _) = alice
+            .post("/channel/create", public(c, "room").encode())
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+    let (_, sealed, id) = seal_file(b"forwarded", sqex_proto::blob_store::CHUNK);
+    assert!(upload(&mut alice, first, &sealed, id, 9, 0).await);
+    let (code, _) = alice
+        .post(
+            "/blob/attach",
+            ByChannelBlob {
+                channel: second,
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(TYPE_ATTACH),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    // The first channel ends. The blob is still in the second.
+    alice
+        .post("/channel/leave", ByChannel { channel: first }.encode(TYPE_LEAVE))
+        .await
+        .unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("channels.db")).unwrap();
+    let blobs: i64 = db
+        .query_row("SELECT COUNT(*) FROM blob", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(blobs, 1, "a blob attached elsewhere was collected anyway");
+}

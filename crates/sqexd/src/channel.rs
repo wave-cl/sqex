@@ -465,13 +465,7 @@ impl Channels {
                 // Discarding is safe because the claim is provable and
                 // exclusive — only these two can produce it — and what goes is
                 // only whatever the squatter put there.
-                DmClaim::Squatted => {
-                    let held = attached_blobs(&tx, &req.channel)?;
-                    destroy(&tx, &req.channel)?;
-                    for blob in held {
-                        collect_blob(&tx, &blob)?;
-                    }
-                }
+                DmClaim::Squatted => destroy(&tx, &req.channel)?,
             }
         }
 
@@ -864,6 +858,14 @@ fn counts(db: &Connection, channel: &[u8; 32]) -> Result<(i64, i64), ChannelErro
 }
 
 fn destroy(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+    // Collected here rather than by the caller, and that is the fix for a leak
+    // rather than a preference. Three of the four call sites remembered to
+    // gather the attached blobs and collect them afterwards; `leave` did not,
+    // so the last member walking out of a private channel orphaned its files
+    // for good — rows in `blob` with no attachment and nothing that would ever
+    // look at them again. A rule every caller must remember is a rule one of
+    // them will not.
+    let held = attached_blobs(db, channel)?;
     for sql in [
         "DELETE FROM entry WHERE channel = ?1",
         "DELETE FROM envelope WHERE channel = ?1",
@@ -875,6 +877,11 @@ fn destroy(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
     ] {
         db.execute(sql, params![&channel[..]])
             .map_err(storage("destroy channel"))?;
+    }
+    // A blob attached elsewhere survives; that is SIP-18's rule, and it is why
+    // this is a collection rather than a delete.
+    for blob in held {
+        collect_blob(db, &blob)?;
     }
     Ok(())
 }
@@ -1133,23 +1140,10 @@ impl Channels {
         if !is_admin(&tx, channel, caller) {
             return Err(ChannelError::NotAnAdmin);
         }
-        let held: Vec<[u8; 32]> = {
-            let mut stmt = tx
-                .prepare("SELECT blob FROM attachment WHERE channel = ?1")
-                .map_err(storage("prepare held blobs"))?;
-            let rows = stmt
-                .query_map(params![&channel[..]], |r| {
-                    Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
-                })
-                .map_err(storage("query held blobs"))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
+        // `destroy` collects the attachments; a blob attached elsewhere
+        // survives, so closing one channel does not take a photograph out of
+        // another.
         destroy(&tx, channel)?;
-        // A blob attached elsewhere survives: closing one channel must not
-        // take a photograph out of another.
-        for blob in held {
-            collect_blob(&tx, &blob)?;
-        }
         tx.commit().map_err(storage("commit close"))?;
         Ok(())
     }
@@ -1269,6 +1263,18 @@ impl Channels {
                 Some(_) => {}
             }
         }
+        // Blobs nothing points at any more. `destroy` collects what it takes
+        // apart, so this catches only what an older version leaked — and it
+        // costs one indexed query per sweep to make an existing deployment
+        // heal instead of carrying its leak forever.
+        let _ = tx.execute(
+            "DELETE FROM blob_chunk WHERE blob NOT IN (SELECT blob FROM attachment)",
+            [],
+        );
+        let _ = tx.execute(
+            "DELETE FROM blob WHERE id NOT IN (SELECT blob FROM attachment)",
+            [],
+        );
         let _ = tx.commit();
         (pruned, closed)
     }
