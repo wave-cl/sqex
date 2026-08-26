@@ -361,7 +361,12 @@ impl Channels {
     /// answered the same way whether or not the caller belongs to it — with
     /// `epoch` 0, since reporting the real one would disclose how often a
     /// channel the caller cannot see has rotated.
-    pub fn create(&self, caller: &PubKey, req: &Create) -> Result<(bool, u32), ChannelError> {
+    pub fn create(
+        &self,
+        caller: &PubKey,
+        req: &Create,
+        blocked: &dyn Fn(&PubKey, &PubKey) -> bool,
+    ) -> Result<(bool, u32), ChannelError> {
         if req.retention_secs < MIN_RETENTION || req.retention_secs > MAX_RETENTION {
             return Err(ChannelError::BadRetention);
         }
@@ -469,6 +474,12 @@ impl Channels {
         .map_err(storage("insert creator"))?;
 
         for i in &req.invites {
+            // A direct message created by somebody the other party has blocked
+            // succeeds and simply does not add them, leaving a channel the
+            // caller is alone in and may post into indefinitely.
+            if blocked(&i.account, caller) {
+                continue;
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO member (channel, account, role, joined)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1114,8 +1125,16 @@ impl Channels {
         channel: &[u8; 32],
         account: &PubKey,
         role: Role,
+        blocked: &dyn Fn(&PubKey, &PubKey) -> bool,
     ) -> Result<(), ChannelError> {
         let now = now_unix();
+        // Silently dropped, and answered as though it landed. That is the
+        // exchange saying something untrue on the blocker's behalf, which is
+        // what a block is: a refusal the caller can detect tells a harasser
+        // they have been blocked.
+        if blocked(account, caller) {
+            return Ok(());
+        }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin invite"))?;
         visibility_of(&tx, channel)?;
@@ -1456,6 +1475,29 @@ fn attached_blobs(db: &Connection, channel: &[u8; 32]) -> Result<Vec<[u8; 32]>, 
         })
         .map_err(storage("query attached blobs"))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Whether two accounts are present in any channel together.
+///
+/// This is what a withheld profile turns on, and it is deliberately a
+/// relationship the exchange already knows: a per-account visibility list would
+/// be an address book at the exchange, a much larger disclosure than the
+/// profile it protected.
+impl Channels {
+    pub fn share_a_channel(&self, a: &PubKey, b: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM member x JOIN member y ON x.channel = y.channel
+             WHERE x.account = ?1 AND y.account = ?2 AND x.present = 1 AND y.present = 1
+             LIMIT 1",
+            params![a.as_bytes(), b.as_bytes()],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
 }
 
 /// Whether a channel's identifier is the derivation over its two members.

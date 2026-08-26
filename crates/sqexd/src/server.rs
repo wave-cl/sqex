@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::device::Registry;
 use crate::mailbox::Mailbox;
 use crate::prekey::Prekeys;
+use crate::profile::Profiles;
 use crate::room::Rooms;
 use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
@@ -42,6 +43,9 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::device::{ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke};
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
+use sqex_proto::profile::{
+    Block as ProfileBlock, ByAccount, Put as ProfilePut, TYPE_GET as PR_GET,
+};
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
 
@@ -138,6 +142,7 @@ pub struct Server {
     channels: Channels,
     prekeys: Prekeys,
     devices: Registry,
+    profiles: Profiles,
     sessions: Sessions,
     live_conns: Connections,
     started: Instant,
@@ -175,6 +180,10 @@ pub async fn bind(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("devices.db"));
+    let profile_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("profiles.db"));
 
     // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
     // transport whitelist stays off: anyone holding the server key may connect,
@@ -221,6 +230,8 @@ pub async fn bind(
         // restart would be worse than none at all.
         devices: Registry::open(device_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the device registry: {e}")))?,
+        profiles: Profiles::open(profile_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open profiles: {e}")))?,
         sessions: Sessions::new(),
         live_conns: Connections::default(),
         started: Instant::now(),
@@ -503,6 +514,63 @@ async fn route(
         // carries. It relays each member's proof without checking it — checking
         // needs the secret it has deliberately not been told — and the members
         // verify each other.
+        // SIP-21 profiles and blocking. Every field is a claim its subject
+        // makes; nothing here is attested, and a client must show the key
+        // alongside a name wherever the distinction could matter.
+        ("POST", "/profile/put") => match (account, ProfilePut::decode(body)) {
+            (None, _) => no_identity("publishing a profile"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.profiles.put(&me, &req.profile) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+        ("POST", "/profile/get") => match (account, ByAccount::decode(body, PR_GET)) {
+            (None, _) => no_identity("reading a profile"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => {
+                let shares = |a: &PubKey, b: &PubKey| server.channels.share_a_channel(a, b);
+                match server.profiles.get(&me, &req.account, &shares) {
+                    Ok(got) => (200, "application/octet-stream", got.encode()),
+                    Err(e) => (
+                        e.status(),
+                        "application/json",
+                        json!({ "error": e.as_str() }).to_string().into_bytes(),
+                    ),
+                }
+            }
+        },
+        ("POST", "/block/set") => match (account, ProfileBlock::decode(body)) {
+            (None, _) => no_identity("blocking"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.profiles.set_block(&me, &req.account, req.add) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+        // Returned only to its owner: a list of who somebody wants to avoid is
+        // more sensitive than the member list it protects them from, so it
+        // takes no argument and answers about nobody else.
+        ("POST", "/block/list") => match account {
+            None => no_identity("listing blocks"),
+            Some(me) => match server.profiles.blocks(&me) {
+                Ok(list) => (200, "application/octet-stream", list.encode()),
+                Err(e) => (
+                    e.status(),
+                    "application/json",
+                    json!({ "error": e.as_str() }).to_string().into_bytes(),
+                ),
+            },
+        },
+
         // SIP-22 device registry. A credential is evidence and not authority:
         // it tells the exchange which account vouches for a key, and does not
         // entitle that key to anything.
@@ -693,14 +761,17 @@ async fn route(
         ("POST", "/channel/create") => match (account, ChannelCreate::decode(body)) {
             (None, _) => no_identity("creating a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.create(&me, &req) {
-                Ok((created, epoch)) => (
-                    200,
-                    "application/octet-stream",
-                    Created { created, epoch, now: now_unix() }.encode(),
-                ),
-                Err(e) => refused(e),
-            },
+            (Some(me), Ok(req)) => {
+                let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
+                match server.channels.create(&me, &req, &blocked) {
+                    Ok((created, epoch)) => (
+                        200,
+                        "application/octet-stream",
+                        Created { created, epoch, now: now_unix() }.encode(),
+                    ),
+                    Err(e) => refused(e),
+                }
+            }
         },
         ("POST", "/channel/join") => match (account, ByChannel::decode(body, CH_JOIN)) {
             (None, _) => no_identity("joining a channel"),
@@ -767,7 +838,11 @@ async fn route(
             (None, _) => no_identity("inviting to a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok((channel, who))) => {
-                match server.channels.invite(&me, &channel, &who.account, who.role) {
+                let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
+                match server
+                    .channels
+                    .invite(&me, &channel, &who.account, who.role, &blocked)
+                {
                     Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                     Err(e) => refused(e),
                 }

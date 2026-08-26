@@ -20,6 +20,7 @@ pub mod device;
 pub mod mailbox;
 pub mod message;
 pub mod prekey;
+pub mod profile;
 pub mod room;
 pub mod session;
 pub mod timeline;

@@ -7,6 +7,7 @@ pub mod config;
 pub mod device;
 pub mod mailbox;
 pub mod prekey;
+pub mod profile;
 pub mod room;
 pub mod server;
 pub mod session;
