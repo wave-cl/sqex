@@ -44,6 +44,9 @@ pub enum ChatError {
     /// We are a member with no key for the current epoch. SIP-17 asks that this
     /// be said plainly rather than shown as an empty conversation.
     NoKey(u32),
+    /// The exchange answered a chat route with the router's own 404. It is
+    /// running, and it does not implement chat at all.
+    NoChatHere(String),
     /// The other party has published no prekeys, so SIP-23 forbids sealing to
     /// them at all. Not an error in the conversation — the channel exists and
     /// they are in it — but nothing can be said until they start their client.
@@ -61,6 +64,12 @@ impl std::fmt::Display for ChatError {
                 f,
                 "no key for epoch {epoch} — you were not sent one, so this conversation \
                  cannot be read until somebody sends it"
+            ),
+            ChatError::NoChatHere(path) => write!(
+                f,
+                "this exchange has no {path} — it is running, but it is older than the \
+                 chat services (SIPs 16-24, sqex 0.9.0). Upgrade it, or point at one \
+                 that has them"
             ),
             ChatError::NotReady(who) => write!(
                 f,
@@ -127,10 +136,16 @@ impl Chat {
             .await
             .map_err(ChatError::Transport)?;
         if code != 200 {
-            return Err(ChatError::Refused(
-                code,
-                String::from_utf8_lossy(&body).into_owned(),
-            ));
+            let said = String::from_utf8_lossy(&body).into_owned();
+            // The router's own 404 for a path it does not have, as against a
+            // chat route's 404 for a channel or blob that does not exist —
+            // those answer JSON. Told apart here because the two mean entirely
+            // different things to whoever is reading the message: one is "your
+            // exchange is too old", the other is "that thing is not there".
+            if code == 404 && said.trim() == "not found" {
+                return Err(ChatError::NoChatHere(path.to_string()));
+            }
+            return Err(ChatError::Refused(code, said));
         }
         Ok(body)
     }
@@ -203,7 +218,7 @@ impl Chat {
             // stale prekeys stay, so sending may fail until they drain; that is
             // the state this amendment exists to fix and it is not a reason to
             // refuse to start.
-            Err(ChatError::Refused(..)) => {
+            Err(ChatError::Refused(..)) | Err(ChatError::NoChatHere(_)) => {
                 let body = self.post("/prekey/count", vec![TYPE_COUNT]).await?;
                 let counts =
                     Counts::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
