@@ -36,6 +36,12 @@ pub struct Said {
     pub who: String,
     pub mine: bool,
     pub text: String,
+    /// The entry's sequence number, which is how `/save` names a message.
+    pub seq: u64,
+    /// Whether this line carries a file. The sequence number is shown only for
+    /// these: it is what `/save` needs, and putting it on every line would be
+    /// a column of noise for the ones nobody can act on.
+    pub has_file: bool,
     pub at: u64,
     pub edited: bool,
 }
@@ -228,6 +234,12 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{:>12} ", truncate(&s.who, 12)), who),
             Span::raw(s.text.clone()),
         ];
+        if s.has_file {
+            spans.push(Span::styled(
+                format!("  /save {} ", s.seq),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
         if s.edited {
             spans.push(Span::styled(
                 " (edited)",
@@ -274,7 +286,7 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 fn status(f: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if app.trouble.is_quiet() {
         (
-            " ^C quit · Tab next · ^N add someone · Enter send".to_string(),
+            " ^C quit · Tab next · ^N add · /file <path> · /save <n> <path>".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
@@ -419,6 +431,8 @@ mod tests {
                     who: "bob".into(),
                     mine: false,
                     text: "are you there?".into(),
+                    seq: 3,
+                    has_file: false,
                     at: 3661,
                     edited: false,
                 },
@@ -426,6 +440,8 @@ mod tests {
                     who: "you".into(),
                     mine: true,
                     text: "i am".into(),
+                    seq: 4,
+                    has_file: false,
                     at: 3700,
                     edited: true,
                 },
@@ -445,6 +461,7 @@ mod tests {
         // A quiet status shows the keys, not a warning.
         assert!(out.contains("^C quit"));
         assert!(out.contains("^N add"));
+        assert!(out.contains("/file"));
     }
 
     #[test]
@@ -457,6 +474,18 @@ mod tests {
         let out = render(&app, 100, 20);
         assert!(out.contains("no key for epoch 3"), "{out}");
         assert!(!out.contains("nothing here yet"), "it claimed the room was empty");
+    }
+
+    #[test]
+    fn a_line_with_a_file_shows_how_to_save_it() {
+        let mut app = sample();
+        app.said[0].text = "[notes.md, 4 KiB]".into();
+        app.said[0].has_file = true;
+        let out = render(&app, 100, 20);
+        assert!(out.contains("[notes.md, 4 KiB]"), "{out}");
+        assert!(out.contains("/save 3"), "the message number is not shown:\n{out}");
+        // And not on the line that has no file to save.
+        assert!(!out.contains("/save 4"));
     }
 
     #[test]
@@ -490,6 +519,8 @@ mod tests {
                 who: "bob".into(),
                 mine: false,
                 text: format!("message {i}"),
+                seq: i,
+                has_file: false,
                 at: 0,
                 edited: false,
             })
