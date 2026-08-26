@@ -76,14 +76,19 @@ calls both:
   spent — which is how a recipient notices an exchange serving the same prekey
   twice.
 
-The client for it is `sqex-chat` — direct messages, in a terminal, with files.
-Group channels are built in the exchange and have no client yet.
+The client for it is `sqex-chat` — direct messages and private groups, in a
+terminal, with files.
 
 ```
 sqex-chat whoami             # your identity, to give to somebody
-sqex-chat add <their-key>    # discovery is this list; see below
-sqex-chat                    # the conversation
+sqex-chat add <their-key>    # somebody you want to write to first
+sqex-chat                    # the conversations
 ```
+
+Inside: `/new <name>` makes a private group, `/invite` and `/kick` change who is
+in it, `/rotate` hands everyone a new key, `/file` and `/save` move files, and
+`^N` adds a contact. A group's name is a sealed entry, so the exchange never
+learns what it is called.
 
 Packaged from v0.9.1. The v0.9.0 archives held only `sqexd` and `sqex`.
 
@@ -122,7 +127,8 @@ account with no way to discover it had happened.
 
 SIP-16's `Mine` closes that: it answers *"which channels am I in"*, about the
 caller and nobody else, and `sqex-chat` asks on startup. Somebody who writes to
-you first is found and added without your knowing them in advance.
+you first is found and added without your knowing them in advance, and a group
+you are invited to appears without anybody sending you its identifier.
 
 For a direct message the identifier is a hash and cannot be run backwards, so
 the other party comes from the member list the exchange enforces — and is then

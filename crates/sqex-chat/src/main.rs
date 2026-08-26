@@ -45,8 +45,9 @@ Your keys live in ~/.sqex/chat, sealed under your identity. Lose that directory 
 and the conversations in it cannot be read again by anyone, including you — \
 that is the forward secrecy working, not a fault.
 
-Group channels exist in the exchange and this client has no interface for them \
-yet; it shows direct messages only."
+Private groups work the same way: /new makes one, /invite and /kick change who \
+is in it, and removing somebody rotates the key so what follows is not theirs. \
+A group's name is a sealed entry, so the exchange never learns it."
 )]
 struct Cli {
     /// Server address, host:port (overrides SQEX_SERVER and ~/.sqnr/config).
