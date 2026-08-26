@@ -505,18 +505,28 @@ async fn handle_key(
             // to be: with none open there is nothing selected, and requiring a
             // selection would mean the first group could never be made.
             if let Command::New(name) = &cmd {
-                let note = match chat.create_group(name, &[]).await {
+                let made = chat.create_group(name, &[]).await;
+                let note = match &made {
                     Ok(_) => format!("made {name} — /invite <key> to add somebody"),
                     Err(e) => e.to_string(),
                 };
-                if let Ok(fresh) = sync_channels(chat).await {
-                    *open = fresh;
-                    app.selected = open.len().saturating_sub(1);
-                    if let Some(last) = open.last_mut() {
-                        last.trouble.message = Some(note);
+                // The window is rebuilt only when there is something new to
+                // show. On failure the list is unchanged and the message must
+                // survive — an earlier version put it on the last row, which
+                // did not exist when the first group was the one that failed,
+                // so the only thing that went wrong went nowhere.
+                match (made, sync_channels(chat).await) {
+                    (Ok(channel), Ok(fresh)) => {
+                        *open = fresh;
+                        app.selected = open
+                            .iter()
+                            .position(|o| o.channel == channel)
+                            .unwrap_or(open.len().saturating_sub(1));
+                        if let Some(o) = open.get_mut(app.selected) {
+                            o.trouble.message = Some(note);
+                        }
                     }
-                } else {
-                    app.trouble.message = Some(note);
+                    _ => app.trouble.message = Some(note),
                 }
                 return;
             }
@@ -652,45 +662,36 @@ impl Command {
         if !trimmed.starts_with('/') {
             return Command::Send(line.to_string());
         }
-        let mut words = trimmed.splitn(3, char::is_whitespace);
-        let verb = words.next().unwrap_or("");
+        // Verb, then the whole of the rest. Splitting into fixed words is what
+        // made `/new release check` a group called "release" — a name, a path
+        // and a topic are all free text, and quoting them would be a rule to
+        // remember for no gain.
+        let (verb, rest) = match trimmed.find(char::is_whitespace) {
+            Some(i) => (&trimmed[..i], trimmed[i..].trim()),
+            None => (trimmed, ""),
+        };
+        let first = rest.split_whitespace().next().unwrap_or("");
         match verb {
-            "/file" => match words.next() {
-                Some(rest) => {
-                    // The rest of the line, so a path with spaces in it works
-                    // without anybody having to think about quoting.
-                    let mut path = rest.to_string();
-                    if let Some(more) = words.next() {
-                        path.push(' ');
-                        path.push_str(more);
+            "/file" if !rest.is_empty() => Command::File(expand(rest)),
+            "/file" => Command::Unknown("/file needs a path".into()),
+            "/save" => {
+                let path = rest[first.len()..].trim();
+                match (first.parse::<u64>(), path.is_empty()) {
+                    (Ok(seq), false) => Command::Save(seq, expand(path)),
+                    (Err(_), _) if !first.is_empty() => {
+                        Command::Unknown(format!("{first} is not a message number"))
                     }
-                    Command::File(expand(path.trim()))
+                    _ => Command::Unknown("/save needs a message number and a path".into()),
                 }
-                None => Command::Unknown("/file needs a path".into()),
-            },
-            "/save" => match (words.next(), words.next()) {
-                (Some(n), Some(path)) => match n.parse::<u64>() {
-                    Ok(seq) => Command::Save(seq, expand(path.trim())),
-                    Err(_) => Command::Unknown(format!("{n} is not a message number")),
-                },
-                _ => Command::Unknown("/save needs a message number and a path".into()),
-            },
-            "/new" => match words.next() {
-                Some(name) => Command::New(name.trim().to_string()),
-                None => Command::Unknown("/new needs a name".into()),
-            },
-            "/name" => match words.next() {
-                Some(name) => Command::Name(name.trim().to_string()),
-                None => Command::Unknown("/name needs a name".into()),
-            },
-            "/invite" => match words.next() {
-                Some(key) => Command::Invite(key.trim().to_string()),
-                None => Command::Unknown("/invite needs a public key".into()),
-            },
-            "/kick" => match words.next() {
-                Some(key) => Command::Kick(key.trim().to_string()),
-                None => Command::Unknown("/kick needs a public key".into()),
-            },
+            }
+            "/new" if !rest.is_empty() => Command::New(rest.to_string()),
+            "/new" => Command::Unknown("/new needs a name".into()),
+            "/name" if !rest.is_empty() => Command::Name(rest.to_string()),
+            "/name" => Command::Unknown("/name needs a name".into()),
+            "/invite" if !first.is_empty() => Command::Invite(first.to_string()),
+            "/invite" => Command::Unknown("/invite needs a public key".into()),
+            "/kick" if !first.is_empty() => Command::Kick(first.to_string()),
+            "/kick" => Command::Unknown("/kick needs a public key".into()),
             "/rotate" => Command::Rotate,
             "/leave" => Command::Leave,
             "/who" => Command::Who,
@@ -845,6 +846,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
     }
     let Some(conv) = selected_index(open, app).map(|i| &open[i]) else {
         app.said.clear();
+        app.peer_typing = false;
         return;
     };
     app.said = conv
@@ -890,13 +892,19 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
         unreadable: conv.trouble.unreadable,
         no_key: conv.trouble.no_key,
         gap: conv.trouble.gap,
-        message: conv
-            .trouble
-            .message
-            .clone()
-            .or_else(|| conv.waiting.then(|| {
-                format!("{} has not started their client yet — nothing can be sent until they do", conv.label)
-            })),
+        message: conv.trouble.message.clone().or_else(|| {
+            conv.waiting.then(|| match conv.peer {
+                Some(_) => format!(
+                    "{} has not started their client yet — nothing can be sent until they do",
+                    conv.label
+                ),
+                // A group is not a person, and saying it "has not started its
+                // client" is nonsense the reader has to decode.
+                None => "somebody here has published no keys yet, so nothing can be sealed \
+                         to them — /who lists everyone"
+                    .to_string(),
+            })
+        }),
     };
 }
 
@@ -1130,6 +1138,25 @@ mod tests {
         assert!(matches!(Command::parse("and/or"), Command::Send(_)));
         assert!(matches!(Command::parse("/file x"), Command::File(_)));
         assert!(matches!(Command::parse("/nonsense"), Command::Unknown(_)));
+    }
+
+    #[test]
+    fn a_name_keeps_its_spaces() {
+        // `/new release check` used to make a group called "release".
+        match Command::parse("/new release check") {
+            Command::New(n) => assert_eq!(n, "release check"),
+            _ => panic!("not parsed as new"),
+        }
+        match Command::parse("/name the tuesday club") {
+            Command::Name(n) => assert_eq!(n, "the tuesday club"),
+            _ => panic!("not parsed as name"),
+        }
+        // A key is one word, so trailing rubbish is ignored rather than folded
+        // into it.
+        match Command::parse("/invite ZfS2aD5B  ") {
+            Command::Invite(k) => assert_eq!(k, "ZfS2aD5B"),
+            _ => panic!("not parsed as invite"),
+        }
     }
 
     #[test]
