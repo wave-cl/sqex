@@ -16,7 +16,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME, Open, OpenAck, OpenState, Session};
 use sqexd::config::FileConfig;
 use sqex_voice::audio::{TONE_HZ, dominant_hz, rms, tone};
-use sqex_voice::jitter::{FRAME_SAMPLES, Jitter, SAMPLE_RATE};
+use sqex_voice::jitter::{FRAME_SAMPLES, Jitter, Playback, SAMPLE_RATE};
 use sqex_voice::media;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -145,7 +145,7 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
             "a 20 ms frame at 24 kbit/s is {} bytes, which does not fit a datagram",
             packet.len()
         );
-        let body = media::Frame { timestamp: seq as u32, payload: packet }.encode();
+        let body = media::Frame::audio(seq as u32, packet).encode();
         let sealed = c.a_sess.seal_datagram(seq, &body).unwrap();
         c.a.send_datagram(
             DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
@@ -173,20 +173,21 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
             .b_sess
             .open(frame.seq, &frame.ciphertext)
             .expect("the peer's key opens it");
-        let m = media::Frame::decode(&plaintext).expect("a media frame");
+        let m = media::Frame::decode(&plaintext).expect("a media frame").expect("a known type");
         arrived.insert(frame.seq);
-        buffer.push(frame.seq, m.timestamp, m.payload);
+        buffer.push(frame.seq, m.timestamp, m.body);
     }
 
     // Drain the buffer the way the playout tick does, but without waiting out
     // a real second to do it.
-    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
     let mut pcm = vec![0f32; FRAME_SAMPLES];
     let mut played = Vec::new();
     loop {
         let slot = buffer.pop();
-        let Some(packet) = slot.to_decode() else { break };
-        dec.decode_float(packet, &mut pcm, false).unwrap();
+        if !playback.render(&slot, &mut pcm) {
+            break;
+        }
         played.push(pcm.clone());
     }
     assert_eq!(
@@ -312,7 +313,7 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
             .collect();
         let packet = enc.encode_vec_float(&frame, MAX_DATAGRAM_FRAME).unwrap();
         assert!(packet.len() <= MAX_DATAGRAM_FRAME);
-        let body = media::Frame { timestamp: seq as u32, payload: packet }.encode();
+        let body = media::Frame::audio(seq as u32, packet).encode();
         let sealed = c.a_sess.seal_datagram(seq, &body).unwrap();
         c.a.send_datagram(
             DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
@@ -332,21 +333,22 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
         };
         let frame = DatagramFrame::decode(&bytes).unwrap();
         let m = media::Frame::decode(&c.b_sess.open(frame.seq, &frame.ciphertext).unwrap())
-            .unwrap();
-        buffer.push(frame.seq, m.timestamp, m.payload);
+            .unwrap()
+            .expect("a known type");
+        buffer.push(frame.seq, m.timestamp, m.body);
         arrived += 1;
     }
     assert_eq!(arrived, FRAMES);
 
-    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
     let mut pcm = vec![0f32; FRAME_SAMPLES];
     let mut played: Vec<f32> = Vec::new();
     loop {
         let slot = buffer.pop();
-        let Some(p) = slot.to_decode() else { break };
-        let n = dec.decode_float(p, &mut pcm, false).unwrap();
-        assert_eq!(n, FRAME_SAMPLES, "decoded at 48 kHz regardless of the sender");
-        played.extend_from_slice(&pcm[..n]);
+        if !playback.render(&slot, &mut pcm) {
+            break;
+        }
+        played.extend_from_slice(&pcm);
     }
 
     // A second in at 16 kHz is a second out at 48 kHz, and still a 440 Hz tone.
@@ -360,72 +362,75 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
     assert!(rms(steady) > 0.2, "and be audible");
 }
 
-/// SIP-14 end to end: somebody stops talking, and the far end hears silence
-/// rather than the codec inventing speech.
+/// SIP-15 end to end: somebody stops talking, and the far end hears their
+/// room — not a hole, not a guess, and not a pulse.
 ///
-/// This is the failure the whole design exists to prevent. Without the
-/// timestamp, the receiver would see missing sequence numbers, call it loss,
-/// and ask Opus to conceal — which extrapolates from the last thing it heard.
-/// A one-second pause would come out as a second of babble.
+/// This is three failures' worth of test. Rendering a pause as zeros chops the
+/// noise floor in and out; concealing it invents speech; and replaying
+/// concealment from an isolated noise frame overshoots and decays, which is the
+/// pulse that killed the first noise gate. Describing the silence and
+/// synthesising it is the only version of this that both saves the bandwidth
+/// and sounds right.
 #[tokio::test]
-async fn a_pause_is_heard_as_silence_and_costs_almost_nothing() {
+async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
     let c = call().await;
 
     let mut enc =
         opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
     enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
-    enc.set_dtx(true).unwrap();
-    // A one-second keepalive, as the client uses.
+    enc.set_dtx(false).unwrap(); // SIP-15: we decide, not the codec
     let mut sender = media::Sender::new(50, true);
 
-    // Talk for a second, say nothing for two, then talk again.
-    let speech = tone(200);
+    // A room, then talking, then the room again. Never digital silence — that
+    // is the case a synthetic test gets wrong and a microphone never produces.
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut phase = 0.0f32;
+    let step = std::f32::consts::TAU * TONE_HZ / SAMPLE_RATE as f32;
     let mut seq = 0u64;
-    let mut on_the_wire = 0usize;
-    let mut bytes = 0usize;
     let mut sent_slots: Vec<usize> = Vec::new();
-    for (i, frame) in speech.iter().enumerate() {
-        let quiet = (50..150).contains(&i);
-        let samples: Vec<f32> = if quiet { vec![0.0; FRAME_SAMPLES] } else { frame.clone() };
-        let packet = enc
-            .encode_vec_float(&samples, MAX_DATAGRAM_FRAME - media::HEADER)
+    const SLOTS: usize = 500;
+
+    for i in 0..SLOTS {
+        let samples: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
+                let s = if (150..250).contains(&i) { phase.sin() * 0.5 + noise } else { noise };
+                phase = (phase + step) % std::f32::consts::TAU;
+                s
+            })
+            .collect();
+        let framed = sender
+            .offer(&samples, |pcm| {
+                enc.encode_vec_float(pcm, MAX_DATAGRAM_FRAME - media::HEADER)
+                    .map_err(|e| sqnr_core::Error::Malformed(format!("{e}")))
+            })
             .unwrap();
-        if let Some(m) = sender.offer(packet) {
-            let body = m.encode();
-            bytes += body.len();
-            let sealed = c.a_sess.seal_datagram(seq, &body).unwrap();
+        if let Some(m) = framed {
+            let sealed = c.a_sess.seal_datagram(seq, &m.encode()).unwrap();
             c.a.send_datagram(
                 DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
             )
             .unwrap();
-            on_the_wire += 1;
             sent_slots.push(i);
             seq += 1;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
-    // The saving. Judge it on the *steady* part of the pause: Opus takes about
-    // ten frames to decide nobody is talking, so a short pause pays a warm-up
-    // that a long one amortises away.
-    assert_eq!(sender.produced(), 200, "time passed for every slot");
-    let deep_pause = (80..150).count();
-    let sent_in_deep_pause = sent_slots.iter().filter(|i| (80..150).contains(*i)).count();
+    let on_the_wire = sent_slots.len();
+    // The settled part of the pause, well clear of the gate's warm-up window
+    // and the hangover after speech.
+    let settled = 320..SLOTS;
+    let in_settled = sent_slots.iter().filter(|i| settled.contains(i)).count();
     println!(
-        "  SIP-14: 200 media slots -> {on_the_wire} packets, {bytes} payload bytes; \
-         {sent_in_deep_pause}/{deep_pause} sent during the settled pause"
-    );
-    // Not one packet per keepalive: Opus also refreshes its comfort-noise
-    // description every few hundred milliseconds. Still a small fraction of
-    // transmitting continuously, which is the property worth asserting.
-    assert!(
-        sent_in_deep_pause * 4 < deep_pause,
-        "a settled pause should cost well under a quarter of continuous \
-         transmission, sent {sent_in_deep_pause}/{deep_pause}"
+        "  SIP-15: {SLOTS} slots -> {on_the_wire} packets; \
+         {in_settled}/{} during the settled pause",
+        settled.len()
     );
     assert!(
-        on_the_wire < 130,
-        "200 slots should not cost 200 packets, sent {on_the_wire}"
+        in_settled * 10 < settled.len(),
+        "a settled pause should cost about a packet a second, sent {in_settled}"
     );
 
     let mut buffer = Jitter::new(3);
@@ -437,44 +442,60 @@ async fn a_pause_is_heard_as_silence_and_costs_almost_nothing() {
         };
         let frame = DatagramFrame::decode(&b).unwrap();
         let m = media::Frame::decode(&c.b_sess.open(frame.seq, &frame.ciphertext).unwrap())
-            .unwrap();
-        buffer.push(frame.seq, m.timestamp, m.payload);
+            .unwrap()
+            .expect("a known type");
+        buffer.push(frame.seq, m.timestamp, m.body);
         got += 1;
     }
     assert_eq!(got, on_the_wire, "everything sent arrived");
 
-    let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
+    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
     let mut pcm = vec![0f32; FRAME_SAMPLES];
     let mut played: Vec<Vec<f32>> = Vec::new();
     loop {
         let slot = buffer.pop();
-        let Some(p) = slot.to_decode() else { break };
-        dec.decode_float(p, &mut pcm, false).unwrap();
+        if !playback.render(&slot, &mut pcm) {
+            break;
+        }
         played.push(pcm.clone());
     }
 
-    // The pause is still a pause: the timeline did not shorten by the frames
-    // nobody sent.
+    // The timeline did not shorten by the frames nobody sent.
     assert!(
-        played.len() >= 195,
-        "the call should still be ~200 slots long, got {}",
+        played.len() >= SLOTS - 10,
+        "the call should still be ~{SLOTS} slots long, got {}",
         played.len()
     );
     assert_eq!(buffer.stats.concealed, 0, "nothing was invented");
-    assert!(buffer.stats.silent > 60, "the pause was played as a pause");
 
-    // And it is actually quiet in the middle, rather than babbling.
-    let during: Vec<f32> = played[90..145].concat();
-    assert!(
-        rms(&during) < 0.02,
-        "a pause must be quiet, measured rms {}",
-        rms(&during)
+    let levels: Vec<f32> = played.iter().map(|f| rms(f)).collect();
+    let pause = &levels[330..levels.len() - 5];
+
+    // Not dead: the room is still there.
+    assert_eq!(
+        pause.iter().filter(|x| **x < 0.0005).count(),
+        0,
+        "a pause must not contain digitally dead frames"
     );
-    // While the speech either side survived.
-    let after: Vec<f32> = played[160..195].concat();
+    // Not pulsing: this is what killed the gate that replayed concealment.
+    let (lo, hi) = pause.iter().fold((f32::MAX, 0.0f32), |(l, h), x| (l.min(*x), h.max(*x)));
     assert!(
-        (dominant_hz(&after) - TONE_HZ).abs() < 10.0,
-        "speech after the pause should be intact, measured {}",
-        dominant_hz(&after)
+        hi / lo < 4.0,
+        "a synthesised pause must be steady, swung {lo:.5} to {hi:.5}"
+    );
+    // And about as loud as the room actually was.
+    let want = 0.006 / 3f32.sqrt();
+    let mean = pause.iter().sum::<f32>() / pause.len() as f32;
+    assert!(
+        (mean / want).log2().abs() < 1.5,
+        "the room came back at {mean:.5}, was {want:.5}"
+    );
+
+    // Speech either side survived.
+    let speech: Vec<f32> = played[170..240].concat();
+    assert!(
+        (dominant_hz(&speech) - TONE_HZ).abs() < 10.0,
+        "speech should be intact, measured {}",
+        dominant_hz(&speech)
     );
 }

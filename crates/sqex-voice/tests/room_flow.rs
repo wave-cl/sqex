@@ -125,7 +125,7 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
             assert!(packet.len() <= MAX_DATAGRAM_FRAME);
             let seq = m.seq;
             for peer in m.room.peers.values() {
-                let body = media::Frame { timestamp: seq as u32, payload: packet.clone() }.encode();
+                let body = media::Frame::audio(seq as u32, packet.clone()).encode();
                 let sealed = peer.session.seal_datagram(seq, &body).unwrap();
                 m.client
                     .send_datagram(
@@ -161,8 +161,8 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
                 .session
                 .open(frame.seq, &frame.ciphertext)
                 .expect("a room peer's frames open");
-            let m = media::Frame::decode(&plaintext).expect("a media frame");
-            peer.jitter.push(frame.seq, m.timestamp, m.payload);
+            let m = media::Frame::decode(&plaintext).expect("a media frame").expect("a known type");
+            peer.jitter.push(frame.seq, m.timestamp, m.body);
             got += 1;
         }
         assert_eq!(got, want, "{} did not hear everyone", m.identity);
@@ -179,10 +179,7 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
             mixer.start();
             for peer in m.room.peers.values_mut() {
                 let slot = peer.jitter.pop();
-                let decoded = match slot.to_decode() {
-                    Some(p) => peer.decoder.decode_float(p, &mut pcm, false).is_ok(),
-                    None => false,
-                };
+                let decoded = peer.playback.render(&slot, &mut pcm);
                 if decoded {
                     mixer.add(&pcm);
                 }

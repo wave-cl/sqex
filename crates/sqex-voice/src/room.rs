@@ -28,7 +28,7 @@ use sqnr::Client;
 use sqnr_core::PubKey;
 
 use crate::audio::Rate;
-use crate::jitter::Jitter;
+use crate::jitter::{Jitter, Playback};
 
 /// One other person in the room, once we can actually hear them.
 pub struct Peer {
@@ -36,7 +36,8 @@ pub struct Peer {
     pub session: Session,
     pub session_id: u64,
     pub jitter: Jitter,
-    pub decoder: opus::Decoder,
+    /// Decoding, concealment and comfort noise for this peer, in one place.
+    pub playback: Playback,
     /// Our next outgoing sequence number *to this peer*. Each session counts
     /// separately — they have separate keys, and the sequence number is in the
     /// nonce.
@@ -264,8 +265,7 @@ impl Membership {
             session,
             session_id: ack.session_id,
             jitter: Jitter::new(self.depth),
-            decoder: opus::Decoder::new(self.rate.hz(), opus::Channels::Mono)
-                .map_err(|e| format!("opus decoder: {e}"))?,
+            playback: Playback::new(self.rate.hz())?,
             out_seq: 0,
             level: 0.0,
             last_heard: std::time::Instant::now(),

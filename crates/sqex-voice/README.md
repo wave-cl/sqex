@@ -166,47 +166,48 @@ The stats line then carries `rtt p50` and `rtt p95`, counting both relay hops
 in each direction. `--rtt` is meaningless against another `call`, whose sequence
 numbers are its own.
 
-## Silence is free-ish (SIP-14)
+## Silence is described, not sent (SIP-15)
 
-A speaker who is not talking stops transmitting. Measured on a live exchange,
-two seconds of speech followed by ten of pause:
+A speaker who is not talking stops transmitting, and says what their room sounds
+like instead — two bytes, about once a second. The far end synthesises noise to
+match. Measured on a live exchange, two seconds of speech and ten of pause:
 
 | | packets |
 |---|---|
 | `--no-dtx` (continuous) | 600 |
-| default, pause is a quiet room | **182** |
-| default, pause is digital silence | 157 |
+| SIP-14 (the codec's own detector) | 182 |
+| **now** | **125** |
 
-Quote the middle row. The bottom one is what a synthetic test measures, and no
-microphone produces it — a real pause is a room's noise floor, which the encoder
-has something to do with. A noisier room saves less again.
+The reason it needs a descriptor at all is that a pause is **not a lost frame**.
+Concealment guesses at what a missing packet contained, extrapolating from what
+it last heard — so using it for silence either invents speech or, from an
+isolated noise frame, overshoots and decays into a pulse once a second. Both
+were built and measured before this was. Describing the silence is the only
+version that both saves the bandwidth and sounds right.
 
-In a room that saving applies to every one of the N(N−1) streams, which is what
-makes eight people affordable.
+Three details decide whether it sounds like a room or a fault, and all three
+were found by listening after the measurements said it was already smooth — a
+synthetic room is stationary and no real one is:
 
-Getting this right needs more than "stop sending". A receiver seeing missing
-packets cannot tell a pause from loss, and a jitter buffer that guesses wrong
-asks the codec to conceal — which extrapolates from the last thing it heard, and
-so invents speech out of a silence nobody spoke. SIP-14 carries a media
-timestamp beside the packet sequence, so the two are distinguishable: a
-timestamp gap with no sequence gap is a pause, a sequence gap is loss. The
-`silent` and `concealed` counters on the stats line report which is happening.
+- the room is described from a **smoothed** estimate, not the one frame the
+  keepalive landed on;
+- the receiver **glides** to a new description over ~200 ms rather than
+  stepping to it, because a step in a noise floor is a click;
+- the detector uses **hysteresis**, because a level sitting near a single
+  threshold makes it chatter — and each flip swaps a real room for a
+  synthesised one, which is audible even at matched levels.
 
-Two things Opus does that are worth knowing, both measured rather than
-documented: DTX takes about **ten frames to engage**, so short pauses save less
-than long ones; and it **refreshes its comfort noise** every few hundred
-milliseconds, so a settled pause is not literally one keepalive per second.
-
-A silent slot is handed to the decoder with no packet, exactly like a lost one —
-the decoder's state decides whether that comes out as comfort noise or as
-concealment. It is emphatically **not** rendered as digital zeros: that cuts the
-room's noise floor in and out fifty times a second, which is inaudible in a test
-and sounds like the line breaking up through a microphone.
+The detector is the sender's own; the codec's is not used. Two ways to write it
+wrong, both of which happened here: let the noise floor rise while the gate is
+open and a monologue drags it up until you are cut off; let it rise only while
+shut and a call that opens mid-sentence never closes. It uses a minimum over a
+two-second window, capped at −30 dBFS — a room is never loud, so the cap makes
+the failure one-directional: too permissive costs bandwidth, never a lost voice.
 
 `--no-dtx` restores continuous transmission. That is a **privacy** switch, not a
-quality one: with DTX, packet timing tells anyone watching — the exchange
-included — exactly when each person speaks. The content stays sealed; the
-pattern of the conversation does not.
+quality one: with a pause costing a packet a second instead of fifty, packet
+timing tells anyone watching — the exchange included — exactly when each person
+speaks. The content stays sealed; the pattern does not.
 
 ## What the numbers mean
 
@@ -220,8 +221,9 @@ sent 412 · recv 410 · loss 0.5% · late 0 · dup 0 · concealed 2 · trimmed 0
   jitter buffer was too shallow for the path. Raise `--jitter`, at 20 ms of
   added delay per frame.
 - **concealed** is a slot Opus invented because the packet never came.
-- **silent** is a slot the speaker deliberately left empty (SIP-14). Never
-  concealed — that is the whole point of carrying a timestamp.
+- **silent** is a slot the speaker deliberately left empty, played as
+  synthesised comfort noise. Never concealed — that is the whole point of
+  carrying a timestamp and a descriptor.
 - **trimmed** is a frame decoded but not played, to shed delay the buffer had
   accumulated. A fixed-depth buffer cannot drain a backlog on its own — frames
   arrive no faster than they are played — so a stall early in the call would
@@ -240,7 +242,9 @@ received audio was still a 440.0 Hz tone at the amplitude it left with.
 - `src/audio.rs` — devices, the tone generator, WAV in and out, and the 48 kHz
   requirement.
 - `src/room.rs` — SIP-13: the roster, proof checking, and a session per peer.
-- `src/media.rs` — SIP-14: the timestamp that tells a pause from a lost packet.
+- `src/media.rs` — SIP-15: the timestamp that tells a pause from a lost
+  packet, the descriptor that says what the pause sounds like, the detector
+  that decides, and the synthesiser.
 - `src/mix.rs` — adding several people together without pumping.
 - `src/main.rs` — the rendezvous and the call loops.
 - `tests/voice_flow.rs` — a tone through a real `sqexd`, out the far side still

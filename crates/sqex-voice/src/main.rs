@@ -25,7 +25,7 @@ use sqnr::{Client, config::Config, identity};
 use sqnr_core::{PubKey, Signer};
 
 use sqex_voice::audio::{self, Rate, Sink, Source};
-use sqex_voice::jitter::{FRAME_MS, Jitter, Rtt};
+use sqex_voice::jitter::{FRAME_MS, Jitter, Playback, Rtt};
 use sqex_voice::media;
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{self, Event as RoomEvent, Membership};
@@ -380,13 +380,13 @@ async fn rendezvous(
 
 /// One encoder, configured the same way whether it is feeding one peer or
 /// seven — a frame is encoded once and sealed per peer, never encoded per peer.
-fn encoder(bitrate: i32, rate: Rate, dtx: bool) -> Result<opus::Encoder, String> {
+fn encoder(bitrate: i32, rate: Rate) -> Result<opus::Encoder, String> {
     let mut e = opus::Encoder::new(rate.hz(), opus::Channels::Mono, opus::Application::Voip)
         .map_err(|e| format!("opus encoder: {e}"))?;
-    // Opus's own detector decides what counts as speech. It is already tuned
-    // for it, already handles onsets, and already describes what the silence
-    // sounds like — none of which an energy threshold would do.
-    e.set_dtx(dtx).map_err(|e| format!("opus dtx: {e}"))?;
+    // Deliberately off. SIP-15 takes the transmit decision back from the
+    // codec: its detector judges whether *encoding* is worthwhile, not whether
+    // *transmitting* is, and against a room it keeps deciding yes.
+    e.set_dtx(false).map_err(|e| format!("opus dtx: {e}"))?;
     e.set_bitrate(opus::Bitrate::Bits(bitrate))
         .map_err(|e| format!("opus bitrate: {e}"))?;
     // Forward error correction lets the decoder rebuild a lost frame from the
@@ -418,13 +418,12 @@ async fn call(
     // Capture and playback pick their own rates, and Opus converts between them
     // and whatever the far end chose. Nothing is negotiated.
     let (mut source, capture) = audio::open_source(&opts.source, opts.seconds, opts.input.as_deref())?;
-    let (out, playback) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
-    let mut encoder = encoder(opts.bitrate, capture, opts.dtx)?;
-    let mut decoder = opus::Decoder::new(playback.hz(), opus::Channels::Mono)
-        .map_err(|e| format!("opus decoder: {e}"))?;
+    let (out, play_rate) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
+    let mut encoder = encoder(opts.bitrate, capture)?;
+    let mut playback = Playback::new(play_rate.hz())?;
     let mut buffer = Jitter::new(opts.depth);
     let mut rtt = Rtt::default();
-    let mut pcm = vec![0f32; playback.frame()];
+    let mut pcm = vec![0f32; play_rate.frame()];
 
     let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
     let mut report = tokio::time::interval(Duration::from_secs(1));
@@ -448,12 +447,16 @@ async fn call(
             // late to matter.
             frame = source.recv(), if hangup.is_none() => match frame {
                 Some(samples) => {
-                    let packet = encoder
-                        .encode_vec_float(&samples, MAX_DATAGRAM_FRAME - media::HEADER)
-                        .map_err(|e| format!("encode: {e}"))?;
-                    // The timestamp advances whether or not this goes out; the
-                    // sequence number only counts what does (SIP-14).
-                    if let Some(media) = outgoing.offer(packet) {
+                    // The gate decides; the encoder only runs when it says yes.
+                    // The timestamp advances whether or not anything goes out;
+                    // the sequence number only counts what does (SIP-15).
+                    let framed = outgoing
+                        .offer(&samples, |pcm| {
+                            encoder.encode_vec_float(pcm, MAX_DATAGRAM_FRAME - media::HEADER)
+                                .map_err(|e| sqnr_core::Error::Malformed(format!("encode: {e}")))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    if let Some(media) = framed {
                         let sealed = session
                             .seal_datagram(seq, &media.encode())
                             .map_err(|e| e.to_string())?;
@@ -484,7 +487,10 @@ async fn call(
                             rtt.returned(frame.seq);
                         }
                         match media::Frame::decode(&plaintext) {
-                            Ok(m) => buffer.push(frame.seq, m.timestamp, m.payload),
+                            // A frame type we do not know is ignored, not an
+                            // error: SIP-15 reserves the space deliberately.
+                            Ok(Some(m)) => buffer.push(frame.seq, m.timestamp, m.body),
+                            Ok(None) => {}
                             Err(e) => eprintln!("(malformed media frame {}: {e})", frame.seq),
                         }
                     }
@@ -501,15 +507,14 @@ async fn call(
                 // do not play it. The call catches up rather than staying half
                 // a second behind the conversation.
                 if let Some(stale) = buffer.trim() {
-                    decoder.decode_float(&stale, &mut pcm, false).map_err(|e| format!("decode: {e}"))?;
+                    playback.render(&sqex_voice::jitter::Playout::Frame(stale), &mut pcm);
                 }
-                // A frame, a concealed slot and a silent slot are all just
-                // "decode this" — see `Playout::to_decode`. Idle alone plays
-                // nothing: the device fills its own silence, and a file should
-                // not be padded with it.
+                // Decoding, concealing and making comfort noise all happen in
+                // one place — see `Playback::render`. Idle alone plays nothing:
+                // the device fills its own silence, and a file should not be
+                // padded with it.
                 let slot = buffer.pop();
-                if let Some(packet) = slot.to_decode() {
-                    decoder.decode_float(packet, &mut pcm, false).map_err(|e| format!("decode: {e}"))?;
+                if playback.render(&slot, &mut pcm) {
                     out.play(&pcm);
                 }
                 if hangup.is_some_and(|at| Instant::now() >= at) {
@@ -603,12 +608,12 @@ async fn room_call(
     }
 
     let (mut source, capture) = audio::open_source(&opts.source, opts.seconds, opts.input.as_deref())?;
-    let (out, playback) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
-    let mut encoder = encoder(opts.bitrate, capture, opts.dtx)?;
-    let mut mixer = Mixer::new(playback.frame());
-    let mut pcm = vec![0f32; playback.frame()];
+    let (out, play_rate) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
+    let mut encoder = encoder(opts.bitrate, capture)?;
+    let mut mixer = Mixer::new(play_rate.frame());
+    let mut pcm = vec![0f32; play_rate.frame()];
     // Every peer decodes at our playback rate, whatever rate they encoded at.
-    let mut members = Membership::new(room, me, signer.seed(), opts.depth, playback);
+    let mut members = Membership::new(room, me, signer.seed(), opts.depth, play_rate);
 
     let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
     let mut roster = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
@@ -654,16 +659,18 @@ async fn room_call(
             // every session has its own key, but the Opus packet does not.
             frame = source.recv(), if hangup.is_none() => match frame {
                 Some(samples) => {
-                    let packet = match encoder
-                        .encode_vec_float(&samples, MAX_DATAGRAM_FRAME - media::HEADER)
-                    {
-                        Ok(p) => p,
-                        Err(e) => break Err(format!("encode: {e}")),
-                    };
-                    // One timestamp for the room: everyone is hearing the same
-                    // person say the same thing at the same moment.
-                    let Some(frame) = outgoing.offer(packet) else {
-                        continue;
+                    // One gate and one timestamp for the room: everyone is
+                    // hearing the same person say the same thing at the same
+                    // moment, so it is described once and sealed per peer.
+                    let framed = outgoing.offer(&samples, |pcm| {
+                        encoder
+                            .encode_vec_float(pcm, MAX_DATAGRAM_FRAME - media::HEADER)
+                            .map_err(|e| sqnr_core::Error::Malformed(format!("encode: {e}")))
+                    });
+                    let frame = match framed {
+                        Ok(Some(f)) => f,
+                        Ok(None) => continue,
+                        Err(e) => break Err(e.to_string()),
                     };
                     let body = frame.encode();
                     for peer in members.peers.values_mut() {
@@ -702,10 +709,10 @@ async fn room_call(
                     // path anything may arrive, and in a room saying so once
                     // per frame would drown the roster.
                     if let Ok(plaintext) = peer.session.open(frame.seq, &frame.ciphertext)
-                        && let Ok(m) = media::Frame::decode(&plaintext)
+                        && let Ok(Some(m)) = media::Frame::decode(&plaintext)
                     {
                         peer.heard();
-                        peer.jitter.push(frame.seq, m.timestamp, m.payload);
+                        peer.jitter.push(frame.seq, m.timestamp, m.body);
                     }
                 }
             }
@@ -716,18 +723,14 @@ async fn room_call(
                     // Each peer's delay is its own: one bad path should not
                     // add latency to everybody else in the room.
                     if let Some(stale) = peer.jitter.trim() {
-                        let _ = peer.decoder.decode_float(&stale, &mut pcm, false);
+                        peer.playback
+                            .render(&sqex_voice::jitter::Playout::Frame(stale), &mut pcm);
                     }
-                    // Silence decodes like loss and counts as an active stream:
-                    // their noise floor stays continuous, and the mix gain does
-                    // not lurch every time somebody pauses for breath.
+                    // A described pause counts as an active stream: their room
+                    // keeps sounding like a room, and the mix gain does not
+                    // lurch every time somebody pauses for breath.
                     let slot = peer.jitter.pop();
-                    let decoded = match slot.to_decode() {
-                        Some(packet) => {
-                            peer.decoder.decode_float(packet, &mut pcm, false).is_ok()
-                        }
-                        None => false,
-                    };
+                    let decoded = peer.playback.render(&slot, &mut pcm);
                     if decoded {
                         peer.note_level(audio::rms(&pcm));
                         mixer.add(&pcm);
