@@ -123,6 +123,14 @@ pub const MAX_RETENTION: u32 = 365 * 24 * 60 * 60;
 
 /// Channels one identity may have created and not yet closed.
 pub const MAX_CHANNELS_PER_IDENTITY: usize = 256;
+/// Channels an identity may be invited to and not yet posted in.
+///
+/// The anti-spam measure. Anyone may invite anyone, so without it an identity
+/// can be added to unbounded numbers of channels by strangers. An invitation
+/// makes somebody a member immediately — there is no pending state at the
+/// exchange to count — so this counts memberships never spoken in, and a
+/// further invite is refused until they post in one or leave it.
+pub const MAX_UNSPOKEN: usize = 64;
 /// Entries returned by one `Fetch`.
 pub const MAX_BATCH: usize = 64;
 /// Bytes returned by one `Fetch`, whichever binds first.

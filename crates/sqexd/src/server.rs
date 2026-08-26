@@ -538,7 +538,7 @@ async fn route(
                     .unwrap_or(0);
                 server
                     .admissions
-                    .request(&me, &req.credential, &req.label, siblings);
+                    .request(&me, peer.key.as_ref(), &req.credential, &req.label, siblings);
                 // `now` is the only field, and it is here for the reason SIP-4
                 // gives: a client with a wrong clock has something to notice it
                 // against. It is identical for every caller.

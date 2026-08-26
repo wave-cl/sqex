@@ -35,6 +35,16 @@ use crate::state::now_unix;
 pub const MAX_PENDING: usize = 64;
 /// Requests held for one account.
 pub const MAX_PER_ACCOUNT: usize = 8;
+/// Requests one connection may have accepted in `RATE_WINDOW`.
+///
+/// A device already in the queue is turned away by the queue itself, so what
+/// this bounds is churn: a caller cycling short-lived credentials to keep
+/// re-entering, or submitting credentials for one account after another. It is
+/// keyed on the MAC1-verified transport key, which is what "per connection"
+/// means here.
+pub const MAX_PER_CONNECTION: usize = 4;
+/// The window `MAX_PER_CONNECTION` is counted over.
+pub const RATE_WINDOW: u64 = 60 * 60;
 pub const MAX_LABEL: usize = 64;
 
 /// One request, as an administrator sees it.
@@ -58,6 +68,9 @@ pub struct Admissions {
     /// Devices already declined, so a denied one does not refill the queue on
     /// its next connection. Expires with the credential that was denied.
     denied: Mutex<HashMap<PubKey, u64>>,
+    /// When each connection's accepted requests landed, for the rate limit.
+    /// Keyed on the transport key, and dropped once the window has passed.
+    accepted: Mutex<HashMap<[u8; 32], Vec<u64>>>,
 }
 
 impl Admissions {
@@ -73,6 +86,7 @@ impl Admissions {
     pub fn request(
         &self,
         caller: &PubKey,
+        connection: Option<&[u8; 32]>,
         credential: &Credential,
         label: &str,
         siblings: usize,
@@ -113,6 +127,21 @@ impl Admissions {
             >= MAX_PER_ACCOUNT
         {
             return;
+        }
+        // Last, because it is the only limit that consumes a budget: checking
+        // it before the others would let a request the queue was going to
+        // refuse anyway spend one.
+        if let Some(conn) = connection {
+            let mut accepted = self.accepted.lock().unwrap();
+            accepted.retain(|_, at| {
+                at.retain(|t| now.saturating_sub(*t) < RATE_WINDOW);
+                !at.is_empty()
+            });
+            let at = accepted.entry(*conn).or_default();
+            if at.len() >= MAX_PER_CONNECTION {
+                return;
+            }
+            at.push(now);
         }
         pending.insert(
             *caller,
@@ -176,7 +205,7 @@ mod tests {
     fn a_request_is_queued_with_what_an_admin_decides_on() {
         let (_, device) = identity(2);
         let a = Admissions::new();
-        a.request(&device, &credential(1, &device), "my laptop", 3);
+        a.request(&device, None, &credential(1, &device), "my laptop", 3);
         let list = a.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].device, device);
@@ -190,7 +219,7 @@ mod tests {
         let (_, mine) = identity(2);
         let (_, theirs) = identity(3);
         let a = Admissions::new();
-        a.request(&theirs, &credential(1, &mine), "", 0);
+        a.request(&theirs, None, &credential(1, &mine), "", 0);
         assert!(a.list().is_empty());
     }
 
@@ -200,7 +229,7 @@ mod tests {
         let mut bad = credential(1, &device);
         bad.signature[0] ^= 1;
         let a = Admissions::new();
-        a.request(&device, &bad, "", 0);
+        a.request(&device, None, &bad, "", 0);
         assert!(a.list().is_empty());
     }
 
@@ -208,10 +237,10 @@ mod tests {
     fn a_denied_device_does_not_refill_the_queue() {
         let (_, device) = identity(2);
         let a = Admissions::new();
-        a.request(&device, &credential(1, &device), "", 0);
+        a.request(&device, None, &credential(1, &device), "", 0);
         a.deny(&device);
         assert!(a.list().is_empty());
-        a.request(&device, &credential(1, &device), "", 0);
+        a.request(&device, None, &credential(1, &device), "", 0);
         assert!(a.list().is_empty(), "the decision stands");
     }
 
@@ -220,7 +249,7 @@ mod tests {
         let a = Admissions::new();
         for i in 0..(MAX_PER_ACCOUNT + 4) {
             let (_, d) = identity(100 + i as u8);
-            a.request(&d, &credential(1, &d), "", 0);
+            a.request(&d, None, &credential(1, &d), "", 0);
         }
         assert_eq!(a.list().len(), MAX_PER_ACCOUNT);
     }
@@ -229,10 +258,57 @@ mod tests {
     fn asking_twice_changes_nothing() {
         let (_, device) = identity(2);
         let a = Admissions::new();
-        a.request(&device, &credential(1, &device), "first", 0);
-        a.request(&device, &credential(1, &device), "second", 0);
+        a.request(&device, None, &credential(1, &device), "first", 0);
+        a.request(&device, None, &credential(1, &device), "second", 0);
         let list = a.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].label, "first");
+    }
+
+    #[test]
+    fn one_connection_may_only_land_so_many_requests_in_the_window() {
+        let a = Admissions::new();
+        let conn = [9u8; 32];
+        // The queue turns away a device that is already in it, so churn is what
+        // this bounds: a caller cycling devices from one connection.
+        for i in 0..MAX_PER_CONNECTION {
+            let (_, d) = identity(20 + i as u8);
+            a.request(&d, Some(&conn), &credential(1, &d), "", 0);
+        }
+        assert_eq!(a.list().len(), MAX_PER_CONNECTION);
+
+        let (_, one_more) = identity(90);
+        a.request(&one_more, Some(&conn), &credential(1, &one_more), "", 0);
+        assert_eq!(
+            a.list().len(),
+            MAX_PER_CONNECTION,
+            "the fifth is dropped, and the caller is told nothing"
+        );
+
+        // Silently: the queue is what changed, and only a different connection
+        // gets a fresh budget.
+        let other = [8u8; 32];
+        a.request(&one_more, Some(&other), &credential(1, &one_more), "", 0);
+        assert_eq!(a.list().len(), MAX_PER_CONNECTION + 1);
+    }
+
+    #[test]
+    fn a_request_the_queue_refuses_does_not_spend_the_budget() {
+        let a = Admissions::new();
+        let conn = [9u8; 32];
+        let (_, mine) = identity(2);
+        let (_, theirs) = identity(3);
+        // A forwarded credential is discarded before the rate limit is reached,
+        // so it costs nothing — otherwise anybody could exhaust their own
+        // budget with requests that were never going to be queued.
+        for _ in 0..(MAX_PER_CONNECTION * 3) {
+            a.request(&theirs, Some(&conn), &credential(1, &mine), "", 0);
+        }
+        assert!(a.list().is_empty());
+        for i in 0..MAX_PER_CONNECTION {
+            let (_, d) = identity(20 + i as u8);
+            a.request(&d, Some(&conn), &credential(1, &d), "", 0);
+        }
+        assert_eq!(a.list().len(), MAX_PER_CONNECTION);
     }
 }

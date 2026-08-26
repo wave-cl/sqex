@@ -36,6 +36,13 @@ pub const MAX_BLOB: u64 = 100 * 1024 * 1024;
 pub const MAX_CHUNKS: u32 = 400;
 /// Stored blob bytes per channel.
 pub const MAX_CHANNEL_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Channels one blob may be attached to.
+///
+/// Forwarding costs the reference and not the file, which is the point — but
+/// it also means one upload can be made to outlive every window that was
+/// supposed to bound it, since an attachment ages against its own channel. The
+/// cap is what stops a blob being kept alive indefinitely by re-forwarding.
+pub const MAX_BLOB_CHANNELS: usize = 64;
 /// Uploads one identity may have open at once.
 pub const MAX_UPLOADS: usize = 8;
 /// How long an incomplete upload is kept.
