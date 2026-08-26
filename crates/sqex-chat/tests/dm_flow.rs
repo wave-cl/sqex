@@ -385,3 +385,44 @@ async fn a_client_that_lost_its_store_can_still_publish_prekeys() {
     let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
     assert_eq!(said(&got.timeline), vec!["before the loss", "after the loss"]);
 }
+
+#[tokio::test]
+async fn a_lost_store_does_not_leave_stale_prekeys_for_peers_to_seal_to() {
+    // The failure a live trial produced, reduced. Before SIP-23's `Clear`, a
+    // client that lost its store left its prekeys on the exchange, still
+    // served; a peer sealed to one; the envelope would not open; the device
+    // rotated; the peer sealed the new epoch to another stale prekey; and the
+    // two rotated past each other until the stale pool drained.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    // Both publish, then both lose everything.
+    {
+        let _a = chat_at(addr, server_pub, 1, &dir.path().join("a1.db")).await;
+        let _b = chat_at(addr, server_pub, 2, &dir.path().join("b1.db")).await;
+    }
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("a2.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("b2.db")).await;
+
+    // Whatever either of them is served now must be a prekey the holder can
+    // actually open — the stale ones are gone rather than queued in front.
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, &bob_key, "after we both lost it").await.unwrap();
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert_eq!(
+        said(&got.timeline),
+        vec!["after we both lost it"],
+        "the two clients rotated past each other"
+    );
+
+    // And it is a conversation, not one lucky message.
+    bob.send(&channel, &alice_key, "so did i").await.unwrap();
+    let mut alices = Timeline::new();
+    let got = alice.poll(&channel, &mut alices, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["after we both lost it", "so did i"]);
+}

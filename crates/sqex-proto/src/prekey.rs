@@ -34,6 +34,7 @@ pub const PREKEY_CONTEXT: &[u8] = b"sqex-prekey-v1";
 pub const TYPE_PUBLISH: u8 = 0x01;
 pub const TYPE_TAKE: u8 = 0x02;
 pub const TYPE_COUNT: u8 = 0x03;
+pub const TYPE_CLEAR: u8 = 0x04;
 
 /// Served once, then gone. The forward secrecy is entirely in this.
 pub const KIND_ONE_TIME: u8 = 0x01;
@@ -52,6 +53,15 @@ pub const LOW_WATER: u16 = 16;
 pub const MAX_PUBLISH: usize = 64;
 /// One-time prekeys the exchange stores per device.
 pub const MAX_STORED: usize = 128;
+/// `Clear` calls one device may make in `CLEAR_WINDOW`.
+///
+/// Bounded because it is the one operation here that makes the exchange throw
+/// work away, and a device with nothing published is a device nothing can be
+/// sealed to. Generous against the intended use — a recovering client calls it
+/// once — and tight against a loop.
+pub const MAX_CLEAR: usize = 4;
+/// The window `MAX_CLEAR` is counted over.
+pub const CLEAR_WINDOW: u64 = 60 * 60;
 /// How long a fallback should live before being replaced. The real granularity
 /// of this SIP's guarantee in the worst case.
 pub const FALLBACK_MAX_AGE: u64 = 7 * 24 * 60 * 60;
@@ -484,6 +494,43 @@ pub struct PoolState {
     pub spent: Vec<u32>,
 }
 
+/// What `Clear` discarded, and where the device may resume.
+///
+/// `next_id` is one above every id the exchange has ever seen for this device.
+/// It is the half of this operation that a recovering client cannot get any
+/// other way: its own record of which ids it used went with the secrets, every
+/// one of them is refused forever, and `Counts` reports only the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cleared {
+    pub discarded: u16,
+    pub next_id: u32,
+    pub now: u64,
+}
+
+impl Cleared {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(14);
+        out.extend_from_slice(&self.discarded.to_be_bytes());
+        out.extend_from_slice(&self.next_id.to_be_bytes());
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Cleared> {
+        if b.len() != 14 {
+            return Err(Error::Malformed(format!(
+                "cleared is {} bytes, want 14",
+                b.len()
+            )));
+        }
+        Ok(Cleared {
+            discarded: u16::from_be_bytes(b[0..2].try_into().unwrap()),
+            next_id: u32::from_be_bytes(b[2..6].try_into().unwrap()),
+            now: u64::from_be_bytes(b[6..14].try_into().unwrap()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,5 +752,30 @@ mod tests {
         assert!(reloaded.take(fallback.id).is_ok());
         reloaded.mint_fallback();
         assert!(reloaded.take(fallback.id).is_err());
+    }
+
+    #[test]
+    fn cleared_round_trips() {
+        let c = Cleared {
+            discarded: 65,
+            next_id: 1_787_766_400,
+            now: 99,
+        };
+        assert_eq!(Cleared::decode(&c.encode()).unwrap(), c);
+        assert_eq!(c.encode().len(), 14);
+    }
+
+    #[test]
+    fn a_pool_can_be_restarted_above_a_floor() {
+        // What a client does with `next_id`: resume above everything the
+        // exchange remembers, having lost its own record of it.
+        let (seed, _) = device(1);
+        let mut pool = Pool::new(&seed);
+        let mut state = pool.save();
+        state.next_id = 1_787_766_400;
+        pool = Pool::load(&seed, state);
+        let minted = pool.mint_one_time(2);
+        assert_eq!(minted[0].id, 1_787_766_400);
+        assert_eq!(minted[1].id, 1_787_766_401);
     }
 }
