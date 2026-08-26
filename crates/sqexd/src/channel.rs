@@ -39,8 +39,8 @@ use sqex_proto::channel::{
     System, direct_message_id,
     ENTRY_HEADER, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
     MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
-    MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Post, Posted, Public, Retain, Role,
-    Visibility,
+    MAX_MINE, MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Membership, Mines, Post,
+    Posted, Public, Retain, Role, Visibility,
 };
 use sqex_proto::blob_store::{
     Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS,
@@ -941,6 +941,83 @@ fn prune(
 }
 
 impl Channels {
+    /// The channels an account belongs to, oldest membership first.
+    ///
+    /// The only route that answers "which channels am I in", and without it a
+    /// private channel cannot be found at all: its identifier is 32 bytes, it
+    /// is absent from the directory by construction, and every other operation
+    /// takes that identifier as input. A direct message escapes that because
+    /// its identifier derives from its two members; a group channel has no
+    /// such derivation, so an invitation reached an account with no way to
+    /// discover it had happened.
+    ///
+    /// Carries the epoch, the retained window and this account's read mark, so
+    /// a client draws a channel list without a request per channel. It carries
+    /// no name, and for a private channel there is none to carry: those are
+    /// stored empty here and travel sealed (SIP-19).
+    pub fn mine(&self, caller: &PubKey, offset: u32) -> Result<Mines, ChannelError> {
+        let db = self.db.lock().unwrap();
+        let total: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM member WHERE account = ?1 AND present = 1",
+                params![caller.as_bytes()],
+                |r| r.get(0),
+            )
+            .map_err(storage("count memberships"))?;
+
+        let mut stmt = db
+            .prepare(
+                "SELECT m.channel, c.visibility, m.role, m.joined, c.epoch,
+                        COALESCE(cu.read, 0)
+                 FROM member m
+                 JOIN channel c ON c.id = m.channel
+                 LEFT JOIN cursor cu ON cu.channel = m.channel AND cu.account = m.account
+                 WHERE m.account = ?1 AND m.present = 1
+                 ORDER BY m.joined ASC, m.channel ASC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(storage("prepare mine"))?;
+        let rows = stmt
+            .query_map(
+                params![caller.as_bytes(), MAX_MINE as i64, offset as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                        r.get::<_, i64>(1)? as u8,
+                        r.get::<_, i64>(2)? as u8,
+                        r.get::<_, i64>(3)? as u64,
+                        r.get::<_, i64>(4)? as u32,
+                        r.get::<_, i64>(5)? as u64,
+                    ))
+                },
+            )
+            .map_err(storage("query mine"))?;
+
+        let mut channels = Vec::new();
+        for row in rows {
+            let (channel, visibility, role, joined, epoch, read) =
+                row.map_err(storage("read membership"))?;
+            // The window is per channel and cheap; it is what tells a client
+            // whether it has a gap it can never fill.
+            let (first, last) = window(&db, &channel);
+            channels.push(Membership {
+                channel,
+                visibility: Visibility::from_u8(visibility).unwrap_or(Visibility::Private),
+                role: Role::from_u8(role).unwrap_or(Role::Member),
+                joined,
+                epoch,
+                first,
+                last,
+                read,
+            });
+        }
+        Ok(Mines {
+            now: now_unix(),
+            total: total as u32,
+            channels,
+        })
+    }
+
     /// Everything a member or an admin may know about a channel.
     ///
     /// An admin need not be a member of a public channel, where the role is

@@ -36,14 +36,16 @@ use ui::{App, Row, Said, Trouble, short};
     long_about = "End-to-end encrypted direct messages over sQUIC.
 
 A conversation's identifier is derived from the two identities in it, so there \
-is nothing to look up and nothing to join. The consequence is worth knowing \
-before you rely on it: the exchange has no way to tell you who has written to \
-you, so this client can only show conversations with people you have added. A \
-message from an account you have not added cannot be seen.
+is nothing to look up and nothing to join. Somebody who writes to you first is \
+found on startup by asking the exchange which channels you are in, and added \
+to your list — you do not have to know them in advance.
 
 Your keys live in ~/.sqex/chat, sealed under your identity. Lose that directory \
 and the conversations in it cannot be read again by anyone, including you — \
-that is the forward secrecy working, not a fault."
+that is the forward secrecy working, not a fault.
+
+Group channels exist in the exchange and this client has no interface for them \
+yet; it shows direct messages only."
 )]
 struct Cli {
     /// Server address, host:port (overrides SQEX_SERVER and ~/.sqnr/config).
@@ -61,7 +63,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Add somebody, so their messages can be seen. Discovery is this list.
+    /// Add somebody you want to write to first. Anyone who writes to you is
+    /// found on startup without this.
     Add {
         /// Their Ed25519 identity, base58.
         key: String,
@@ -166,7 +169,60 @@ struct Open {
     waiting: bool,
 }
 
+/// Find conversations nobody told us about, and add whoever started them.
+///
+/// This is what `Mine` bought. A direct message's identifier is a hash of the
+/// two accounts, so it cannot be run backwards to say who the other party is —
+/// but the exchange enforces membership and will therefore name them. Each
+/// candidate is checked by re-deriving the identifier from the account it
+/// found: a channel that does not hash back is not a direct message with that
+/// person, whatever the exchange said.
+///
+/// A channel that is not a direct message is left alone. This client has no
+/// interface for group channels yet, and inventing a contact for one would put
+/// a row on screen that nothing can open.
+async fn discover(chat: &mut Chat) -> std::result::Result<usize, ChatError> {
+    let known: Vec<PubKey> = chat
+        .store()
+        .contacts()
+        .map_err(ChatError::Store)?
+        .into_iter()
+        .map(|c| c.account)
+        .collect();
+    let mut found = 0;
+    for m in chat.mine().await? {
+        if known.iter().any(|k| chat.dm_with(k) == m.channel) {
+            continue;
+        }
+        let info = match chat.info(&m.channel).await {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let Some(other) = info
+            .members
+            .iter()
+            .map(|mem| mem.account)
+            .find(|a| *a != chat.me)
+        else {
+            continue;
+        };
+        if chat.dm_with(&other) != m.channel {
+            continue;
+        }
+        chat.store()
+            .add_contact(&other, &short(&other), now())
+            .map_err(ChatError::Store)?;
+        found += 1;
+    }
+    Ok(found)
+}
+
 async fn interface(mut chat: Chat) -> Result<(), String> {
+    // Before anything is drawn: somebody may have written to us while this
+    // client had never heard of them.
+    if let Err(e) = discover(&mut chat).await {
+        eprintln!("could not list your channels ({e}); showing known contacts only");
+    }
     let contacts = chat.store().contacts().map_err(|e| e.to_string())?;
     let mut open: Vec<Open> = Vec::new();
     for c in &contacts {

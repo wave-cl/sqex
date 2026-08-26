@@ -30,7 +30,7 @@ use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::channel::{
     Ack as ChannelAck, ByChannel, ByTarget, Cursor as ChannelCursor, Invitee, Role,
     SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
-    List as ChannelList, Post as ChannelPost, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
+    List as ChannelList, Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
@@ -873,6 +873,19 @@ async fn route(
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.close(&me, &req.channel) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        // The only route that answers "which channels am I in". Answerable
+        // about the caller and nobody else — it takes no account, so there is
+        // no way to ask about somebody. Without it a private channel cannot be
+        // found at all: it is absent from the directory by construction and
+        // every other operation takes its 32-byte identifier as input.
+        ("POST", "/channel/mine") => match (account, ChannelMine::decode(body)) {
+            (None, _) => no_identity("listing your channels"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.mine(&me, req.offset) {
+                Ok(mine) => (200, "application/octet-stream", mine.encode()),
                 Err(e) => refused(e),
             },
         },

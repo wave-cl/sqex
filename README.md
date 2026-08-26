@@ -76,9 +76,8 @@ calls both:
   spent — which is how a recipient notices an exchange serving the same prekey
   twice.
 
-The client for it is `sqex-chat` — direct messages, in a terminal. Group
-channels are built in the exchange and have no client yet, for a reason worth
-knowing before relying on any of this: see **Who can find you**.
+The client for it is `sqex-chat` — direct messages, in a terminal, with files.
+Group channels are built in the exchange and have no client yet.
 
 ```
 sqex-chat whoami             # your identity, to give to somebody
@@ -116,14 +115,19 @@ the confidentiality of two messages.
 ### Who can find you
 
 A direct message's identifier is derived from the two account keys, so starting
-one needs nothing from the exchange. **Being found does.** There is no route
-that answers *"which channels am I in"* — a private channel is invisible to the
-directory under any query, by design — so `sqex-chat` polls the conversations it
-knows about, and its contact list is the whole of discovery.
+one needs nothing from the exchange. **Being found used to.** A private channel
+is invisible to the directory under any query by design, and every other
+operation takes its 32-byte identifier as input — so an invitation reached an
+account with no way to discover it had happened.
 
-The consequence is real and the client says so in its `--help`: a message from
-an account you have not added cannot be seen. Closing that properly means a new
-route and a change to SIP-16; nothing here works around it.
+SIP-16's `Mine` closes that: it answers *"which channels am I in"*, about the
+caller and nobody else, and `sqex-chat` asks on startup. Somebody who writes to
+you first is found and added without your knowing them in advance.
+
+For a direct message the identifier is a hash and cannot be run backwards, so
+the other party comes from the member list the exchange enforces — and is then
+checked by re-deriving the identifier from it. A channel that does not hash
+back is not a direct message with that person, whatever the exchange said.
 
 ## How admin commands work
 

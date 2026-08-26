@@ -6,8 +6,8 @@
 //! because the exchange is either unable or is the party being constrained.
 
 use sqex_proto::channel::{
-    Ack, ByChannel, ChannelInfo, Create, Entries, Fetch, Invitee, KIND_MEMBER, Post, Posted, Role,
-    TYPE_INFO, Visibility, direct_message_id,
+    Ack, ByChannel, ChannelInfo, Create, Entries, Fetch, Invitee, KIND_MEMBER, MAX_MINE,
+    Membership, Mine, Mines, Post, Posted, Role, TYPE_INFO, Visibility, direct_message_id,
 };
 use sqex_proto::channel_key::{
     ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, open_envelope, seal_envelope,
@@ -253,6 +253,31 @@ impl Chat {
         p.verify(&them)
             .map_err(|e| ChatError::Protocol(format!("prekey for {them} does not verify: {e}")))?;
         Ok(p)
+    }
+
+    /// The channels this account is in, as the exchange sees them.
+    ///
+    /// The only way to learn about a channel nobody told us about. For direct
+    /// messages it is a cross-check rather than a discovery — the identifier
+    /// derives from the two accounts — but it is what finds a conversation
+    /// somebody started with us while this client had never heard of them.
+    pub async fn mine(&mut self) -> Result<Vec<Membership>> {
+        let mut all = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let body = self.post("/channel/mine", Mine { offset }.encode()).await?;
+            let page = Mines::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            let got = page.channels.len();
+            all.extend(page.channels);
+            // The total can move under paging as memberships change; stopping
+            // on a short page rather than on the count avoids looping forever
+            // if it grows while we read.
+            if got < MAX_MINE || all.len() as u32 >= page.total {
+                break;
+            }
+            offset += got as u32;
+        }
+        Ok(all)
     }
 
     // ---- opening a conversation -----------------------------------------

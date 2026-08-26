@@ -673,3 +673,169 @@ async fn a_parked_fetch_is_answered_by_a_signal_too() {
     assert_eq!(Entries::decode(&body).unwrap().signals.len(), 1);
     assert!(elapsed < std::time::Duration::from_secs(5), "waited {elapsed:?}");
 }
+
+#[tokio::test]
+async fn an_invitee_can_discover_the_private_channel_they_were_added_to() {
+    // The gap this route closes. A private channel is absent from the
+    // directory by construction and its identifier is 32 bytes, so before
+    // `Mine` an invitation reached an account with no way to learn it had
+    // happened — the identifier had to arrive out of band or the channel was
+    // unreachable. A direct message escapes that only because its identifier
+    // derives from its two members.
+    use sqex_proto::channel::{Mine, Mines};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, _alice) = identity(1);
+    let (bob_seed, bob) = identity(2);
+    let mut a = as_identity(addr, server_pub, alice_seed).await;
+    let mut b = as_identity(addr, server_pub, bob_seed).await;
+
+    let channel = [0x33; 32];
+    let (code, _) = a
+        .post(
+            "/channel/create",
+            Create {
+                channel,
+                visibility: Visibility::Private,
+                retention_secs: 3600,
+                max_entries: 0,
+                name: String::new(),
+                topic: String::new(),
+                invites: vec![sqex_proto::channel::Invitee {
+                    account: bob,
+                    role: Role::Member,
+                }],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    // Bob was never told the identifier, and the directory will not say.
+    let (code, body) = b
+        .post("/channel/list", sqex_proto::channel::List { offset: 0, query: String::new() }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    assert!(
+        sqex_proto::channel::Listing::decode(&body).unwrap().channels.is_empty(),
+        "a private channel appeared in the public directory"
+    );
+
+    // He asks what he is in, and finds it.
+    let (code, body) = b.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    assert_eq!(code, 200);
+    let mine = Mines::decode(&body).unwrap();
+    assert_eq!(mine.total, 1);
+    assert_eq!(mine.channels.len(), 1);
+    assert_eq!(mine.channels[0].channel, channel);
+    assert_eq!(mine.channels[0].visibility, Visibility::Private);
+    assert_eq!(mine.channels[0].role, Role::Member);
+    // Alice created it, so she is its admin and sees the same channel.
+    let (_, body) = a.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    assert_eq!(Mines::decode(&body).unwrap().channels[0].role, Role::Admin);
+}
+
+#[tokio::test]
+async fn mine_answers_about_the_caller_and_nobody_else() {
+    use sqex_proto::channel::{Mine, Mines};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(1);
+    let (stranger_seed, _) = identity(9);
+    let mut a = as_identity(addr, server_pub, alice_seed).await;
+    let mut s = as_identity(addr, server_pub, stranger_seed).await;
+
+    create(&mut a, &public([0x41; 32], "alice's room")).await;
+
+    // The request names no account, so there is no way to ask about one. A
+    // stranger asking gets their own empty list, not hers.
+    let (code, body) = s.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    assert_eq!(code, 200);
+    assert!(Mines::decode(&body).unwrap().channels.is_empty());
+
+    // And an anonymous connection has no memberships to report.
+    let mut anon = Client::connect(addr, &server_pub).await.unwrap();
+    let (code, body) = anon.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    assert_eq!(code, 403, "an unidentified caller was answered");
+    assert!(String::from_utf8_lossy(&body).contains("no_identity"));
+}
+
+#[tokio::test]
+async fn mine_pages_and_reports_the_window_and_the_read_mark() {
+    use sqex_proto::channel::{Cursor, Mine, Mines, MAX_MINE};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(1);
+    let mut a = as_identity(addr, server_pub, alice_seed).await;
+
+    for n in 0..(MAX_MINE + 5) {
+        let mut id = [0u8; 32];
+        id[0] = n as u8;
+        id[1] = (n >> 8) as u8;
+        create(&mut a, &public(id, &format!("room {n}"))).await;
+    }
+
+    let (_, body) = a.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let first = Mines::decode(&body).unwrap();
+    assert_eq!(first.total as usize, MAX_MINE + 5, "total counts them all");
+    assert_eq!(first.channels.len(), MAX_MINE, "one reply is bounded");
+
+    let (_, body) = a
+        .post("/channel/mine", Mine { offset: MAX_MINE as u32 }.encode())
+        .await
+        .unwrap();
+    let second = Mines::decode(&body).unwrap();
+    assert_eq!(second.channels.len(), 5);
+    // No overlap: paging by offset over a stable order.
+    assert!(second.channels.iter().all(|m| !first.channels.contains(m)));
+
+    // Post, read, and see both reflected without a second call per channel.
+    let mut id = [0u8; 32];
+    id[0] = 0;
+    post(&mut a, id, b"hello").await;
+    post(&mut a, id, b"again").await;
+    let (_, body) = a
+        .post("/channel/cursor", Cursor { channel: id, read: 1, receipts: true }.encode())
+        .await
+        .unwrap();
+    let _ = body;
+    let (_, body) = a.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let mine = Mines::decode(&body).unwrap();
+    let row = mine.channels.iter().find(|m| m.channel == id).unwrap();
+    assert_eq!(row.read, 1, "the read mark did not travel");
+    assert!(row.last >= 2, "the window did not travel: {row:?}");
+    assert!(row.first >= 1);
+}
+
+#[tokio::test]
+async fn leaving_removes_a_channel_from_mine() {
+    use sqex_proto::channel::{Mine, Mines, TYPE_LEAVE};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(1);
+    let (bob_seed, _) = identity(2);
+    let mut a = as_identity(addr, server_pub, alice_seed).await;
+    let mut b = as_identity(addr, server_pub, bob_seed).await;
+
+    let channel = [0x55; 32];
+    create(&mut a, &public(channel, "a room")).await;
+    join(&mut b, channel).await;
+
+    let (_, body) = b.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    assert_eq!(Mines::decode(&body).unwrap().channels.len(), 1);
+
+    b.post("/channel/leave", ByChannel { channel }.encode(TYPE_LEAVE))
+        .await
+        .unwrap();
+    let (_, body) = b.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    assert!(
+        Mines::decode(&body).unwrap().channels.is_empty(),
+        "a channel somebody left is still listed as theirs"
+    );
+}
