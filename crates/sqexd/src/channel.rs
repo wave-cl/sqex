@@ -1410,7 +1410,19 @@ impl Channels {
     /// `epoch` is the channel's current epoch — adding envelopes without
     /// rotating, which is how a member is handed the key already in use — or
     /// exactly one greater, which is a rotation and advances the channel.
-    pub fn put_keys(&self, caller: &PubKey, req: &KeyPut) -> Result<PutAck, ChannelError> {
+    /// Store envelopes for an epoch.
+    ///
+    /// `account_of` resolves a **device** to the account it belongs to (SIP-22),
+    /// because an envelope is addressed to a device while membership is held
+    /// per account. Passed in rather than held, so this store keeps no
+    /// dependency on the device registry — the same shape as `blocked` for
+    /// SIP-21.
+    pub fn put_keys(
+        &self,
+        caller: &PubKey,
+        req: &KeyPut,
+        account_of: &dyn Fn(&PubKey) -> PubKey,
+    ) -> Result<PutAck, ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin put"))?;
@@ -1429,11 +1441,17 @@ impl Channels {
             return Err(ChannelError::WrongEpoch);
         }
 
-        // An admin may publish to any member. A plain member may publish only
-        // to devices of its own account — which, until a device registry
-        // exists, means itself.
+        // An admin may publish to any member's devices. A plain member may
+        // publish to the devices of its **own account** and no others — which
+        // is SIP-17's same-account rule, and how a device linked after the fact
+        // gets the epoch in force without an admin having to come back for it.
         let admin = is_admin(&tx, &req.channel, caller);
-        if !admin && req.envelopes.iter().any(|e| &e.recipient != caller) {
+        if !admin
+            && req
+                .envelopes
+                .iter()
+                .any(|e| account_of(&e.recipient) != *caller)
+        {
             return Err(ChannelError::NotAnAdmin);
         }
         // Minting an epoch is an admin's act.
@@ -1445,7 +1463,8 @@ impl Channels {
             if e.prekey_id == 0 {
                 return Err(ChannelError::NoPrekey);
             }
-            if role_of(&tx, &req.channel, &e.recipient).is_none() {
+            // The recipient is a device; membership is held per account.
+            if role_of(&tx, &req.channel, &account_of(&e.recipient)).is_none() {
                 return Err(ChannelError::NotAMember);
             }
             let taken: Option<i64> = tx
@@ -1505,15 +1524,22 @@ impl Channels {
     /// Collect the envelopes addressed to the caller. Served **only** to the
     /// recipient each names; the exchange stores them opaquely and holds no key
     /// that opens one.
+    /// Collect the envelopes sealed to this **device**.
+    ///
+    /// Two identities, and they do different jobs: membership is checked
+    /// against the `account`, and the envelopes are looked up by the `device`
+    /// they were addressed to. An account with no registered devices is its own
+    /// device, so the single-client case passes the same key twice.
     pub fn get_keys(
         &self,
-        caller: &PubKey,
+        account: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         since_epoch: u32,
     ) -> Result<Got, ChannelError> {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
-        if role_of(&db, channel, caller).is_none() {
+        if role_of(&db, channel, account).is_none() {
             return Err(ChannelError::NotAMember);
         }
         let mut stmt = db
@@ -1525,7 +1551,7 @@ impl Channels {
             .map_err(storage("prepare get"))?;
         let envelopes = stmt
             .query_map(
-                params![&channel[..], caller.as_bytes(), since_epoch as i64],
+                params![&channel[..], device.as_bytes(), since_epoch as i64],
                 |r| {
                     Ok(Envelope {
                         recipient: PubKey::new([0; 32]),
