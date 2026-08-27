@@ -22,12 +22,12 @@ use sqex_chat::store::{Store, store_path};
 use sqex_proto::timeline::Timeline;
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::Signer;
-use sqex_proto::channel::Role;
+use sqex_proto::channel::{Role, Visibility};
 use sqnr_core::PubKey;
 
 mod ui;
 
-use ui::{App, Row, Said, Trouble, short};
+use ui::{App, Found, Row, Said, Trouble, short};
 
 #[derive(Parser)]
 #[command(
@@ -160,8 +160,11 @@ async fn run(cli: Cli) -> Result<(), String> {
 /// does not, which is the whole of the difference at this level — everything
 /// below is the same log, the same epoch key and the same timeline.
 struct Open {
-    /// The other party, for a direct message. `None` for a group.
+    /// The other party, for a direct message. `None` for a group or a public
+    /// channel.
     peer: Option<PubKey>,
+    /// Anybody may join and read this one.
+    public: bool,
     label: String,
     channel: [u8; 32],
     /// Who may redact and rename here. From the exchange, remembered so that a
@@ -247,21 +250,26 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
 
         // The exchange is authoritative about who administers a channel; the
         // store is what makes that survive being offline.
-        let admins = match chat.info(&m.channel).await {
-            Ok(info) => info
-                .members
-                .iter()
-                .filter(|mem| mem.role == Role::Admin)
-                .map(|mem| mem.account)
-                .collect(),
-            Err(_) => remembered.map(|k| k.3.clone()).unwrap_or_default(),
+        let public = m.visibility == Visibility::Public;
+        let (admins, given_name) = match chat.info(&m.channel).await {
+            Ok(info) => (
+                info.members
+                    .iter()
+                    .filter(|mem| mem.role == Role::Admin)
+                    .map(|mem| mem.account)
+                    .collect(),
+                info.name,
+            ),
+            Err(_) => (remembered.map(|k| k.3.clone()).unwrap_or_default(), String::new()),
         };
 
         let label = match &peer {
             Some((_, l)) => l.clone(),
-            // A group's name is a sealed entry, so it is not known until the
-            // log is read. Until then it is called by its identifier, which is
-            // at least unambiguous.
+            // A public channel's name is held by the exchange in the clear —
+            // that is what the directory searches — so it is known before a
+            // single entry is read. A group's is a sealed entry and is not, so
+            // until the log is read it goes by its identifier.
+            None if public && !given_name.is_empty() => given_name,
             None => remembered
                 .map(|k| k.2.clone())
                 .filter(|l| !l.is_empty())
@@ -276,6 +284,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
         let timeline_len = timeline.messages().count();
         open.push(Open {
             peer: peer.map(|(a, _)| a),
+            public,
             label,
             channel: m.channel,
             admins,
@@ -298,6 +307,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
         }
         open.push(Open {
             peer: Some(c.account),
+            public: false,
             label: c.label.clone(),
             channel,
             admins: vec![chat.me, c.account],
@@ -483,6 +493,13 @@ async fn handle_key(
         return;
     }
 
+    // The directory is a view over the transcript, so Esc puts it away rather
+    // than leaving the reader stuck looking at a search.
+    if code == KeyCode::Esc && !app.found.is_empty() {
+        app.found.clear();
+        return;
+    }
+
     match code {
         KeyCode::Tab | KeyCode::Down => {
             app.select_next();
@@ -505,32 +522,70 @@ async fn handle_key(
             // `/new` is the one command that needs no conversation, and it has
             // to be: with none open there is nothing selected, and requiring a
             // selection would mean the first group could never be made.
-            if let Command::New(name) = &cmd {
-                let made = chat.create_group(name, &[]).await;
-                let note = match &made {
-                    Ok(_) => format!("made {name} — /invite <key> to add somebody"),
-                    Err(e) => e.to_string(),
-                };
-                // The window is rebuilt only when there is something new to
-                // show. On failure the list is unchanged and the message must
-                // survive — an earlier version put it on the last row, which
-                // did not exist when the first group was the one that failed,
-                // so the only thing that went wrong went nowhere.
-                match (made, sync_channels(chat).await) {
-                    (Ok(channel), Ok(fresh)) => {
-                        *open = fresh;
-                        app.selected = open
-                            .iter()
-                            .position(|o| o.channel == channel)
-                            .unwrap_or(open.len().saturating_sub(1));
-                        if let Some(o) = open.get_mut(app.selected) {
-                            o.trouble.message = Some(note);
-                        }
-                    }
-                    _ => app.trouble.message = Some(note),
+            // Commands that need no conversation, and cannot require one:
+            // with none open there is nothing selected, so demanding a
+            // selection would mean the first channel could never be made or
+            // found.
+            match &cmd {
+                Command::New(name) => {
+                    let made = chat.create_group(name, &[]).await;
+                    let note = match &made {
+                        Ok(_) => format!("made {name} — /invite <key> to add somebody"),
+                        Err(e) => e.to_string(),
+                    };
+                    settle(chat, open, app, made.ok(), note).await;
+                    return;
                 }
-                return;
+                Command::Public(name) => {
+                    let made = chat.create_public(name, "").await;
+                    let note = match &made {
+                        Ok(_) => format!("made #{name} — anybody can find and join it"),
+                        Err(e) => e.to_string(),
+                    };
+                    settle(chat, open, app, made.ok(), note).await;
+                    return;
+                }
+                Command::Find(query) => {
+                    match chat.find(query, 0).await {
+                        Ok(listing) => {
+                            app.found_total = listing.total;
+                            app.found = listing
+                                .channels
+                                .into_iter()
+                                .map(|c| Found {
+                                    channel: c.channel,
+                                    name: c.name,
+                                    topic: c.topic,
+                                    members: c.members,
+                                })
+                                .collect();
+                            if app.found.is_empty() {
+                                app.trouble.message =
+                                    Some("no public channels match".into());
+                            }
+                        }
+                        Err(e) => app.trouble.message = Some(e.to_string()),
+                    }
+                    return;
+                }
+                Command::Join(n) => {
+                    let Some(found) = app.found.get(*n) else {
+                        app.trouble.message =
+                            Some("no such number — /find first".into());
+                        return;
+                    };
+                    let (channel, name) = (found.channel, found.name.clone());
+                    let note = match chat.join(&channel).await {
+                        Ok(()) => format!("joined #{name}"),
+                        Err(e) => e.to_string(),
+                    };
+                    app.found.clear();
+                    settle(chat, open, app, Some(channel), note).await;
+                    return;
+                }
+                _ => {}
             }
+
             let Some(i) = selected_index(open, app) else {
                 app.trouble.message =
                     Some("no conversation selected — ^N adds somebody, /new makes a group".into());
@@ -545,8 +600,11 @@ async fn handle_key(
                 Command::Send(text) => chat.send(&channel, &text).await.map(|_| None),
                 Command::File(path) => send_file(chat, &channel, &path).await.map(Some),
                 Command::Save(seq, path) => save_file(chat, &open[i], seq, &path).await.map(Some),
-                // Handled above: it needs no conversation.
-                Command::New(_) => Ok(None),
+                // Handled above: these need no conversation.
+                Command::New(_)
+                | Command::Public(_)
+                | Command::Find(_)
+                | Command::Join(_) => Ok(None),
                 Command::Name(name) => match chat.set_name(&channel, &name).await {
                     Ok(_) => Ok(Some(format!("renamed to {name}"))),
                     Err(e) => Err(e),
@@ -642,6 +700,12 @@ enum Command {
     Save(u64, std::path::PathBuf),
     /// `/new <name>` — a private group, which you can then invite people into.
     New(String),
+    /// `/public <name>` — a channel anybody may find and join.
+    Public(String),
+    /// `/find [query]` — search the public directory.
+    Find(String),
+    /// `/join <n>` — join a channel from the last search.
+    Join(usize),
     /// `/invite <key>` — add somebody, and give them the key.
     Invite(String),
     /// `/kick <key>` — remove somebody, and rotate so what follows is not theirs.
@@ -687,6 +751,17 @@ impl Command {
             }
             "/new" if !rest.is_empty() => Command::New(rest.to_string()),
             "/new" => Command::Unknown("/new needs a name".into()),
+            "/public" if !rest.is_empty() => Command::Public(rest.to_string()),
+            "/public" => Command::Unknown("/public needs a name".into()),
+            // An empty query lists everything, which is the useful default on
+            // a small exchange and what SIP-16 specifies.
+            "/find" => Command::Find(rest.to_string()),
+            "/join" => match first.parse::<usize>() {
+                Ok(n) if n >= 1 => Command::Join(n - 1),
+                _ => Command::Unknown(
+                    "/join takes a number from the last /find".into(),
+                ),
+            },
             "/name" if !rest.is_empty() => Command::Name(rest.to_string()),
             "/name" => Command::Unknown("/name needs a name".into()),
             "/invite" if !first.is_empty() => Command::Invite(first.to_string()),
@@ -778,6 +853,36 @@ async fn save_file(
     Ok(format!("saved {} bytes to {}", bytes.len(), target.display()))
 }
 
+/// Rebuild the conversation list and land on `channel`, carrying a note.
+///
+/// The list is rebuilt rather than patched because the exchange is the
+/// authority on what we are in, and guessing at it here is how the two drift
+/// apart. On failure the list is unchanged and the note must still survive —
+/// an earlier version put it on the last row, which did not exist when the
+/// first channel was the one that failed, so the only thing that went wrong
+/// went nowhere.
+async fn settle(
+    chat: &mut Chat,
+    open: &mut Vec<Open>,
+    app: &mut App,
+    channel: Option<[u8; 32]>,
+    note: String,
+) {
+    match (channel, sync_channels(chat).await) {
+        (Some(channel), Ok(fresh)) => {
+            *open = fresh;
+            app.selected = open
+                .iter()
+                .position(|o| o.channel == channel)
+                .unwrap_or(open.len().saturating_sub(1));
+            if let Some(o) = open.get_mut(app.selected) {
+                o.trouble.message = Some(note);
+            }
+        }
+        _ => app.trouble.message = Some(note),
+    }
+}
+
 async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed: &str) {
     let Ok(account) = typed.parse::<PubKey>() else {
         app.trouble.message = Some(format!("{typed:?} is not a base58 identity"));
@@ -798,6 +903,7 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
     let channel = chat.dm_with(&account);
     let mut conv = Open {
         peer: Some(account),
+        public: false,
         label,
         channel,
         admins: vec![chat.me, account],
@@ -838,6 +944,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
             channel: o.channel,
             label: o.label.clone(),
             group: o.peer.is_none(),
+            public: o.public,
             unread: o.unread,
             waiting: o.waiting,
         })
@@ -1017,6 +1124,7 @@ mod tests {
     fn conv(peer: u8, label: &str) -> Open {
         Open {
             peer: Some(PubKey::new([peer; 32])),
+            public: false,
             label: label.to_string(),
             channel: [7; 32],
             admins: vec![PubKey::new([1; 32]), PubKey::new([peer; 32])],
@@ -1053,6 +1161,7 @@ mod tests {
                 channel: [7; 32],
                 label: "bob".into(),
                 group: false,
+                public: false,
                 unread: 0,
                 waiting: false,
             }],
@@ -1078,6 +1187,7 @@ mod tests {
                 channel: [7; 32],
                 label: "bob".into(),
                 group: false,
+                public: false,
                 unread: 0,
                 waiting: true,
             }],
@@ -1100,6 +1210,7 @@ mod tests {
                 channel: [7; 32],
                 label: "bob".into(),
                 group: false,
+                public: false,
                 unread: 0,
                 waiting: true,
             }],

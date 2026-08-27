@@ -7,8 +7,8 @@
 
 use sqex_proto::channel::{
     Ack, ByAccount, ByChannel, ChannelInfo, Create, Entries, Fetch, Invite, Invitee, KIND_MEMBER,
-    MAX_MINE, Membership, Mine, Mines, Post, Posted, Role, TYPE_INFO, TYPE_LEAVE, TYPE_REMOVE,
-    Visibility, direct_message_id,
+    List, Listing, MAX_MINE, MAX_NAME, MAX_TOPIC, Membership, Mine, Mines, Post, Posted, Role,
+    TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REMOVE, Visibility, direct_message_id,
 };
 use sqex_proto::channel_key::{
     ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, open_envelope, seal_envelope,
@@ -377,6 +377,13 @@ impl Chat {
     /// difference is what a person sees on the screen.
     pub async fn ensure_epoch(&mut self, channel: &[u8; 32]) -> Result<u32> {
         let info = self.info(channel).await?;
+        // A public channel has no epoch and never gains one. Everything in it
+        // is stored in the clear, because anybody may join and would therefore
+        // hold any key it used — SIP-16 says so plainly, and encrypting anyway
+        // would produce something that looks end-to-end and is not.
+        if info.visibility == Visibility::Public {
+            return Ok(0);
+        }
         if info.epoch == 0 {
             self.mint_epoch(channel, 1, &members_of(&info)).await?;
             return Ok(self.info(channel).await?.epoch);
@@ -593,6 +600,61 @@ impl Chat {
         Ok(channel)
     }
 
+    /// Make a public channel: anybody may find it and anybody may join.
+    ///
+    /// Its name and topic go to the exchange **in the clear**, which is the
+    /// point — the directory is how somebody finds a room they were never told
+    /// about. A private channel's name is sealed precisely because it has a
+    /// membership graph beside it; a public one has nothing to protect.
+    pub async fn create_public(&mut self, name: &str, topic: &str) -> Result<[u8; 32]> {
+        let mut channel = [0u8; 32];
+        {
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut channel);
+        }
+        self.post(
+            "/channel/create",
+            Create {
+                channel,
+                visibility: Visibility::Public,
+                retention_secs: RETENTION_SECS,
+                max_entries: 0,
+                name: name.chars().take(MAX_NAME).collect(),
+                topic: topic.chars().take(MAX_TOPIC).collect(),
+                invites: Vec::new(),
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(channel)
+    }
+
+    /// Search the public directory. An empty query returns everything.
+    pub async fn find(&mut self, query: &str, offset: u32) -> Result<Listing> {
+        let body = self
+            .post(
+                "/channel/list",
+                List {
+                    offset,
+                    query: query.to_string(),
+                }
+                .encode(),
+            )
+            .await?;
+        Listing::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// Join a public channel. A private one refuses, which is what stops its
+    /// identifier being a way in.
+    pub async fn join(&mut self, channel: &[u8; 32]) -> Result<()> {
+        self.post(
+            "/channel/join",
+            ByChannel { channel: *channel }.encode(TYPE_JOIN),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Name a channel, for everyone who can read it.
     ///
     /// A sealed entry rather than a field, so the exchange never learns what a
@@ -766,10 +828,6 @@ impl Chat {
     pub async fn send_body(&mut self, channel: &[u8; 32], body: Body) -> Result<Posted> {
         let epoch = self.ensure_epoch(channel).await?;
         let info = self.info(channel).await?;
-        let key = self
-            .store
-            .key(channel, epoch)?
-            .ok_or(ChatError::NoKey(epoch))?;
 
         // The counter must never repeat under one key. Take the higher of what
         // we remember and what the exchange accepted from us — the exchange
@@ -779,9 +837,19 @@ impl Chat {
         let local = if seen_epoch == epoch { mine } else { 0 };
         let msg_seq = local.max(info.my_msg_seq) + 1;
 
-        let sealed = key
-            .seal(channel, epoch, &self.me, msg_seq, &body.encode())
-            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let plain = body.encode();
+        let sealed = if epoch == 0 {
+            // Public: posted as it stands. The counter is still kept, because
+            // the exchange orders on it and a reader still sees which device
+            // said what — it simply is not a nonce here, since there is no key.
+            plain
+        } else {
+            self.store
+                .key(channel, epoch)?
+                .ok_or(ChatError::NoKey(epoch))?
+                .seal(channel, epoch, &self.me, msg_seq, &plain)
+                .map_err(|e| ChatError::Protocol(e.to_string()))?
+        };
 
         // Recorded before the post, not after. If the answer is lost in flight
         // the entry may still have landed, and burning a counter costs nothing
@@ -876,12 +944,17 @@ impl Chat {
                 }
                 self.store.record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
             }
-            let plain = self
-                .store
-                .key(channel, e.epoch)
-                .ok()
-                .flatten()
-                .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok());
+            let plain = if e.epoch == 0 {
+                // Epoch 0 is unsealed by construction: every entry in a public
+                // channel, and the exchange's own system entries everywhere.
+                Some(e.body.clone())
+            } else {
+                self.store
+                    .key(channel, e.epoch)
+                    .ok()
+                    .flatten()
+                    .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok())
+            };
             // Kept, not cached. The counter may not be decrypted twice and the
             // exchange serves an epoch key's envelope once, so a message not
             // written here is one this client can never read again.

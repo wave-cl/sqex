@@ -30,6 +30,9 @@ pub struct Row {
     /// to" and "who can read this" are the same question in one and not in the
     /// other.
     pub group: bool,
+    /// Anybody may join and read this one. Marked differently from a private
+    /// group because the difference is the whole of what matters about it.
+    pub public: bool,
     pub unread: usize,
     /// They have never run a client, so nothing can be sealed to them yet.
     pub waiting: bool,
@@ -108,6 +111,14 @@ impl Trouble {
     }
 }
 
+/// One row of a directory search.
+pub struct Found {
+    pub channel: [u8; 32],
+    pub name: String,
+    pub topic: String,
+    pub members: u16,
+}
+
 /// Everything on screen.
 #[derive(Default)]
 pub struct App {
@@ -120,6 +131,11 @@ pub struct App {
     pub peer_typing: bool,
     /// The "add a contact" prompt, when it is open.
     pub adding: Option<String>,
+    /// The last directory search, if one is showing. Numbered, because joining
+    /// by index beats pasting sixty-four hex characters.
+    pub found: Vec<Found>,
+    /// How many matched in total, which may exceed what one reply carries.
+    pub found_total: u32,
     pub should_quit: bool,
 }
 
@@ -195,14 +211,24 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, r)| {
             let selected = i == app.selected;
-            let mut spans = vec![Span::styled(
-                format!("{}{:<15}", if r.group { "#" } else { " " }, truncate(&r.label, 15)),
-                if selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
-                },
-            )];
+            let base = if selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![
+                // Yellow for public: anybody may join and read it, and that is
+                // the one thing about a row worth seeing before you type.
+                Span::styled(
+                    if r.group { "#" } else { " " }.to_string(),
+                    if r.public {
+                        base.fg(Color::Yellow)
+                    } else {
+                        base
+                    },
+                ),
+                Span::styled(format!("{:<15}", truncate(&r.label, 15)), base),
+            ];
             if r.unread > 0 {
                 spans.push(Span::styled(
                     format!(" {}", r.unread),
@@ -233,6 +259,10 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn transcript(f: &mut Frame, app: &App, area: Rect) {
+    if !app.found.is_empty() {
+        directory(f, app, area);
+        return;
+    }
     let mut lines: Vec<Line> = Vec::new();
     if app.trouble.lost > 0 {
         // In the transcript, above the messages that did survive, because that
@@ -297,6 +327,36 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The directory, numbered so `/join <n>` can act on it.
+fn directory(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "{} public channel{} — /join <n> to enter, Esc to go back",
+            app.found_total,
+            if app.found_total == 1 { "" } else { "s" }
+        ),
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for (i, c) in app.found.iter().enumerate() {
+        let mut spans = vec![
+            Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("#{}", c.name), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("  {} member{}", c.members, if c.members == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if !c.topic.is_empty() {
+            spans.push(Span::styled(
+                format!("  {}", truncate(&c.topic, 40)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
 fn input(f: &mut Frame, app: &App, area: Rect) {
     let (title, content) = match &app.adding {
         Some(buf) => ("their public key (base58), then Enter", buf.as_str()),
@@ -313,7 +373,7 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 fn status(f: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if app.trouble.is_quiet() {
         (
-            " ^C quit · Tab · ^N add · /new /invite /kick /rotate /who · /file /save".to_string(),
+            " ^C quit · Tab · ^N add · /public /find /join · /new /invite /kick · /file /save".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
@@ -390,6 +450,7 @@ mod tests {
                     channel: [i; 32],
                     label: format!("p{i}"),
                     group: false,
+                    public: false,
                     unread: 0,
                     waiting: false,
                 })
@@ -452,6 +513,7 @@ mod tests {
                 channel: [2; 32],
                 label: "bob".into(),
                 group: false,
+                public: false,
                 unread: 2,
                 waiting: false,
             }],
@@ -492,7 +554,7 @@ mod tests {
         assert!(out.contains("^C quit"));
         assert!(out.contains("^N add"));
         assert!(out.contains("/file"));
-        assert!(out.contains("/new"));
+        assert!(out.contains("/find"));
     }
 
     #[test]
