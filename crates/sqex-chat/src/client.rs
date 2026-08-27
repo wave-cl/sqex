@@ -11,7 +11,8 @@ use sqex_proto::channel::{
     TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REMOVE, Visibility, direct_message_id,
 };
 use sqex_proto::channel_key::{
-    ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, open_envelope, seal_envelope,
+    Absent, ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING, open_envelope,
+    seal_envelope,
 };
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
 use sqex_proto::device::{Device, Devices, ListDevices, Register, Revoke};
@@ -226,6 +227,14 @@ impl Chat {
             // exchange is too old", the other is "that thing is not there".
             if code == 404 && said.trim() == "not found" {
                 return Err(ChatError::NoChatHere(path.to_string()));
+            }
+            // A refusal the caller can act on, rather than a status code it has
+            // to parse. This one matters now that the client no longer decides
+            // locally whether it may rotate: SIP-17 lets a member rekey after
+            // revoking one of its own devices, and only the exchange holds the
+            // facts to judge it.
+            if code == 403 && said.contains("not_an_admin") {
+                return Err(ChatError::NotAnAdmin);
             }
             return Err(ChatError::Refused(code, said));
         }
@@ -725,6 +734,21 @@ impl Chat {
         Ok(sealed)
     }
 
+    /// Which devices in this channel hold no key for the epoch in force.
+    ///
+    /// SIP-17 says to check after inviting somebody and after any device
+    /// registers, because those are the two moments that create a member who
+    /// can fetch entries and open none of them — a state nothing else reports.
+    pub async fn stranded(&mut self, channel: &[u8; 32]) -> Result<Absent> {
+        let body = self
+            .post(
+                "/channel/key/missing",
+                ByChannel { channel: *channel }.encode(TYPE_MISSING),
+            )
+            .await?;
+        Absent::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
     /// Withdraw a device.
     ///
     /// What a portable credential structurally cannot do. Note what it does
@@ -915,9 +939,11 @@ impl Chat {
     /// next one, not the last.
     pub async fn rotate(&mut self, channel: &[u8; 32]) -> Result<u32> {
         let info = self.info(channel).await?;
-        if !is_admin(&info, &self.me) {
-            return Err(ChatError::NotAnAdmin);
-        }
+        // Not gated on being an admin here. SIP-17 lets a member rekey after
+        // revoking one of its own devices, and the exchange is the party that
+        // can check it — it holds both the revocation and the moment the epoch
+        // was minted. Refusing locally would make that rule unreachable.
+        let _ = is_admin(&info, &self.me);
         let to = self.devices_of(&members_of(&info)).await?;
         self.mint_epoch(channel, info.epoch + 1, &to).await?;
         Ok(self.info(channel).await?.epoch)
@@ -1108,7 +1134,16 @@ impl Chat {
 
         // Who may redact and whose metadata counts — Timeline needs this, and
         // it is only in the member list.
-        let info = self.info(channel).await?;
+        let mut info = self.info(channel).await?;
+
+        // Somebody may have rotated while this client was running — after a
+        // removal, or after revoking a device. Collect once when we hold no key
+        // for the epoch in force, or a client would sit showing unreadable
+        // entries until it was restarted.
+        if info.epoch > 0 && self.store.key(channel, info.epoch)?.is_none() {
+            self.collect_keys(channel).await?;
+            info = self.info(channel).await?;
+        }
         let admins: Vec<PubKey> = info
             .members
             .iter()

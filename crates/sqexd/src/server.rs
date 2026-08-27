@@ -952,7 +952,15 @@ async fn route(
                 // the channel store, which keeps that store free of any
                 // knowledge of the registry.
                 let account_of = |d: &PubKey| server.devices.account_for(d);
-                match server.channels.put_keys(&me, &req, &account_of) {
+                // SIP-17: a member who is not an admin may advance the epoch
+                // when it revoked one of its own devices since this one was
+                // minted. The exchange holds both facts; neither store needs
+                // to know about the other.
+                let revoked_since = |a: &PubKey, since: u64| server.devices.revoked_since(a, since);
+                match server
+                    .channels
+                    .put_keys(&me, &req, &account_of, &revoked_since)
+                {
                     Ok(ack) => (200, "application/octet-stream", ack.encode()),
                     Err(e) => refused(e),
                 }
@@ -973,7 +981,24 @@ async fn route(
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
                 let has = |d: &PubKey| server.prekeys.has_any(d);
-                match server.channels.missing_keys(&me, &req.channel, &has) {
+                // An account with none registered is its own device (SIP-22).
+                let devices_of = |a: &PubKey| {
+                    server
+                        .devices
+                        .list(a)
+                        .map(|d| {
+                            if d.devices.is_empty() {
+                                vec![*a]
+                            } else {
+                                d.devices.iter().map(|x| x.device).collect()
+                            }
+                        })
+                        .unwrap_or_else(|_| vec![*a])
+                };
+                match server
+                    .channels
+                    .missing_keys(&me, &req.channel, &devices_of, &has)
+                {
                     Ok(absent) => (200, "application/octet-stream", absent.encode()),
                     Err(e) => refused(e),
                 }

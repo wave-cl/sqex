@@ -168,6 +168,19 @@ fn unspoken_full(db: &Connection, account: &PubKey) -> Result<bool, ChannelError
     Ok(n as usize >= MAX_UNSPOKEN)
 }
 
+/// Add a column to a table that predates it, if it is not already there.
+fn add_column(db: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing.iter().any(|c| c == column) {
+        db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
 fn storage<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> ChannelError + '_ {
     move |e| {
         tracing::error!(error = %e, "channel storage: {what}");
@@ -210,7 +223,11 @@ CREATE TABLE IF NOT EXISTS channel (
     next_seq       INTEGER NOT NULL,
     creator        BLOB    NOT NULL,
     created        INTEGER NOT NULL,
-    empty_since    INTEGER
+    empty_since    INTEGER,
+    -- When the current epoch was minted. SIP-17 lets a member who is not an
+    -- admin advance the epoch when it revoked one of its own devices *since*
+    -- this moment, so the exchange has to hold the moment.
+    epoch_at       INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS member (
     channel BLOB    NOT NULL,
@@ -331,6 +348,9 @@ impl Channels {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch(SCHEMA)?;
+        // A deployed exchange has a `channel` table without `epoch_at`, and
+        // `CREATE TABLE IF NOT EXISTS` will not add it.
+        add_column(&db, "channel", "epoch_at", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Channels {
             db: Mutex::new(db),
             max_channel_bytes: MAX_CHANNEL_BYTES,
@@ -1422,6 +1442,7 @@ impl Channels {
         caller: &PubKey,
         req: &KeyPut,
         account_of: &dyn Fn(&PubKey) -> PubKey,
+        revoked_since: &dyn Fn(&PubKey, u64) -> bool,
     ) -> Result<PutAck, ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
@@ -1446,7 +1467,36 @@ impl Channels {
         // is SIP-17's same-account rule, and how a device linked after the fact
         // gets the epoch in force without an admin having to come back for it.
         let admin = is_admin(&tx, &req.channel, caller);
+
+        // Ordinarily an admin's act — but not always. A member may rekey after
+        // revoking one of its own devices, and without that the advice to
+        // rotate after a revocation is advice nobody can follow: losing a phone
+        // in a group where you are an ordinary member would leave you able to
+        // revoke the device and unable to change the key, so whoever holds it
+        // keeps reading every future message until an admin happens to act.
+        //
+        // It is not an escalation. They already hold the current key and can
+        // already read everything; all they gain is stopping a key they know to
+        // be compromised from continuing to work.
+        let rekeying = !admin && req.epoch != epoch && {
+            let minted: i64 = tx
+                .query_row(
+                    "SELECT epoch_at FROM channel WHERE id = ?1",
+                    params![&req.channel[..]],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("read epoch_at"))?
+                .unwrap_or(0);
+            revoked_since(caller, minted as u64)
+        };
+
+        // A plain member publishes only to the devices of its own account —
+        // SIP-17's same-account rule. One rekeying is advancing the epoch for
+        // everybody, so it must be able to seal to everybody: permitting the
+        // rotation and not its envelopes would be no permission at all.
         if !admin
+            && !rekeying
             && req
                 .envelopes
                 .iter()
@@ -1454,8 +1504,7 @@ impl Channels {
         {
             return Err(ChannelError::NotAnAdmin);
         }
-        // Minting an epoch is an admin's act.
-        if !admin && req.epoch != epoch {
+        if !admin && req.epoch != epoch && !rekeying {
             return Err(ChannelError::NotAnAdmin);
         }
 
@@ -1507,8 +1556,8 @@ impl Channels {
         }
         if req.epoch == epoch + 1 {
             tx.execute(
-                "UPDATE channel SET epoch = ?2 WHERE id = ?1",
-                params![&req.channel[..], req.epoch as i64],
+                "UPDATE channel SET epoch = ?2, epoch_at = ?3 WHERE id = ?1",
+                params![&req.channel[..], req.epoch as i64, now as i64],
             )
             .map_err(storage("advance epoch"))?;
             write_system(&tx, &req.channel, EVENT_ROTATED, caller, caller, now)?;
@@ -1578,10 +1627,19 @@ impl Channels {
     /// Without this a member can be stranded silently: they fetch entries
     /// successfully, open none of them, and look exactly like somebody who is
     /// not reading.
+    /// Which devices hold no envelope for the epoch in force.
+    ///
+    /// **Devices, not accounts**, and the distinction is the whole value of the
+    /// call: envelopes are addressed to devices, so asking whether an *account*
+    /// has one reports every correctly-sealed member as stranded and never
+    /// reports the device that actually is. This is the one diagnostic the
+    /// design has for the failure that linking a client creates, and it was
+    /// inverted by linking until this took `devices_of`.
     pub fn missing_keys(
         &self,
         caller: &PubKey,
         channel: &[u8; 32],
+        devices_of: &dyn Fn(&PubKey) -> Vec<PubKey>,
         has_prekeys: &dyn Fn(&PubKey) -> bool,
     ) -> Result<Absent, ChannelError> {
         let db = self.db.lock().unwrap();
@@ -1593,34 +1651,51 @@ impl Channels {
         let mut stmt = db
             .prepare(
                 "SELECT account FROM member WHERE channel = ?1 AND present = 1
-                 AND account NOT IN (
-                     SELECT recipient FROM envelope WHERE channel = ?1 AND epoch = ?2)
                  ORDER BY account ASC",
             )
             .map_err(storage("prepare missing"))?;
         let accounts: Vec<PubKey> = stmt
-            .query_map(params![&channel[..], epoch as i64], |r| {
+            .query_map(params![&channel[..]], |r| {
                 Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
             })
             .map_err(storage("query missing"))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage("read missing"))?;
 
+        let mut sealed = db
+            .prepare(
+                "SELECT 1 FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = ?3",
+            )
+            .map_err(storage("prepare sealed"))?;
+
+        let mut stranded = Vec::new();
+        for account in accounts {
+            // A member may ask only about its own account; an admin about all.
+            if !admin && account != *caller {
+                continue;
+            }
+            for device in devices_of(&account) {
+                let has: Option<i64> = sealed
+                    .query_row(
+                        params![&channel[..], device.as_bytes(), epoch as i64],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(storage("check sealed"))?;
+                if has.is_none() {
+                    stranded.push(Stranded {
+                        account,
+                        device,
+                        has_prekeys: has_prekeys(&device),
+                    });
+                }
+            }
+        }
+
         Ok(Absent {
             epoch,
             now: now_unix(),
-            devices: accounts
-                .into_iter()
-                // A member may ask only about its own account.
-                .filter(|a| admin || a == caller)
-                .map(|a| Stranded {
-                    account: a,
-                    // No device registry yet, so an account is its own device,
-                    // which is what SIP-22 says of one with none registered.
-                    device: a,
-                    has_prekeys: has_prekeys(&a),
-                })
-                .collect(),
+            devices: stranded,
         })
     }
 }

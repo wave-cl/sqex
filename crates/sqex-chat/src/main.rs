@@ -274,6 +274,14 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                 collected += chat.collect_keys(&m.channel).await.unwrap_or(0);
             }
             println!("collected {collected} channel key(s)");
+            // SIP-17 says to check after any device registers.
+            let mut waiting = 0;
+            for m in chat.mine().await.map_err(|e| e.to_string())? {
+                waiting += chat.stranded(&m.channel).await.map(|a| a.devices.len()).unwrap_or(0);
+            }
+            if waiting > 0 {
+                println!("{waiting} device(s) across your channels still hold no key");
+            }
             println!("run `sqex-chat` on your other client once, so it can seal you the rest");
             Ok(())
         }
@@ -775,10 +783,27 @@ async fn handle_key(
                     Err(e) => Err(e),
                 },
                 Command::Invite(key) => match key.parse::<PubKey>() {
-                    Ok(who) => chat
-                        .invite(&channel, &who)
-                        .await
-                        .map(|()| Some(format!("invited {}", short(&who)))),
+                    Ok(who) => match chat.invite(&channel, &who).await {
+                        // SIP-17 says to check after inviting: this is the one
+                        // report of a member who can fetch entries and open
+                        // none of them, and nothing else would say so.
+                        Ok(()) => {
+                            let waiting = chat
+                                .stranded(&channel)
+                                .await
+                                .map(|a| a.devices.len())
+                                .unwrap_or(0);
+                            Ok(Some(if waiting > 0 {
+                                format!(
+                                    "invited {} — {waiting} device(s) still hold no key",
+                                    short(&who)
+                                )
+                            } else {
+                                format!("invited {}", short(&who))
+                            }))
+                        }
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
                 },
                 Command::Kick(key) => match key.parse::<PubKey>() {

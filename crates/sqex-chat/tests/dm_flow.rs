@@ -1261,3 +1261,83 @@ async fn a_late_key_opens_what_was_already_held() {
     );
     let _ = &mut bob;
 }
+
+#[tokio::test]
+async fn missing_names_devices_and_not_accounts() {
+    // The one diagnostic the design has for a member who can fetch entries and
+    // open none of them — and device-addressed envelopes inverted it. Asking
+    // whether an *account* holds an envelope reports every correctly-sealed
+    // member as stranded, and never reports the device that actually is.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
+
+    let channel = phone.create_group("the thing", &[bob_key]).await.unwrap();
+    // Everybody sealed: nothing is stranded.
+    assert!(
+        phone.stranded(&channel).await.unwrap().devices.is_empty(),
+        "a correctly sealed channel reported somebody stranded"
+    );
+
+    // Link a device and do *not* reseal to it.
+    let laptop =
+        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    let absent = phone.stranded(&channel).await.unwrap();
+    assert_eq!(absent.devices.len(), 1, "the new device should be reported");
+    assert_eq!(absent.devices[0].device, laptop.device());
+    assert_eq!(
+        absent.devices[0].account, phone.me,
+        "reported under the account it belongs to"
+    );
+    assert!(
+        absent.devices[0].has_prekeys,
+        "it published prekeys when it claimed, so it can be sealed to"
+    );
+
+    // Once sealed, it stops being reported.
+    phone.reseal_to_siblings(&channel).await.unwrap();
+    assert!(phone.stranded(&channel).await.unwrap().devices.is_empty());
+    let _ = &mut bob;
+}
+
+#[tokio::test]
+async fn a_member_may_rekey_after_revoking_one_of_its_own_devices() {
+    // SIP-17 makes this a MUST, and without it the advice to rotate after a
+    // revocation is advice nobody can follow: lose a phone in a group where
+    // you are an ordinary member and you could revoke the device and not
+    // change the key, so whoever holds it keeps reading every future message
+    // until an admin — who may be unreachable — happens to act.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+
+    // Carol owns the group. Bob is an ordinary member.
+    let channel = carol.create_group("the thing", &[bob_key]).await.unwrap();
+    bob.collect_keys(&channel).await.unwrap();
+    let before = carol.info(&channel).await.unwrap().epoch;
+
+    // Bob has revoked nothing, so he may not rotate.
+    assert!(
+        matches!(bob.rotate(&channel).await, Err(sqex_chat::ChatError::NotAnAdmin)),
+        "an ordinary member rotated without cause"
+    );
+
+    // He links a device, loses it, and revokes it.
+    let laptop = link_device(addr, server_pub, &mut bob, 8, &dir.path().join("laptop.db")).await;
+    bob.revoke_device(&laptop.device()).await.unwrap();
+
+    // Now he may rekey — exactly once per revocation, and the exchange checks
+    // it because it holds both the revocation and when the epoch was minted.
+    bob.rotate(&channel).await.unwrap();
+    assert!(carol.info(&channel).await.unwrap().epoch > before);
+
+    // And what follows is not the revoked device's.
+    bob.send(&channel, "after the revoke").await.unwrap();
+    let mut t = Timeline::new();
+    let got = carol.poll(&channel, &mut t, 0).await.unwrap();
+    assert!(said(&got.timeline).contains(&"after the revoke".to_string()));
+}
