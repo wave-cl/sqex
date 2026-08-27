@@ -430,3 +430,63 @@ async fn a_malformed_request_is_still_a_malformed_request() {
     let (code, _) = c.post("/admission/request", vec![0x04, 0, 0]).await.unwrap();
     assert_eq!(code, 400);
 }
+
+#[tokio::test]
+async fn the_account_may_revoke_a_device_it_never_registered_beside() {
+    // SIP-22's Security considerations name the account key as the recovery
+    // when somebody has lost their oldest device, and until this rule nothing
+    // in its Specification granted it. Every path refused the account:
+    // not_authorised while unregistered, and Senior if it registered itself
+    // afterwards, being by then the junior of its own devices.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (account_seed, account) = keys(51);
+    let (laptop_seed, laptop) = keys(52);
+
+    let mut l = connect(addr, pubkey, laptop_seed).await;
+    assert_eq!(enrol(&mut l, &account_seed, &laptop, 3600).await, 200);
+    assert_eq!(devices_of(&mut l, &account).await.devices.len(), 1);
+
+    // The account has no device row of its own, and revokes anyway.
+    let mut a = connect(addr, pubkey, account_seed).await;
+    let (code, body) = a
+        .post("/device/revoke", Revoke { device: laptop }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(devices_of(&mut a, &account).await.devices.is_empty());
+}
+
+#[tokio::test]
+async fn the_account_is_exempt_from_seniority_and_nobody_else_is() {
+    // The exemption is for the account a device belongs to. It must not have
+    // widened the door for anyone else.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (account_seed, account) = keys(61);
+    let (first_seed, first) = keys(62);
+    let (stranger_seed, stranger) = keys(63);
+
+    let mut f = connect(addr, pubkey, first_seed).await;
+    assert_eq!(enrol(&mut f, &account_seed, &first, 3600).await, 200);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // The account registers itself last, so it is the junior of the two.
+    let mut a = connect(addr, pubkey, account_seed).await;
+    assert_eq!(enrol(&mut a, &account_seed, &account, 3600).await, 200);
+
+    // A stranger with its own account cannot touch somebody else's device.
+    let mut s = connect(addr, pubkey, stranger_seed).await;
+    assert_eq!(enrol(&mut s, &stranger_seed, &stranger, 3600).await, 200);
+    let (code, _) = s
+        .post("/device/revoke", Revoke { device: first }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 403, "a stranger revoked another account's device");
+
+    // The account may, junior though it is.
+    let (code, body) = a
+        .post("/device/revoke", Revoke { device: first }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+}

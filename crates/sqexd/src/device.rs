@@ -81,6 +81,19 @@ impl DeviceError {
     }
 }
 
+/// Add a column to a table that predates it, if it is not already there.
+fn add_column(db: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let mut stmt = db.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing.iter().any(|c| c == column) {
+        db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
 fn storage<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> DeviceError + '_ {
     move |e| {
         tracing::error!(error = %e, "device registry: {what}");
@@ -101,7 +114,11 @@ CREATE TABLE IF NOT EXISTS device (
 CREATE TABLE IF NOT EXISTS revoked (
     device    BLOB PRIMARY KEY,
     at        INTEGER NOT NULL,
-    not_after INTEGER NOT NULL
+    not_after INTEGER NOT NULL,
+    -- Whose device it was. The device row is deleted on revocation, so without
+    -- this the account is lost — and SIP-17 needs exactly this fact to let a
+    -- member rekey a channel after revoking one of its own devices.
+    account   BLOB
 );
 CREATE INDEX IF NOT EXISTS device_by_account ON device (account);
 "#;
@@ -119,7 +136,30 @@ impl Registry {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch(SCHEMA)?;
+        // `CREATE TABLE IF NOT EXISTS` creates tables and never alters one that
+        // already exists, so a column added after a release needs this. A
+        // deployed exchange has a `revoked` table without `account`.
+        add_column(&db, "revoked", "account", "BLOB")?;
         Ok(Registry { db: Mutex::new(db) })
+    }
+
+    /// Whether this account revoked any device at or after `since`.
+    ///
+    /// SIP-17 lets a member who is not an admin advance a channel's epoch when
+    /// it holds a revocation made since that epoch was minted — which is what
+    /// makes "rotate after revoking" advice somebody can actually follow when
+    /// they are an ordinary member of a group.
+    pub fn revoked_since(&self, account: &PubKey, since: u64) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM revoked WHERE account = ?1 AND at >= ?2 LIMIT 1",
+            params![account.as_bytes(), since as i64],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
     }
 
     /// Map a device to the account whose credential it presents.
@@ -242,21 +282,34 @@ impl Registry {
         expire(&tx, now)?;
 
         let target = row(&tx, device)?.ok_or(DeviceError::NoSuchDevice)?;
-        let mine = row(&tx, caller)?.ok_or(DeviceError::NotAuthorised)?;
-        if mine.1 != target.1 {
-            return Err(DeviceError::NotAuthorised);
-        }
-        // May name itself, which is how a client signs itself out.
-        if caller != device && mine.2 > target.2 {
-            return Err(DeviceError::Senior);
+
+        // The account itself may revoke any of its devices, registered or not,
+        // and is exempt from seniority. It signed every credential; a design in
+        // which it can withdraw none of them is not one anybody intended, and
+        // seniority exists to stop a compromised recent device evicting its
+        // seniors rather than to bind the authority they all derive from.
+        //
+        // Necessary rather than convenient: an account that registered itself
+        // after linking another device would be the junior of the two, so
+        // seniority alone would leave it unable to remove a device it
+        // authorised.
+        if *caller != target.1 {
+            let mine = row(&tx, caller)?.ok_or(DeviceError::NotAuthorised)?;
+            if mine.1 != target.1 {
+                return Err(DeviceError::NotAuthorised);
+            }
+            // May name itself, which is how a client signs itself out.
+            if caller != device && mine.2 > target.2 {
+                return Err(DeviceError::Senior);
+            }
         }
 
         tx.execute("DELETE FROM device WHERE device = ?1", params![device.as_bytes()])
             .map_err(storage("delete device"))?;
         tx.execute(
-            "INSERT INTO revoked (device, at, not_after) VALUES (?1, ?2, ?3)
-             ON CONFLICT (device) DO UPDATE SET at = ?2, not_after = ?3",
-            params![device.as_bytes(), now as i64, target.3 as i64],
+            "INSERT INTO revoked (device, at, not_after, account) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (device) DO UPDATE SET at = ?2, not_after = ?3, account = ?4",
+            params![device.as_bytes(), now as i64, target.3 as i64, target.1.as_bytes()],
         )
         .map_err(storage("record revocation"))?;
         tx.commit().map_err(storage("commit revoke"))?;

@@ -49,7 +49,7 @@ SQEX_SERVER=host:5400 SQEX_SERVER_KEY=<b58> sqex status   # environment
 | Store-and-forward mailbox | [5](https://github.com/wave-cl/sips/blob/main/sip-0005.md) | `sqex mail` |
 | Relayed session | [12](https://github.com/wave-cl/sips/blob/main/sip-0012.md) | `sqex session talk` |
 | Rooms and voice | [13](https://github.com/wave-cl/sips/blob/main/sip-0013.md), [15](https://github.com/wave-cl/sips/blob/main/sip-0015.md) | `sqex-voice call`, `sqex-voice room` |
-| Chat: direct messages, groups, files | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | `sqex-chat` |
+| Chat: messages, groups, public channels, files | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | `sqex-chat` |
 
 ## Chat
 
@@ -76,19 +76,27 @@ calls both:
   spent — which is how a recipient notices an exchange serving the same prekey
   twice.
 
-The client for it is `sqex-chat` — direct messages and private groups, in a
-terminal, with files.
+The client for it is `sqex-chat` — direct messages, private groups, public
+channels and files, in a terminal, across as many of your own clients as you
+care to link.
 
 ```
 sqex-chat whoami             # your identity, to give to somebody
 sqex-chat add <their-key>    # somebody you want to write to first
 sqex-chat                    # the conversations
+sqex-chat device link <key>  # authorise another of your own clients
 ```
 
-Inside: `/new <name>` makes a private group, `/invite` and `/kick` change who is
-in it, `/rotate` hands everyone a new key, `/who` lists the members, `/file` and
-`/save` move files, and `^N` adds a contact. A group's name is a sealed entry,
-so the exchange never learns what it is called.
+Inside: `/public <name>` makes a channel anybody may find, `/find [query]`
+searches the directory and `/join <n>` enters one by number. `/new <name>` makes
+a private group instead, `/invite` and `/kick` change who is in it, `/rotate`
+hands everyone a new key, `/who` lists the members, `/file` and `/save` move
+files, and `^N` adds a contact.
+
+A private group's name is a sealed entry, so the exchange never learns what it
+is called. A public channel's is not, and cannot be: the directory is how
+somebody finds a room nobody told them about. Public rows carry a yellow `#`,
+because "anybody can read this" is the one thing worth seeing before you type.
 
 `/kick` rotates, and that is not optional: the exchange refuses a removed member
 further entries, but they keep every key they were ever given, so without a new
@@ -107,7 +115,16 @@ prekey, and opening that envelope spends the prekey. Ask the exchange for the
 same envelope tomorrow and it will hand over the same bytes to no effect,
 because the secret that opened them is gone. That is the forward secrecy
 working exactly as intended, and it means the copy `sqex-chat` writes to
-`~/.sqex/chat` is the only copy that will exist.
+`~/.sqex/chat` is the only copy that will exist — unless you have made another
+one, which is what linking a second client is.
+
+**That is the closest thing to a backup this design offers, and it is worth
+knowing before you need it.** A linked client holds its own copy of every epoch
+key its siblings have handed it, so losing one machine stops being losing the
+conversation. Nothing else recovers it: an exchange refuses a second envelope
+for a recipient at an epoch, so a client that lost its store cannot simply be
+sent the key again — the remedy is `/rotate`, which hands out the *next* epoch
+and never a past one.
 
 So losing that directory loses the conversations in it, permanently, for
 everybody including you. The store is SQLite with every secret sealed under a
@@ -143,6 +160,11 @@ SIP-16's `Mine` closes that: it answers *"which channels am I in"*, about the
 caller and nobody else, and `sqex-chat` asks on startup. Somebody who writes to
 you first is found and added without your knowing them in advance, and a group
 you are invited to appears without anybody sending you its identifier.
+
+A **public** channel is the opposite case and needs none of that: it is in the
+directory, `/find` searches it by name and topic, and joining is one request
+with nothing granted to you. Private channels never appear there under any
+query, which is the rule that stops an identifier being a way in.
 
 For a direct message the identifier is a hash and cannot be run backwards, so
 the other party comes from the member list the exchange enforces — and is then
