@@ -734,6 +734,20 @@ impl Chat {
         Ok(sealed)
     }
 
+    /// Whether this client still acts for the account it was linked to.
+    ///
+    /// `None` when it was never linked — an account with no registered devices
+    /// is its own device, and there is nothing to check. `Some(false)` means it
+    /// has been revoked, which is otherwise learned only by being refused as a
+    /// stranger to every conversation it can see.
+    pub async fn still_linked(&mut self) -> Result<Option<bool>> {
+        if self.me == self.device {
+            return Ok(None);
+        }
+        let devices = self.my_devices().await?;
+        Ok(Some(devices.iter().any(|d| d.device == self.device)))
+    }
+
     /// Which devices in this channel hold no key for the epoch in force.
     ///
     /// SIP-17 says to check after inviting somebody and after any device

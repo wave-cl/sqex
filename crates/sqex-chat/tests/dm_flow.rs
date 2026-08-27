@@ -1341,3 +1341,22 @@ async fn a_member_may_rekey_after_revoking_one_of_its_own_devices() {
     let got = carol.poll(&channel, &mut t, 0).await.unwrap();
     assert!(said(&got.timeline).contains(&"after the revoke".to_string()));
 }
+
+#[tokio::test]
+async fn a_revoked_client_is_told_so_rather_than_refused_everywhere() {
+    // Otherwise it learns by being treated as a stranger by every route it
+    // tries, which is true and explains nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
+    let mut laptop =
+        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+
+    assert_eq!(laptop.still_linked().await.unwrap(), Some(true));
+    phone.revoke_device(&laptop.device()).await.unwrap();
+    assert_eq!(laptop.still_linked().await.unwrap(), Some(false));
+
+    // A client that was never linked has nothing to check and must not be
+    // told it was revoked.
+    assert_eq!(phone.still_linked().await.unwrap(), None);
+}

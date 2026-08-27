@@ -192,6 +192,17 @@ async fn run(cli: Cli) -> Result<(), String> {
         return device_command(&mut chat, cmd).await;
     }
 
+    // A revoked client is otherwise refused as a stranger by every route it
+    // tries, which is true and tells nobody what happened.
+    if matches!(chat.still_linked().await, Ok(Some(false))) {
+        return Err(format!(
+            "this client has been revoked from {} — it is no longer one of that \
+             account's devices, and the keys it already holds are all it will \
+             ever have. Link it again to carry on.",
+            chat.me
+        ));
+    }
+
     interface(chat).await
 }
 
