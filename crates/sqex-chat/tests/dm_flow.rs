@@ -929,3 +929,116 @@ async fn a_key_that_has_not_arrived_yet_is_not_called_lost() {
     assert!(!got.unreadable.is_empty(), "and it should say something is waiting");
     let _ = &mut bob;
 }
+
+// ---- public channels ------------------------------------------------------
+
+#[tokio::test]
+async fn a_stranger_finds_a_public_channel_and_joins_it() {
+    // The whole point of a public channel: no invitation, no identifier passed
+    // out of band, no key. The directory is how you find it and joining is how
+    // you read it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut stranger = chat_at(addr, server_pub, 9, &dir.path().join("stranger.db")).await;
+
+    let channel = alice.create_public("rustaceans", "").await.unwrap();
+    alice.send(&channel, "anybody about?").await.unwrap();
+
+    // The stranger was told nothing. They search, find it, and join.
+    let listing = stranger.find("rusta", 0).await.unwrap();
+    assert_eq!(listing.total, 1);
+    assert_eq!(listing.channels[0].channel, channel);
+    assert_eq!(listing.channels[0].name, "rustaceans");
+    stranger.join(&channel).await.unwrap();
+
+    let mut t = Timeline::new();
+    let got = stranger.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["anybody about?"]);
+    assert!(got.unreadable.is_empty(), "nothing to unseal");
+    assert_eq!(got.lost, 0);
+
+    // And they can speak, without anybody granting them anything.
+    stranger.send(&channel, "just arrived").await.unwrap();
+    let mut at = Timeline::new();
+    let got = alice.poll(&channel, &mut at, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["anybody about?", "just arrived"]);
+}
+
+#[tokio::test]
+async fn a_public_channel_is_stored_in_the_clear_and_that_is_the_point() {
+    // SIP-16 is explicit: anybody may join, so anybody may hold any key it
+    // used. Encrypting anyway would produce something that looks end-to-end
+    // and is not. This test exists so that nobody later "fixes" it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice.create_public("town square", "").await.unwrap();
+    let said_aloud = "this is not a secret";
+    alice.send(&channel, said_aloud).await.unwrap();
+
+    // Read it the way the exchange can: straight out of the entry it stored.
+    let db = rusqlite::Connection::open(dir.path().join("channels.db")).unwrap();
+    let body: Vec<u8> = db
+        .query_row(
+            "SELECT body FROM entry WHERE channel = ?1 AND kind = 1 ORDER BY seq DESC LIMIT 1",
+            [&channel[..]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        body.windows(said_aloud.len())
+            .any(|w| w == said_aloud.as_bytes()),
+        "a public channel should be readable by the exchange"
+    );
+    // And it decodes as an ordinary SIP-19 body, with no key involved.
+    let post = sqex_proto::message::Body::decode(&body).unwrap().unwrap();
+    assert!(matches!(post, sqex_proto::message::Body::Post(_)));
+    // No epoch, so no key was ever minted for it.
+    assert_eq!(alice.info(&channel).await.unwrap().epoch, 0);
+    assert!(alice.store().key(&channel, 0).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_private_channel_refuses_a_join() {
+    // The rule that stops an identifier being a way in. A group's id is random
+    // rather than derived, but 32 bytes is not a secret and must not be one.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut stranger = chat_at(addr, server_pub, 9, &dir.path().join("stranger.db")).await;
+
+    let channel = alice.create_group("private club", &[bob_key]).await.unwrap();
+    alice.send(&channel, "members only").await.unwrap();
+
+    // Not in the directory under any query.
+    assert!(stranger.find("", 0).await.unwrap().channels.is_empty());
+    // And knowing the identifier does not help.
+    assert!(stranger.join(&channel).await.is_err());
+    let mut t = Timeline::new();
+    assert!(stranger.poll(&channel, &mut t, 0).await.is_err());
+}
+
+#[tokio::test]
+async fn a_public_channel_a_person_joined_comes_back_from_mine() {
+    // It has to appear in the client's own list on the next start, or joining
+    // is a thing you have to do again every time.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let joiner_store = dir.path().join("joiner.db");
+    let mut joiner = chat_at(addr, server_pub, 9, &joiner_store).await;
+
+    let channel = alice.create_public("the pub", "open to all").await.unwrap();
+    joiner.join(&channel).await.unwrap();
+
+    let mine = joiner.mine().await.unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].channel, channel);
+    assert_eq!(mine[0].visibility, sqex_proto::channel::Visibility::Public);
+    // Epoch 0: there is nothing to collect and nothing to wait for.
+    assert_eq!(mine[0].epoch, 0);
+}
