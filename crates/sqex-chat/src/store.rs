@@ -549,7 +549,8 @@ impl Store {
             .execute(
                 "INSERT INTO message (channel, seq, account, posted, kind, sealed)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT (channel, seq) DO NOTHING",
+                 ON CONFLICT (channel, seq)
+                 DO UPDATE SET sealed = COALESCE(message.sealed, excluded.sealed)",
                 params![
                     &channel[..],
                     seq as i64,
@@ -600,6 +601,38 @@ impl Store {
             out.push((seq, account, posted, kind, plain));
         }
         Ok(out)
+    }
+
+    // ---- who this client is ---------------------------------------------
+
+    /// The account this client acts for, once it has been linked to one.
+    ///
+    /// `None` until `device claim` records it. An unlinked client is its own
+    /// account, and the caller substitutes its device key — which is the
+    /// ordinary single-client case and why this was invisible until a second
+    /// device existed.
+    pub fn account(&self) -> Result<Option<PubKey>> {
+        let v: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'account'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read account"))?;
+        Ok(v.and_then(|b| b.try_into().ok()).map(PubKey::new))
+    }
+
+    pub fn set_account(&self, account: &PubKey) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('account', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = ?1",
+                params![account.as_bytes()],
+            )
+            .map_err(storage("set account"))?;
+        Ok(())
     }
 
     // ---- what a channel is ----------------------------------------------
@@ -701,6 +734,20 @@ impl Store {
             .optional()
             .map_err(storage("read cursor"))?
             .unwrap_or((0, 0, 0)))
+    }
+
+    /// Read this channel again from the beginning.
+    ///
+    /// For when a key arrives after the entries it opens: those were held and
+    /// could not be read, and nothing else would ever look at them again.
+    pub fn rewind(&self, channel: &[u8; 32]) -> Result<()> {
+        self.db
+            .execute(
+                "UPDATE cursor SET since = 0 WHERE channel = ?1",
+                params![&channel[..]],
+            )
+            .map_err(storage("rewind"))?;
+        Ok(())
     }
 
     pub fn set_since(&self, channel: &[u8; 32], since: u64) -> Result<()> {

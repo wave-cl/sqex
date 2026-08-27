@@ -13,6 +13,8 @@ use sqex_proto::channel::{
 use sqex_proto::channel_key::{
     ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, open_envelope, seal_envelope,
 };
+use sqex_proto::credential::{Credential, SCOPE_CHAT};
+use sqex_proto::device::{Device, Devices, ListDevices, Register, Revoke};
 use sqex_proto::message::{Body, Post as SipPost};
 use sqex_proto::prekey::{
     Cleared, Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_CLEAR, TYPE_COUNT, Take, Taken,
@@ -107,6 +109,34 @@ fn members_of(info: &ChannelInfo) -> Vec<PubKey> {
     info.members.iter().map(|m| m.account).collect()
 }
 
+/// Everyone a channel key must actually reach.
+///
+/// **Devices, not accounts.** SIP-17 derives its per-sender subkey from the
+/// device precisely so two clients under one identity do not share one and
+/// reuse a nonce — so an envelope has to be openable by the device that will
+/// use it, and a device holds its own key, not its account's.
+///
+/// An account with no registered devices is its own device, which is the
+/// ordinary single-client case and why this was invisible for so long.
+impl Chat {
+    async fn devices_of(&mut self, members: &[PubKey]) -> Result<Vec<PubKey>> {
+        let mut out = Vec::new();
+        for account in members {
+            let body = self
+                .post("/device/list", ListDevices { account: *account }.encode())
+                .await?;
+            let listed =
+                Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            if listed.devices.is_empty() {
+                out.push(*account);
+            } else {
+                out.extend(listed.devices.iter().map(|d| d.device));
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Whether an account may mint an epoch here.
 fn is_admin(info: &ChannelInfo, who: &PubKey) -> bool {
     info.members
@@ -139,21 +169,35 @@ pub struct Conversation {
 pub struct Chat {
     client: Client,
     seed: [u8; 32],
-    /// Our own account. With no registered devices an account is its own
-    /// device, which is the ordinary single-client case and the one this
-    /// client is built for.
+    /// The account we act for. Membership, roles, direct-message identifiers
+    /// and display are all per account.
     pub me: PubKey,
+    /// This client's own key. Sealing subkeys, message counters and prekeys are
+    /// all per device, which is the distinction SIP-17 and SIP-22 exist to
+    /// draw — two clients under one identity must not share a subkey.
+    device: PubKey,
     store: Store,
 }
 
 impl Chat {
-    pub fn new(client: Client, seed: [u8; 32], me: PubKey, store: Store) -> Chat {
+    /// `device` is this client's own key — what it seals under, publishes
+    /// prekeys for, and counts messages with. The **account** it acts for is
+    /// usually the same key, and is not once the client has been linked to
+    /// one, which is what `device claim` records.
+    pub fn new(client: Client, seed: [u8; 32], device: PubKey, store: Store) -> Chat {
+        let me = store.account().ok().flatten().unwrap_or(device);
         Chat {
             client,
             seed,
             me,
+            device,
             store,
         }
+    }
+
+    /// This client's own key, as against the account it acts for.
+    pub fn device(&self) -> PubKey {
+        self.device
     }
 
     pub fn store(&self) -> &Store {
@@ -385,7 +429,8 @@ impl Chat {
             return Ok(0);
         }
         if info.epoch == 0 {
-            self.mint_epoch(channel, 1, &members_of(&info)).await?;
+            let to = self.devices_of(&members_of(&info)).await?;
+            self.mint_epoch(channel, 1, &to).await?;
             return Ok(self.info(channel).await?.epoch);
         }
         if self.store.key(channel, info.epoch)?.is_none() {
@@ -405,8 +450,8 @@ impl Chat {
                 if !is_admin(&info, &self.me) {
                     return Err(ChatError::NoKey(info.epoch));
                 }
-                self.mint_epoch(channel, info.epoch + 1, &members_of(&info))
-                    .await?;
+                let to = self.devices_of(&members_of(&info)).await?;
+                self.mint_epoch(channel, info.epoch + 1, &to).await?;
                 let after = self.info(channel).await?.epoch;
                 return self
                     .store
@@ -528,6 +573,11 @@ impl Chat {
         // Deleting is the mechanism, and it only counts once it is durable.
         self.store.save_pool(&pool)?;
         if opened > 0 {
+            // Entries under these epochs were held and unreadable; now they are
+            // not. Nothing else would ever revisit them.
+            self.store.rewind(channel)?;
+        }
+        if opened > 0 {
             self.top_up_prekeys().await?;
         }
         Ok(opened)
@@ -555,6 +605,136 @@ impl Chat {
             );
         }
         Ok(timeline)
+    }
+
+    // ---- devices (SIP-20 and SIP-22) ------------------------------------
+
+    /// The devices this account has registered, and when each expires.
+    pub async fn my_devices(&mut self) -> Result<Vec<Device>> {
+        let body = self
+            .post("/device/list", ListDevices { account: self.me }.encode())
+            .await?;
+        Ok(Devices::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .devices)
+    }
+
+    /// Sign a credential naming `device`, so that device may act for us.
+    ///
+    /// The credential is **portable and self-contained**: anybody holding the
+    /// account key can verify it with no record of the grant, which is what
+    /// lets a device present it to an exchange that has never heard of it. That
+    /// is also why it cannot be withdrawn — revocation is SIP-22's half, and it
+    /// lives at the exchange because a signature cannot un-sign itself.
+    pub fn issue_credential(&self, device: &PubKey, lifetime: u64) -> Result<Credential> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Credential::issue(&self.seed, device, SCOPE_CHAT, now, now + lifetime)
+            .map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// Register ourselves as a device of the account that signed `credential`.
+    ///
+    /// Called by the **new** device, on its own connection: the credential's
+    /// delegate must equal the caller's transport identity, so a credential
+    /// somebody found is a credential they cannot use.
+    pub async fn register_self(&mut self, credential: &Credential) -> Result<()> {
+        self.post(
+            "/device/register",
+            Register {
+                credential: credential.clone(),
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Hand the epoch in force to our own other devices.
+    ///
+    /// SIP-17 permits this without an admin — a device may seal to devices of
+    /// its own account — and it is how a client linked after a conversation
+    /// started gets in without anybody rotating. Rotating instead would be the
+    /// wrong tool: it would deny the new device everything said before it, and
+    /// disturb every other member to do it.
+    ///
+    /// One envelope per request, because the exchange refuses a whole batch if
+    /// any single recipient already holds one for that epoch — and a sibling
+    /// that already has its key is the ordinary case, not a failure.
+    pub async fn reseal_to_siblings(&mut self, channel: &[u8; 32]) -> Result<usize> {
+        let info = self.info(channel).await?;
+        if info.epoch == 0 {
+            return Ok(0);
+        }
+        let key = self
+            .store
+            .key(channel, info.epoch)?
+            .ok_or(ChatError::NoKey(info.epoch))?;
+
+        let mut sealed = 0;
+        let mut siblings = 0;
+        for device in self.my_devices().await? {
+            if device.device == self.device {
+                continue;
+            }
+            siblings += 1;
+            let p = match self.take_prekey_for(device.device).await {
+                Ok(p) => p,
+                // Not yet started, so nothing to seal to. It will collect once
+                // it has published, and asking again costs one request.
+                Err(ChatError::NotReady(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            let envelope = seal_envelope(&device.device, p.id, &p.public, info.epoch, &[key])
+                .map_err(|e| ChatError::Protocol(e.to_string()))?;
+            let body = self
+                .post(
+                    "/channel/key/put",
+                    KeyPut {
+                        channel: *channel,
+                        epoch: info.epoch,
+                        envelopes: vec![envelope],
+                    }
+                    .encode(),
+                )
+                .await?;
+            if PutAck::decode(&body)
+                .map_err(|e| ChatError::Protocol(e.to_string()))?
+                .accepted
+            {
+                sealed += 1;
+            }
+        }
+        self.top_up_prekeys().await?;
+        if siblings > 0 && sealed == 0 {
+            // They already hold this epoch, or they have published nothing to
+            // seal against. Either is ordinary, and saying nothing at all is
+            // how the one operation a linked device depends on fails invisibly.
+            // One envelope per recipient per epoch, and the exchange will not
+            // replace it — so a sibling that already has one either holds the
+            // key or lost the secret that opened it, and from here those look
+            // identical. Naming the remedy beats reporting a non-event.
+            return Err(ChatError::Protocol(format!(
+                "{siblings} other device(s) already hold an envelope for epoch {}; \
+                 if one of them still cannot read this, /rotate",
+                info.epoch
+            )));
+        }
+        Ok(sealed)
+    }
+
+    /// Withdraw a device.
+    ///
+    /// What a portable credential structurally cannot do. Note what it does
+    /// *not* undo: SIP-17 is explicit that a revoked device keeps every key it
+    /// was ever given, so this bounds what happens next rather than reaching
+    /// back. Rotating is what actually cuts them off from what follows.
+    pub async fn revoke_device(&mut self, device: &PubKey) -> Result<()> {
+        self.post("/device/revoke", Revoke { device: *device }.encode())
+            .await?;
+        Ok(())
     }
 
     // ---- groups ---------------------------------------------------------
@@ -693,16 +873,21 @@ impl Chat {
             .store
             .key(channel, info.epoch)?
             .ok_or(ChatError::NoKey(info.epoch))?;
-        let p = self.take_prekey_for(*who).await?;
-        let envelope = seal_envelope(who, p.id, &p.public, info.epoch, &[key])
-            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let mut envelopes = Vec::new();
+        for device in self.devices_of(&[*who]).await? {
+            let p = self.take_prekey_for(device).await?;
+            envelopes.push(
+                seal_envelope(&device, p.id, &p.public, info.epoch, &[key])
+                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
+            );
+        }
         let body = self
             .post(
                 "/channel/key/put",
                 KeyPut {
                     channel: *channel,
                     epoch: info.epoch,
-                    envelopes: vec![envelope],
+                    envelopes,
                 }
                 .encode(),
             )
@@ -733,8 +918,8 @@ impl Chat {
         if !is_admin(&info, &self.me) {
             return Err(ChatError::NotAnAdmin);
         }
-        self.mint_epoch(channel, info.epoch + 1, &members_of(&info))
-            .await?;
+        let to = self.devices_of(&members_of(&info)).await?;
+        self.mint_epoch(channel, info.epoch + 1, &to).await?;
         Ok(self.info(channel).await?.epoch)
     }
 
@@ -781,8 +966,8 @@ impl Chat {
         )
         .await?;
         let info = self.info(channel).await?;
-        self.mint_epoch(channel, info.epoch + 1, &members_of(&info))
-            .await?;
+        let to = self.devices_of(&members_of(&info)).await?;
+        self.mint_epoch(channel, info.epoch + 1, &to).await?;
         Ok(())
     }
 
@@ -847,7 +1032,7 @@ impl Chat {
             self.store
                 .key(channel, epoch)?
                 .ok_or(ChatError::NoKey(epoch))?
-                .seal(channel, epoch, &self.me, msg_seq, &plain)
+                .seal(channel, epoch, &self.device, msg_seq, &plain)
                 .map_err(|e| ChatError::Protocol(e.to_string()))?
         };
 
@@ -942,7 +1127,6 @@ impl Chat {
                 if !replay.accept(&e.device, e.epoch, e.msg_seq) {
                     continue;
                 }
-                self.store.record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
             }
             let plain = if e.epoch == 0 {
                 // Epoch 0 is unsealed by construction: every entry in a public
@@ -958,6 +1142,15 @@ impl Chat {
             // Kept, not cached. The counter may not be decrypted twice and the
             // exchange serves an epoch key's envelope once, so a message not
             // written here is one this client can never read again.
+            // Recorded only once it has actually been opened. SIP-17's rule is
+            // that a counter must not be *decrypted* twice; marking one seen on
+            // an attempt that failed would refuse the entry for good, which is
+            // exactly what happens to a device linked after the fact — it polls
+            // before its key arrives, and every message it could not read then
+            // stays unreadable forever.
+            if plain.is_some() && e.kind == KIND_MEMBER {
+                self.store.record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
+            }
             self.store.put_message(
                 channel,
                 Kept {

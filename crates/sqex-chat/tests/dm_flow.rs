@@ -1042,3 +1042,222 @@ async fn a_public_channel_a_person_joined_comes_back_from_mine() {
     // Epoch 0: there is nothing to collect and nothing to wait for.
     assert_eq!(mine[0].epoch, 0);
 }
+
+// ---- multi-device (SIP-20, SIP-22, SIP-23) --------------------------------
+
+/// A second client for an account that already has one.
+///
+/// Its own key, its own store, its own prekeys — everything a device holds
+/// separately, which is the whole point.
+async fn link_device(
+    addr: SocketAddr,
+    server_pub: [u8; 32],
+    owner: &mut Chat,
+    b: u8,
+    store: &std::path::Path,
+) -> Chat {
+    let mut second = chat_at(addr, server_pub, b, store).await;
+    // The owner registers itself first. An account with no registered devices
+    // is its own device; once one is registered that fallback stops applying,
+    // so the owner must be in the set or it seals itself out.
+    if !owner
+        .my_devices()
+        .await
+        .unwrap()
+        .iter()
+        .any(|d| d.device == owner.me)
+    {
+        let own = owner.issue_credential(&owner.me, 90 * 24 * 60 * 60).unwrap();
+        owner.register_self(&own).await.unwrap();
+    }
+    let credential = owner
+        .issue_credential(&second.device(), 90 * 24 * 60 * 60)
+        .unwrap();
+    second.register_self(&credential).await.unwrap();
+    // The client learns whose it is; the exchange resolves device to account
+    // internally and has no route that answers "who am I".
+    second.store().set_account(&credential.account).unwrap();
+    // A device that has published nothing cannot be sealed to.
+    second.top_up_prekeys().await.unwrap();
+    // Rebuilt so it picks the account up, as a real client would on next start.
+    let client = Client::connect_as(addr, &server_pub, &identity(b).0).await.unwrap();
+    let store = Store::open(&identity(b).0, Some(store)).unwrap();
+    let mut second = Chat::new(client, identity(b).0, identity(b).1, store);
+    second.top_up_prekeys().await.unwrap();
+    second
+}
+
+#[tokio::test]
+async fn two_devices_of_one_account_never_share_a_counter() {
+    // The failure this whole stratum exists to prevent. SIP-17 derives the
+    // sender subkey from the *device*, so two clients under one identity must
+    // seal under different subkeys — otherwise both start at msg_seq 0 under
+    // one key and ChaCha20-Poly1305 gives up the XOR of two plaintexts and its
+    // authentication with it.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
+
+    let channel = phone.open_dm(&bob_key).await.unwrap();
+    phone.send(&channel, "from the phone").await.unwrap();
+
+    // Link a laptop to the same account, and give it the epoch in force.
+    let mut laptop = link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    phone.reseal_to_siblings(&channel).await.unwrap();
+    assert!(laptop.collect_keys(&channel).await.unwrap() > 0, "the laptop got no key");
+    laptop.send(&channel, "from the laptop").await.unwrap();
+
+    // Both read the whole conversation.
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut t = Timeline::new();
+    let got = bob.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["from the phone", "from the laptop"]);
+
+    // And the exchange recorded them under different devices. That is the
+    // property; equal device keys here would mean a shared subkey.
+    let db = rusqlite::Connection::open(dir.path().join("channels.db")).unwrap();
+    let devices: Vec<Vec<u8>> = db
+        .prepare("SELECT device FROM entry WHERE channel = ?1 AND kind = 1 ORDER BY seq")
+        .unwrap()
+        .query_map([&channel[..]], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(devices.len(), 2);
+    assert_ne!(devices[0], devices[1], "both entries came from one device key");
+    // And both are the *same account*, which is the other half of the property:
+    // two devices, one person, as far as anybody reading is concerned.
+    let accounts: Vec<Vec<u8>> = db
+        .prepare("SELECT DISTINCT account FROM entry WHERE channel = ?1 AND kind = 1")
+        .unwrap()
+        .query_map([&channel[..]], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(accounts.len(), 1, "the two devices reported as two people");
+    assert_eq!(accounts[0], alice_key.as_bytes().to_vec());
+}
+
+#[tokio::test]
+async fn a_device_gets_its_key_from_a_sibling_with_no_admin_involved() {
+    // SIP-17's same-account rule, which the exchange used not to implement: a
+    // plain member could seal only to itself, and membership was checked
+    // against the member table, which is keyed by account. So an envelope
+    // aimed at a second device was refused as NotAMember.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, carol_key) = identity(3);
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+
+    // Carol owns the group; Bob is an ordinary member with two devices.
+    let (_, bob_key) = identity(2);
+    let channel = carol.create_group("the thing", &[bob_key]).await.unwrap();
+    carol.send(&channel, "before bob linked").await.unwrap();
+    bob.collect_keys(&channel).await.unwrap();
+
+    let mut bob2 = link_device(addr, server_pub, &mut bob, 8, &dir.path().join("bob2.db")).await;
+    // Bob is not an admin here. He seals to his own other device anyway.
+    bob.reseal_to_siblings(&channel).await.unwrap();
+    assert!(bob2.collect_keys(&channel).await.unwrap() > 0);
+
+    let mut t = Timeline::new();
+    let got = bob2.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["before bob linked"]);
+    // And the epoch did not move — nobody had to rotate to let him in.
+    assert_eq!(carol.info(&channel).await.unwrap().epoch, 1);
+    let _ = (alice_key, carol_key);
+}
+
+#[tokio::test]
+async fn a_credential_is_bound_to_the_device_it_names() {
+    // A credential somebody found is a credential they cannot use: the
+    // delegate must equal the caller's transport identity.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut mine = chat_at(addr, server_pub, 7, &dir.path().join("mine.db")).await;
+    let mut theirs = chat_at(addr, server_pub, 8, &dir.path().join("theirs.db")).await;
+
+    let credential = alice.issue_credential(&mine.device(), 3600).unwrap();
+    assert!(
+        theirs.register_self(&credential).await.is_err(),
+        "a forwarded credential registered somebody else's device"
+    );
+    assert!(mine.register_self(&credential).await.is_ok());
+}
+
+#[tokio::test]
+async fn revoking_a_device_stops_it_being_sealed_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
+    let mut laptop =
+        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+
+    // Both are registered: the phone by linking, the laptop by claiming.
+    assert_eq!(phone.my_devices().await.unwrap().len(), 2);
+    // `laptop.me` is the *account* now that it is linked — the thing to revoke
+    // is its own key. Getting this wrong in a test is the same confusion the
+    // account/device split exists to prevent.
+    phone.revoke_device(&laptop.device()).await.unwrap();
+    let left = phone.my_devices().await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].device, phone.device());
+
+    // It can no longer act for the account: the exchange resolves it to
+    // itself again, so it is a stranger to the channel.
+    let channel = phone.open_dm(&bob_key).await.unwrap();
+    phone.send(&channel, "after the revoke").await.unwrap();
+    let mut t = Timeline::new();
+    assert!(
+        laptop.poll(&channel, &mut t, 0).await.is_err(),
+        "a revoked device still read the conversation"
+    );
+}
+
+#[tokio::test]
+async fn a_late_key_opens_what_was_already_held() {
+    // A device linked after a conversation started polls before its key
+    // arrives, so it holds entries it cannot read. When the key comes, nothing
+    // else would ever look at them again — and marking their counters seen on
+    // a failed attempt would refuse them for good, which is not what SIP-17's
+    // replay rule is for: it forbids decrypting a counter twice, and a failed
+    // open decrypted nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
+
+    let channel = phone.open_dm(&bob_key).await.unwrap();
+    phone.send(&channel, "said before you linked").await.unwrap();
+
+    let mut laptop =
+        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+
+    // The laptop reads first, with no key. It keeps what it cannot open.
+    let mut t = Timeline::new();
+    let got = laptop.poll(&channel, &mut t, 0).await.unwrap();
+    assert!(said(&got.timeline).is_empty(), "it should read nothing yet");
+
+    // Then the key arrives.
+    phone.reseal_to_siblings(&channel).await.unwrap();
+    assert!(laptop.collect_keys(&channel).await.unwrap() > 0);
+
+    // And what it was already holding opens.
+    let mut t = laptop.history(&channel, &[]).unwrap();
+    let got = laptop.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(
+        said(&got.timeline),
+        vec!["said before you linked"],
+        "the entries held before the key arrived stayed shut"
+    );
+    let _ = &mut bob;
+}

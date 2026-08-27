@@ -80,6 +80,41 @@ enum Cmd {
     List,
     /// Print your own identity, to give to somebody who wants to write to you.
     Whoami,
+    /// Link, list and withdraw the clients that act for you.
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// What this account has registered, and when each expires.
+    List,
+    /// Sign a credential naming another client, so it may act for you.
+    ///
+    /// Run this on the client you already use, then take the printed line to
+    /// the new one and give it to `device claim`.
+    Link {
+        /// The new client's identity, base58 — its own `whoami`.
+        key: String,
+        /// How long the grant lasts, in days.
+        #[arg(long, default_value_t = 90)]
+        days: u64,
+    },
+    /// Register *this* client using a credential from `device link`.
+    Claim {
+        /// The credential, base58, as `device link` printed it.
+        credential: String,
+    },
+    /// Withdraw a client. It keeps every key it already holds — rotate the
+    /// channels that matter if that is the point.
+    Revoke { key: String },
+    /// Push this client's channel keys to your other devices.
+    ///
+    /// Runs on its own at startup; this is the same thing, said out loud, for
+    /// when you want to know whether it worked.
+    Reseal,
 }
 
 #[tokio::main]
@@ -140,6 +175,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             return Ok(());
         }
         None => {}
+        _ => {}
     }
 
     let (addr, server) = endpoint(&cli, &cfg)?;
@@ -151,7 +187,118 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
 
+    // The rest of `device` needs the exchange.
+    if let Some(Cmd::Device { cmd }) = &cli.cmd {
+        return device_command(&mut chat, cmd).await;
+    }
+
     interface(chat).await
+}
+
+/// The device operations that talk to the exchange.
+async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> {
+    match cmd {
+        DeviceCmd::Link { key, days } => {
+            let device: PubKey = key.trim().parse().map_err(|e| format!("bad key: {e}"))?;
+            if device == chat.me {
+                return Err("that is this client's own key".into());
+            }
+            // This client registers itself first, and it has to. An account
+            // with no registered devices is its own device; the moment one is
+            // registered, that fallback stops applying and everything seals to
+            // the registered set only — so linking without doing this would cut
+            // *this* client out of every epoch minted afterwards.
+            let already = chat.my_devices().await.map_err(|e| e.to_string())?;
+            if !already.iter().any(|d| d.device == chat.me) {
+                let own = chat
+                    .issue_credential(&chat.me, days * 24 * 60 * 60)
+                    .map_err(|e| e.to_string())?;
+                chat.register_self(&own).await.map_err(|e| e.to_string())?;
+                eprintln!("registered this client as a device first");
+            }
+            let credential = chat
+                .issue_credential(&device, days * 24 * 60 * 60)
+                .map_err(|e| e.to_string())?;
+            println!("{}", bs58::encode(credential.encode()).into_string());
+            eprintln!();
+            eprintln!("Give that line to the new client:");
+            eprintln!("  sqex-chat -i <its identity> device claim <the line>");
+            eprintln!();
+            eprintln!("Then run `sqex-chat` here once, so it can seal the new client");
+            eprintln!("into the conversations it should be able to read.");
+            eprintln!("It expires in {days} days; `device revoke` withdraws it sooner.");
+            Ok(())
+        }
+        DeviceCmd::List => {
+            let devices = chat.my_devices().await.map_err(|e| e.to_string())?;
+            if devices.is_empty() {
+                println!("no registered devices — this client is its own device");
+                println!("(that is the ordinary single-client case, not a fault)");
+            }
+            for d in devices {
+                let left = d.not_after.saturating_sub(now());
+                println!("{}  expires in {} days", d.device, left / (24 * 60 * 60));
+            }
+            Ok(())
+        }
+        DeviceCmd::Claim { credential } => {
+            let raw = bs58::decode(credential.trim())
+                .into_vec()
+                .map_err(|e| format!("that is not base58: {e}"))?;
+            let credential = sqex_proto::credential::Credential::decode(&raw)
+                .map_err(|e| format!("bad credential: {e}"))?;
+            if credential.delegate != chat.me {
+                return Err(format!(
+                    "that credential names {}, not this client ({}) — \
+                     a credential is bound to the device it was written for",
+                    credential.delegate, chat.me
+                ));
+            }
+            chat.register_self(&credential)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Remember whose client this now is. Everything account-shaped
+            // depends on it — a direct message's identifier, whether we are an
+            // admin, whose name goes beside a message — and the exchange will
+            // not tell us: it resolves device to account internally and has no
+            // route that answers "who am I".
+            chat.store()
+                .set_account(&credential.account)
+                .map_err(|e| e.to_string())?;
+            println!("registered as a device of {}", credential.account);
+            // Prekeys under the new device key, or nothing can be sealed to it
+            // — and then whatever its siblings have already sealed.
+            chat.top_up_prekeys().await.map_err(|e| e.to_string())?;
+            let mut collected = 0;
+            for m in chat.mine().await.map_err(|e| e.to_string())? {
+                collected += chat.collect_keys(&m.channel).await.unwrap_or(0);
+            }
+            println!("collected {collected} channel key(s)");
+            println!("run `sqex-chat` on your other client once, so it can seal you the rest");
+            Ok(())
+        }
+        DeviceCmd::Reseal => {
+            let mut total = 0;
+            for m in chat.mine().await.map_err(|e| e.to_string())? {
+                match chat.reseal_to_siblings(&m.channel).await {
+                    Ok(n) => {
+                        total += n;
+                        println!("{}  sealed {n}", hex8(&m.channel));
+                    }
+                    Err(e) => println!("{}  {e}", hex8(&m.channel)),
+                }
+            }
+            println!("{total} key(s) sent to your other devices");
+            Ok(())
+        }
+        DeviceCmd::Revoke { key } => {
+            let device: PubKey = key.trim().parse().map_err(|e| format!("bad key: {e}"))?;
+            chat.revoke_device(&device).await.map_err(|e| e.to_string())?;
+            println!("revoked {device}");
+            println!("it keeps every key it already holds — rotate what matters");
+            Ok(())
+        }
+    }
 }
 
 /// One open conversation's live state.
@@ -354,6 +501,24 @@ async fn event_loop(
 ) -> Result<(), String> {
     // Every conversation is opened once at startup, so a message that arrived
     // while this client was off is collected rather than waited for.
+    // Hand the epoch in force to our own other devices before anything else.
+    // A client linked after a conversation started has no key for it, and this
+    // is the only thing that gives it one without an admin rotating — which
+    // would deny it everything said before, and disturb everybody else to do
+    // it. Cheap when there are no siblings: one request that lists none.
+    for conv in open.iter_mut() {
+        match chat.reseal_to_siblings(&conv.channel).await {
+            Ok(0) => {}
+            Ok(n) => {
+                conv.trouble.message =
+                    Some(format!("sent the key to {n} of your other device(s)"))
+            }
+            // Discarded, this used to be, which meant the one operation that
+            // makes a linked device work failed in silence.
+            Err(e) => conv.trouble.message = Some(format!("sealing to your devices: {e}")),
+        }
+    }
+
     for conv in open.iter_mut() {
         let opened = match conv.peer {
             // `Create` on a direct message is idempotent and is how a party

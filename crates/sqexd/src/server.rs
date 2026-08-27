@@ -947,16 +947,22 @@ async fn route(
         ("POST", "/channel/key/put") => match (account, KeyPut::decode(body)) {
             (None, _) => no_identity("publishing channel keys"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.put_keys(&me, &req) {
-                Ok(ack) => (200, "application/octet-stream", ack.encode()),
-                Err(e) => refused(e),
-            },
-        },
-        ("POST", "/channel/key/get") => match (account, KeyGet::decode(body)) {
-            (None, _) => no_identity("collecting channel keys"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
-                match server.channels.get_keys(&me, &req.channel, req.since_epoch) {
+                // A device is resolved to its account here rather than inside
+                // the channel store, which keeps that store free of any
+                // knowledge of the registry.
+                let account_of = |d: &PubKey| server.devices.account_for(d);
+                match server.channels.put_keys(&me, &req, &account_of) {
+                    Ok(ack) => (200, "application/octet-stream", ack.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        ("POST", "/channel/key/get") => match (account, device, KeyGet::decode(body)) {
+            (None, _, _) | (_, None, _) => no_identity("collecting channel keys"),
+            (_, _, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Some(mine), Ok(req)) => {
+                match server.channels.get_keys(&me, &mine, &req.channel, req.since_epoch) {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
                     Err(e) => refused(e),
                 }
