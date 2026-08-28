@@ -155,6 +155,10 @@ pub struct Conversation {
     /// have been away longer than the window and there is history we can never
     /// fill. It must be shown as a gap and not as the whole conversation.
     pub gap: bool,
+    /// True when this channel's sequence space restarted: it was destroyed and
+    /// recreated under the same identifier, so what came before is unrelated to
+    /// what follows and has been dropped (SIP-16).
+    pub restarted: bool,
     /// Entries held under a superseded epoch we have no key for. Gone for
     /// good, as against `unreadable`, which is something to wait for.
     pub lost: usize,
@@ -1127,7 +1131,7 @@ impl Chat {
         timeline: &mut Timeline,
         wait_secs: u16,
     ) -> Result<Conversation> {
-        let (since, _, _) = self.store.cursor(channel)?;
+        let (mut since, _, _) = self.store.cursor(channel)?;
         let body = self
             .post(
                 "/channel/fetch",
@@ -1139,7 +1143,43 @@ impl Chat {
                 .encode(),
             )
             .await?;
-        let entries = Entries::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let mut entries =
+            Entries::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+
+        // Being *above* the newest retained entry is not being ahead of the
+        // conversation: it is holding the cursor of a channel that no longer
+        // exists (SIP-16, "A reset sequence space"). The one we knew was
+        // destroyed and a new one created under the same identifier, numbering
+        // from 1 — which only a direct message can do, and always does, because
+        // its identifier is derived from the two accounts.
+        //
+        // Left alone this never recovers. Every entry the new channel accepts
+        // is numbered at or below our cursor, so `Fetch` returns nothing for
+        // good, including our own posts: the exchange takes them and we never
+        // read one back. It presents as typing a message and watching nothing
+        // appear, with no error at either end.
+        //
+        // `last > 0` is what separates this from a channel whose entries have
+        // all passed the retention window. That reports `last == 0` and needs
+        // no reset — it heals itself as soon as an entry arrives above our
+        // cursor, and resetting would throw away history for nothing.
+        let restarted = since > 0 && entries.last > 0 && entries.last < since;
+        if restarted {
+            self.store.reset_sequence_space(channel)?;
+            since = 0;
+            let body = self
+                .post(
+                    "/channel/fetch",
+                    Fetch {
+                        channel: *channel,
+                        since: 0,
+                        wait_secs: 0,
+                    }
+                    .encode(),
+                )
+                .await?;
+            entries = Entries::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        }
 
         // Being below the oldest retained entry means we have been away longer
         // than the window. There is history we can never fill, and presenting
@@ -1253,6 +1293,7 @@ impl Chat {
             unreadable: if have_current { Vec::new() } else { shut },
             timeline: timeline.clone(),
             gap,
+            restarted,
             typing,
             last,
             admins,

@@ -1360,3 +1360,64 @@ async fn a_revoked_client_is_told_so_rather_than_refused_everywhere() {
     // told it was revoked.
     assert_eq!(phone.still_linked().await.unwrap(), None);
 }
+
+/// SIP-16, "A reset sequence space". A cursor above the exchange's newest entry
+/// is not being ahead of the conversation: it is the cursor of a channel that
+/// was destroyed and recreated under the same identifier, numbering from 1
+/// again. Only a direct message can do that, and it always does, because its
+/// identifier is derived from the two accounts.
+///
+/// Left alone it never recovers — every entry the new channel accepts is at or
+/// below the stale cursor, so a fetch returns nothing for good, including the
+/// client's own posts. It presented as typing a message and watching nothing
+/// appear, with no error at either end, and it cost an afternoon to find.
+#[tokio::test]
+async fn a_restarted_sequence_space_recovers_instead_of_going_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let a_store = dir.path().join("alice.db");
+    let b_store = dir.path().join("bob.db");
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let mut bob = chat_at(addr, server_pub, 2, &b_store).await;
+    let mut alice = chat_at(addr, server_pub, 1, &a_store).await;
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, "before").await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+
+    let mut alices = Timeline::new();
+    alice.poll(&channel, &mut alices, 0).await.unwrap();
+
+    // Strand Alice's cursor far above anything the exchange holds. That is
+    // exactly the state a destroyed-and-recreated channel leaves behind, without
+    // needing to destroy one: the client is asking for entries that this
+    // channel's numbering will not reach.
+    alice.store().set_since(&channel, 9_999).unwrap();
+
+    bob.send(&channel, "after the reset").await.unwrap();
+
+    let mut fresh = Timeline::new();
+    let got = alice.poll(&channel, &mut fresh, 0).await.unwrap();
+
+    assert!(
+        got.restarted,
+        "a cursor above the exchange's newest entry was not recognised as a restart"
+    );
+    assert!(
+        said(&got.timeline).contains(&"after the reset".to_string()),
+        "the conversation stayed silent after its sequence space restarted: {:?}",
+        said(&got.timeline)
+    );
+
+    // And it keeps working afterwards — the reset is a recovery, not a one-off
+    // read that leaves the cursor wrong again.
+    alice.send(&channel, "and onwards").await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert!(
+        said(&got.timeline).contains(&"and onwards".to_string()),
+        "sending after the recovery did not reach the other side: {:?}",
+        said(&got.timeline)
+    );
+}

@@ -66,6 +66,11 @@ pub struct Trouble {
     pub no_key: Option<u32>,
     /// History older than the retention window, gone for good.
     pub gap: bool,
+    /// This conversation's sequence space restarted — it was destroyed and
+    /// recreated under the same identifier — so what came before it was
+    /// dropped. Worth saying once: the reader had messages here and now does
+    /// not, and nothing else would explain where they went.
+    pub restarted: bool,
     /// Anything else — a refusal, a dropped connection.
     pub message: Option<String>,
 }
@@ -77,7 +82,11 @@ impl Trouble {
     /// once in the transcript where the messages would have been, and not a
     /// fault for somebody to chase every session.
     pub fn is_quiet(&self) -> bool {
-        self.unreadable == 0 && self.no_key.is_none() && !self.gap && self.message.is_none()
+        self.unreadable == 0
+            && self.no_key.is_none()
+            && !self.gap
+            && !self.restarted
+            && self.message.is_none()
     }
 
     /// The status line, worst first.
@@ -95,6 +104,11 @@ impl Trouble {
         if self.gap {
             parts.push(
                 "older messages have passed the retention window and are gone".to_string(),
+            );
+        }
+        if self.restarted {
+            parts.push(
+                "this conversation was restarted — everything before it is gone".to_string(),
             );
         }
         if self.unreadable > 0 {
@@ -417,6 +431,7 @@ mod tests {
             lost: 0,
             no_key: Some(2),
             gap: true,
+            restarted: false,
             message: None,
         };
         let line = t.line();
@@ -424,6 +439,16 @@ mod tests {
         assert!(line.contains("retention window"));
         assert!(line.contains("3 messages cannot be opened yet"));
         assert!(!t.is_quiet());
+
+        // A restarted sequence space is not quiet either: the reader had
+        // messages here a moment ago and now does not, and nothing else on
+        // screen would account for it (SIP-16).
+        let t = Trouble {
+            restarted: true,
+            ..Default::default()
+        };
+        assert!(!t.is_quiet());
+        assert!(t.line().contains("restarted"), "{}", t.line());
     }
 
     #[test]

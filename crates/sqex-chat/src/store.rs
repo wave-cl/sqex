@@ -705,6 +705,37 @@ impl Store {
         Ok(out)
     }
 
+    /// Forget everything numbered in this channel's sequence space.
+    ///
+    /// SIP-16, "A reset sequence space": a cursor above the exchange's newest
+    /// entry means the channel this client knew was destroyed and a new one
+    /// created under the same identifier, numbering from 1 again. Only a direct
+    /// message can do that, and it always does — its identifier is derived from
+    /// the two accounts, so it cannot be made unique per incarnation.
+    ///
+    /// The two sequence spaces are unrelated, so the old entries cannot stay
+    /// beside the new ones: entry 7 of this channel is not entry 7 of the one
+    /// before it, and the message table is keyed on (channel, seq). Keeping
+    /// them would mean every new entry merging into a stale row and never
+    /// appearing — which is the failure this exists to end, not a milder form
+    /// of it.
+    ///
+    /// `channel_meta` is deliberately left: the conversation is between the
+    /// same two people and should stay where the reader left it.
+    pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
+        for sql in [
+            "DELETE FROM message WHERE channel = ?1",
+            "DELETE FROM seen WHERE channel = ?1",
+            "DELETE FROM channel_key WHERE channel = ?1",
+            "DELETE FROM cursor WHERE channel = ?1",
+        ] {
+            self.db
+                .execute(sql, params![&channel[..]])
+                .map_err(storage("reset sequence space"))?;
+        }
+        Ok(())
+    }
+
     pub fn forget_channel(&self, channel: &[u8; 32]) -> Result<()> {
         self.db
             .execute(
