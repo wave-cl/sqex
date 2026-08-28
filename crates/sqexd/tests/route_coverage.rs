@@ -50,26 +50,10 @@ const ROUTES: &[(&str, &str, By)] = &[
         "/admission/request",
         Unreachable("SIP-24: no client asks to be admitted"),
     ),
-    (
-        "POST",
-        "/profile/put",
-        Unreachable("SIP-21: nobody can publish a display name"),
-    ),
-    (
-        "POST",
-        "/profile/get",
-        Unreachable("SIP-21: nobody can read one"),
-    ),
-    (
-        "POST",
-        "/block/set",
-        Unreachable("SIP-21: nothing can stop an unwanted message"),
-    ),
-    (
-        "POST",
-        "/block/list",
-        Unreachable("SIP-21: the block list cannot be seen"),
-    ),
+    ("POST", "/profile/put", Chat("/profile")),
+    ("POST", "/profile/get", Chat("Chat::refresh_profiles")),
+    ("POST", "/block/set", Chat("/block, /unblock")),
+    ("POST", "/block/list", Chat("/blocked")),
     ("POST", "/device/register", Chat("Chat::register_self")),
     ("POST", "/device/revoke", Chat("Chat::revoke_device")),
     ("POST", "/device/list", Chat("Chat::my_devices")),
@@ -207,13 +191,9 @@ fn the_unreachable_routes_are_the_ones_we_know_about() {
     let expected: Vec<&str> = vec![
         "/admission/request",
         "/blob/attach",
-        "/block/list",
-        "/block/set",
         "/channel/close",
         "/channel/cursors",
         "/channel/retain",
-        "/profile/get",
-        "/profile/put",
     ];
 
     let mut open_sorted = open.clone();

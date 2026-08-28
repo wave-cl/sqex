@@ -19,6 +19,12 @@ use ratatui::backend::CrosstermBackend;
 use sqex_chat::attach::describe;
 use sqex_chat::client::{Chat, ChatError};
 use sqex_chat::store::{Store, store_path};
+use std::collections::HashMap;
+
+/// How long the answer to a command stays on screen. Long enough to read a
+/// sentence, short enough not to sit over the next thing that goes wrong.
+const NOTE_LINGER: Duration = Duration::from_secs(8);
+
 use sqex_proto::message::Post as SipPost;
 use sqex_proto::timeline::Timeline;
 use sqnr::{Client, config::Config, identity};
@@ -342,6 +348,14 @@ struct Open {
     /// without diffing two timelines.
     timeline_len: usize,
     trouble: Trouble,
+    /// The answer to something we just did, and when it was said.
+    ///
+    /// Separate from `trouble.message`, which is about the *state* of the
+    /// conversation and is rebuilt by every poll. A note is about an action,
+    /// and the poll runs every 700 ms — so keeping the two in one field meant
+    /// every confirmation this client has ever printed was on screen for less
+    /// than a second, which is to say it was never read.
+    note: Option<(String, std::time::Instant)>,
     typing: bool,
     /// Messages arrived while this conversation was not the one on screen.
     unread: usize,
@@ -458,6 +472,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             timeline,
             timeline_len,
             trouble: Trouble::default(),
+            note: None,
             typing: false,
             unread: 0,
             waiting: false,
@@ -481,6 +496,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             timeline: Timeline::default(),
             timeline_len: 0,
             trouble: Trouble::default(),
+            note: None,
             typing: false,
             unread: 0,
             waiting: false,
@@ -557,7 +573,8 @@ async fn event_loop(
 
     let mut poll_at = tokio::time::Instant::now();
     loop {
-        refresh(app, open, &chat.me);
+        let names = name_map(chat, selected_index(open, app).map(|i| &open[i]));
+        refresh(app, open, &chat.me, &names);
         terminal
             .draw(|f| ui::draw(f, app))
             .map_err(|e| e.to_string())?;
@@ -626,6 +643,17 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
                     &conv.admins,
                 );
             }
+            // Whoever spoke here, asked for once and then read from the store.
+            // Silent on failure: a name is decoration, and a conversation that
+            // stopped working because one could not be fetched would be the
+            // tail wagging the dog.
+            let mut who: Vec<PubKey> = Vec::new();
+            for m in conv.timeline.messages() {
+                if !who.contains(&m.account) {
+                    who.push(m.account);
+                }
+            }
+            let _ = chat.refresh_profiles(&who, now()).await;
         }
         Err(ChatError::NoKey(epoch)) => {
             conv.timeline = timeline;
@@ -642,6 +670,83 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
     }
 }
 
+/// The commands that are about this account rather than about a conversation.
+///
+/// Split out because they must work with nothing open: somebody being written
+/// to by a stranger should not have to open the conversation in order to stop
+/// it.
+async fn account_command(
+    chat: &mut Chat,
+    cmd: Command,
+) -> std::result::Result<String, ChatError> {
+    let note = match cmd {
+            Command::Profile(None) => {
+                let me = chat.me;
+                match chat.profile_of(&me).await {
+                    Ok(got) if got.found => Ok(Some(format!(
+                        "you are {:?}{} — /profile <name> | <title> changes it",
+                        got.profile.name,
+                        if got.profile.title.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {:?}", got.profile.title)
+                        }
+                    ))),
+                    Ok(_) => Ok(Some(
+                        "you have published no profile — /profile <name> | <title>".into(),
+                    )),
+                    Err(e) => Err(e),
+                }
+            }
+            Command::Profile(Some((name, title))) => {
+                let profile = sqex_proto::profile::Profile {
+                    flags: 0,
+                    name: name.clone(),
+                    title: title.clone(),
+                    avatar: Vec::new(),
+                };
+                chat.set_profile(profile).await.map(|()| {
+                    // Said back with a reminder of what it is. A display
+                    // name is a claim, not a credential, and a client that
+                    // reported "you are now X" would be agreeing with it.
+                    Some(format!(
+                        "published {name:?} — a name is a claim, and readers see \
+                         your key beside it"
+                    ))
+                })
+            }
+            Command::Block(key) => match key.parse::<PubKey>() {
+                Ok(who) if who == chat.me => Err(ChatError::Protocol(
+                    "that is your own key".into(),
+                )),
+                Ok(who) => chat.set_block(&who, true).await.map(|()| {
+                    Some(format!(
+                        "blocked {} — what they send is dropped, and they are \
+                         answered as though it landed",
+                        short(&who)
+                    ))
+                }),
+                Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+            },
+            Command::Unblock(key) => match key.parse::<PubKey>() {
+                Ok(who) => chat
+                    .set_block(&who, false)
+                    .await
+                    .map(|()| Some(format!("unblocked {}", short(&who)))),
+                Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+            },
+            Command::Blocked => chat.blocked().await.map(|who| {
+                Some(if who.is_empty() {
+                    "you have blocked nobody".to_string()
+                } else {
+                    who.iter().map(short).collect::<Vec<_>>().join(" ")
+                })
+            }),
+        _ => Ok(None),
+    }?;
+    Ok(note.unwrap_or_default())
+}
+
 /// Poll the conversation just acted on and redraw from it.
 ///
 /// Every action in pick mode changes what the transcript should say, and the
@@ -649,7 +754,8 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
 async fn settle_here(chat: &mut Chat, open: &mut [Open], app: &mut App, at: usize) {
     let me = chat.me;
     poll_one(chat, &mut open[at], app).await;
-    refresh(app, open, &me);
+    let names = name_map(chat, open.get(at));
+    refresh(app, open, &me, &names);
 }
 
 /// Keys while a message is picked.
@@ -934,6 +1040,28 @@ async fn handle_key(
                 _ => {}
             }
 
+            // The profile and block commands are about this account rather
+            // than about a conversation, and blocking in particular must work
+            // when there is nothing open: somebody being written to by a
+            // stranger should not have to open the conversation to stop it.
+            if matches!(
+                cmd,
+                Command::Profile(_) | Command::Block(_) | Command::Unblock(_) | Command::Blocked
+            ) {
+                let note = match account_command(chat, cmd).await {
+                    Ok(note) => note,
+                    Err(e) => e.to_string(),
+                };
+                // On the conversation when there is one: the next redraw
+                // rebuilds `app.trouble` from the selected conversation, so a
+                // note left only on `app` is gone before anybody reads it.
+                match selected_index(open, app) {
+                    Some(i) => open[i].note = Some((note, std::time::Instant::now())),
+                    None => app.trouble.message = Some(note),
+                }
+                return;
+            }
+
             let Some(i) = selected_index(open, app) else {
                 app.trouble.message =
                     Some("no conversation selected — ^N adds somebody, /new makes a group".into());
@@ -952,7 +1080,11 @@ async fn handle_key(
                 Command::New(_)
                 | Command::Public(_)
                 | Command::Find(_)
-                | Command::Join(_) => Ok(None),
+                | Command::Join(_)
+                | Command::Profile(_)
+                | Command::Block(_)
+                | Command::Unblock(_)
+                | Command::Blocked => Ok(None),
                 Command::Name(name) => match chat.set_name(&channel, &name).await {
                     Ok(_) => Ok(Some(format!("renamed to {name}"))),
                     Err(e) => Err(e),
@@ -1060,7 +1192,7 @@ async fn handle_key(
             poll_one(chat, &mut open[i], app).await;
             let note = match outcome {
                 Ok(note) => {
-                    open[i].trouble.message = note.clone();
+                    open[i].note = note.clone().map(|n| (n, std::time::Instant::now()));
                     note
                 }
                 Err(ChatError::NotReady(_)) => {
@@ -1068,7 +1200,7 @@ async fn handle_key(
                     None
                 }
                 Err(e) => {
-                    open[i].trouble.message = Some(e.to_string());
+                    open[i].note = Some((e.to_string(), std::time::Instant::now()));
                     None
                 }
             };
@@ -1079,7 +1211,7 @@ async fn handle_key(
                 if let Some(n) = note
                     && let Some(last) = open.last_mut()
                 {
-                    last.trouble.message = Some(n);
+                    last.note = Some((n, std::time::Instant::now()));
                 }
                 app.selected = open.len().saturating_sub(1);
             }
@@ -1126,6 +1258,15 @@ enum Command {
     Redact(u64),
     /// `/who` — who is in here.
     Who,
+    /// `/profile [name] [| title]` — what to say about ourselves, or nothing
+    /// to see what we currently say.
+    Profile(Option<(String, String)>),
+    /// `/block <key>` — stop an account reaching us.
+    Block(String),
+    /// `/unblock <key>` — let it again.
+    Unblock(String),
+    /// `/blocked` — who we have blocked. Answered to nobody else.
+    Blocked,
     Unknown(String),
 }
 
@@ -1202,6 +1343,22 @@ impl Command {
                 ),
             },
             "/who" => Command::Who,
+            // The name and the title are both free text, so they are separated
+            // by a character neither would contain rather than by a space —
+            // `/profile Ada Lovelace` is a name, not a name and a title.
+            "/profile" if rest.is_empty() => Command::Profile(None),
+            "/profile" => {
+                let (name, title) = match rest.split_once('|') {
+                    Some((n, t)) => (n.trim().to_string(), t.trim().to_string()),
+                    None => (rest.to_string(), String::new()),
+                };
+                Command::Profile(Some((name, title)))
+            }
+            "/block" if !first.is_empty() => Command::Block(first.to_string()),
+            "/block" => Command::Unknown("/block needs a public key".into()),
+            "/unblock" if !first.is_empty() => Command::Unblock(first.to_string()),
+            "/unblock" => Command::Unknown("/unblock needs a public key".into()),
+            "/blocked" => Command::Blocked,
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -1368,7 +1525,7 @@ async fn settle(
                 .position(|o| o.channel == channel)
                 .unwrap_or(open.len().saturating_sub(1));
             if let Some(o) = open.get_mut(app.selected) {
-                o.trouble.message = Some(note);
+                o.note = Some((note, std::time::Instant::now()));
             }
         }
         _ => app.trouble.message = Some(note),
@@ -1402,6 +1559,7 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         timeline: Timeline::new(),
         timeline_len: 0,
         trouble: Trouble::default(),
+        note: None,
         typing: false,
         unread: 0,
         waiting: false,
@@ -1429,7 +1587,25 @@ fn clear_unread(open: &mut [Open], app: &App) {
 }
 
 /// Rebuild what is on screen from what the client knows.
-fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
+/// Every display name we hold for the people in `conv`.
+///
+/// Built here rather than looked up in the renderer, which has no store — and
+/// deliberately a map of *names only*: `ui::author` pairs each with a key, and
+/// cannot be handed a name with no key to pair it with.
+fn name_map(chat: &Chat, conv: Option<&Open>) -> HashMap<PubKey, String> {
+    let mut out = HashMap::new();
+    let Some(conv) = conv else { return out };
+    for m in conv.timeline.messages() {
+        if let std::collections::hash_map::Entry::Vacant(e) = out.entry(m.account)
+            && let Some(name) = chat.display_name(&m.account)
+        {
+            e.insert(name);
+        }
+    }
+    out
+}
+
+fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, String>) {
     app.rows = open
         .iter()
         .map(|o| Row {
@@ -1474,17 +1650,22 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
                 (None, true) => "(nothing to show)".to_string(),
             };
             Said {
-                // In a direct message the other party is the conversation, so
-                // its name serves. In a group there are several, and only the
-                // key distinguishes them — a display name is a claim its
-                // subject makes (SIP-21), so it is not what goes here.
-                who: if m.account == *me {
-                    "you".to_string()
-                } else if conv.peer.is_some() {
-                    conv.label.clone()
-                } else {
-                    short(&m.account)
-                },
+                // A name and a key, never a name alone: `ui::author` composes
+                // them, and refuses to drop the key to make room. What goes
+                // here is only the name half — the display name its author
+                // published, or the label we chose for a direct message, both
+                // of which are claims about who somebody is.
+                who: names
+                    .get(&m.account)
+                    .cloned()
+                    .or_else(|| conv.peer.map(|_| conv.label.clone()))
+                    // A contact with no chosen label is labelled with its own
+                    // short key, and pairing that with itself renders
+                    // "E4LUkjrZ (E4LUkjrZ)". A name that *is* the key is not a
+                    // name.
+                    .filter(|name| *name != short(&m.account))
+                    .unwrap_or_default(),
+                key: short(&m.account),
                 mine: m.account == *me,
                 text,
                 seq: m.seq,
@@ -1533,13 +1714,21 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
     if app.picked.is_none() {
         app.reacting = false;
     }
+    // A note about what we just did wins over the conversation's state while
+    // it is fresh: somebody who has typed a command is waiting for its answer,
+    // not for a description of the channel.
+    let note = conv
+        .note
+        .as_ref()
+        .filter(|(_, at)| at.elapsed() < NOTE_LINGER)
+        .map(|(n, _)| n.clone());
     app.trouble = Trouble {
         unreadable: conv.trouble.unreadable,
         lost: conv.trouble.lost,
         no_key: conv.trouble.no_key,
         gap: conv.trouble.gap,
         restarted: conv.trouble.restarted,
-        message: conv.trouble.message.clone().or_else(|| {
+        message: note.or_else(|| conv.trouble.message.clone()).or_else(|| {
             conv.waiting.then(|| match conv.peer {
                 Some(_) => format!(
                     "{} has not started their client yet — nothing can be sent until they do",
@@ -1669,6 +1858,7 @@ mod tests {
             timeline: Timeline::new(),
             timeline_len: 0,
             trouble: Trouble::default(),
+            note: None,
             typing: false,
             unread: 0,
             waiting: false,
@@ -1706,14 +1896,109 @@ mod tests {
             }],
             ..Default::default()
         };
-        refresh(&mut app, &open, &PubKey::new([1; 32]));
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
         assert_eq!(app.said.len(), 2);
         assert_eq!(app.said[0].who, "bob");
         assert!(!app.said[0].mine);
         // Anything not from the peer is ours: a direct message has two members,
         // so there is no third case to get wrong.
-        assert_eq!(app.said[1].who, "you");
         assert!(app.said[1].mine);
+
+        // The line a reader actually sees pairs the name with the key, and
+        // never shows one without the other (SIP-21).
+        let line = ui::author(&app.said[0].who, &app.said[0].key, app.said[0].mine);
+        assert!(line.contains("bob"), "{line}");
+        assert!(
+            line.contains(&app.said[0].key),
+            "the name appeared without the key: {line}"
+        );
+        assert_eq!(
+            ui::author(&app.said[1].who, &app.said[1].key, app.said[1].mine),
+            "you"
+        );
+    }
+
+    /// A contact with no chosen label is labelled with its own short key, and
+    /// pairing that with itself rendered "E4LUkjrZ (E4LUkjrZ)". A name that is
+    /// the key is not a name.
+    #[test]
+    fn a_label_that_is_only_the_key_is_not_treated_as_a_name() {
+        let bob = PubKey::new([2; 32]);
+        let mut c = conv(2, &ui::short(&bob));
+        c.timeline = Timeline::fold(
+            &[Received {
+                seq: 1,
+                account: bob,
+                posted: 10,
+                kind: sqex_proto::channel::KIND_MEMBER,
+                tombstone: false,
+                body: Some(Body::Post(SipPost::text("hello"))),
+            }],
+            &[],
+        );
+        let open = vec![c];
+        let mut app = App {
+            rows: vec![Row {
+                channel: [7; 32],
+                label: ui::short(&bob),
+                group: false,
+                public: false,
+                unread: 0,
+                waiting: false,
+            }],
+            ..Default::default()
+        };
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+        assert_eq!(app.said.len(), 1);
+        assert_eq!(
+            ui::author(&app.said[0].who, &app.said[0].key, false),
+            ui::short(&bob),
+            "the key was rendered twice"
+        );
+    }
+
+    /// The poll runs every 700 ms and clears the conversation's trouble, so a
+    /// confirmation kept in that field was on screen for less than a second —
+    /// which is to say it was never read. A note outlives the poll.
+    #[test]
+    fn the_answer_to_a_command_outlives_the_next_poll() {
+        let mut c = conv(2, "bob");
+        c.note = Some(("renamed to shipping".into(), std::time::Instant::now()));
+        // What a poll does to the conversation's own state.
+        c.trouble.message = None;
+        let open = vec![c];
+        let mut app = App {
+            rows: vec![Row {
+                channel: [7; 32],
+                label: "bob".into(),
+                group: false,
+                public: false,
+                unread: 0,
+                waiting: false,
+            }],
+            ..Default::default()
+        };
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+        assert_eq!(
+            app.trouble.message.as_deref(),
+            Some("renamed to shipping"),
+            "the answer to a command was cleared by a poll"
+        );
+
+        // And it does not sit there for the rest of the session over the next
+        // thing that goes wrong.
+        let mut c = conv(2, "bob");
+        c.note = Some((
+            "renamed to shipping".into(),
+            std::time::Instant::now() - NOTE_LINGER - Duration::from_secs(1),
+        ));
+        c.trouble.message = Some("the exchange refused (403)".into());
+        let open = vec![c];
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+        assert_eq!(
+            app.trouble.message.as_deref(),
+            Some("the exchange refused (403)")
+        );
     }
 
     #[test]
@@ -1732,7 +2017,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        refresh(&mut app, &open, &PubKey::new([1; 32]));
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
         let line = app.trouble.line();
         assert!(line.contains("bob has not started their client"), "{line}");
     }
@@ -1755,7 +2040,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        refresh(&mut app, &open, &PubKey::new([1; 32]));
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
         assert!(app.trouble.line().contains("403"));
     }
 
@@ -1767,7 +2052,7 @@ mod tests {
             selected: 7,
             ..Default::default()
         };
-        refresh(&mut app, &open, &PubKey::new([1; 32]));
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
         assert_eq!(app.selected, 0);
         assert_eq!(app.said.len(), 0);
     }
@@ -1778,7 +2063,7 @@ mod tests {
             selected: 0,
             ..Default::default()
         };
-        refresh(&mut app, &[], &PubKey::new([1; 32]));
+        refresh(&mut app, &[], &PubKey::new([1; 32]), &HashMap::new());
         assert!(app.rows.is_empty());
         assert!(app.said.is_empty());
     }

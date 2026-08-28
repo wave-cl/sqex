@@ -41,7 +41,11 @@ pub struct Row {
 /// One line of conversation, already resolved to what the reader should see.
 #[derive(Default)]
 pub struct Said {
+    /// The display name its author published, if any. **Never shown without
+    /// `key`** — see [`author`].
     pub who: String,
+    /// The author's key, short. Always present, always drawn.
+    pub key: String,
     pub mine: bool,
     pub text: String,
     /// The entry's sequence number, which is how `/save` names a message.
@@ -228,6 +232,41 @@ pub fn short(key: &PubKey) -> String {
     full.chars().take(8).collect()
 }
 
+/// How wide the author column is. A name and a key both have to fit, because
+/// [`author`] will not drop the key to make room.
+const AUTHOR: usize = 22;
+
+/// The author of a line: a name **and** a key, or a key alone.
+///
+/// SIP-21, on display names: "A client MUST show the key alongside the name
+/// wherever the distinction could matter … and MUST NOT let a name be the only
+/// thing a person sees at those moments. This is the one requirement in this
+/// SIP that is load-bearing."
+///
+/// A name is a claim its subject makes. Two accounts may publish the same one,
+/// or names differing by a homoglyph, a combining mark or a bidirectional
+/// override, and the key is the only thing that tells them apart. So when the
+/// column is too narrow for both, it is the **name** that is cut — never the
+/// key, which is what makes this function the whole of the rule.
+///
+/// `mine` is the exception, and a narrow one: our own messages are the one
+/// place impersonation is not a question a reader has.
+pub fn author(name: &str, key: &str, mine: bool) -> String {
+    if mine {
+        return "you".to_string();
+    }
+    if name.is_empty() {
+        return key.to_string();
+    }
+    // The key, the brackets and a space: what the name may have is whatever is
+    // left, and never less than nothing.
+    let room = AUTHOR.saturating_sub(key.chars().count() + 3);
+    if room < 2 {
+        return key.to_string();
+    }
+    format!("{} ({key})", truncate(name, room))
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -364,7 +403,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
         // and the reader has no way to find the target by hand.
         if let Some((seq, stub)) = &s.reply_to {
             lines.push(Line::from(vec![
-                Span::raw(" ".repeat(clock(s.at).chars().count() + 13)),
+                Span::raw(" ".repeat(clock(s.at).chars().count() + AUTHOR + 1)),
                 Span::styled(
                     format!("↳ {seq}: {}", truncate(stub, 48)),
                     Style::default().fg(Color::DarkGray),
@@ -391,7 +430,10 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(clock(s.at), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{:>12} ", truncate(&s.who, 12)), who),
+            Span::styled(
+                format!("{:>AUTHOR$} ", author(&s.who, &s.key, s.mine)),
+                who,
+            ),
             body,
         ];
         if s.has_file && !s.redacted {
@@ -420,7 +462,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
 
         if !s.reactions.is_empty() && !s.redacted {
             let mut row = vec![Span::raw(
-                " ".repeat(clock(s.at).chars().count() + 14),
+                " ".repeat(clock(s.at).chars().count() + AUTHOR + 2),
             )];
             for (emoji, count, mine) in &s.reactions {
                 row.push(Span::styled(
@@ -436,7 +478,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
         }
 
         if picked && app.reacting {
-            let mut row = vec![Span::raw(" ".repeat(clock(s.at).chars().count() + 14))];
+            let mut row = vec![Span::raw(" ".repeat(clock(s.at).chars().count() + AUTHOR + 2))];
             for (n, emoji) in REACTIONS.iter().enumerate() {
                 row.push(Span::styled(
                     format!("{}:{emoji}  ", n + 1),
@@ -545,6 +587,7 @@ fn keys_line(width: usize) -> String {
         "/public /find /join",
         "/new /invite /kick",
         "/name /topic /avatar",
+        "/profile /block /blocked",
     ];
     let mut out = String::new();
     for g in GROUPS {
@@ -859,6 +902,7 @@ mod tests {
                         "/public /find /join",
                         "/new /invite /kick",
                         "/name /topic /avatar",
+                        "/profile /block /blocked",
                     ]
                     .contains(&group),
                     "a group was cut in half at width {width}: {group:?}"
@@ -1081,6 +1125,68 @@ mod tests {
         assert!(
             out.contains("/avatar save"),
             "a picture was set and nothing said how to see it:\n{out}"
+        );
+    }
+
+    /// SIP-21's one load-bearing requirement: "A client MUST show the key
+    /// alongside the name wherever the distinction could matter … and MUST NOT
+    /// let a name be the only thing a person sees at those moments."
+    ///
+    /// A name is a claim its subject makes, and two accounts may publish the
+    /// same one. If this ever passes with the key absent, the client has become
+    /// a thing that can be impersonated by typing.
+    #[test]
+    fn a_display_name_never_appears_without_its_key() {
+        assert_eq!(author("", "9hMLdY3V", false), "9hMLdY3V");
+        let line = author("Alice", "9hMLdY3V", false);
+        assert!(line.contains("Alice"), "{line}");
+        assert!(line.contains("9hMLdY3V"), "{line}");
+
+        // Two accounts, the same claimed name. Only the key separates them, so
+        // only the key can be the thing that is always there.
+        let one = author("Alice", "9hMLdY3V", false);
+        let two = author("Alice", "E4LUkjrZ", false);
+        assert_ne!(one, two, "two accounts named Alice rendered identically");
+
+        // A name that will not fit is cut. The key is not.
+        let long = author(&"n".repeat(200), "9hMLdY3V", false);
+        assert!(
+            long.contains("9hMLdY3V"),
+            "a long name pushed the key off the line: {long}"
+        );
+        assert!(long.chars().count() <= AUTHOR, "{long}");
+
+        // Including one made of characters that are wide, combining, or
+        // right-to-left — the exact material an impersonation is built from.
+        for name in ["🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈", "e\u{301}\u{301}\u{301}\u{301}", "\u{202e}ecilA"] {
+            let line = author(name, "9hMLdY3V", false);
+            assert!(
+                line.contains("9hMLdY3V"),
+                "the key was lost rendering {name:?}: {line}"
+            );
+        }
+
+        // Our own messages are the one place impersonation is not a question a
+        // reader has.
+        assert_eq!(author("Alice", "9hMLdY3V", true), "you");
+    }
+
+    #[test]
+    fn the_transcript_shows_a_name_with_the_key_it_belongs_to() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "Alice".into(),
+            key: "9hMLdY3V".into(),
+            text: "hello".into(),
+            seq: 3,
+            at: 3661,
+            ..Default::default()
+        }];
+        let out = render(&app, 100, 20);
+        assert!(out.contains("Alice"), "{out}");
+        assert!(
+            out.contains("9hMLdY3V"),
+            "a name reached the screen with no key beside it:\n{out}"
         );
     }
 

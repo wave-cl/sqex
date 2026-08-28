@@ -121,6 +121,21 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
 );
+-- SIP-21 profiles, cached. Every field here is a claim its subject makes about
+-- itself, which is why `account` is the primary key and the name is not
+-- indexed: nothing in this client may ever look somebody up by the name they
+-- chose. `fetched` is kept so a stale claim can be refreshed without asking
+-- the exchange about everybody on every poll.
+--
+-- Not sealed. A display name is published to anybody who shares a channel with
+-- its subject, so it is not a secret, and the rows that are secret are sealed
+-- for a reason this one does not share.
+CREATE TABLE IF NOT EXISTS profile (
+    account BLOB PRIMARY KEY,
+    name    TEXT    NOT NULL DEFAULT '',
+    title   TEXT    NOT NULL DEFAULT '',
+    fetched INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 pub struct Store {
@@ -601,6 +616,43 @@ impl Store {
             out.push((seq, account, posted, kind, plain));
         }
         Ok(out)
+    }
+
+    // ---- profiles (SIP-21) ----------------------------------------------
+
+    /// Remember what an account says about itself.
+    ///
+    /// An account that publishes nothing, or withholds it, is stored as empty
+    /// rather than left absent: "asked and told nothing" and "never asked" have
+    /// to be different, or the client asks again on every poll forever.
+    pub fn put_profile(&self, account: &PubKey, name: &str, title: &str, now: u64) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO profile (account, name, title, fetched)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (account) DO UPDATE SET name = ?2, title = ?3, fetched = ?4",
+                params![account.as_bytes(), name, title, now as i64],
+            )
+            .map_err(storage("store profile"))?;
+        Ok(())
+    }
+
+    /// The name and title we hold for an account, and when we asked.
+    pub fn profile(&self, account: &PubKey) -> Result<Option<(String, String, u64)>> {
+        self.db
+            .query_row(
+                "SELECT name, title, fetched FROM profile WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage("read profile"))
     }
 
     // ---- who this client is ---------------------------------------------

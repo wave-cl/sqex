@@ -18,6 +18,10 @@ use sqex_proto::channel_key::{
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
 use sqex_proto::device::{Device, Devices, ListDevices, Register, Revoke};
 use sqex_proto::blob::Attachment;
+use sqex_proto::profile::{
+    self, Block, Blocks, ByAccount as ProfileByAccount, Got as GotProfile, Profile,
+    Put as ProfilePut,
+};
 use sqex_proto::message::{Body, MAX_EMOJI, Part, Post as SipPost};
 use sqex_proto::prekey::{
     Cleared, Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_CLEAR, TYPE_COUNT, Take, Taken,
@@ -39,6 +43,12 @@ const RETENTION_SECS: u32 = 30 * 24 * 60 * 60;
 ///
 /// Under SIP-16's `MAX_WAIT` of 25 s, so the exchange never has to clamp it.
 pub const WAIT_SECS: u16 = 20;
+
+/// How long a cached profile is used before it is asked for again.
+///
+/// SIP-21 caps updates at 32 an hour, so an hour is the shortest interval at
+/// which asking more often could tell us anything new.
+const PROFILE_TTL: u64 = 60 * 60;
 
 #[derive(Debug)]
 pub enum ChatError {
@@ -1204,6 +1214,136 @@ impl Chat {
             // identical from here and are not the same.
             opened,
         })
+    }
+
+    /// Publish what this account says about itself (SIP-21).
+    ///
+    /// Nothing here is attested. A display name is a claim its subject makes,
+    /// and so is a title — which is called `title` and not `role` precisely
+    /// because `role` already means something the exchange holds and vouches
+    /// for. Publishing one does not make it true of anybody.
+    pub async fn set_profile(&mut self, profile: Profile) -> Result<()> {
+        if profile.name.len() > profile::MAX_NAME {
+            return Err(ChatError::Protocol(format!(
+                "a display name is at most {} bytes",
+                profile::MAX_NAME
+            )));
+        }
+        if profile.title.len() > profile::MAX_TITLE {
+            return Err(ChatError::Protocol(format!(
+                "a title is at most {} bytes",
+                profile::MAX_TITLE
+            )));
+        }
+        let body = self
+            .post("/profile/put", ProfilePut { profile }.encode())
+            .await?;
+        Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
+    /// What an account says about itself, if it will say.
+    ///
+    /// A profile withheld from us and one that was never published answer the
+    /// same way, on purpose: the difference would say whether somebody exists.
+    /// `Got::found` is that answer, and a caller must not read anything more
+    /// into it.
+    pub async fn profile_of(&mut self, account: &PubKey) -> Result<GotProfile> {
+        let body = self
+            .post(
+                "/profile/get",
+                ProfileByAccount { account: *account }.encode(profile::TYPE_GET),
+            )
+            .await?;
+        GotProfile::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// Stop an account reaching us, or let it again.
+    ///
+    /// The exchange drops what a blocked account sends and answers it exactly
+    /// as though it had landed, so blocking is not a signal the blocked party
+    /// can read. Nothing here tells them either.
+    pub async fn set_block(&mut self, account: &PubKey, add: bool) -> Result<()> {
+        let body = self
+            .post(
+                "/block/set",
+                Block {
+                    account: *account,
+                    add,
+                }
+                .encode(),
+            )
+            .await?;
+        Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Who we have blocked. Answered to nobody else — a list of who somebody
+    /// wants to avoid is more sensitive than the membership it protects them
+    /// from — which is why it takes no argument.
+    pub async fn blocked(&mut self) -> Result<Vec<PubKey>> {
+        let body = self.post("/block/list", vec![profile::TYPE_BLOCKED]).await?;
+        Ok(Blocks::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .accounts)
+    }
+
+    /// Fetch the profiles of accounts we do not hold a recent one for.
+    ///
+    /// Bounded by what has not been asked for lately rather than by what is on
+    /// screen: a name is asked for once and then read from the store, because
+    /// asking the exchange who everybody is on every poll would turn a display
+    /// convenience into a stream of traffic about who this client is reading.
+    ///
+    /// Failures are silent by design. A name is decoration; a conversation that
+    /// stopped working because a name could not be fetched would be the tail
+    /// wagging the dog.
+    pub async fn refresh_profiles(&mut self, accounts: &[PubKey], now: u64) -> Result<usize> {
+        let mut asked = 0;
+        for account in accounts {
+            if *account == self.me {
+                continue;
+            }
+            let held = self.store.profile(account)?;
+            if held.is_some_and(|(_, _, at)| now.saturating_sub(at) < PROFILE_TTL) {
+                continue;
+            }
+            let got = match self.profile_of(account).await {
+                Ok(got) => got,
+                Err(_) => continue,
+            };
+            // A profile withheld from us and one never published answer the
+            // same way. Both are stored as empty: we asked, and were told
+            // nothing, and asking again in an hour is the whole of what we can
+            // do about it.
+            let (name, title) = if got.found {
+                (got.profile.name, got.profile.title)
+            } else {
+                (String::new(), String::new())
+            };
+            self.store.put_profile(account, &name, &title, now)?;
+            asked += 1;
+        }
+        Ok(asked)
+    }
+
+    /// The display name we hold for an account, if it published one.
+    ///
+    /// A caller **MUST NOT** show this on its own. SIP-21: "A client MUST show
+    /// the key alongside the name wherever the distinction could matter … and
+    /// MUST NOT let a name be the only thing a person sees at those moments."
+    /// Two accounts may publish the same name, or names differing by a
+    /// homoglyph or a bidirectional override, and only the key tells them
+    /// apart.
+    pub fn display_name(&self, account: &PubKey) -> Option<String> {
+        let (name, _, _) = self.store.profile(account).ok().flatten()?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The title an account claims. Carries no authority of any kind.
+    pub fn title_of(&self, account: &PubKey) -> Option<String> {
+        let (_, title, _) = self.store.profile(account).ok().flatten()?;
+        (!title.is_empty()).then_some(title)
     }
 
     /// React to a message, or take a reaction back.
