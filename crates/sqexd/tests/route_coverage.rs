@@ -79,16 +79,8 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/channel/leave", Chat("/leave")),
     ("POST", "/channel/post", Chat("Chat::send_body")),
     ("POST", "/channel/info", Chat("Chat::info")),
-    (
-        "POST",
-        "/channel/retain",
-        Unreachable("SIP-16: retention cannot be changed after creation"),
-    ),
-    (
-        "POST",
-        "/channel/close",
-        Unreachable("SIP-16: a channel cannot be ended, so quota only depletes"),
-    ),
+    ("POST", "/channel/retain", Chat("/retain")),
+    ("POST", "/channel/close", Chat("/close yes")),
     ("POST", "/channel/mine", Chat("Chat::mine")),
     ("POST", "/channel/list", Chat("/find")),
     ("POST", "/channel/invite", Chat("/invite")),
@@ -97,11 +89,7 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/channel/key/get", Chat("Chat::collect_keys")),
     ("POST", "/channel/key/missing", Chat("Chat::stranded")),
     ("POST", "/channel/cursor", Chat("Chat::mark_read")),
-    (
-        "POST",
-        "/channel/cursors",
-        Unreachable("SIP-16: receipts are published and never shown"),
-    ),
+    ("POST", "/channel/cursors", Chat("/read")),
     ("POST", "/channel/redact", Chat("/redact")),
     ("POST", "/channel/signal", Chat("Chat::typing")),
     ("POST", "/channel/fetch", Chat("Chat::poll")),
@@ -191,9 +179,6 @@ fn the_unreachable_routes_are_the_ones_we_know_about() {
     let expected: Vec<&str> = vec![
         "/admission/request",
         "/blob/attach",
-        "/channel/close",
-        "/channel/cursors",
-        "/channel/retain",
     ];
 
     let mut open_sorted = open.clone();

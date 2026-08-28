@@ -1071,7 +1071,7 @@ async fn handle_key(
             // These change which conversations exist, so the list is rebuilt
             // rather than patched — the exchange is the authority on what we
             // are in, and guessing at it here is how the two drift apart.
-            let restructured = matches!(cmd, Command::Leave);
+            let restructured = matches!(cmd, Command::Leave | Command::CloseConfirmed);
             let outcome = match cmd {
                 Command::Send(text) => chat.send(&channel, &text).await.map(|_| None),
                 Command::File(path) => send_file(chat, &channel, &path).await.map(Some),
@@ -1165,6 +1165,39 @@ async fn handle_key(
                 Command::Leave => chat.leave(&channel).await.map(|()| {
                     Some("left — it will be gone from the list next time".to_string())
                 }),
+                Command::Retain(secs, max) => {
+                    chat.set_retention(&channel, secs, max).await.map(|()| {
+                        Some(format!(
+                            "keeping {secs} seconds{} — anything older is already gone",
+                            match max {
+                                0 => String::new(),
+                                n => format!(" and at most {n} messages"),
+                            }
+                        ))
+                    })
+                }
+                // Asked rather than done. There is no tombstone and no undo:
+                // the entries, the envelopes and the attachments all go, and
+                // the identifier becomes free for an unrelated channel.
+                Command::Close => Ok(Some(
+                    "/close yes — this destroys every message here for everyone, \
+                     permanently, and cannot be undone"
+                        .to_string(),
+                )),
+                Command::CloseConfirmed => match chat.close(&channel).await {
+                    Ok(()) => {
+                        // Only after the exchange has confirmed. Dropping our
+                        // own keys first would destroy the conversation twice
+                        // over if the call turned out to have failed.
+                        let _ = chat.store().forget_channel(&channel);
+                        Ok(Some("closed — it is gone for everyone".to_string()))
+                    }
+                    Err(e) => Err(e),
+                },
+                Command::Read => match chat.marks(&channel).await {
+                    Ok(marks) => Ok(Some(read_marks(&marks, &chat.me, &open[i]))),
+                    Err(e) => Err(e),
+                },
                 Command::Who => match chat.info(&channel).await {
                     Ok(info) => Ok(Some(
                         info.members
@@ -1267,6 +1300,14 @@ enum Command {
     Unblock(String),
     /// `/blocked` — who we have blocked. Answered to nobody else.
     Blocked,
+    /// `/retain <secs> [max]` — how long this channel keeps what is said here.
+    Retain(u32, u32),
+    /// `/close` — end this channel. Irreversible, so it asks first.
+    Close,
+    /// `/close yes` — the answer to that question.
+    CloseConfirmed,
+    /// `/read` — how far everybody else has read.
+    Read,
     Unknown(String),
 }
 
@@ -1359,6 +1400,24 @@ impl Command {
             "/unblock" if !first.is_empty() => Command::Unblock(first.to_string()),
             "/unblock" => Command::Unknown("/unblock needs a public key".into()),
             "/blocked" => Command::Blocked,
+            "/retain" => {
+                let mut words = rest.split_whitespace();
+                match (
+                    words.next().map(str::parse::<u32>),
+                    words.next().map(str::parse::<u32>),
+                ) {
+                    (Some(Ok(secs)), None) => Command::Retain(secs, 0),
+                    (Some(Ok(secs)), Some(Ok(max))) => Command::Retain(secs, max),
+                    _ => Command::Unknown(
+                        "/retain <seconds> [max messages] — narrowing it deletes what \
+                         falls outside straight away"
+                            .into(),
+                    ),
+                }
+            }
+            "/close" if first == "yes" => Command::CloseConfirmed,
+            "/close" => Command::Close,
+            "/read" => Command::Read,
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -1396,6 +1455,40 @@ async fn send_file(
     post.parts.push(Part::Attachment(attachment));
     chat.send_post(channel, post).await?;
     Ok(note)
+}
+
+/// How far everybody else has read, in words.
+///
+/// A direct message has one other person, so "read to here" is the whole of
+/// what there is to say. A group has several, and naming them is the point —
+/// but a name is a claim, so each is shown with its key beside it (SIP-21).
+///
+/// An account that opted out of receipts reports `read: 0` and a real
+/// `delivered`: the exchange withholds their reading, not their existence, and
+/// saying "has not read any of it" of somebody who simply declined to say
+/// would be inventing a fact.
+fn read_marks(marks: &[sqex_proto::channel::Mark], me: &PubKey, conv: &Open) -> String {
+    let others: Vec<&sqex_proto::channel::Mark> =
+        marks.iter().filter(|m| m.account != *me).collect();
+    if others.is_empty() {
+        return "nobody else here yet".into();
+    }
+    others
+        .iter()
+        .map(|m| {
+            let who = if conv.peer.is_some() {
+                conv.label.clone()
+            } else {
+                short(&m.account)
+            };
+            match (m.read, m.delivered) {
+                (0, 0) => format!("{who}: nothing delivered"),
+                (0, d) => format!("{who}: delivered to {d}, reading not shared"),
+                (r, _) => format!("{who}: read to {r}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Set or remove the channel's picture.
@@ -2075,6 +2168,32 @@ mod tests {
         assert!(matches!(Command::parse("and/or"), Command::Send(_)));
         assert!(matches!(Command::parse("/file x"), Command::File(_)));
         assert!(matches!(Command::parse("/nonsense"), Command::Unknown(_)));
+    }
+
+    /// Closing destroys every message for everyone, with no tombstone and no
+    /// undo, so the bare word is a question and only the answer acts.
+    #[test]
+    fn closing_asks_before_it_acts() {
+        assert!(matches!(Command::parse("/close"), Command::Close));
+        assert!(matches!(
+            Command::parse("/close yes"),
+            Command::CloseConfirmed
+        ));
+        // Anything else is still the question, not the answer.
+        assert!(matches!(Command::parse("/close please"), Command::Close));
+    }
+
+    #[test]
+    fn retention_takes_a_window_and_optionally_a_count() {
+        assert!(matches!(Command::parse("/retain 3600"), Command::Retain(3600, 0)));
+        assert!(matches!(
+            Command::parse("/retain 3600 50"),
+            Command::Retain(3600, 50)
+        ));
+        // Not a number is a mistake to report rather than a value to guess at:
+        // narrowing a window deletes messages straight away.
+        assert!(matches!(Command::parse("/retain soon"), Command::Unknown(_)));
+        assert!(matches!(Command::parse("/retain"), Command::Unknown(_)));
     }
 
     #[test]

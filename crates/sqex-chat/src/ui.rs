@@ -588,6 +588,7 @@ fn keys_line(width: usize) -> String {
         "/new /invite /kick",
         "/name /topic /avatar",
         "/profile /block /blocked",
+        "/retain /close /read",
     ];
     let mut out = String::new();
     for g in GROUPS {
@@ -903,6 +904,7 @@ mod tests {
                         "/new /invite /kick",
                         "/name /topic /avatar",
                         "/profile /block /blocked",
+                        "/retain /close /read",
                     ]
                     .contains(&group),
                     "a group was cut in half at width {width}: {group:?}"
@@ -910,7 +912,7 @@ mod tests {
             }
         }
         // And a wide terminal gets all of them.
-        assert!(keys_line(200).contains("/name /topic /avatar"));
+        assert!(keys_line(200).contains("/retain /close /read"));
     }
 
     #[test]

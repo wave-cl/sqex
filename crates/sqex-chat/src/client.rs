@@ -7,9 +7,9 @@
 
 use sqex_proto::channel::{
     Ack, ByAccount, ByChannel, ByTarget, ChannelInfo, Create, Entries, Fetch, Invite, Invitee,
-    KIND_MEMBER, List, Listing, MAX_MINE, MAX_NAME, MAX_TOPIC, Membership, Mine, Mines, Post,
-    Posted, Role, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, Visibility,
-    direct_message_id,
+    KIND_MEMBER, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
+    Marks, Membership, Mine, Mines, Post, Posted, Retain, Role, TYPE_CLOSE, TYPE_CURSORS,
+    TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, Visibility, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING, open_envelope,
@@ -469,6 +469,20 @@ impl Chat {
         // would produce something that looks end-to-end and is not.
         if info.visibility == Visibility::Public {
             return Ok(0);
+        }
+        // The exchange's epoch going *backwards* is the other face of SIP-16's
+        // reset sequence space, and the only one a writer sees. `poll` catches
+        // the reader who is ahead of the log; somebody whose cursor happens to
+        // sit below the new channel's newest entry never trips that rule, and
+        // for a direct message — whose identifier is derived from the two
+        // accounts — the destroyed channel and its successor have the same
+        // name. So this client would carry a key from a channel that no longer
+        // exists into a new one, and `put_key` will not overwrite an epoch key
+        // (rightly: replacing one loses everything sealed under it). The result
+        // is a message sealed under a key nobody else has, accepted by the
+        // exchange and openable by no one.
+        if info.epoch < self.store.highest_epoch(channel)? {
+            self.store.reset_sequence_space(channel)?;
         }
         if info.epoch == 0 {
             let to = self.devices_of(&members_of(&info)).await?;
@@ -1216,6 +1230,81 @@ impl Chat {
         })
     }
 
+    /// Change how long this channel keeps entries, and how many.
+    ///
+    /// Admin only, and the exchange prunes immediately — so narrowing a window
+    /// is a deletion, not a policy that takes effect later. `max_entries` of 0
+    /// means no limit on count.
+    pub async fn set_retention(
+        &mut self,
+        channel: &[u8; 32],
+        retention_secs: u32,
+        max_entries: u32,
+    ) -> Result<()> {
+        if !(MIN_RETENTION..=MAX_RETENTION).contains(&retention_secs) {
+            return Err(ChatError::Protocol(format!(
+                "retention is {MIN_RETENTION} to {MAX_RETENTION} seconds"
+            )));
+        }
+        let body = self
+            .post(
+                "/channel/retain",
+                Retain {
+                    channel: *channel,
+                    retention_secs,
+                    max_entries,
+                }
+                .encode(),
+            )
+            .await?;
+        Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
+    /// End a channel: entries, envelopes and attachments, all of it.
+    ///
+    /// Not reversible and no tombstone. The identifier becomes free, and a
+    /// create naming it afterwards makes a new and unrelated channel — which
+    /// for a direct message, whose identifier is derived from the two accounts,
+    /// is exactly how a conversation comes back with its numbering restarted
+    /// (SIP-16, "A reset sequence space").
+    ///
+    /// This is also the only thing that gives the creator's quota back: SIP-16
+    /// notes it otherwise "only ever depletes".
+    ///
+    /// Forgetting it locally is the caller's to do, and deliberately not done
+    /// here: a client that dropped its own keys before the exchange confirmed
+    /// would have destroyed the conversation twice over if the call failed.
+    pub async fn close(&mut self, channel: &[u8; 32]) -> Result<()> {
+        let body = self
+            .post(
+                "/channel/close",
+                ByChannel { channel: *channel }.encode(TYPE_CLOSE),
+            )
+            .await?;
+        Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
+    /// How far everybody else has read.
+    ///
+    /// This client has published its own cursor with `receipts: true` since it
+    /// was written and has never once read anybody else's, so the receipts
+    /// went out and nothing came back. An account that opted out of receipts
+    /// reports `read: 0` and a real `delivered` — the exchange withholds their
+    /// reading, not their existence.
+    pub async fn marks(&mut self, channel: &[u8; 32]) -> Result<Vec<Mark>> {
+        let body = self
+            .post(
+                "/channel/cursors",
+                ByChannel { channel: *channel }.encode(TYPE_CURSORS),
+            )
+            .await?;
+        Ok(Marks::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .marks)
+    }
+
     /// Publish what this account says about itself (SIP-21).
     ///
     /// Nothing here is attested. A display name is a claim its subject makes,
@@ -1557,6 +1646,11 @@ impl Chat {
         let restarted = since > 0 && entries.last > 0 && entries.last < since;
         if restarted {
             self.store.reset_sequence_space(channel)?;
+            // The caller's fold goes too. Every message in it is filed under a
+            // sequence number that now belongs to a different channel, so
+            // keeping it would merge two conversations — and where the numbers
+            // collide, silently replace one message with another.
+            *timeline = Timeline::new();
             since = 0;
             let body = self
                 .post(

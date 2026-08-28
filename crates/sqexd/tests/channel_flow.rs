@@ -11,10 +11,10 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{
-    ByChannel, ByTarget, ChannelInfo, Create, Cursor, EVENT_JOINED, Entries, Fetch,
-    KIND_MEMBER, KIND_SYSTEM, List, Listing, MIN_RETENTION, Mark, Marks, Post, Posted, Role,
-    SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT,
-    Visibility,
+    ByChannel, ByTarget, ChannelInfo, Create, Cursor, EVENT_JOINED, EVENT_RETENTION, Entries,
+    Fetch, KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_RETENTION, MIN_RETENTION, Mark, Marks,
+    Post, Posted, Retain, Role, SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
+    TYPE_LEAVE, TYPE_REDACT, Visibility,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -838,4 +838,126 @@ async fn leaving_removes_a_channel_from_mine() {
         Mines::decode(&body).unwrap().channels.is_empty(),
         "a channel somebody left is still listed as theirs"
     );
+}
+
+/// `/channel/retain` had no test anywhere in this workspace. It is the one
+/// route in the lifecycle nothing exercised, and it both rewrites the window
+/// and prunes against it immediately — so getting it wrong deletes messages.
+#[tokio::test]
+async fn narrowing_retention_drops_what_now_falls_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice_key) = identity(101);
+    let channel = [21u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+
+    assert_eq!(create(&mut a, &public(channel, "a long memory")).await, 200);
+    for i in 0..6u8 {
+        assert_eq!(post(&mut a, channel, &[b'a' + i]).await.0, 200);
+    }
+    assert_eq!(bodies(&Entries::decode(&fetch(&mut a, channel, 0, 0).await.1).unwrap()).len(), 6);
+
+    let (code, _) = a
+        .post(
+            "/channel/retain",
+            Retain {
+                channel,
+                retention_secs: MIN_RETENTION,
+                max_entries: 3,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    // Not a policy that takes effect later: the exchange prunes as part of the
+    // same transaction, so narrowing a window is a deletion.
+    //
+    // Two messages out of a limit of three, because the record of the change
+    // itself is an entry and occupies one of the places. Worth knowing: asking
+    // for a limit of two here keeps one message.
+    let seen = Entries::decode(&fetch(&mut a, channel, 0, 0).await.1).unwrap();
+    assert_eq!(bodies(&seen), vec![vec![b'e'], vec![b'f']]);
+
+    // And a reader is told where the surviving history starts, or it would
+    // present what is left as the whole conversation.
+    assert_eq!(seen.first, 5);
+
+    // The change is recorded, so a member can see that somebody narrowed it
+    // rather than finding messages missing with no explanation.
+    let system: Vec<System> = seen
+        .entries
+        .iter()
+        .filter(|e| e.kind == KIND_SYSTEM)
+        .filter_map(|e| System::decode(&e.body).ok().flatten())
+        .collect();
+    assert!(
+        system.iter().any(|s| s.event == EVENT_RETENTION && s.actor == alice_key),
+        "narrowing the window left no record of who did it"
+    );
+
+    let info = ChannelInfo::decode(&info(&mut a, channel).await.1).unwrap();
+    assert_eq!(info.retention_secs, MIN_RETENTION);
+    assert_eq!(info.max_entries, 3);
+}
+
+#[tokio::test]
+async fn only_an_admin_may_change_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(102);
+    let (bob_seed, _) = identity(103);
+    let channel = [22u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    let mut b = as_identity(addr, pubkey, bob_seed).await;
+
+    assert_eq!(create(&mut a, &public(channel, "not yours")).await, 200);
+    assert_eq!(join(&mut b, channel).await, 200);
+    assert_eq!(post(&mut a, channel, b"keep me").await.0, 200);
+
+    let narrow = Retain {
+        channel,
+        retention_secs: MIN_RETENTION,
+        max_entries: 1,
+    }
+    .encode();
+    let (code, _) = b.post("/channel/retain", narrow.clone()).await.unwrap();
+    assert_ne!(code, 200, "a member who is not an admin narrowed the window");
+
+    // A member being able to do this would be a member being able to delete
+    // everybody's history, so the refusal is the whole point.
+    let seen = Entries::decode(&fetch(&mut b, channel, 0, 0).await.1).unwrap();
+    assert_eq!(bodies(&seen), vec![b"keep me".to_vec()]);
+}
+
+#[tokio::test]
+async fn retention_outside_the_permitted_range_is_refused_by_retain_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(104);
+    let channel = [23u8; 32];
+    let mut a = as_identity(addr, pubkey, alice_seed).await;
+    assert_eq!(create(&mut a, &public(channel, "bounded")).await, 200);
+
+    // Create enforces the range. Retain is a second door into the same field
+    // and has to enforce it as well, or the bound is only a default.
+    for secs in [0, MIN_RETENTION - 1, MAX_RETENTION + 1] {
+        let (code, _) = a
+            .post(
+                "/channel/retain",
+                Retain {
+                    channel,
+                    retention_secs: secs,
+                    max_entries: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(code, 200, "retention of {secs} was accepted");
+    }
+
+    let info = ChannelInfo::decode(&info(&mut a, channel).await.1).unwrap();
+    assert_eq!(info.retention_secs, 3600, "a refused change took effect");
 }
