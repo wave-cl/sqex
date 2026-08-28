@@ -1363,6 +1363,7 @@ mod tests {
                 account: PubKey::new([from; 32]),
                 posted: 0,
                 kind: sqex_proto::channel::KIND_MEMBER,
+                tombstone: false,
                 body: Some(Body::Post(SipPost::text(text))),
             },
             &[],

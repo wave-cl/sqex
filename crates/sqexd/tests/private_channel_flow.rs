@@ -632,6 +632,7 @@ fn timeline_of(entries: &[sqex_proto::channel::Entry], key: &ChannelKey, channel
             account: e.account,
             posted: e.posted,
             kind: e.kind,
+            tombstone: false,
             body: key
                 .open(&channel, e.epoch, &e.device, e.msg_seq, &e.body)
                 .ok()

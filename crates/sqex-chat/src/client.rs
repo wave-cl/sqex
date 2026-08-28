@@ -613,6 +613,7 @@ impl Chat {
                     account,
                     posted,
                     kind,
+                    tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
                     body: plain.and_then(|p| Body::decode(&p).ok().flatten()),
                 },
                 admins,
@@ -1271,6 +1272,12 @@ impl Chat {
             if plain.is_some() && e.kind == KIND_MEMBER {
                 self.store.record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
             }
+            // SIP-16 redaction leaves the entry with no body at all. That is
+            // a deleted message, not one this client could not open, and the
+            // difference has to be read off the entry rather than off `plain`:
+            // a sealed tombstone has nothing to unseal, so opening it fails
+            // exactly as a missing key does.
+            let tombstone = e.body.is_empty();
             self.store.put_message(
                 channel,
                 Kept {
@@ -1278,7 +1285,13 @@ impl Chat {
                     account: e.account,
                     posted: e.posted,
                     kind: e.kind,
-                    plain: plain.as_deref(),
+                    // Stored as empty rather than absent, so that reopening
+                    // this store still tells the two apart.
+                    plain: if tombstone {
+                        Some(&[][..])
+                    } else {
+                        plain.as_deref()
+                    },
                 },
             )?;
             let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
@@ -1288,6 +1301,7 @@ impl Chat {
                     account: e.account,
                     posted: e.posted,
                     kind: e.kind,
+                    tombstone,
                     body,
                 },
                 &admins,

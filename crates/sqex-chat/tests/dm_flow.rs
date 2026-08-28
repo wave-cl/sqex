@@ -1479,4 +1479,18 @@ async fn redacting_removes_the_words_from_the_exchange_and_tells_the_other_side(
         !said(&got.timeline).contains(&"delete this".to_string()),
         "the exchange still served the redacted body to a fresh reader"
     );
+
+    // And they are told it was deleted, not that they are missing a key. A
+    // reader who arrives after a redaction never held the words; reporting the
+    // empty entry as unopenable sends them looking for a fault that is not
+    // there.
+    assert!(
+        !got.timeline.unreadable().contains(&regret),
+        "the tombstone (seq {regret}) was reported unopenable: {:?}",
+        got.timeline.unreadable()
+    );
+    assert!(
+        got.timeline.get(regret).is_some_and(|m| m.redacted),
+        "a fresh reader did not see the tombstone at all"
+    );
 }

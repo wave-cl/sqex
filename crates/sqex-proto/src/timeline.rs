@@ -46,6 +46,17 @@ pub struct Received {
     /// opened. Either way it is carried rather than dropped, so a client can
     /// say something was there.
     pub body: Option<Body>,
+    /// The entry arrived carrying no body at all.
+    ///
+    /// SIP-16 redaction removes the body and keeps the entry with `len` 0 as a
+    /// tombstone, so this is a message that was deleted — not one this client
+    /// failed to open. Telling a reader their key is missing when somebody
+    /// simply deleted a message sends them looking for a fault that is not
+    /// there.
+    ///
+    /// The distinction is safe to make on length: a sealed body always carries
+    /// its tag, so nothing openable is ever zero bytes.
+    pub tombstone: bool,
 }
 
 /// A message as it should be shown.
@@ -128,6 +139,25 @@ impl Timeline {
             return;
         }
         let Some(body) = &e.body else {
+            if e.tombstone {
+                // Deleted, and the entry kept so the gap is visible. A reader
+                // arriving after the redaction never held the words and never
+                // will, but should still see that something was here.
+                self.messages.insert(
+                    e.seq,
+                    Message {
+                        seq: e.seq,
+                        account: e.account,
+                        posted: e.posted,
+                        post: Post::default(),
+                        edited: None,
+                        edit_seq: None,
+                        redacted: true,
+                        reactions: BTreeMap::new(),
+                    },
+                );
+                return;
+            }
             // Well formed and not understood, or sealed under a key we lack.
             // Either way it happened, and the reader is told.
             self.unreadable.push(e.seq);
@@ -222,12 +252,24 @@ mod tests {
         PubKey::new([b; 32])
     }
 
+    fn tombstone(seq: u64, who: u8, posted: u64) -> Received {
+        Received {
+            seq,
+            account: PubKey::new([who; 32]),
+            posted,
+            kind: 0x01,
+            tombstone: true,
+            body: None,
+        }
+    }
+
     fn post(seq: u64, who: u8, posted: u64, text: &str) -> Received {
         Received {
             seq,
             account: key(who),
             posted,
             kind: 0x01,
+            tombstone: false,
             body: Some(Body::Post(Post::text(text))),
         }
     }
@@ -238,6 +280,7 @@ mod tests {
             account: key(who),
             posted,
             kind: 0x01,
+            tombstone: false,
             body: Some(b),
         }
     }
@@ -492,6 +535,7 @@ mod tests {
                     account: PubKey::new([0; 32]),
                     posted: 101,
                     kind: KIND_SYSTEM,
+                    tombstone: false,
                     body: None,
                 },
             ],
@@ -514,6 +558,7 @@ mod tests {
                     account: key(1),
                     posted: 101,
                     kind: 0x01,
+                    tombstone: false,
                     body: None,
                 },
             ],
@@ -521,5 +566,44 @@ mod tests {
         );
         assert_eq!(t.messages().count(), 1);
         assert_eq!(t.unreadable(), &[2]);
+    }
+
+    /// A reader arriving after a redaction never held the words and never
+    /// will. The entry still reaches them, with no body, and SIP-16 keeps it
+    /// so the gap is visible — so it is a deleted message, not one this client
+    /// failed to open. Reporting "cannot be opened" sends the reader looking
+    /// for a missing key that does not exist.
+    #[test]
+    fn a_tombstone_reads_as_deleted_and_not_as_unreadable() {
+        let mut t = Timeline::new();
+        t.apply(&post(1, 1, 10, "still here"), &[]);
+        t.apply(&tombstone(2, 1, 20), &[]);
+
+        assert!(
+            t.unreadable().is_empty(),
+            "a tombstone was reported as unreadable: {:?}",
+            t.unreadable()
+        );
+        let m = t.get(2).expect("the tombstone was dropped entirely");
+        assert!(m.redacted, "the tombstone was not marked redacted");
+        assert!(!m.is_visible());
+        assert_eq!(m.account, PubKey::new([1; 32]), "it lost its author");
+        assert_eq!(m.posted, 20, "it lost its time");
+
+        // And it does not disturb what is around it.
+        assert_eq!(t.get(1).map(|m| m.redacted), Some(false));
+    }
+
+    /// An entry with a body this client cannot read is a different thing, and
+    /// must keep saying so — a key may still arrive for it.
+    #[test]
+    fn an_unopenable_body_is_still_unreadable() {
+        let mut t = Timeline::new();
+        let mut e = tombstone(3, 1, 30);
+        e.tombstone = false; // body absent because we could not open it
+        t.apply(&e, &[]);
+
+        assert_eq!(t.unreadable(), &[3]);
+        assert!(t.get(3).is_none(), "an unopenable entry became a message");
     }
 }
