@@ -211,6 +211,13 @@ pub async fn bind(
         ..Default::default()
     };
 
+    // Only override squic's own default when the config actually named a set
+    // of versions (SIP-29). Pinning one here would silently override it.
+    let mut squic_config = squic_config;
+    if let Some(versions) = &config.accepted_envelope_versions {
+        squic_config.accepted_envelope_versions = versions.clone();
+    }
+
     let listener = squic::listen(config.listen, &signing_key, squic_config)
         .await
         .map_err(|e| Error::Malformed(format!("cannot listen on {}: {e}", config.listen)))?;

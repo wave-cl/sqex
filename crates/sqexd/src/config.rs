@@ -45,6 +45,17 @@ pub struct FileConfig {
     /// How long an issued challenge nonce stays valid, in seconds.
     #[serde(default = "default_challenge_ttl")]
     pub challenge_ttl_secs: u64,
+
+    /// The sQUIC envelope versions this server parses (SIP-29). Omitted means
+    /// squic's own default, which is both. Narrowing it to `[2]` retires
+    /// version 1, after which clients older than sqex v0.11.0 cannot reach
+    /// this exchange at all.
+    ///
+    /// Deliberately `Option`: resolving an omitted key to a hard-coded list
+    /// would silently override squic's default and pin whatever this file
+    /// happened to say when it was written.
+    #[serde(default)]
+    pub accepted_envelope_versions: Option<Vec<u8>>,
 }
 
 /// Configuration with everything parsed and resolved.
@@ -56,6 +67,7 @@ pub struct Config {
     pub admins: Vec<PubKey>,
     pub seed_whitelist: Vec<PubKey>,
     pub challenge_ttl: std::time::Duration,
+    pub accepted_envelope_versions: Option<Vec<u8>>,
 }
 
 impl FileConfig {
@@ -64,6 +76,19 @@ impl FileConfig {
         let listen = parse_listen(&self.listen)?;
         let admins = parse_keys(&self.admins, "admins")?;
         let seed_whitelist = parse_keys(&self.seed_whitelist, "seed_whitelist")?;
+
+        // SIP-29 reserves version 0 and forbids emitting it, and an empty list
+        // would refuse every caller in silence — both are configuration
+        // mistakes worth catching at load rather than at the first dropped
+        // Initial.
+        if let Some(versions) = &self.accepted_envelope_versions
+            && (versions.is_empty() || versions.contains(&0))
+        {
+            return Err(Error::Malformed(
+                "accepted_envelope_versions must be a non-empty list without 0".into(),
+            ));
+        }
+
         Ok(Config {
             listen,
             key_file: self.key_file,
@@ -71,6 +96,7 @@ impl FileConfig {
             admins,
             seed_whitelist,
             challenge_ttl: std::time::Duration::from_secs(self.challenge_ttl_secs.max(1)),
+            accepted_envelope_versions: self.accepted_envelope_versions,
         })
     }
 }
@@ -154,5 +180,33 @@ mod tests {
         assert!(cfg.admins.is_empty());
         assert_eq!(cfg.challenge_ttl.as_secs(), 30);
         assert_eq!(cfg.listen.port(), DEFAULT_PORT);
+    }
+
+    /// SIP-29. An omitted key must stay omitted so squic's own default applies:
+    /// resolving it to a hard-coded list here would pin whatever this file said
+    /// when it was written, which is how sqssh v0.4.0 kept emitting envelope
+    /// version 1 after squic moved its default and locked its clients out of a
+    /// server that had retired it.
+    #[test]
+    fn accepted_envelope_versions_is_unset_unless_named() {
+        let base = "key_file = \"/tmp/k\"\n";
+
+        let unset: FileConfig = toml::from_str(base).unwrap();
+        assert_eq!(unset.resolve().unwrap().accepted_envelope_versions, None);
+
+        let retired: FileConfig =
+            toml::from_str(&format!("{base}accepted_envelope_versions = [2]\n")).unwrap();
+        assert_eq!(
+            retired.resolve().unwrap().accepted_envelope_versions,
+            Some(vec![2])
+        );
+
+        // Version 0 is reserved, and an empty list would refuse everyone in
+        // silence. Both are caught at load.
+        for bad in ["[0]", "[]", "[1, 0]"] {
+            let cfg: FileConfig =
+                toml::from_str(&format!("{base}accepted_envelope_versions = {bad}\n")).unwrap();
+            assert!(cfg.resolve().is_err(), "{bad} should be refused");
+        }
     }
 }
