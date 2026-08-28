@@ -13,7 +13,7 @@
 //! sequence number and that total order is the only one; there is no causal
 //! clock here, because the exchange is already the sole authority on
 //! availability and membership and a sequence number sits on that side of the
-//! line (SIP-9 draws it).
+//! line (SIP-28 draws it).
 //!
 //! An entry's `body` is **opaque**. In a public channel it is a SIP-19 message
 //! in the clear; in a private one it is sealed under SIP-17 and nothing here
