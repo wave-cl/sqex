@@ -16,7 +16,7 @@ use sqex_proto::channel_key::{
     seal_envelope,
 };
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
-use sqex_proto::device::{Device, Devices, ListDevices, Register, Revoke};
+use sqex_proto::device::{AdmissionRequest, Device, Devices, ListDevices, Register, Revoke};
 use sqex_proto::blob::Attachment;
 use sqex_proto::profile::{
     self, Block, Blocks, ByAccount as ProfileByAccount, Got as GotProfile, Profile,
@@ -49,6 +49,13 @@ pub const WAIT_SECS: u16 = 20;
 /// SIP-21 caps updates at 32 an hour, so an hour is the shortest interval at
 /// which asking more often could tell us anything new.
 const PROFILE_TTL: u64 = 60 * 60;
+
+/// How long the credential in an admission request stays valid.
+///
+/// Long enough for somebody to read the request and act on it, short enough
+/// that one left unanswered stops being usable rather than sitting in a queue
+/// as a standing grant.
+const ADMISSION_LIFETIME: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug)]
 pub enum ChatError {
@@ -1228,6 +1235,33 @@ impl Chat {
             // identical from here and are not the same.
             opened,
         })
+    }
+
+    /// Ask an exchange that does not whitelist us to let us in (SIP-24).
+    ///
+    /// The credential names this very client, signed by this identity, so the
+    /// request carries a verifiable account key. `label` does not: it is text
+    /// the requester chose, shown to an administrator at the moment of a
+    /// security decision, and an interface **MUST** display the key rather
+    /// than let the label stand in for it.
+    ///
+    /// The answer says only that the request was received. It is identical for
+    /// every caller, whatever the exchange goes on to decide, so a caller must
+    /// not read approval, refusal or delay into it.
+    pub async fn request_admission(&mut self, label: &str) -> Result<()> {
+        let credential = self.issue_credential(&self.device, ADMISSION_LIFETIME)?;
+        let body = self
+            .post(
+                "/admission/request",
+                AdmissionRequest {
+                    credential,
+                    label: label.to_string(),
+                }
+                .encode(),
+            )
+            .await?;
+        Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok(())
     }
 
     /// Change how long this channel keeps entries, and how many.

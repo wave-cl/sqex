@@ -32,6 +32,11 @@ enum By {
     Probe,
     /// Served and reachable from nothing. Every one of these is a decision
     /// somebody has to make: wire it up, or delete the route.
+    ///
+    /// Unused, which is the point — there are none. It stays because it is the
+    /// word for the next route somebody serves before anything can call it,
+    /// and having to invent that word again is how the gap gets glossed over.
+    #[allow(dead_code)]
     Unreachable(&'static str),
 }
 
@@ -45,11 +50,7 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/admin/command", Sqnr("signed transactions")),
     ("POST", "/beacon/beat", Cli("sqex beacon")),
     ("POST", "/beacon/read", Cli("sqex beacon read")),
-    (
-        "POST",
-        "/admission/request",
-        Unreachable("SIP-24: no client asks to be admitted"),
-    ),
+    ("POST", "/admission/request", Chat("sqex-chat admit")),
     ("POST", "/profile/put", Chat("/profile")),
     ("POST", "/profile/get", Chat("Chat::refresh_profiles")),
     ("POST", "/block/set", Chat("/block, /unblock")),
@@ -64,11 +65,7 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/blob/abort", Chat("Chat::send_file, on failure")),
     ("POST", "/blob/head", Chat("Chat::fetch_file")),
     ("POST", "/blob/get", Chat("Chat::fetch_file")),
-    (
-        "POST",
-        "/blob/attach",
-        Unreachable("SIP-18: a file cannot be forwarded without re-uploading"),
-    ),
+    ("POST", "/blob/attach", Chat("/forward")),
     ("POST", "/blob/detach", Chat("Chat::redact, via Chat::detach")),
     ("POST", "/prekey/publish", Chat("Chat::top_up_prekeys")),
     ("POST", "/prekey/take", Chat("Chat::ensure_epoch")),
@@ -176,10 +173,9 @@ fn the_unreachable_routes_are_the_ones_we_know_about() {
         .map(|(_, p, _)| *p)
         .collect();
 
-    let expected: Vec<&str> = vec![
-        "/admission/request",
-        "/blob/attach",
-    ];
+    // Empty, and the assertion below is what keeps it that way: a route added
+    // with nothing able to call it fails here until somebody decides which.
+    let expected: Vec<&str> = vec![];
 
     let mut open_sorted = open.clone();
     open_sorted.sort();

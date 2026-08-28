@@ -589,6 +589,7 @@ fn keys_line(width: usize) -> String {
         "/name /topic /avatar",
         "/profile /block /blocked",
         "/retain /close /read",
+        "/forward",
     ];
     let mut out = String::new();
     for g in GROUPS {
@@ -905,6 +906,7 @@ mod tests {
                         "/name /topic /avatar",
                         "/profile /block /blocked",
                         "/retain /close /read",
+                        "/forward",
                     ]
                     .contains(&group),
                     "a group was cut in half at width {width}: {group:?}"

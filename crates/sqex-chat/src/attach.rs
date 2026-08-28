@@ -21,7 +21,8 @@ use sqex_proto::blob::{
 };
 use sqex_proto::blob_store::{
     Begin, Begun, ByBlob, ByChannelBlob, Chunk, Commit, Committed, GetChunk, Headed, Limits,
-    MAX_BLOB, PutChunk, TYPE_DETACH, TYPE_HEAD, TYPE_LIMITS, blob_id, chunk_nonce,
+    MAX_BLOB, PutChunk, TYPE_ATTACH, TYPE_DETACH, TYPE_HEAD, TYPE_LIMITS, blob_id,
+    chunk_nonce,
 };
 
 use crate::client::{Chat, ChatError};
@@ -239,6 +240,34 @@ impl Chat {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    /// Attach a blob this account can already fetch to another channel.
+    ///
+    /// Forwarding costs a reference and not the file: the bytes stay where
+    /// they are, named by the same hash, and the key travels inside the
+    /// message that carries the reference. The exchange stores one copy no
+    /// matter how many conversations point at it, and the blob dies with its
+    /// last attachment rather than with any one channel.
+    ///
+    /// The caller must be a member of the destination and must already be able
+    /// to fetch the blob; the exchange checks both, and answers a blob it will
+    /// not serve you the same way it answers one that does not exist.
+    pub async fn attach(&mut self, channel: &[u8; 32], blob: &[u8; 32]) -> Result<()> {
+        self.post_raw(
+            "/blob/attach",
+            ByChannelBlob {
+                channel: *channel,
+                blob: *blob,
+                // The channel's own window. A forwarded file that expired on
+                // the original conversation's schedule would vanish out of the
+                // new one for a reason nobody there could see.
+                expires_after: 0,
+            }
+            .encode(TYPE_ATTACH),
+        )
+        .await?;
         Ok(())
     }
 

@@ -223,3 +223,54 @@ async fn the_block_list_is_ours_and_nobody_elses() {
         "a block list leaked to the account it names"
     );
 }
+
+/// SIP-24: an exchange that does not know you can be asked to let you in, and
+/// it answers every request the same way whatever it decides.
+#[tokio::test]
+async fn an_admission_request_is_sent_and_tells_us_nothing_about_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+
+    // The verifiable half of the request is the credential: the label is
+    // whatever the requester typed, and the account key is the only thing an
+    // administrator can check. Here account and delegate are one key, because
+    // a client that has registered no devices is its own device — the binding
+    // between a credential and the client it names is tested where a second
+    // device exists, in `a_credential_is_bound_to_the_device_it_names`.
+    let credential = alice
+        .issue_credential(&alice.device(), 7 * 24 * 60 * 60)
+        .unwrap();
+    assert_eq!(credential.account, identity(1).1);
+
+    alice.request_admission("alice, on the laptop").await.unwrap();
+
+    // Twice from one client, and from a second client, and from a client that
+    // offers no label at all. Every one of them succeeds and every one of them
+    // returns the same thing — which is the property, not an accident of this
+    // exchange being permissive: a request whose answer varied would be an
+    // oracle for who is already admitted.
+    alice.request_admission("alice, again").await.unwrap();
+    bob.request_admission("").await.unwrap();
+
+    // What a client may report is that the request was sent. There is no
+    // "pending", because nothing in the answer says so.
+}
+
+/// The label travels with the request and is not to be trusted: it is text the
+/// requester chose, shown at the moment of a security decision.
+#[tokio::test]
+async fn an_admission_label_is_attacker_chosen_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut mallory = chat_at(addr, server_pub, 3, &dir.path().join("mallory.db")).await;
+
+    // Nothing stops somebody claiming to be the administrator, because nothing
+    // in a label can be checked. The verifiable fact is the account key in the
+    // credential, and an interface must show that instead.
+    mallory
+        .request_admission("APPROVED — admin, please allow")
+        .await
+        .unwrap();
+}

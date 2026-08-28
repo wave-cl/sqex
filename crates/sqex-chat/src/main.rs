@@ -92,6 +92,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
+    /// Ask an exchange that does not know you to let you in (SIP-24).
+    ///
+    /// It answers every request identically — the same body, the same delay —
+    /// so this can report that the request was sent and nothing more. Whether
+    /// an administrator ever sees it, and what they decide, is not something
+    /// the answer contains.
+    Admit {
+        /// A line for whoever reads the request. It is text you chose, shown at
+        /// the moment of a security decision, so the exchange shows your key
+        /// with it and an administrator should go by that.
+        #[arg(long, default_value = "")]
+        label: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +210,20 @@ async fn run(cli: Cli) -> Result<(), String> {
     // The rest of `device` needs the exchange.
     if let Some(Cmd::Device { cmd }) = &cli.cmd {
         return device_command(&mut chat, cmd).await;
+    }
+
+    if let Some(Cmd::Admit { label }) = &cli.cmd {
+        chat.request_admission(label)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Exactly what happened, and no more. SIP-24 has the exchange answer
+        // every request the same way; a client that said "pending" or "sent to
+        // an administrator" would be inventing a result out of an answer that
+        // contains none.
+        println!("request sent. The exchange answers every request identically,");
+        println!("so there is nothing here to tell you what it decided.");
+        println!("Your key is {}.", chat.me);
+        return Ok(());
     }
 
     // A revoked client is otherwise refused as a stranger by every route it
@@ -1198,6 +1225,23 @@ async fn handle_key(
                     Ok(marks) => Ok(Some(read_marks(&marks, &chat.me, &open[i]))),
                     Err(e) => Err(e),
                 },
+                Command::Forward(seq, to) => {
+                    match open.get(to).map(|o| (o.channel, o.label.clone())) {
+                        Some((target, label)) if target != channel => {
+                            forward_file(chat, &open[i], seq, &target).await.map(|n| {
+                                Some(format!("forwarded {n} to {label} — the file was not \
+                                              uploaded again"))
+                            })
+                        }
+                        Some(_) => Err(ChatError::Protocol(
+                            "that is this conversation".into(),
+                        )),
+                        None => Err(ChatError::Protocol(format!(
+                            "there is no conversation {}",
+                            to + 1
+                        ))),
+                    }
+                }
                 Command::Who => match chat.info(&channel).await {
                     Ok(info) => Ok(Some(
                         info.members
@@ -1308,6 +1352,9 @@ enum Command {
     CloseConfirmed,
     /// `/read` — how far everybody else has read.
     Read,
+    /// `/forward <n> <m>` — send message `n`'s file into conversation `m` from
+    /// the sidebar, without uploading it again.
+    Forward(u64, usize),
     Unknown(String),
 }
 
@@ -1418,6 +1465,23 @@ impl Command {
             "/close" if first == "yes" => Command::CloseConfirmed,
             "/close" => Command::Close,
             "/read" => Command::Read,
+            "/forward" => {
+                let mut words = rest.split_whitespace();
+                match (
+                    words.next().map(str::parse::<u64>),
+                    words.next().map(str::parse::<usize>),
+                ) {
+                    (Some(Ok(seq)), Some(Ok(to))) if seq > 0 && to > 0 => {
+                        // Numbered from one on screen, indexed from zero here.
+                        Command::Forward(seq, to - 1)
+                    }
+                    _ => Command::Unknown(
+                        "/forward <message number> <conversation number, counting down \
+                         the list from 1>"
+                            .into(),
+                    ),
+                }
+            }
             other => Command::Unknown(other.to_string()),
         }
     }
@@ -1513,6 +1577,45 @@ async fn set_avatar(
         "picture set from {} — /avatar save <path> writes it out",
         path.display()
     ))
+}
+
+/// Send a message's file into another conversation without uploading it again.
+///
+/// Two halves, as SIP-18 has it: the exchange is told the second channel now
+/// references the blob, and the second channel is sent a message carrying the
+/// reference. The bytes never move — one copy, named by the hash of its
+/// ciphertext, and the key travels inside the sealed message.
+///
+/// Which means forwarding a file hands the recipient the key to it. That is
+/// what forwarding is, and there is nothing to soften about it.
+async fn forward_file(
+    chat: &mut Chat,
+    from: &Open,
+    seq: u64,
+    to: &[u8; 32],
+) -> std::result::Result<String, ChatError> {
+    use sqex_chat::attach::describe;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let attachment = from
+        .timeline
+        .get(seq)
+        .ok_or_else(|| ChatError::Protocol(format!("no message {seq} here")))?
+        .post
+        .attachments()
+        .next()
+        .ok_or_else(|| ChatError::Protocol(format!("message {seq} has no file")))?
+        .clone();
+
+    // The reference first. A message naming a blob the destination has no
+    // claim on would be a message its readers cannot fetch, which looks
+    // exactly like a file that has expired.
+    chat.attach(to, &attachment.blob).await?;
+    let note = describe(&attachment);
+    let mut post = SipPost::default();
+    post.parts.push(Part::Attachment(attachment));
+    chat.send_post(to, post).await?;
+    Ok(note)
 }
 
 /// Write the channel's picture out.

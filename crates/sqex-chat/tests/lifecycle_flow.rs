@@ -237,3 +237,110 @@ async fn reading_is_reported_back_and_declining_to_say_is_not_the_same_as_not_re
     assert_eq!(mark.read, last, "reading was not reported back");
     assert!(mark.delivered >= last);
 }
+
+/// SIP-18 forwarding: the reference moves, the bytes do not.
+///
+/// Which also means forwarding a file hands its recipients the key to it —
+/// the key rides inside the message carrying the reference. That is what
+/// forwarding is, and the test says so by opening the file at the far end.
+#[tokio::test]
+async fn a_file_is_forwarded_without_being_uploaded_again() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+
+    let path = dir.path().join("plan.txt");
+    let contents: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &contents).unwrap();
+
+    // Alice sends Bob a file.
+    let first = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    let attachment = alice.upload(&first, &prepared).await.unwrap();
+    let mut post = SipPost::text("the plan");
+    post.parts.push(Part::Attachment(attachment.clone()));
+    alice.send_post(&first, post).await.unwrap();
+
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&first, &mut bobs, 0).await.unwrap();
+    let held = got
+        .timeline
+        .messages()
+        .next()
+        .unwrap()
+        .post
+        .attachments()
+        .next()
+        .unwrap()
+        .clone();
+
+    // Bob forwards it to Carol, uploading nothing.
+    let second = bob.open_dm(&carol_key).await.unwrap();
+    carol.open_dm(&bob_key).await.unwrap();
+    bob.attach(&second, &held.blob).await.unwrap();
+    let mut post = SipPost::text("look at this");
+    post.parts.push(Part::Attachment(held.clone()));
+    bob.send_post(&second, post).await.unwrap();
+
+    let mut carols = Timeline::new();
+    let got = carol.poll(&second, &mut carols, 0).await.unwrap();
+    let arrived = got
+        .timeline
+        .messages()
+        .next()
+        .unwrap()
+        .post
+        .attachments()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(arrived.blob, attachment.blob, "the file was re-uploaded");
+    assert_eq!(
+        carol.download(&arrived).await.unwrap(),
+        contents,
+        "the forwarded file did not open"
+    );
+
+    // Alice ending her conversation with Bob does not take the file out of
+    // Carol's: a blob dies with its last attachment, not with one channel.
+    alice.close(&first).await.unwrap();
+    assert_eq!(carol.download(&arrived).await.unwrap(), contents);
+}
+
+/// SIP-18 again, from the other side: a reference cannot be minted for a blob
+/// the caller has no claim on, or forwarding would be a way to attach any file
+/// on the exchange to a channel by guessing its name.
+#[tokio::test]
+async fn a_blob_we_cannot_fetch_cannot_be_attached() {
+    use sqex_proto::blob_store::CHUNK;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut mallory = chat_at(addr, server_pub, 3, &dir.path().join("mallory.db")).await;
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(4);
+
+    let path = dir.path().join("private.txt");
+    std::fs::write(&path, vec![7u8; 2000]).unwrap();
+    let theirs = alice.open_dm(&bob_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    let attachment = alice.upload(&theirs, &prepared).await.unwrap();
+
+    // Mallory knows the name — it is the hash of the ciphertext, and a name is
+    // not a secret. It buys nothing.
+    let mine = mallory.open_dm(&carol_key).await.unwrap();
+    assert!(
+        mallory.attach(&mine, &attachment.blob).await.is_err(),
+        "a blob was attached by somebody with no claim on it"
+    );
+}
