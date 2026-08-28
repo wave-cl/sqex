@@ -387,7 +387,8 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 fn status(f: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if app.trouble.is_quiet() {
         (
-            " ^C quit · Tab · ^N add · /public /find /join · /new /invite /kick · /file /save".to_string(),
+            " ^C quit · Tab · ^N add · /public /find /join · /new /invite /kick · /file /save /redact"
+                .to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {

@@ -833,6 +833,9 @@ async fn handle_key(
                          and what came before is unchanged"
                     ))
                 }),
+                Command::Redact(target) => chat.redact(&channel, target).await.map(|()| {
+                    Some(format!("redacted {target} — the exchange no longer holds it"))
+                }),
                 Command::Leave => chat.leave(&channel).await.map(|()| {
                     Some("left — it will be gone from the list next time".to_string())
                 }),
@@ -918,6 +921,8 @@ enum Command {
     Rotate,
     /// `/leave` — leave this channel.
     Leave,
+    /// `/redact <n>` — delete a message you posted, by its number.
+    Redact(u64),
     /// `/who` — who is in here.
     Who,
     Unknown(String),
@@ -972,6 +977,12 @@ impl Command {
             "/kick" => Command::Unknown("/kick needs a public key".into()),
             "/rotate" => Command::Rotate,
             "/leave" => Command::Leave,
+            "/redact" => match first.parse::<u64>() {
+                Ok(n) if n > 0 => Command::Redact(n),
+                _ => Command::Unknown(
+                    "/redact takes the number of a message you posted".into(),
+                ),
+            },
             "/who" => Command::Who,
             other => Command::Unknown(other.to_string()),
         }

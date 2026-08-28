@@ -6,9 +6,10 @@
 //! because the exchange is either unable or is the party being constrained.
 
 use sqex_proto::channel::{
-    Ack, ByAccount, ByChannel, ChannelInfo, Create, Entries, Fetch, Invite, Invitee, KIND_MEMBER,
-    List, Listing, MAX_MINE, MAX_NAME, MAX_TOPIC, Membership, Mine, Mines, Post, Posted, Role,
-    TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REMOVE, Visibility, direct_message_id,
+    Ack, ByAccount, ByChannel, ByTarget, ChannelInfo, Create, Entries, Fetch, Invite, Invitee,
+    KIND_MEMBER, List, Listing, MAX_MINE, MAX_NAME, MAX_TOPIC, Membership, Mine, Mines, Post,
+    Posted, Role, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, Visibility,
+    direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING, open_envelope,
@@ -1043,6 +1044,36 @@ impl Chat {
     /// a key before it posts anything.
     pub async fn send(&mut self, channel: &[u8; 32], text: &str) -> Result<Posted> {
         self.send_post(channel, SipPost::text(text)).await
+    }
+
+    /// Delete a message: remove its bytes at the exchange, and tell other
+    /// clients to show it as deleted.
+    ///
+    /// SIP-16 requires both halves. `/channel/redact` removes the body and
+    /// leaves the entry as a tombstone, so a reader can see that something was
+    /// deleted rather than find a conversation that silently does not follow.
+    /// The SIP-19 body is what other clients render. Issuing only the SIP-19
+    /// body would leave the words sitting at the exchange for anyone who joined
+    /// later with history access, which is the mistake worth not making.
+    ///
+    /// The exchange call goes first: if the second half fails, the words are
+    /// already gone, which is the direction to fail in.
+    ///
+    /// The caller must be the account that posted `target`, or an admin here.
+    /// The exchange decides that — it is why this is an operation there and not
+    /// only a message.
+    pub async fn redact(&mut self, channel: &[u8; 32], target: u64) -> Result<()> {
+        self.post(
+            "/channel/redact",
+            ByTarget {
+                channel: *channel,
+                target,
+            }
+            .encode(TYPE_REDACT),
+        )
+        .await?;
+        self.send_body(channel, Body::Redact { target }).await?;
+        Ok(())
     }
 
     /// Send a message built by the caller — text, attachments, a reply, or a

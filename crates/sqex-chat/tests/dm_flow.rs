@@ -1421,3 +1421,52 @@ async fn a_restarted_sequence_space_recovers_instead_of_going_silent() {
         said(&got.timeline)
     );
 }
+
+/// SIP-16 redaction has two halves and a client must issue both: the exchange
+/// call removes the bytes and leaves a tombstone, the SIP-19 body is what other
+/// clients render. Issuing only the second would leave the words at the
+/// exchange for anyone who joined later with history access.
+#[tokio::test]
+async fn redacting_removes_the_words_from_the_exchange_and_tells_the_other_side() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, "keep this").await.unwrap();
+    let regret = alice.send(&channel, "delete this").await.unwrap().seq;
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert!(said(&got.timeline).contains(&"delete this".to_string()));
+
+    alice.redact(&channel, regret).await.unwrap();
+
+    // Bob no longer shows it. The entry survives as a tombstone — the gap is
+    // the record — but the words are gone. The same timeline is reused: it
+    // accumulates, and the redaction arrives as a further entry against it.
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let visible = said(&got.timeline);
+    assert!(
+        visible.contains(&"keep this".to_string()),
+        "redaction took the wrong message: {visible:?}"
+    );
+    assert!(
+        !visible.contains(&"delete this".to_string()),
+        "the redacted message is still being shown: {visible:?}"
+    );
+
+    // And a reader arriving fresh, who never saw the original, cannot find it
+    // either — which is the half that only the exchange call provides.
+    let mut newcomer = chat_at(addr, server_pub, 2, &dir.path().join("bob2.db")).await;
+    let mut fresh = Timeline::new();
+    let got = newcomer.poll(&channel, &mut fresh, 0).await.unwrap();
+    assert!(
+        !said(&got.timeline).contains(&"delete this".to_string()),
+        "the exchange still served the redacted body to a fresh reader"
+    );
+}
