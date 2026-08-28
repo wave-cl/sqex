@@ -17,7 +17,8 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
 use sqex_proto::device::{Device, Devices, ListDevices, Register, Revoke};
-use sqex_proto::message::{Body, Post as SipPost};
+use sqex_proto::blob::Attachment;
+use sqex_proto::message::{Body, MAX_EMOJI, Part, Post as SipPost};
 use sqex_proto::prekey::{
     Cleared, Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_CLEAR, TYPE_COUNT, Take, Taken,
 };
@@ -906,7 +907,26 @@ impl Chat {
         self.set_metadata(channel, None, Some(topic)).await
     }
 
+    /// Set a channel's picture, or take it away with `None`.
+    pub async fn set_avatar(
+        &mut self,
+        channel: &[u8; 32],
+        avatar: Option<Attachment>,
+    ) -> Result<Posted> {
+        self.publish_metadata(channel, None, None, Some(avatar)).await
+    }
+
     /// Change a channel's name, its topic, or both.
+    pub async fn set_metadata(
+        &mut self,
+        channel: &[u8; 32],
+        name: Option<&str>,
+        topic: Option<&str>,
+    ) -> Result<Posted> {
+        self.publish_metadata(channel, name, topic, None).await
+    }
+
+    /// Publish a new metadata record, changing only what was asked for.
     ///
     /// A sealed entry rather than a field, so the exchange never learns what a
     /// private channel is called. Only an admin's is honoured by a reader.
@@ -916,11 +936,17 @@ impl Chat {
     /// what the record now is. So the fields not being changed are carried over
     /// rather than sent empty. Sending them empty is what made `/name` destroy
     /// a channel's topic with nothing able to restore it.
-    pub async fn set_metadata(
+    ///
+    /// `avatar` is an option of an option on purpose: `None` leaves the
+    /// picture as it is, and `Some(None)` removes it. Collapsing those would
+    /// mean a rename could not help but delete the picture, which is the same
+    /// bug in a different field.
+    async fn publish_metadata(
         &mut self,
         channel: &[u8; 32],
         name: Option<&str>,
         topic: Option<&str>,
+        avatar: Option<Option<Attachment>>,
     ) -> Result<Posted> {
         // The current record comes from the folded history rather than from
         // `info`: for a private channel the exchange holds neither field, and
@@ -939,10 +965,7 @@ impl Chat {
             Body::Metadata {
                 name: name.unwrap_or(&held.name).to_string(),
                 topic: topic.unwrap_or(&held.topic).to_string(),
-                // Not carried over. An avatar is an attachment, and re-sending
-                // the reference without checking the blob is still attached
-                // would publish a name for a file that may be gone.
-                avatar: None,
+                avatar: avatar.unwrap_or_else(|| held.avatar.clone()),
             },
         )
         .await
@@ -1181,6 +1204,74 @@ impl Chat {
             // identical from here and are not the same.
             opened,
         })
+    }
+
+    /// React to a message, or take a reaction back.
+    ///
+    /// Keyed on (account, target, emoji) by the fold, so adding one that is
+    /// already there changes nothing and removing one that is not is ordinary
+    /// rather than an error. That is what lets a client send this without
+    /// first knowing what it has already sent.
+    ///
+    /// A reaction is an ordinary sealed entry: the exchange counts nothing and
+    /// learns nothing, and a reader who lacks the key sees neither the message
+    /// nor what anyone thought of it.
+    pub async fn react(
+        &mut self,
+        channel: &[u8; 32],
+        target: u64,
+        emoji: &str,
+        add: bool,
+    ) -> Result<Posted> {
+        // The wire limit is on bytes, and an emoji is several of them, so
+        // this is checked the same way rather than in characters — a
+        // character-length check would pass something the decoder refuses.
+        if emoji.is_empty() || emoji.len() > MAX_EMOJI {
+            return Err(ChatError::Protocol(format!(
+                "a reaction is 1 to {MAX_EMOJI} bytes, and {:?} is {}",
+                emoji,
+                emoji.len()
+            )));
+        }
+        self.send_body(
+            channel,
+            Body::Reaction {
+                target,
+                add,
+                emoji: emoji.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Replace the text of a message already sent.
+    ///
+    /// A reader honours this only from the account that posted the target and
+    /// only within [`EDIT_WINDOW`] of it, and the reader is where that is
+    /// enforced — the exchange cannot check either, since it cannot read the
+    /// entry. Checking here as well is a courtesy, so that a client tells
+    /// somebody their edit will be ignored rather than sending one that
+    /// silently is.
+    pub async fn edit(
+        &mut self,
+        channel: &[u8; 32],
+        target: u64,
+        post: SipPost,
+    ) -> Result<Posted> {
+        post.validate().map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.send_body(channel, Body::Edit { target, post }).await
+    }
+
+    /// Reply to a message: an ordinary post carrying [`Part::Reply`].
+    pub async fn reply(
+        &mut self,
+        channel: &[u8; 32],
+        target: u64,
+        text: &str,
+    ) -> Result<Posted> {
+        let mut post = SipPost::text(text);
+        post.parts.push(Part::Reply(target));
+        self.send_post(channel, post).await
     }
 
     /// Send a message built by the caller — text, attachments, a reply, or a

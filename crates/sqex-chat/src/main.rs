@@ -19,6 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use sqex_chat::attach::describe;
 use sqex_chat::client::{Chat, ChatError};
 use sqex_chat::store::{Store, store_path};
+use sqex_proto::message::Post as SipPost;
 use sqex_proto::timeline::Timeline;
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::Signer;
@@ -641,6 +642,109 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
     }
 }
 
+/// Poll the conversation just acted on and redraw from it.
+///
+/// Every action in pick mode changes what the transcript should say, and the
+/// change only exists at the exchange until something fetches it.
+async fn settle_here(chat: &mut Chat, open: &mut [Open], app: &mut App, at: usize) {
+    let me = chat.me;
+    poll_one(chat, &mut open[at], app).await;
+    refresh(app, open, &me);
+}
+
+/// Keys while a message is picked.
+///
+/// Everything here acts on one message, so it is all guarded by there being
+/// one. The actions that produce text — reply and edit — leave the mode,
+/// because the next thing wanted is the input line.
+async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyCode) {
+    let Some(i) = app.picked else { return };
+    let Some(said) = app.said.get(i) else {
+        app.picked = None;
+        return;
+    };
+    let (seq, mine, redacted, text) = (said.seq, said.mine, said.redacted, said.text.clone());
+
+    if app.reacting {
+        match code {
+            KeyCode::Esc => app.reacting = false,
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                let Some(n) = c.to_digit(10).map(|d| d as usize) else {
+                    return;
+                };
+                let Some(emoji) = n.checked_sub(1).and_then(|n| ui::REACTIONS.get(n)) else {
+                    return;
+                };
+                // Pressing the same one again takes it back. The fold is keyed
+                // on (account, target, emoji), so this is a toggle at the
+                // reader too and needs no agreement about order.
+                let already = app
+                    .said
+                    .get(i)
+                    .is_some_and(|s| s.reactions.iter().any(|(e, _, m)| e == *emoji && *m));
+                app.reacting = false;
+                let Some(at) = selected_index(open, app) else {
+                    return;
+                };
+                let channel = open[at].channel;
+                if let Err(e) = chat.react(&channel, seq, emoji, !already).await {
+                    app.trouble.message = Some(e.to_string());
+                }
+                settle_here(chat, open, app, at).await;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Esc => app.picked = None,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.picked = Some(i.saturating_sub(1));
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.picked = Some((i + 1).min(app.said.len().saturating_sub(1)));
+        }
+        KeyCode::Char('a') if !redacted => app.reacting = true,
+        KeyCode::Char('r') if !redacted => {
+            app.replying = Some((seq, text));
+            app.picked = None;
+        }
+        KeyCode::Char('e') if mine && !redacted => {
+            // Only our own, and the reader would ignore anybody else's anyway
+            // — refusing here is what tells somebody that, rather than letting
+            // them type an edit that quietly goes nowhere.
+            app.editing = Some(seq);
+            app.input = text;
+            app.picked = None;
+        }
+        KeyCode::Char('e') if !mine => {
+            app.trouble.message =
+                Some("only the person who wrote a message can rewrite it".into());
+        }
+        KeyCode::Char('d') if !redacted => {
+            let Some(at) = selected_index(open, app) else {
+                return;
+            };
+            let channel = open[at].channel;
+            app.picked = None;
+            match chat.redact(&channel, seq).await {
+                Ok(r) if !r.left_behind.is_empty() => {
+                    app.trouble.message = Some(format!(
+                        "deleted, but {} file(s) could not be detached and may still \
+                         be fetchable by anyone who read it",
+                        r.left_behind.len()
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => app.trouble.message = Some(e.to_string()),
+            }
+            settle_here(chat, open, app, at).await;
+        }
+        _ => {}
+    }
+}
+
 async fn handle_key(
     chat: &mut Chat,
     open: &mut Vec<Open>,
@@ -685,6 +789,33 @@ async fn handle_key(
         return;
     }
 
+    // Picking a message is a mode, and it has to be: reacting, replying and
+    // rewriting all act on one message, and there is no way to say which
+    // without either a mode or a sequence number typed by hand. Bare letters
+    // are safe here and not outside it — the transcript shows the cursor and
+    // the key line changes — which is the difference from a binding that
+    // silently eats the first letter of a message.
+    if app.picked.is_some() {
+        pick_mode(chat, open, app, code).await;
+        return;
+    }
+
+    // Esc with nothing else to dismiss enters it, on the newest message, which
+    // is the one somebody almost always means.
+    if code == KeyCode::Esc {
+        if app.editing.take().is_some() || app.replying.take().is_some() {
+            // Abandon what the input line was about to do first. Leaving an
+            // edit half-typed and then entering pick mode would send it to the
+            // wrong place on the next Enter.
+            app.input.clear();
+            return;
+        }
+        if !app.said.is_empty() {
+            app.picked = Some(app.said.len() - 1);
+        }
+        return;
+    }
+
     match code {
         KeyCode::Tab | KeyCode::Down => {
             app.select_next();
@@ -701,8 +832,40 @@ async fn handle_key(
         KeyCode::Enter => {
             let text = std::mem::take(&mut app.input);
             if text.trim().is_empty() {
+                // An edit emptied to nothing is a deletion asked for the wrong
+                // way. Say so rather than posting an empty message: /redact
+                // removes the words at the exchange, and an empty edit would
+                // leave them there.
+                if app.editing.take().is_some() {
+                    app.trouble.message =
+                        Some("an edit cannot be empty — pick it and press d to delete it".into());
+                }
+                app.replying = None;
                 return;
             }
+
+            // A rewrite or a reply, before the line is read as a command:
+            // "/save" typed into an edit is text somebody meant to keep, not
+            // an instruction.
+            if let Some(target) = app.editing.take() {
+                let Some(at) = selected_index(open, app) else { return };
+                let channel = open[at].channel;
+                if let Err(e) = chat.edit(&channel, target, SipPost::text(&text)).await {
+                    app.trouble.message = Some(e.to_string());
+                }
+                settle_here(chat, open, app, at).await;
+                return;
+            }
+            if let Some((target, _)) = app.replying.take() {
+                let Some(at) = selected_index(open, app) else { return };
+                let channel = open[at].channel;
+                if let Err(e) = chat.reply(&channel, target, &text).await {
+                    app.trouble.message = Some(e.to_string());
+                }
+                settle_here(chat, open, app, at).await;
+                return;
+            }
+
             let cmd = Command::parse(&text);
             // `/new` is the one command that needs no conversation, and it has
             // to be: with none open there is nothing selected, and requiring a
@@ -798,6 +961,12 @@ async fn handle_key(
                     Ok(_) => Ok(Some(format!("topic set to {topic}"))),
                     Err(e) => Err(e),
                 },
+                Command::Avatar(path) => set_avatar(chat, &channel, path.as_deref())
+                    .await
+                    .map(Some),
+                Command::SaveAvatar(path) => {
+                    save_avatar(chat, &open[i], &path).await.map(Some)
+                }
                 Command::Invite(key) => match key.parse::<PubKey>() {
                     Ok(who) => match chat.invite(&channel, &who).await {
                         // SIP-17 says to check after inviting: this is the one
@@ -944,6 +1113,11 @@ enum Command {
     Name(String),
     /// `/topic <text>` — set what this channel is for, likewise sealed.
     Topic(String),
+    /// `/avatar <path>` — set the channel's picture, or `/avatar off`.
+    Avatar(Option<std::path::PathBuf>),
+    /// `/avatar save <path>` — write the current picture out. A terminal
+    /// cannot draw one, so saving it is how it is looked at.
+    SaveAvatar(std::path::PathBuf),
     /// `/rotate` — mint a new key for everyone currently here.
     Rotate,
     /// `/leave` — leave this channel.
@@ -1000,6 +1174,21 @@ impl Command {
             "/name" => Command::Unknown("/name needs a name".into()),
             "/topic" if !rest.is_empty() => Command::Topic(rest.to_string()),
             "/topic" => Command::Unknown("/topic needs some text".into()),
+            "/avatar" if first == "off" => Command::Avatar(None),
+            "/avatar" if first == "save" => {
+                let path = rest[first.len()..].trim();
+                if path.is_empty() {
+                    Command::Unknown("/avatar save needs a path".into())
+                } else {
+                    Command::SaveAvatar(expand(path))
+                }
+            }
+            "/avatar" if !rest.is_empty() => Command::Avatar(Some(expand(rest))),
+            "/avatar" => Command::Unknown(
+                "/avatar <path> sets the picture, /avatar save <path> writes it out, \
+                 /avatar off removes it"
+                    .into(),
+            ),
             "/invite" if !first.is_empty() => Command::Invite(first.to_string()),
             "/invite" => Command::Unknown("/invite needs a public key".into()),
             "/kick" if !first.is_empty() => Command::Kick(first.to_string()),
@@ -1050,6 +1239,67 @@ async fn send_file(
     post.parts.push(Part::Attachment(attachment));
     chat.send_post(channel, post).await?;
     Ok(note)
+}
+
+/// Set or remove the channel's picture.
+///
+/// The upload is the same path a file takes, because it is one: an avatar is
+/// an ordinary attachment, sealed under its own key and named by the hash of
+/// its ciphertext, so the exchange stores a picture it cannot look at.
+async fn set_avatar(
+    chat: &mut Chat,
+    channel: &[u8; 32],
+    path: Option<&std::path::Path>,
+) -> std::result::Result<String, ChatError> {
+    let Some(path) = path else {
+        chat.set_avatar(channel, None).await?;
+        return Ok("the picture was removed".into());
+    };
+    let limits = chat.blob_limits().await?;
+    let prepared = chat.prepare_file(path, limits.chunk as usize)?;
+    let attachment = chat.upload(channel, &prepared).await?;
+    chat.set_avatar(channel, Some(attachment)).await?;
+    Ok(format!(
+        "picture set from {} — /avatar save <path> writes it out",
+        path.display()
+    ))
+}
+
+/// Write the channel's picture out.
+///
+/// There is nothing to draw it on, and pretending otherwise — a coloured block
+/// approximation — would be showing somebody a thing that is not the picture
+/// at the moment they are trying to see what it is.
+async fn save_avatar(
+    chat: &mut Chat,
+    conv: &Open,
+    path: &std::path::Path,
+) -> std::result::Result<String, ChatError> {
+    let attachment = conv
+        .timeline
+        .avatar
+        .clone()
+        .ok_or_else(|| ChatError::Protocol("this channel has no picture".into()))?;
+    let bytes = chat.download(&attachment).await?;
+    let target = if path.is_dir() {
+        let name = sqex_chat::file_name(&attachment).unwrap_or_else(|| "avatar".into());
+        let leaf = std::path::Path::new(&name)
+            .file_name()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("avatar"));
+        path.join(leaf)
+    } else {
+        path.to_path_buf()
+    };
+    if target.exists() {
+        return Err(ChatError::Protocol(format!(
+            "{} already exists — nothing was overwritten",
+            target.display()
+        )));
+    }
+    std::fs::write(&target, &bytes)
+        .map_err(|e| ChatError::Protocol(format!("{}: {e}", target.display())))?;
+    Ok(format!("saved {} bytes to {}", bytes.len(), target.display()))
 }
 
 /// Fetch the attachment on message `seq` and write it out.
@@ -1196,7 +1446,10 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
     }
     let Some(conv) = selected_index(open, app).map(|i| &open[i]) else {
         app.said.clear();
+        app.picked = None;
         app.peer_typing = false;
+        app.topic.clear();
+        app.has_avatar = false;
         return;
     };
     app.said = conv
@@ -1239,10 +1492,47 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
                 at: m.posted,
                 edited: m.edited.is_some(),
                 redacted: m.redacted,
+                // The stub is resolved here rather than in the renderer, which
+                // has no timeline to look the target up in. A target we do not
+                // hold — pruned, or from before we joined — still shows the
+                // number: "answering something we cannot see" is the truth,
+                // and dropping the marker would hide that a reply is a reply.
+                reply_to: m.post.reply_to().map(|t| {
+                    let stub = conv
+                        .timeline
+                        .get(t)
+                        .map(|target| match (target.redacted, target.post.body_text()) {
+                            (true, _) => "message deleted".to_string(),
+                            (_, Some(text)) => text.to_string(),
+                            (_, None) => "(nothing to show)".to_string(),
+                        })
+                        .unwrap_or_else(|| "(not held)".to_string());
+                    (t, stub)
+                }),
+                reactions: m
+                    .reactions
+                    .iter()
+                    .map(|(emoji, who)| {
+                        (emoji.clone(), who.len(), who.contains(me))
+                    })
+                    .collect(),
+                mentions: m.post.mentions().map(short).collect(),
             }
         })
         .collect();
     app.peer_typing = conv.typing;
+    app.topic = conv.timeline.topic.clone();
+    app.has_avatar = conv.timeline.avatar.is_some();
+    // The cursor holds a position in a list that has just been rebuilt. A
+    // message can arrive or be deleted between one frame and the next, and a
+    // cursor left past the end would act on nothing or on the wrong line.
+    app.picked = app
+        .picked
+        .filter(|_| !app.said.is_empty())
+        .map(|i| i.min(app.said.len() - 1));
+    if app.picked.is_none() {
+        app.reacting = false;
+    }
     app.trouble = Trouble {
         unreadable: conv.trouble.unreadable,
         lost: conv.trouble.lost,

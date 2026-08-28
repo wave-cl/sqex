@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use sqnr_core::PubKey;
 
 use crate::channel::KIND_SYSTEM;
+use crate::blob::Attachment;
 use crate::message::{Body, EDIT_WINDOW, Post};
 
 /// One entry as it reached us, with its body already opened if we could.
@@ -94,6 +95,11 @@ pub struct Timeline {
     unreadable: Vec<u64>,
     pub name: String,
     pub topic: String,
+    /// The channel's picture, as an attachment reference. Kept rather than
+    /// discarded: a client that drops it cannot show one, and cannot carry it
+    /// over when it changes the name — which turns any rename into a deletion
+    /// of the avatar.
+    pub avatar: Option<Attachment>,
     /// Which entry set the metadata currently held, so a later one wins.
     metadata_seq: u64,
 }
@@ -229,7 +235,11 @@ impl Timeline {
                     m.reactions.remove(emoji);
                 }
             }
-            Body::Metadata { name, topic, .. } => {
+            Body::Metadata {
+                name,
+                topic,
+                avatar,
+            } => {
                 // Only an admin names a channel, and the highest sequence
                 // number is current.
                 if !admins.contains(&e.account) || e.seq < self.metadata_seq {
@@ -237,6 +247,7 @@ impl Timeline {
                 }
                 self.name = name.clone();
                 self.topic = topic.clone();
+                self.avatar = avatar.clone();
                 self.metadata_seq = e.seq;
             }
         }

@@ -39,6 +39,7 @@ pub struct Row {
 }
 
 /// One line of conversation, already resolved to what the reader should see.
+#[derive(Default)]
 pub struct Said {
     pub who: String,
     pub mine: bool,
@@ -56,6 +57,20 @@ pub struct Said {
     /// something was removed, instead of finding a conversation that silently
     /// does not follow.
     pub redacted: bool,
+    /// The message this one answers, and a stub of what it said. Carried
+    /// because a reply shown without its target is a non-sequitur, and the
+    /// fold has always kept `Part::Reply` while this struct had nowhere to put
+    /// it.
+    pub reply_to: Option<(u64, String)>,
+    /// Emoji, how many reacted with it, and whether we are one of them. The
+    /// timeline has counted these since it was written and nothing has ever
+    /// drawn them, so somebody could react to your message and you would never
+    /// know.
+    pub reactions: Vec<(String, usize, bool)>,
+    /// Identities named in the message, as keys. SIP-19 puts no display name
+    /// in a mention on purpose — a name inside a message is one the sender
+    /// controls, rendered where a reader looks for identity.
+    pub mentions: Vec<String>,
 }
 
 /// What the status line has to say, in the order it says it.
@@ -155,8 +170,35 @@ pub struct App {
     pub found: Vec<Found>,
     /// How many matched in total, which may exceed what one reply carries.
     pub found_total: u32,
+    /// The message under the cursor, as an index into `said`.
+    ///
+    /// Reacting, replying, editing and deleting all act on *a message*, and
+    /// there was no way to say which: every key went into the input line.
+    /// Naming one by sequence number works for a script and not for a person.
+    pub picked: Option<usize>,
+    /// The reaction picker is open over the picked message.
+    pub reacting: bool,
+    /// A reply the next send will carry, and a stub of what it answers.
+    pub replying: Option<(u64, String)>,
+    /// The message the input line is rewriting, if it is rewriting one.
+    pub editing: Option<u64>,
+    /// What the selected channel is for. Folded from a sealed entry since the
+    /// timeline was written and never drawn, so a topic could be set and no
+    /// client would show it.
+    pub topic: String,
+    /// The selected channel has a picture. Said rather than drawn: a terminal
+    /// cannot show one, and a coloured-block approximation is not the picture.
+    pub has_avatar: bool,
     pub should_quit: bool,
 }
+
+/// The reactions offered by the picker.
+///
+/// A short list on purpose: a terminal has no emoji search, and a long one
+/// would be a scrolling grid nobody wants. Any emoji can still be sent by a
+/// client that offers more — the wire carries the string, not an index into
+/// this.
+pub const REACTIONS: &[&str] = &["👍", "🎉", "❤️", "😂", "🤔", "👀"];
 
 impl App {
     pub fn selected_row(&self) -> Option<&Row> {
@@ -211,16 +253,26 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn header(f: &mut Frame, app: &App, area: Rect) {
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" sqex-chat ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("· {}", app.me),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        area,
-    );
+    let mut spans = vec![
+        Span::styled(" sqex-chat ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("· {}", app.me),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if !app.topic.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}", truncate(&app.topic, 60)),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if app.has_avatar {
+        spans.push(Span::styled(
+            " · /avatar save <path>",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn conversations(f: &mut Frame, app: &App, area: Rect) {
@@ -303,8 +355,23 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-    for s in &app.said {
+    for (i, s) in app.said.iter().enumerate() {
+        let picked = app.picked == Some(i);
         let who = Style::default().fg(if s.mine { Color::Green } else { Color::Cyan });
+
+        // What is being answered goes above the answer, indented under the
+        // author column. A reply rendered without it reads as a non-sequitur,
+        // and the reader has no way to find the target by hand.
+        if let Some((seq, stub)) = &s.reply_to {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(clock(s.at).chars().count() + 13)),
+                Span::styled(
+                    format!("↳ {seq}: {}", truncate(stub, 48)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+
         let body = if s.redacted {
             Span::styled(
                 "message deleted",
@@ -316,6 +383,13 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(s.text.clone())
         };
         let mut spans = vec![
+            // The cursor is a character in the gutter rather than a reversed
+            // line: the transcript already uses colour to say who spoke, and
+            // inverting it would take that away exactly where it is needed.
+            Span::styled(
+                if picked { "▸" } else { " " },
+                Style::default().fg(Color::Yellow),
+            ),
             Span::styled(clock(s.at), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{:>12} ", truncate(&s.who, 12)), who),
             body,
@@ -332,7 +406,49 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        // Mentions as keys, never as names. SIP-19 leaves the display name out
+        // of a mention deliberately, and putting one in here from a profile
+        // would be showing the reader a name the *sender* chose at the moment
+        // they are working out who is being talked about.
+        for m in &s.mentions {
+            spans.push(Span::styled(
+                format!(" @{m}"),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
         lines.push(Line::from(spans));
+
+        if !s.reactions.is_empty() && !s.redacted {
+            let mut row = vec![Span::raw(
+                " ".repeat(clock(s.at).chars().count() + 14),
+            )];
+            for (emoji, count, mine) in &s.reactions {
+                row.push(Span::styled(
+                    format!("{emoji} {count}  "),
+                    if *mine {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ));
+            }
+            lines.push(Line::from(row));
+        }
+
+        if picked && app.reacting {
+            let mut row = vec![Span::raw(" ".repeat(clock(s.at).chars().count() + 14))];
+            for (n, emoji) in REACTIONS.iter().enumerate() {
+                row.push(Span::styled(
+                    format!("{}:{emoji}  ", n + 1),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            row.push(Span::styled(
+                "Esc",
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(row));
+        }
     }
     if app.said.is_empty() && app.trouble.is_quiet() {
         lines.push(Line::from(Span::styled(
@@ -387,9 +503,22 @@ fn directory(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn input(f: &mut Frame, app: &App, area: Rect) {
-    let (title, content) = match &app.adding {
-        Some(buf) => ("their public key (base58), then Enter", buf.as_str()),
-        None => ("message", app.input.as_str()),
+    // The title says what Enter will do. Sending a reply, rewriting an old
+    // message and posting a new one all look identical from the input line
+    // otherwise, and only one of them is undoable.
+    let editing;
+    let replying;
+    let (title, content) = match (&app.adding, app.editing, &app.replying) {
+        (Some(buf), _, _) => ("their public key (base58), then Enter", buf.as_str()),
+        (None, Some(seq), _) => {
+            editing = format!("rewriting message {seq} — Esc to leave it alone");
+            (editing.as_str(), app.input.as_str())
+        }
+        (None, None, Some((seq, stub))) => {
+            replying = format!("replying to {seq}: {} — Esc to stop", truncate(stub, 40));
+            (replying.as_str(), app.input.as_str())
+        }
+        (None, None, None) => ("message", app.input.as_str()),
     };
     f.render_widget(
         Paragraph::new(content)
@@ -410,11 +539,12 @@ fn keys_line(width: usize) -> String {
     const GROUPS: &[&str] = &[
         "^C quit",
         "Tab",
+        "Esc pick",
         "^N add",
         "/file /save /redact",
         "/public /find /join",
         "/new /invite /kick",
-        "/name /topic",
+        "/name /topic /avatar",
     ];
     let mut out = String::new();
     for g in GROUPS {
@@ -429,7 +559,22 @@ fn keys_line(width: usize) -> String {
 }
 
 fn status(f: &mut Frame, app: &App, area: Rect) {
-    let (text, style) = if app.trouble.is_quiet() {
+    let (text, style) = if app.picked.is_some() {
+        // The mode's own keys, and only them. A person who has just entered a
+        // mode by pressing Esc needs to be told what it does, and the general
+        // command list is the wrong answer to that question.
+        let mine = app
+            .picked
+            .and_then(|i| app.said.get(i))
+            .is_some_and(|s| s.mine);
+        (
+            format!(
+                " ↑↓ move · a react · r reply{} · d delete · Esc back",
+                if mine { " · e rewrite" } else { "" }
+            ),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if app.trouble.is_quiet() {
         (
             keys_line(area.width as usize),
             Style::default().fg(Color::DarkGray),
@@ -597,6 +742,7 @@ mod tests {
                     at: 3661,
                     edited: false,
                     redacted: false,
+                    ..Default::default()
                 },
                 Said {
                     who: "you".into(),
@@ -607,6 +753,7 @@ mod tests {
                     at: 3700,
                     edited: true,
                     redacted: false,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -707,10 +854,11 @@ mod tests {
                         "^C quit",
                         "Tab",
                         "^N add",
+                        "Esc pick",
                         "/file /save /redact",
                         "/public /find /join",
                         "/new /invite /kick",
-                        "/name /topic",
+                        "/name /topic /avatar",
                     ]
                     .contains(&group),
                     "a group was cut in half at width {width}: {group:?}"
@@ -718,7 +866,7 @@ mod tests {
             }
         }
         // And a wide terminal gets all of them.
-        assert!(keys_line(200).contains("/name /topic"));
+        assert!(keys_line(200).contains("/name /topic /avatar"));
     }
 
     #[test]
@@ -746,6 +894,7 @@ mod tests {
             at: 0,
             edited: true,
             redacted: true,
+            ..Default::default()
         }];
         let out = render(&app, 80, 20);
 
@@ -769,6 +918,172 @@ mod tests {
         assert!(out.contains("bob"), "the tombstone lost its author:\n{out}");
     }
 
+    /// The fold has counted reactions since it was written and nothing drew
+    /// them, so somebody could react to your message and you would never know.
+    #[test]
+    fn reactions_are_drawn_under_the_message_they_belong_to() {
+        let mut app = sample();
+        app.said = vec![
+            Said {
+                who: "bob".into(),
+                text: "we ship on friday".into(),
+                seq: 3,
+                at: 3661,
+                reactions: vec![("👍".into(), 2, true), ("🎉".into(), 1, false)],
+                ..Default::default()
+            },
+            Said {
+                who: "you".into(),
+                mine: true,
+                text: "agreed".into(),
+                seq: 4,
+                at: 3700,
+                ..Default::default()
+            },
+        ];
+        let out = render(&app, 80, 20);
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("we ship on friday"))
+            .expect("the message is not on screen");
+        let row = lines[at + 1];
+        assert!(row.contains("👍"), "no reaction row under the message:\n{out}");
+        assert!(row.contains('2'), "the count is missing:\n{out}");
+        assert!(row.contains("🎉"), "only one of the two was drawn:\n{out}");
+        // And under *that* message, not the next one.
+        assert!(
+            !lines[at + 1].contains("agreed"),
+            "the reaction row landed on the wrong message:\n{out}"
+        );
+    }
+
+    /// A reply with no sign of what it answers reads as a non-sequitur, and
+    /// there is no way to find the target by hand.
+    #[test]
+    fn a_reply_shows_what_it_answers() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "you".into(),
+            mine: true,
+            text: "friday".into(),
+            seq: 8,
+            at: 3700,
+            reply_to: Some((3, "thursday or friday?".into())),
+            ..Default::default()
+        }];
+        let out = render(&app, 80, 20);
+        assert!(out.contains("thursday or friday?"), "{out}");
+        assert!(out.contains("friday"), "{out}");
+    }
+
+    /// A target we no longer hold still shows the marker. "Answering something
+    /// we cannot see" is the truth; dropping it would hide that a reply is a
+    /// reply at all.
+    #[test]
+    fn a_reply_to_something_we_do_not_hold_still_says_it_is_one() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "bob".into(),
+            text: "yes".into(),
+            seq: 8,
+            at: 3700,
+            reply_to: Some((3, "(not held)".into())),
+            ..Default::default()
+        }];
+        let out = render(&app, 80, 20);
+        assert!(out.contains("↳ 3"), "the reply marker was dropped:\n{out}");
+    }
+
+    #[test]
+    fn the_picked_message_is_visibly_picked_and_the_keys_change() {
+        let mut app = sample();
+        app.picked = Some(1);
+        let out = render(&app, 80, 20);
+        assert!(out.contains('▸'), "nothing marks the picked message:\n{out}");
+        // The mode's own keys replace the command list: somebody who just
+        // pressed Esc needs to be told what the mode does.
+        assert!(out.contains("a react"), "{out}");
+        assert!(out.contains("Esc back"), "{out}");
+        // The second message is ours, so rewriting is offered.
+        assert!(out.contains("e rewrite"), "{out}");
+
+        // The first is not, and it is not offered — a reader would ignore the
+        // edit, so offering it would be a promise the protocol breaks.
+        app.picked = Some(0);
+        let out = render(&app, 80, 20);
+        assert!(!out.contains("e rewrite"), "offered to rewrite bob's message:\n{out}");
+    }
+
+    #[test]
+    fn the_reaction_picker_offers_numbered_choices() {
+        let mut app = sample();
+        app.picked = Some(0);
+        app.reacting = true;
+        let out = render(&app, 80, 20);
+        assert!(out.contains("1:"), "the picker is not numbered:\n{out}");
+        assert!(out.contains(REACTIONS[0]), "{out}");
+    }
+
+    /// SIP-19 leaves the display name out of a mention deliberately, so what
+    /// is rendered is the key.
+    #[test]
+    fn a_mention_is_shown_as_a_key() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "bob".into(),
+            text: "ask them".into(),
+            seq: 3,
+            at: 3661,
+            mentions: vec!["ZfS2aD5B".into()],
+            ..Default::default()
+        }];
+        let out = render(&app, 80, 20);
+        assert!(out.contains("@ZfS2aD5B"), "the mention was dropped:\n{out}");
+    }
+
+    #[test]
+    fn a_picked_tombstone_offers_nothing_to_do_to_it() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "bob".into(),
+            text: String::new(),
+            seq: 3,
+            at: 3661,
+            redacted: true,
+            reactions: vec![("👍".into(), 1, false)],
+            ..Default::default()
+        }];
+        app.picked = Some(0);
+        let out = render(&app, 80, 20);
+        // Reactions to a message that no longer exists are not shown against
+        // the gap: the tombstone is a record that something was removed, and
+        // decorating it re-creates a little of what was deleted.
+        assert!(
+            !out.contains("👍"),
+            "a deleted message kept its reactions:\n{out}"
+        );
+    }
+
+    /// The topic has been folded from a sealed entry since the timeline was
+    /// written and never drawn, so it could be set and no client would show it.
+    #[test]
+    fn the_topic_is_on_screen_and_an_avatar_says_how_to_look_at_it() {
+        let mut app = sample();
+        app.topic = "what we ship in October".into();
+        let out = render(&app, 100, 20);
+        assert!(out.contains("what we ship in October"), "{out}");
+        // Nothing claims a picture until there is one.
+        assert!(!out.contains("/avatar save"), "{out}");
+
+        app.has_avatar = true;
+        let out = render(&app, 100, 20);
+        assert!(
+            out.contains("/avatar save"),
+            "a picture was set and nothing said how to see it:\n{out}"
+        );
+    }
+
     #[test]
     fn a_long_transcript_shows_the_end_of_it() {
         let mut app = sample();
@@ -782,6 +1097,7 @@ mod tests {
                 at: 0,
                 edited: false,
                 redacted: false,
+                ..Default::default()
             })
             .collect();
         let out = render(&app, 80, 20);
