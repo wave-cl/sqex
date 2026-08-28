@@ -172,6 +172,23 @@ pub struct Conversation {
     pub admins: Vec<PubKey>,
 }
 
+/// What a redaction actually managed to remove.
+///
+/// Reported rather than swallowed because the two halves can come apart: the
+/// words go at the exchange, and a file may not. A caller that said "deleted"
+/// regardless would be describing something that did not happen.
+pub struct Redacted {
+    /// Files this client detached, so the exchange no longer serves them here.
+    pub detached: usize,
+    /// Files it could not: already gone, or attached by somebody else. A reader
+    /// holding the id may still be able to fetch these.
+    pub left_behind: Vec<[u8; 32]>,
+    /// Whether the message being deleted was one this client could read. If it
+    /// was not, we never learned what it carried, and detaching nothing is not
+    /// the same as there having been nothing to detach.
+    pub opened: bool,
+}
+
 pub struct Chat {
     client: Client,
     seed: [u8; 32],
@@ -879,16 +896,52 @@ impl Chat {
         Ok(())
     }
 
-    /// Name a channel, for everyone who can read it.
+    /// Name a channel, for everyone who can read it. Leaves the topic alone.
+    pub async fn set_name(&mut self, channel: &[u8; 32], name: &str) -> Result<Posted> {
+        self.set_metadata(channel, Some(name), None).await
+    }
+
+    /// Set a channel's topic, leaving its name alone.
+    pub async fn set_topic(&mut self, channel: &[u8; 32], topic: &str) -> Result<Posted> {
+        self.set_metadata(channel, None, Some(topic)).await
+    }
+
+    /// Change a channel's name, its topic, or both.
     ///
     /// A sealed entry rather than a field, so the exchange never learns what a
     /// private channel is called. Only an admin's is honoured by a reader.
-    pub async fn set_name(&mut self, channel: &[u8; 32], name: &str) -> Result<Posted> {
+    ///
+    /// `Body::Metadata` is the whole record and a reader assigns all of it
+    /// (`Timeline::apply`), which is correct — it is the sender's job to say
+    /// what the record now is. So the fields not being changed are carried over
+    /// rather than sent empty. Sending them empty is what made `/name` destroy
+    /// a channel's topic with nothing able to restore it.
+    pub async fn set_metadata(
+        &mut self,
+        channel: &[u8; 32],
+        name: Option<&str>,
+        topic: Option<&str>,
+    ) -> Result<Posted> {
+        // The current record comes from the folded history rather than from
+        // `info`: for a private channel the exchange holds neither field, and
+        // for a public one it holds the values from creation, which a later
+        // sealed rename has since replaced.
+        let info = self.info(channel).await?;
+        let admins: Vec<PubKey> = info
+            .members
+            .iter()
+            .filter(|m| m.role == Role::Admin)
+            .map(|m| m.account)
+            .collect();
+        let held = self.history(channel, &admins)?;
         self.send_body(
             channel,
             Body::Metadata {
-                name: name.to_string(),
-                topic: String::new(),
+                name: name.unwrap_or(&held.name).to_string(),
+                topic: topic.unwrap_or(&held.topic).to_string(),
+                // Not carried over. An avatar is an attachment, and re-sending
+                // the reference without checking the blob is still attached
+                // would publish a name for a file that may be gone.
                 avatar: None,
             },
         )
@@ -1063,7 +1116,53 @@ impl Chat {
     /// The caller must be the account that posted `target`, or an admin here.
     /// The exchange decides that — it is why this is an operation there and not
     /// only a message.
-    pub async fn redact(&mut self, channel: &[u8; 32], target: u64) -> Result<()> {
+    ///
+    /// # The files go too
+    ///
+    /// SIP-18: "deleting a message must delete what it carried". The exchange
+    /// cannot do this half — the references live inside a sealed body it cannot
+    /// read — so the client that is deleting the message detaches them, and it
+    /// is the only party that can, because it is the only one that can read
+    /// what it is deleting. Without this a reader who already saw the message
+    /// keeps the blob id and can still fetch the file afterwards.
+    pub async fn redact(&mut self, channel: &[u8; 32], target: u64) -> Result<Redacted> {
+        // Before anything is destroyed, while the plaintext is still ours to
+        // read. An edit replaces a post's parts, so the files this entry has
+        // referenced over its life are the union of the original and every edit
+        // that named it — detaching only the current set would leave the ones
+        // an edit dropped.
+        let mut blobs: Vec<[u8; 32]> = Vec::new();
+        let mut opened = false;
+        for (seq, _, _, _, plain) in self.store.messages(channel)? {
+            let Some(bytes) = plain else { continue };
+            let Ok(Some(body)) = Body::decode(&bytes) else {
+                continue;
+            };
+            let post = match (&body, seq == target) {
+                (Body::Post(p), true) => {
+                    opened = true;
+                    p
+                }
+                (Body::Edit { target: t, post }, _) if *t == target => post,
+                _ => continue,
+            };
+            for a in post.attachments() {
+                if !blobs.contains(&a.blob) {
+                    blobs.push(a.blob);
+                }
+            }
+        }
+
+        let mut left = Vec::new();
+        for blob in &blobs {
+            // A blob already gone, or attached by somebody else, refuses. That
+            // is not a reason to keep the words: report it and carry on, since
+            // leaving the body behind is the worse of the two failures.
+            if self.detach(channel, blob).await.is_err() {
+                left.push(*blob);
+            }
+        }
+
         self.post(
             "/channel/redact",
             ByTarget {
@@ -1074,7 +1173,14 @@ impl Chat {
         )
         .await?;
         self.send_body(channel, Body::Redact { target }).await?;
-        Ok(())
+        Ok(Redacted {
+            detached: blobs.len() - left.len(),
+            left_behind: left,
+            // A message we never opened is one whose references we cannot know.
+            // Said plainly rather than reported as nothing to do: the two look
+            // identical from here and are not the same.
+            opened,
+        })
     }
 
     /// Send a message built by the caller — text, attachments, a reply, or a
@@ -1103,7 +1209,7 @@ impl Chat {
             // Public: posted as it stands. The counter is still kept, because
             // the exchange orders on it and a reader still sees which device
             // said what — it simply is not a nonce here, since there is no key.
-            plain
+            plain.clone()
         } else {
             self.store
                 .key(channel, epoch)?
@@ -1130,7 +1236,29 @@ impl Chat {
                 .encode(),
             )
             .await?;
-        Posted::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))
+        let posted = Posted::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))?;
+
+        // Keep what we just said, rather than waiting for the exchange to hand
+        // it back on the next fetch. Between posting and that fetch the client
+        // was the only party that could not see its own message, which is a
+        // strange enough thing to be true that something eventually depends on
+        // it: redaction reads the message it is deleting to find the files it
+        // referenced, and a message sent moments ago is exactly the one a
+        // person deletes.
+        //
+        // Idempotent against the echo — `put_message` conflicts on (channel,
+        // seq) and keeps the body it already holds.
+        self.store.put_message(
+            channel,
+            Kept {
+                seq: posted.seq,
+                account: self.me,
+                posted: posted.posted,
+                kind: KIND_MEMBER,
+                plain: Some(&plain),
+            },
+        )?;
+        Ok(posted)
     }
 
     /// Say we are typing. Best-effort: a signal nobody stores is not worth an

@@ -1494,3 +1494,97 @@ async fn redacting_removes_the_words_from_the_exchange_and_tells_the_other_side(
         "a fresh reader did not see the tombstone at all"
     );
 }
+
+/// SIP-18: "deleting a message must delete what it carried". The exchange
+/// cannot do this half — the reference lives inside a sealed body it cannot
+/// read — so the client deleting the message has to detach the blob, and it is
+/// the only party that can.
+///
+/// The fetch here is **by id**, not through the timeline, because the id is
+/// exactly what a reader who already saw the message still holds. A reader who
+/// wrote it down before the redaction is the whole threat: checking that the
+/// message no longer shows the attachment proves nothing about whether the
+/// bytes are still being served.
+#[tokio::test]
+async fn redacting_takes_the_file_with_it() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let path = dir.path().join("regret.txt");
+    let secret: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &secret).unwrap();
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    let attachment = alice.upload(&channel, &prepared).await.unwrap();
+    let mut post = SipPost::text("this was a mistake");
+    post.parts.push(Part::Attachment(attachment.clone()));
+    let regret = alice.send_post(&channel, post).await.unwrap().seq;
+
+    // Bob reads it, and keeps the reference — as any client that rendered the
+    // message necessarily has.
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let held = got
+        .timeline
+        .get(regret)
+        .and_then(|m| m.post.attachments().next().cloned())
+        .expect("bob never saw the attachment");
+    assert_eq!(bob.download(&held).await.unwrap(), secret);
+
+    let outcome = alice.redact(&channel, regret).await.unwrap();
+    assert!(outcome.opened, "alice could not read her own message");
+    assert_eq!(outcome.detached, 1, "the file was not detached");
+    assert!(
+        outcome.left_behind.is_empty(),
+        "a file was left attached: {:?}",
+        outcome.left_behind
+    );
+
+    // The reference Bob still holds no longer resolves.
+    let after = bob.download(&held).await;
+    assert!(
+        after.is_err(),
+        "the exchange still served the file of a deleted message to a reader \
+         holding its id"
+    );
+}
+
+/// Metadata is one record and a reader assigns all of it, so a client changing
+/// one field must carry the others. `/name` sending an empty topic silently
+/// destroyed it, with nothing in the client able to put it back.
+#[tokio::test]
+async fn renaming_a_channel_leaves_its_topic_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice.create_group("planning", &[]).await.unwrap();
+    alice
+        .set_topic(&channel, "what we ship in October")
+        .await
+        .unwrap();
+    alice.set_name(&channel, "shipping").await.unwrap();
+
+    let (_, me) = identity(1);
+    let held = alice.history(&channel, &[me]).unwrap();
+    assert_eq!(held.name, "shipping");
+    assert_eq!(
+        held.topic, "what we ship in October",
+        "renaming destroyed the topic"
+    );
+
+    // And the other way round, since the same record carries both.
+    alice.set_topic(&channel, "what we ship in November").await.unwrap();
+    let held = alice.history(&channel, &[me]).unwrap();
+    assert_eq!(held.name, "shipping", "setting the topic destroyed the name");
+    assert_eq!(held.topic, "what we ship in November");
+}

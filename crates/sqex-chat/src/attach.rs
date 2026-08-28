@@ -20,8 +20,8 @@ use sqex_proto::blob::{
     Attachment, KIND_FILE, KIND_IMAGE, KIND_VIDEO, KIND_VOICE, MAX_MIME,
 };
 use sqex_proto::blob_store::{
-    Begin, Begun, ByBlob, Chunk, Commit, Committed, GetChunk, Headed, Limits, MAX_BLOB,
-    PutChunk, TYPE_HEAD, TYPE_LIMITS, blob_id, chunk_nonce,
+    Begin, Begun, ByBlob, ByChannelBlob, Chunk, Commit, Committed, GetChunk, Headed, Limits,
+    MAX_BLOB, PutChunk, TYPE_DETACH, TYPE_HEAD, TYPE_LIMITS, blob_id, chunk_nonce,
 };
 
 use crate::client::{Chat, ChatError};
@@ -239,6 +239,32 @@ impl Chat {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    /// Drop this channel's reference to a blob.
+    ///
+    /// SIP-18 puts this in the client's hands because only the client can know
+    /// it is needed: the reference lives inside a sealed message, so the
+    /// exchange deleting the message cannot tell what the message carried.
+    ///
+    /// The blob survives while another channel still references it — detaching
+    /// a photograph from one conversation does not take it out of another.
+    ///
+    /// The exchange refuses this from anybody but the uploader or an admin,
+    /// which is the same authority it requires to redact.
+    pub async fn detach(&mut self, channel: &[u8; 32], blob: &[u8; 32]) -> Result<()> {
+        self.post_raw(
+            "/blob/detach",
+            ByChannelBlob {
+                channel: *channel,
+                blob: *blob,
+                // Not encoded for a detach; the field belongs to attach.
+                expires_after: 0,
+            }
+            .encode(TYPE_DETACH),
+        )
+        .await?;
         Ok(())
     }
 

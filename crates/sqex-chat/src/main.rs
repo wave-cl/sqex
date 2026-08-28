@@ -794,6 +794,10 @@ async fn handle_key(
                     Ok(_) => Ok(Some(format!("renamed to {name}"))),
                     Err(e) => Err(e),
                 },
+                Command::Topic(topic) => match chat.set_topic(&channel, &topic).await {
+                    Ok(_) => Ok(Some(format!("topic set to {topic}"))),
+                    Err(e) => Err(e),
+                },
                 Command::Invite(key) => match key.parse::<PubKey>() {
                     Ok(who) => match chat.invite(&channel, &who).await {
                         // SIP-17 says to check after inviting: this is the one
@@ -833,9 +837,30 @@ async fn handle_key(
                          and what came before is unchanged"
                     ))
                 }),
-                Command::Redact(target) => chat.redact(&channel, target).await.map(|()| {
-                    Some(format!("redacted {target} — the exchange no longer holds it"))
-                }),
+                Command::Redact(target) => {
+                    chat.redact(&channel, target).await.map(|r| {
+                        // Say which of the two halves happened. "Deleted" when
+                        // a file was left behind would be a claim about
+                        // somebody else's copy that we cannot make.
+                        let mut said = format!("redacted {target} — the exchange no longer holds it");
+                        match r.detached {
+                            0 => {}
+                            1 => said += ", and the file it carried",
+                            n => said += &format!(", and the {n} files it carried"),
+                        }
+                        if !r.left_behind.is_empty() {
+                            let n = r.left_behind.len();
+                            let files = if n == 1 { "file" } else { "files" };
+                            said += &format!(
+                                "; {n} {files} could not be detached and may still be \
+                                 fetchable by anyone who read the message"
+                            );
+                        } else if !r.opened {
+                            said += "; this client could not read it, so any file it carried is still attached";
+                        }
+                        Some(said)
+                    })
+                }
                 Command::Leave => chat.leave(&channel).await.map(|()| {
                     Some("left — it will be gone from the list next time".to_string())
                 }),
@@ -917,6 +942,8 @@ enum Command {
     Kick(String),
     /// `/name <name>` — rename, as a sealed entry the exchange cannot read.
     Name(String),
+    /// `/topic <text>` — set what this channel is for, likewise sealed.
+    Topic(String),
     /// `/rotate` — mint a new key for everyone currently here.
     Rotate,
     /// `/leave` — leave this channel.
@@ -971,6 +998,8 @@ impl Command {
             },
             "/name" if !rest.is_empty() => Command::Name(rest.to_string()),
             "/name" => Command::Unknown("/name needs a name".into()),
+            "/topic" if !rest.is_empty() => Command::Topic(rest.to_string()),
+            "/topic" => Command::Unknown("/topic needs some text".into()),
             "/invite" if !first.is_empty() => Command::Invite(first.to_string()),
             "/invite" => Command::Unknown("/invite needs a public key".into()),
             "/kick" if !first.is_empty() => Command::Kick(first.to_string()),
@@ -1484,6 +1513,13 @@ mod tests {
             Command::Name(n) => assert_eq!(n, "the tuesday club"),
             _ => panic!("not parsed as name"),
         }
+        match Command::parse("/topic what we ship in October") {
+            Command::Topic(t) => assert_eq!(t, "what we ship in October"),
+            _ => panic!("not parsed as topic"),
+        }
+        // Neither is a way of clearing the other: an empty argument is a
+        // mistake to report, not a blank record to publish.
+        assert!(matches!(Command::parse("/topic"), Command::Unknown(_)));
         // A key is one word, so trailing rubbish is ignored rather than folded
         // into it.
         match Command::parse("/invite ZfS2aD5B  ") {

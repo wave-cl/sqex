@@ -399,11 +399,39 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// The keys and commands, as many as the terminal is wide enough to hold.
+///
+/// A fixed string was fine while there were three groups of them and stopped
+/// being fine as they were added: at 80 columns the end of the line was simply
+/// cut off, so the commands that fell off were undiscoverable and nothing said
+/// so. Ordered by how often each is wanted, and a group is either shown whole
+/// or not at all — half of "/file /save" helps nobody.
+fn keys_line(width: usize) -> String {
+    const GROUPS: &[&str] = &[
+        "^C quit",
+        "Tab",
+        "^N add",
+        "/file /save /redact",
+        "/public /find /join",
+        "/new /invite /kick",
+        "/name /topic",
+    ];
+    let mut out = String::new();
+    for g in GROUPS {
+        let sep = if out.is_empty() { " " } else { " · " };
+        if out.chars().count() + sep.len() + g.chars().count() > width {
+            break;
+        }
+        out += sep;
+        out += g;
+    }
+    out
+}
+
 fn status(f: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if app.trouble.is_quiet() {
         (
-            " ^C quit · Tab · ^N add · /public /find /join · /new /invite /kick · /file /save /redact"
-                .to_string(),
+            keys_line(area.width as usize),
             Style::default().fg(Color::DarkGray),
         )
     } else {
@@ -661,6 +689,36 @@ mod tests {
     fn an_empty_client_says_what_to_do_next() {
         let out = render(&App::default(), 60, 12);
         assert!(out.contains("no contacts yet"), "{out}");
+    }
+
+    #[test]
+    fn the_key_line_is_cut_between_groups_and_never_inside_one() {
+        // A narrow terminal loses the least-wanted commands, not the tail of a
+        // word: "/file /sa" is worse than not mentioning /file at all.
+        for width in 1..140usize {
+            let line = keys_line(width);
+            assert!(
+                line.chars().count() <= width,
+                "the key line overflowed {width} columns: {line:?}"
+            );
+            for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
+                assert!(
+                    [
+                        "^C quit",
+                        "Tab",
+                        "^N add",
+                        "/file /save /redact",
+                        "/public /find /join",
+                        "/new /invite /kick",
+                        "/name /topic",
+                    ]
+                    .contains(&group),
+                    "a group was cut in half at width {width}: {group:?}"
+                );
+            }
+        }
+        // And a wide terminal gets all of them.
+        assert!(keys_line(200).contains("/name /topic"));
     }
 
     #[test]
