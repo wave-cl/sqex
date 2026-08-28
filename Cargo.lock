@@ -1250,7 +1250,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "der_derive",
+ "flagset",
  "zeroize",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1288,7 +1301,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1587,7 +1600,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1666,6 +1679,12 @@ name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+
+[[package]]
+name = "flagset"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "flate2"
@@ -2807,7 +2826,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3611,7 +3630,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3926,7 +3945,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3983,7 +4002,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4437,7 +4456,7 @@ dependencies = [
  "sqexd",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.16.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4470,7 +4489,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "sqnr-core",
- "squic",
+ "squic 0.16.0",
  "x25519-dalek",
 ]
 
@@ -4490,7 +4509,7 @@ dependencies = [
  "sqexd",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.16.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4522,7 +4541,7 @@ dependencies = [
  "sqex-proto",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.16.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4556,7 +4575,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqnr-core",
- "squic",
+ "squic 0.15.0",
  "tokio",
  "toml",
  "zeroize",
@@ -4596,6 +4615,31 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "x25519-dalek",
+]
+
+[[package]]
+name = "squic"
+version = "0.16.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.16.0#4ecbe67ebff420d132976b5bd29d83274de84070"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "quinn",
+ "quinn-proto",
+ "rand 0.9.5",
+ "rand_core 0.6.4",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "socket2 0.5.10",
+ "thiserror 2.0.20",
+ "tokio",
+ "x25519-dalek",
+ "x509-cert",
 ]
 
 [[package]]
@@ -4704,7 +4748,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5528,7 +5572,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5945,6 +5989,17 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "x509-cert"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+dependencies = [
+ "const-oid",
+ "der",
+ "spki",
 ]
 
 [[package]]
