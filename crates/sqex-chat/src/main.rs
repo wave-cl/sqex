@@ -1173,7 +1173,11 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
     app.said = conv
         .timeline
         .messages()
-        .filter(|m| m.is_visible())
+        // Deliberately not filtered on `is_visible`. A redacted message is a
+        // tombstone, and SIP-16 keeps the entry so that a reader can see
+        // something was removed rather than find a conversation that silently
+        // does not follow. Dropping it here is what made /redact look like it
+        // deleted messages without trace.
         .map(|m| {
             // An attachment is described on the line rather than fetched: a
             // transcript should not pull megabytes to draw itself, and the
@@ -1205,6 +1209,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey) {
                 has_file,
                 at: m.posted,
                 edited: m.edited.is_some(),
+                redacted: m.redacted,
             }
         })
         .collect();

@@ -51,6 +51,11 @@ pub struct Said {
     pub has_file: bool,
     pub at: u64,
     pub edited: bool,
+    /// Deleted by its sender or an admin. Shown as a tombstone rather than
+    /// dropped: SIP-16 keeps the entry precisely so a reader can see that
+    /// something was removed, instead of finding a conversation that silently
+    /// does not follow.
+    pub redacted: bool,
 }
 
 /// What the status line has to say, in the order it says it.
@@ -300,18 +305,28 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
     }
     for s in &app.said {
         let who = Style::default().fg(if s.mine { Color::Green } else { Color::Cyan });
+        let body = if s.redacted {
+            Span::styled(
+                "message deleted",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )
+        } else {
+            Span::raw(s.text.clone())
+        };
         let mut spans = vec![
             Span::styled(clock(s.at), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{:>12} ", truncate(&s.who, 12)), who),
-            Span::raw(s.text.clone()),
+            body,
         ];
-        if s.has_file {
+        if s.has_file && !s.redacted {
             spans.push(Span::styled(
                 format!("  /save {} ", s.seq),
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        if s.edited {
+        if s.edited && !s.redacted {
             spans.push(Span::styled(
                 " (edited)",
                 Style::default().fg(Color::DarkGray),
@@ -553,6 +568,7 @@ mod tests {
                     has_file: false,
                     at: 3661,
                     edited: false,
+                    redacted: false,
                 },
                 Said {
                     who: "you".into(),
@@ -562,6 +578,7 @@ mod tests {
                     has_file: false,
                     at: 3700,
                     edited: true,
+                    redacted: false,
                 },
             ],
             ..Default::default()
@@ -655,6 +672,45 @@ mod tests {
         }
     }
 
+    /// SIP-16 keeps a redacted entry precisely so a reader can see that
+    /// something was removed rather than find a conversation that silently does
+    /// not follow. Dropping the line instead is what made /redact look like it
+    /// deleted messages without trace.
+    #[test]
+    fn a_redacted_message_is_shown_as_a_tombstone() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "bob".into(),
+            mine: false,
+            text: "the original words".into(),
+            seq: 9,
+            has_file: true,
+            at: 0,
+            edited: true,
+            redacted: true,
+        }];
+        let out = render(&app, 80, 20);
+
+        assert!(out.contains("message deleted"), "no tombstone drawn:\n{out}");
+        assert!(
+            !out.contains("the original words"),
+            "the redacted text was rendered anyway:\n{out}"
+        );
+        // A tombstone has nothing to save and was not edited into existence.
+        // The footer always names /save, so the check is for the per-message
+        // form, which carries the sequence number.
+        assert!(
+            !out.contains("/save 9"),
+            "a tombstone offered a file:\n{out}"
+        );
+        assert!(
+            !out.contains("(edited)"),
+            "a tombstone claimed to have been edited:\n{out}"
+        );
+        // And it is still somebody's line, at a time, or the gap says nothing.
+        assert!(out.contains("bob"), "the tombstone lost its author:\n{out}");
+    }
+
     #[test]
     fn a_long_transcript_shows_the_end_of_it() {
         let mut app = sample();
@@ -667,6 +723,7 @@ mod tests {
                 has_file: false,
                 at: 0,
                 edited: false,
+                redacted: false,
             })
             .collect();
         let out = render(&app, 80, 20);

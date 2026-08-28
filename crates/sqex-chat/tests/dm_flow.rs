@@ -1460,6 +1460,16 @@ async fn redacting_removes_the_words_from_the_exchange_and_tells_the_other_side(
         "the redacted message is still being shown: {visible:?}"
     );
 
+    // The entry is kept, marked, and not dropped: SIP-16's tombstone is the
+    // record, and a client that discarded it would show a conversation that
+    // silently does not follow.
+    let tomb = got.timeline.get(regret).expect("the tombstone was dropped");
+    assert!(tomb.redacted, "the entry survived but was not marked redacted");
+    assert!(
+        tomb.post.body_text().is_none_or(|t| t.is_empty()),
+        "the redacted body was kept in the timeline"
+    );
+
     // And a reader arriving fresh, who never saw the original, cannot find it
     // either — which is the half that only the exchange call provides.
     let mut newcomer = chat_at(addr, server_pub, 2, &dir.path().join("bob2.db")).await;
