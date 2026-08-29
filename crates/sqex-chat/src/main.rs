@@ -600,6 +600,38 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
     Ok(open)
 }
 
+/// Move what a rebuild would throw away from the old list onto the new one.
+///
+/// `sync_channels` asks the exchange what we are in and builds the answer from
+/// scratch, which is right — it is the authority — but everything a *reader*
+/// has accumulated lives here and not there: how many messages arrived while
+/// they were looking elsewhere, where they had read up to, the answer to the
+/// command they just typed. Rebuilding without this would clear all of it
+/// every time somebody started a conversation with them, which is a rude
+/// answer to a message arriving.
+fn carry_over(old: &[Open], fresh: &mut [Open]) {
+    for o in fresh.iter_mut() {
+        let Some(was) = old.iter().find(|p| p.channel == o.channel) else {
+            continue;
+        };
+        o.unread = was.unread;
+        o.divider = was.divider;
+        o.note = was.note.clone();
+        o.marks = was.marks.clone();
+        o.marks_at = was.marks_at;
+        o.typing = was.typing;
+        o.waiting = was.waiting;
+        o.members = o.members.max(was.members);
+        // The read mark only ever moves forward, and the exchange's copy can
+        // be behind ours between publishing it and it being acknowledged.
+        o.read_to = o.read_to.max(was.read_to);
+        // Counted, not recomputed: this is what tells the next poll how many
+        // messages are new, and resetting it would count the whole
+        // conversation as having just arrived.
+        o.timeline_len = was.timeline_len.max(o.timeline_len);
+    }
+}
+
 /// Eight hex characters of a channel identifier, to call it something.
 fn hex8(channel: &[u8; 32]) -> String {
     channel[..4].iter().map(|b| format!("{b:02x}")).collect()
@@ -667,6 +699,11 @@ async fn event_loop(
     }
 
     let mut poll_at = tokio::time::Instant::now();
+    // Deliberately slower than the poll: somebody starting a conversation with
+    // you is rare next to a message arriving in one you already have, and this
+    // is a whole extra round trip.
+    const ARRIVALS: Duration = Duration::from_secs(5);
+    let mut arrivals_at = tokio::time::Instant::now() + ARRIVALS;
     let mut hover = ui::Drawn::default();
     loop {
         let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
@@ -775,6 +812,31 @@ async fn event_loop(
             let me = chat.me;
             for (i, conv) in open.iter_mut().enumerate() {
                 place_divider(conv, &me, Some(i) == here);
+            }
+            // Has anybody started talking to us since we last looked?
+            //
+            // `discover` and `sync_channels` used to run once, before the loop
+            // — so a conversation somebody else opened never appeared at all
+            // until the client was restarted, and nothing said so. A direct
+            // message needs no invitation and no acceptance, which makes it
+            // exactly the thing that arrives without warning.
+            //
+            // One request on a slow cadence, and a rebuild only when the
+            // answer contains something we do not hold: rebuilding on every
+            // pass would be a round trip per conversation for nothing.
+            if tokio::time::Instant::now() >= arrivals_at {
+                arrivals_at = tokio::time::Instant::now() + ARRIVALS;
+                if let Ok(mine) = chat.mine().await
+                    && mine
+                        .iter()
+                        .any(|m| !open.iter().any(|o| o.channel == m.channel))
+                {
+                    let _ = discover(chat).await;
+                    if let Ok(mut rebuilt) = sync_channels(chat).await {
+                        carry_over(open, &mut rebuilt);
+                        *open = rebuilt;
+                    }
+                }
             }
             // Receipts, for the conversation on screen only.
             //
@@ -2897,6 +2959,45 @@ mod tests {
         assert!(note.contains(&key), "the note does not carry the key: {note}");
         assert!(note.contains("their key"), "{note}");
         assert!(copied(&key, true).contains("your key"));
+    }
+
+    /// A rebuild asks the exchange what we are in and builds it from scratch.
+    /// Everything a *reader* has accumulated lives on this side and not that
+    /// one, so without carrying it the client would clear somebody's unread
+    /// counts and their place in a conversation every time anybody started
+    /// talking to them.
+    #[test]
+    fn a_rebuild_keeps_what_the_exchange_does_not_know() {
+        let mut was = conv(2, "bob");
+        was.unread = 4;
+        was.divider = Some(7);
+        was.read_to = 9;
+        was.timeline_len = 12;
+        was.marks_at = Some(std::time::Instant::now());
+        was.note = Some(("renamed".into(), std::time::Instant::now()));
+
+        // What a fresh `sync_channels` would produce: the exchange's facts,
+        // and defaults for everything else.
+        let mut fresh = vec![conv(2, "bob"), conv(3, "carol")];
+        // `conv` gives every conversation the same identifier, and this is
+        // keyed on it — without a distinct one the new arrival matches the old
+        // row and inherits its counts, which is the bug this guards against
+        // wearing a disguise.
+        fresh[1].channel = [3; 32];
+        fresh[0].read_to = 8;
+        carry_over(&[was], &mut fresh);
+
+        assert_eq!(fresh[0].unread, 4, "the unread count was cleared");
+        assert_eq!(fresh[0].divider, Some(7), "the reader lost their place");
+        assert_eq!(fresh[0].timeline_len, 12, "everything would count as new");
+        assert!(fresh[0].note.is_some(), "the answer to a command was lost");
+        // The read mark only moves forward: the exchange's copy can be behind
+        // ours between publishing it and it being acknowledged.
+        assert_eq!(fresh[0].read_to, 9);
+
+        // And a conversation that has just arrived keeps its own defaults.
+        assert_eq!(fresh[1].unread, 0);
+        assert_eq!(fresh[1].divider, None);
     }
 
     #[test]
