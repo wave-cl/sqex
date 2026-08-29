@@ -27,6 +27,7 @@ It is still only good enough to *read*: no scroll region, no insert/delete, no
 alternate screen. Those do not appear in what ratatui emits here.
 """
 
+import codecs
 import os
 import re
 import select
@@ -142,6 +143,34 @@ class Screen:
         for row in self.grid:
             rows.append("".join(c for c in row if c is not None).rstrip())
         return "\n".join(rows)
+
+
+class Reader:
+    """Bytes from a pty, applied to a screen.
+
+    Two things have to be held across reads, because a pty hands back whatever
+    bytes are ready and neither the client nor the harness chooses where that
+    falls:
+
+    - **half a character.** `bytes.decode` on each read in turn makes U+FFFD of
+      whatever straddles the boundary and loses the rest of it. Every character
+      this client draws that is not ASCII is three bytes — the box rule, the
+      identicon, the quotation arrow — so this went wrong constantly, and a
+      capture full of holes was reported as a fault in the client. An
+      incremental decoder keeps the partial sequence instead.
+    - **half an escape sequence**, which `feed` already returns for feeding
+      back. Kept here so a caller cannot forget it.
+
+    Both are the same property, and `selftest.py` states it: the screen must
+    not depend on where the reads fall.
+    """
+
+    def __init__(self):
+        self.pending = ""
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def feed(self, scr: Screen, chunk: bytes) -> None:
+        self.pending = feed(scr, self.pending + self.decoder.decode(chunk))
 
 
 def feed(scr: Screen, text: str) -> str:

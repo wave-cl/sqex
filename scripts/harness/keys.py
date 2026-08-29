@@ -83,10 +83,9 @@ def main():
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
     scr = tui.Screen(ROWS, COLS)
-    pending = ""
+    reader = tui.Reader()
 
     def pump(sec):
-        nonlocal pending
         end = time.time() + sec
         while time.time() < end:
             r, _, _ = select.select([fd], [], [], 0.2)
@@ -98,7 +97,7 @@ def main():
                 return
             if not chunk:
                 return
-            pending = tui.feed(scr, pending + chunk.decode("utf-8", "replace"))
+            reader.feed(scr, chunk)
 
     # Whatever happens in here, the client gets shut down: a harness that
     # leaves the thing it was driving still running is worse than none.

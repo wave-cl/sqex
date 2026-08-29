@@ -23,7 +23,12 @@ drives a scripted sequence of keys. The script is one step per line:
 caption, and a step with one prints the screen. A caption beginning `ENTER`
 also presses Return. Key names: `ESC ENTER TAB UP DOWN CTRLC`.
 
-`tui.py` is the terminal emulator both use.
+`tui.py` is the terminal emulator both use, and
+
+    python3 scripts/harness/selftest.py
+
+checks the one property it has to have: the screen must not depend on where the
+reads fall. Run it after touching `tui.py`.
 
 ## What it is good for, and what it is not
 
@@ -38,7 +43,17 @@ For anything about layout, use ratatui's own `TestBackend` and read
 `buffer[(x, y)].symbol()` per cell. That is what the terminal is handed, and it
 settles the question outright. Measure before reporting a layout bug.
 
-## Two things that have caused real mistakes
+## Three things that have caused real mistakes
+
+**Half a character.** A pty hands back whatever bytes are ready, so a read can
+land in the middle of a character. Decoding each read on its own made U+FFFD of
+whatever straddled the boundary and lost the rest — and every non-ASCII
+character this client draws is three bytes: the rule under the conversation
+header, the identicon, the quotation arrow. A capture full of holes was
+reported as a rendering fault in the client before this was understood.
+`tui.Reader` holds the partial sequence now, and `selftest.py` is there so it
+stays held.
+
 
 **Escape is modal.** It enters the message picker and leaves it again, so an
 odd number of them lands somewhere unintended and the next bare letter goes
