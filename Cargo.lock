@@ -4417,7 +4417,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-admin"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "bs58",
  "card-backend-pcsc",
@@ -4438,7 +4438,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-chat"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -4466,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-cli"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "clap",
  "rand_core 0.6.4",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-proto"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -4496,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-voice"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "clap",
  "cpal",
@@ -4519,7 +4519,7 @@ dependencies = [
 
 [[package]]
 name = "sqexd"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "bs58",
  "bytes",
