@@ -429,29 +429,44 @@ pub fn identicon(key: &str) -> Vec<Span<'static>> {
 /// without a mark of its own — see [`identicon`].
 pub fn identicon_of(id: &[u8]) -> Vec<Span<'static>> {
     let h = fnv(id);
-    // Two hues a third of the wheel apart, so the halves stay distinguishable
-    // whatever the key, and mid-lightness so both work on dark and light.
-    let a = hue((h & 0xFF) as u8);
-    let b = hue(((h >> 8) & 0xFF) as u8 / 3 * 2);
-    // Four bits choose which of the four pixels take the second colour. The
-    // pattern is mirrored across the vertical axis, which is what makes these
-    // read as a shape rather than as noise.
+    // Two hues, drawn independently and then pushed apart if they landed too
+    // close together.
+    //
+    // Independently, because deriving the second from the first makes the
+    // whole pair a function of one byte — two accounts whose first hue is
+    // near each other then get near-identical marks, which is the thing these
+    // exist to prevent. Pushed apart, because the comment here has always
+    // claimed the halves stay distinguishable and the expression never did it.
+    let first = (h & 0xFF) as u8;
+    let mut second = ((h >> 8) & 0xFF) as u8;
+    // Distance round the wheel, which is a circle: 250 and 5 are ten apart.
+    let apart = |x: u8, y: u8| x.wrapping_sub(y).min(y.wrapping_sub(x));
+    if apart(first, second) < 60 {
+        second = second.wrapping_add(85);
+    }
+    let a = hue(first);
+    let b = hue(second);
+
+    // One of four patterns, every one of which uses **both** colours in both
+    // cells: two banded, two chequered.
+    //
+    // The old version took two bits and let them choose each pixel freely,
+    // which meant `00` painted every pixel the first colour and `11` every
+    // pixel the second. Forty-seven per cent of keys came out as a flat block
+    // with no pattern in it and only one of its two hues — half the
+    // information the mark claims to carry, gone, and two accounts a shade
+    // apart indistinguishable. It was reported, reasonably, as the identicons
+    // having stopped working.
     let bits = ((h >> 16) & 0b11) as u8;
-    let pick = |on: bool| if on { b } else { a };
-    vec![
-        Span::styled(
-            "▀",
-            Style::default()
-                .fg(pick(bits & 0b01 != 0))
-                .bg(pick(bits & 0b10 != 0)),
-        ),
-        Span::styled(
-            "▀",
-            Style::default()
-                .fg(pick(bits & 0b10 != 0))
-                .bg(pick(bits & 0b01 != 0)),
-        ),
-    ]
+    let (top, bottom) = if bits & 0b01 == 0 { (a, b) } else { (b, a) };
+    let cell = |fg: Color, bg: Color| Span::styled("▀", Style::default().fg(fg).bg(bg));
+    if bits & 0b10 == 0 {
+        // Banded: the same both sides, so it reads as one mark.
+        vec![cell(top, bottom), cell(top, bottom)]
+    } else {
+        // Chequered: the halves swap across the middle.
+        vec![cell(top, bottom), cell(bottom, top)]
+    }
 }
 
 /// How wide an identicon is on screen, so callers can leave room for it.
@@ -2638,6 +2653,73 @@ mod tests {
         assert!(row_at(&app, 100, 24, 2).contains("4 people"));
         app.members = 1;
         assert!(row_at(&app, 100, 24, 2).contains("1 person"));
+    }
+
+    /// An identicon is two cells of `▀`: the foreground is the top half of
+    /// each cell and the background the bottom. If a cell's foreground and
+    /// background are the same colour there is no pattern in it at all — it is
+    /// a solid block — and if *both* cells are solid and the same, the whole
+    /// mark is one flat colour carrying half the information it claims to.
+    ///
+    /// Written after the marks were reported as having "stopped working".
+    #[test]
+    fn no_key_renders_as_a_flat_blob() {
+        let mut flat = Vec::new();
+        for n in 0..400u32 {
+            // Keys the shape of real ones, since the length feeds the hash.
+            let key = format!("{n:0>44}");
+            let spans = identicon(&key);
+            let colours: Vec<_> = spans
+                .iter()
+                .flat_map(|s| [s.style.fg.unwrap(), s.style.bg.unwrap()])
+                .collect();
+            if colours.iter().all(|c| *c == colours[0]) {
+                flat.push(key);
+            }
+        }
+        assert!(
+            flat.is_empty(),
+            "{} of 400 keys have no pattern at all, e.g. {:?}",
+            flat.len(),
+            &flat[..flat.len().min(3)]
+        );
+    }
+
+    /// The two halves have to be different colours, or the mark is a blob
+    /// whatever the pattern says. The doc comment claimed a third of the wheel
+    /// between them; the expression did not do it.
+    #[test]
+    fn the_two_halves_of_a_mark_are_visibly_different() {
+        for n in 0..400u32 {
+            let key = format!("{n:0>44}");
+            let spans = identicon(&key);
+            let seen: std::collections::HashSet<_> = spans
+                .iter()
+                .flat_map(|s| [s.style.fg.unwrap(), s.style.bg.unwrap()])
+                .collect();
+            assert_eq!(seen.len(), 2, "{key} uses {} colours, not two", seen.len());
+        }
+    }
+
+    /// The point of the mark is that two of them differ. Half the keys used to
+    /// come out as a flat block, which collapsed the space they are drawn
+    /// from; deriving the second hue from the first collapsed it again a
+    /// different way.
+    #[test]
+    fn two_keys_seldom_look_alike() {
+        let mark = |key: &str| {
+            identicon(key)
+                .iter()
+                .map(|s| (s.style.fg.unwrap(), s.style.bg.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let marks: Vec<_> = (0..400u32).map(|n| mark(&format!("{n:0>44}"))).collect();
+        let distinct: std::collections::HashSet<_> = marks.iter().collect();
+        assert!(
+            distinct.len() > 380,
+            "only {} of 400 marks are distinct",
+            distinct.len()
+        );
     }
 
     /// A channel has an identifier as good as a key, and no reason to go
