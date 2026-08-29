@@ -139,10 +139,46 @@ class Screen:
                 self.grid[y] = [" "] * self.cols
 
     def render(self) -> str:
+        """The screen as text: exactly `rows` lines, blank ones included.
+
+        Trailing spaces go, trailing *rows* do not. A caller matching a
+        substring wants this; a caller **printing** wants `show`, which is
+        the one that cannot be quietly truncated.
+        """
         rows = []
         for row in self.grid:
             rows.append("".join(c for c in row if c is not None).rstrip())
         return "\n".join(rows)
+
+    def numbered(self, label: str = "") -> str:
+        """The whole screen, framed and numbered, ready to print.
+
+        Every line carries its row number and the footer states the size, so a
+        capture that has been cut — by `head`, by a slice, by a scrollback that
+        ran out — says so on its face instead of looking like content.
+
+        This exists because it is the failure this harness keeps producing.
+        `sqex-chat` bottom-aligns its transcript against the composer, the way
+        every chat client does, so a short conversation leaves the top two
+        thirds of the pane blank and puts its messages in the last few rows.
+        Printing the first twenty lines of that shows a header, a rule and
+        nothing else — which is indistinguishable from a conversation that
+        failed to load, and has been reported as one more than once. Once it
+        was even "confirmed" by running an older build and slicing that
+        identically, which reproduces the mistake on both sides and reads as
+        agreement.
+        """
+        head = f" {label} " if label else ""
+        out = [f"┌{head:─<{self.cols + 5}}┐"]
+        for i, line in enumerate(self.render().splitlines(), 1):
+            out.append(f"{i:>3} │{line}")
+        out.append(f"└{'─' * (self.cols + 5)}┘")
+        out.append(f"    {self.rows} rows x {self.cols} cols, all shown")
+        return "\n".join(out)
+
+    def show(self, label: str = "") -> None:
+        """Print the whole screen. Use this rather than `print(scr.render())`."""
+        print(self.numbered(label), flush=True)
 
 
 class Reader:

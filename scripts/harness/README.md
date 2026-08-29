@@ -27,8 +27,9 @@ also presses Return. Key names: `ESC ENTER TAB UP DOWN CTRLC`.
 
     python3 scripts/harness/selftest.py
 
-checks the one property it has to have: the screen must not depend on where the
-reads fall. Run it after touching `tui.py`.
+checks the two properties it has to have: the screen must not depend on where
+the reads fall, and printing a screen must print all of it. Run it after
+touching `tui.py`.
 
 ## What it is good for, and what it is not
 
@@ -43,7 +44,7 @@ For anything about layout, use ratatui's own `TestBackend` and read
 `buffer[(x, y)].symbol()` per cell. That is what the terminal is handed, and it
 settles the question outright. Measure before reporting a layout bug.
 
-## Three things that have caused real mistakes
+## Four things that have caused real mistakes
 
 **Half a character.** A pty hands back whatever bytes are ready, so a read can
 land in the middle of a character. Decoding each read on its own made U+FFFD of
@@ -53,6 +54,25 @@ header, the identicon, the quotation arrow. A capture full of holes was
 reported as a rendering fault in the client before this was understood.
 `tui.Reader` holds the partial sequence now, and `selftest.py` is there so it
 stays held.
+
+
+**The bottom of the screen is where the conversation is.** `sqex-chat`
+bottom-aligns its transcript against the composer, the way every chat client
+does. A two-message conversation is a header, a rule, **twenty-eight blank
+rows**, and then the messages just above the input box. Print the first twenty
+lines of that and you have a header and a rule — which looks exactly like a
+conversation that failed to load, and has been reported as one twice.
+
+So print the **whole** screen: `scr.show(label)`, never `print(scr.render())`
+and never a slice. `show` numbers every row and states the screen's size in its
+footer, so a capture cut short says so on its face. Do not pipe it through
+`head`, a line range, or `grep -v '^$'` — the blank rows are the information.
+
+The second of those two reports was "confirmed" by building the previous
+release and comparing. Both sides were sliced the same way, so the comparison
+faithfully reproduced the mistake on both halves and read as agreement. A
+control that applies the same error to both arms confirms the error, not the
+finding.
 
 
 **Escape is modal.** It enters the message picker and leaves it again, so an

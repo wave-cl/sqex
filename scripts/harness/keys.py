@@ -107,8 +107,9 @@ def main():
                 os.write(fd, keys.encode())
             pump(secs)
             if caption:
-                print(f"\n{'=' * 72}\n{caption}\n{'=' * 72}")
-                print(scr.render())
+                # The whole screen, numbered and sized — see `Screen.numbered`.
+                print()
+                scr.show(caption)
     finally:
         tui.shutdown(pid, fd)
 

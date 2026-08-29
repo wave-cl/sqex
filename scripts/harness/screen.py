@@ -51,8 +51,11 @@ def main():
             reader.feed(scr, chunk)
 
     def shot(label):
-        print(f"\n{'=' * 70}\n{label}\n{'=' * 70}")
-        print(scr.render())
+        # `show`, not `print(render())`: the whole screen, numbered, with its
+        # own size in the footer, so a truncated capture cannot pass for a
+        # short one.
+        print()
+        scr.show(label)
 
     # Whatever happens in here, the client gets shut down: a harness that
     # leaves the thing it was driving still running is worse than none.
