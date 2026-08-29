@@ -391,8 +391,16 @@ struct Open {
     marks: Vec<sqex_proto::channel::Mark>,
     marks_at: Option<std::time::Instant>,
     /// How far we have told the exchange we have read, so the same mark is not
-    /// posted on every pass.
+    /// posted on every pass. Seeded from the exchange's own record at startup,
+    /// which is what makes "where was I" survive closing the client.
     read_to: u64,
+    /// Where the unread divider sits, frozen when the conversation was opened.
+    ///
+    /// Frozen on purpose. Reading a conversation immediately advances the read
+    /// mark, so a divider computed from it would vanish the moment it appeared
+    /// — exactly when somebody wants it. It is set once on arriving here and
+    /// cleared on leaving.
+    divider: Option<u64>,
     /// When something last happened here, for ordering the list. The newest
     /// message's time, or when we joined if nothing has been said.
     last_at: u64,
@@ -507,6 +515,9 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             .map(|msg| msg.posted)
             .max()
             .unwrap_or(m.joined);
+        // The exchange's record of our own read mark. Seeding from it is what
+        // lets the client be closed and reopened and still say where you were.
+        let read_to = m.read;
         open.push(Open {
             peer: peer.map(|(a, _)| a),
             public,
@@ -520,7 +531,8 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             typing: false,
             marks: Vec::new(),
             marks_at: None,
-            read_to: 0,
+            read_to,
+            divider: None,
             last_at,
             unread: 0,
             waiting: false,
@@ -549,6 +561,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             marks: Vec::new(),
             marks_at: None,
             read_to: 0,
+            divider: None,
             // Nothing has happened here yet, so it sorts below anything that
             // has rather than claiming a time it does not have.
             last_at: 0,
@@ -654,13 +667,21 @@ async fn event_loop(
             for conv in open.iter_mut() {
                 poll_one(chat, conv, app).await;
             }
+            // Where the unread divider goes, decided once on arriving at a
+            // conversation and left alone after — reading advances the mark
+            // immediately, so a divider recomputed from it would disappear the
+            // instant it was wanted.
+            let here = selected_index(open, app);
+            for (i, conv) in open.iter_mut().enumerate() {
+                place_divider(conv, Some(i) == here);
+            }
             // Receipts, for the conversation on screen only.
             //
             // Reading is what somebody does to the channel they are looking
             // at, so that is the only one to say so about — and telling the
             // exchange you have read a conversation you are not looking at
             // would be publishing something untrue about yourself.
-            if let Some(at) = selected_index(open, app) {
+            if let Some(at) = here {
                 receipts(chat, &mut open[at]).await;
             }
             poll_at = tokio::time::Instant::now() + Duration::from_millis(700);
@@ -804,6 +825,28 @@ async fn account_command(
         _ => Ok(None),
     }?;
     Ok(note.unwrap_or_default())
+}
+
+/// Decide where the unread divider sits in `conv`.
+///
+/// Set once on arriving and left alone after. Reading a conversation advances
+/// the read mark within the second, so a divider recomputed from it would
+/// disappear the instant it appeared — which is exactly when somebody wants to
+/// see it. Leaving the conversation clears it, so coming back later marks the
+/// new place.
+fn place_divider(conv: &mut Open, selected: bool) {
+    if !selected {
+        conv.divider = None;
+        return;
+    }
+    if conv.divider.is_some() {
+        return;
+    }
+    conv.divider = conv
+        .timeline
+        .messages()
+        .map(|m| m.seq)
+        .find(|seq| *seq > conv.read_to);
 }
 
 /// Publish how far we have read here, and collect how far everybody else has.
@@ -1883,6 +1926,7 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         marks: Vec::new(),
         marks_at: None,
         read_to: 0,
+        divider: None,
         admins: vec![chat.me, account],
         timeline: Timeline::new(),
         timeline_len: 0,
@@ -2120,6 +2164,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         .collect();
     app.peer_typing = conv.typing;
     app.topic = conv.timeline.topic.clone();
+    app.divider = conv.divider;
     app.now = now();
     app.has_avatar = conv.timeline.avatar.is_some();
     // The cursor holds a position in a list that has just been rebuilt. A
@@ -2278,6 +2323,7 @@ mod tests {
             marks: Vec::new(),
             marks_at: None,
             read_to: 0,
+            divider: None,
             last_at: 0,
             trouble: Trouble::default(),
             note: None,
@@ -2595,6 +2641,47 @@ mod tests {
         assert_eq!(app.said.len(), 2);
         assert_eq!(app.said[0].receipt, None, "a receipt on somebody else's message");
         assert_eq!(app.said[1].receipt, Some(ui::Receipt::Read));
+    }
+
+    /// The divider is frozen on arriving, not recomputed. Reading advances the
+    /// mark within the second, so recomputing would take the line away at the
+    /// moment it became useful.
+    #[test]
+    fn the_unread_divider_stays_where_it_was_put() {
+        let me = PubKey::new([1; 32]);
+        let bob = PubKey::new([2; 32]);
+        let entry = |seq| Received {
+            seq,
+            account: bob,
+            posted: 10 + seq,
+            kind: sqex_proto::channel::KIND_MEMBER,
+            tombstone: false,
+            body: Some(Body::Post(SipPost::text("hello"))),
+        };
+        let mut c = conv(2, "bob");
+        c.timeline = Timeline::fold(&[entry(1), entry(2), entry(3)], &[me]);
+        c.read_to = 1;
+
+        // Arriving: the line goes above the first one not yet read.
+        place_divider(&mut c, true);
+        assert_eq!(c.divider, Some(2));
+
+        // Reading them advances the mark. The line does not move.
+        c.read_to = 3;
+        place_divider(&mut c, true);
+        assert_eq!(c.divider, Some(2), "the divider moved as it was read past");
+
+        // Leaving clears it, so coming back marks the new place.
+        place_divider(&mut c, false);
+        assert_eq!(c.divider, None);
+        place_divider(&mut c, true);
+        assert_eq!(c.divider, None, "a divider appeared with nothing unread");
+
+        // And something new arriving later gets its own line.
+        c.timeline.apply(&entry(4), &[me]);
+        place_divider(&mut c, false);
+        place_divider(&mut c, true);
+        assert_eq!(c.divider, Some(4));
     }
 
     /// Signal's ordering: whatever happened last is at the top. The exchange

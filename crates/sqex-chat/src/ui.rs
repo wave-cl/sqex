@@ -236,6 +236,9 @@ pub struct App {
     /// The selected channel has a picture. Said rather than drawn: a terminal
     /// cannot show one, and a coloured-block approximation is not the picture.
     pub has_avatar: bool,
+    /// The first message not read when this conversation was opened, if there
+    /// was one. A line goes above it.
+    pub divider: Option<u64>,
     /// Now, so a day separator can leave the year off the current one and put
     /// it on older history, where a bare date is a trap.
     pub now: u64,
@@ -825,10 +828,21 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
             );
             day = this_day;
         }
-        let head = starts_run(i.checked_sub(1).and_then(|p| app.said.get(p)), s);
-        if head && i > 0 {
+        // Where you had got to when you opened this. Above the first message
+        // you had not seen, and it stays there while you read past it.
+        if app.divider == Some(s.seq) {
+            let n = app.said.len() - i;
+            lines.push(
+                Line::from(Span::styled(
+                    format!("─── {n} unread ───"),
+                    Style::default().fg(Color::Yellow),
+                ))
+                .alignment(Alignment::Center),
+            );
+        } else if starts_run(i.checked_sub(1).and_then(|p| app.said.get(p)), s) && i > 0 {
             lines.push(Line::from(""));
         }
+        let head = starts_run(i.checked_sub(1).and_then(|p| app.said.get(p)), s);
         lines.extend(bubble(app, s, app.picked == Some(i), head, width));
     }
 
@@ -2119,6 +2133,40 @@ mod tests {
         assert_ne!(delivered, read);
         assert!(delivered.contains('✓'));
         assert!(read.contains("✓✓"));
+    }
+
+    /// Where you had got to when you opened the conversation. The count is
+    /// the point — "3 unread" tells you how far to scroll back.
+    #[test]
+    fn an_unread_divider_marks_where_you_left_off() {
+        let mut app = sample();
+        app.said = (1..=5)
+            .map(|n| {
+                let mut s = said("bob", "8qbHbw2B", false, &format!("message {n}"), 3661);
+                s.seq = n;
+                s
+            })
+            .collect();
+        app.divider = Some(3);
+        let out = render(&app, 100, 30);
+        let rows: Vec<&str> = out.lines().collect();
+        let line = rows
+            .iter()
+            .position(|l| l.contains("unread"))
+            .expect("no divider drawn");
+        let third = rows.iter().position(|l| l.contains("message 3")).unwrap();
+        let second = rows.iter().position(|l| l.contains("message 2")).unwrap();
+        assert!(second < line && line < third, "the divider is in the wrong place:\n{out}");
+        // Three messages sit below it.
+        assert!(rows[line].contains("3 unread"), "{}", rows[line]);
+    }
+
+    #[test]
+    fn nothing_unread_draws_no_divider() {
+        let mut app = sample();
+        app.divider = None;
+        let out = render(&app, 100, 24);
+        assert!(!out.contains("unread"), "a divider appeared with nothing new:\n{out}");
     }
 
     #[test]
