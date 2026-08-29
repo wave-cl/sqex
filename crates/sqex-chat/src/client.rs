@@ -669,7 +669,12 @@ impl Chat {
     /// so that a client starting offline still folds correctly.
     pub fn history(&self, channel: &[u8; 32], admins: &[PubKey]) -> Result<Timeline> {
         let mut timeline = Timeline::new();
-        for (seq, account, posted, kind, plain) in self.store.messages(channel)? {
+        let held = self.store.messages(channel)?;
+        let mut with_body: Vec<u64> = Vec::new();
+        for (seq, account, posted, kind, plain) in held {
+            if plain.as_ref().is_some_and(|p| !p.is_empty()) {
+                with_body.push(seq);
+            }
             timeline.apply(
                 &Received {
                     seq,
@@ -681,6 +686,19 @@ impl Chat {
                 },
                 admins,
             );
+        }
+
+        // Anything the fold says was deleted, and whose words are still here.
+        //
+        // The poll path clears a body as the redaction arrives, but that only
+        // helps from now on: a message deleted before this client learned to
+        // do it kept its plaintext, and would have kept it for good. Folding
+        // is where we find out which those are, and it happens once per
+        // channel at startup rather than on every poll.
+        for seq in with_body {
+            if timeline.get(seq).is_some_and(|m| m.redacted) {
+                self.store.redact_message(channel, seq)?;
+            }
         }
         Ok(timeline)
     }
@@ -1241,6 +1259,9 @@ impl Chat {
         )
         .await?;
         self.send_body(channel, Body::Redact { target }).await?;
+        // Ours too, and now: the next poll would fetch our own notice back and
+        // do it, but "deleted" should not mean "deleted in a moment".
+        self.store.redact_message(channel, target)?;
         Ok(Redacted {
             detached: blobs.len() - left.len(),
             left_behind: left,
@@ -1829,7 +1850,17 @@ impl Chat {
                     },
                 },
             )?;
+            // A tombstone fetched fresh must overwrite a body we already hold.
+            // `put_message` keeps what it has, which is right for a re-fetch
+            // and wrong for this.
+            if tombstone {
+                self.store.redact_message(channel, e.seq)?;
+            }
             let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
+            let redacts = match &body {
+                Some(Body::Redact { target }) => Some(*target),
+                _ => None,
+            };
             timeline.apply(
                 &Received {
                     seq: e.seq,
@@ -1841,6 +1872,17 @@ impl Chat {
                 },
                 &admins,
             );
+            // The words go from disk as well as from the exchange. Gated on
+            // the fold having *honoured* the redaction rather than on having
+            // seen one: only the message's own account or an admin may delete
+            // it, and asking the timeline reuses that rule instead of keeping
+            // a second copy of it here — a forged redaction must not be able
+            // to make this client destroy somebody else's message.
+            if let Some(target) = redacts
+                && timeline.get(target).is_some_and(|m| m.redacted)
+            {
+                self.store.redact_message(channel, target)?;
+            }
         }
         if last > since {
             self.store.set_since(channel, last)?;

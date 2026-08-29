@@ -1588,3 +1588,190 @@ async fn renaming_a_channel_leaves_its_topic_alone() {
     assert_eq!(held.name, "shipping", "setting the topic destroyed the name");
     assert_eq!(held.topic, "what we ship in November");
 }
+
+/// Deleting a message has to reach the copies on disk. The exchange drops the
+/// bytes, but every reader that opened the message keeps the plaintext in its
+/// own store — sealed at rest, and recoverable by anyone holding the identity.
+/// "Delete" meaning hidden rather than gone is not what the word promises.
+#[tokio::test]
+async fn redacting_takes_the_words_off_both_disks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let regret = alice.send(&channel, "the incriminating words").await.unwrap().seq;
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+
+    // Both hold the plaintext at this point, which is the whole point of the
+    // store: an entry the exchange serves once is one a client cannot re-read.
+    let held = |c: &Chat| {
+        c.store()
+            .messages(&channel)
+            .unwrap()
+            .into_iter()
+            .find(|(seq, ..)| *seq == regret)
+            .and_then(|(_, _, _, _, plain)| plain)
+    };
+    assert!(held(&alice).is_some_and(|p| !p.is_empty()));
+    assert!(held(&bob).is_some_and(|p| !p.is_empty()));
+
+    alice.redact(&channel, regret).await.unwrap();
+
+    // The sender's copy goes at once, not on some later poll.
+    assert_eq!(
+        held(&alice),
+        Some(Vec::new()),
+        "the words stayed on the deleting client's disk"
+    );
+
+    // And the reader's, as soon as it learns of the redaction.
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert_eq!(
+        held(&bob),
+        Some(Vec::new()),
+        "the words stayed on the reader's disk"
+    );
+
+    // Empty and not absent: "deleted" and "held but could not be opened" are
+    // different things and have to survive a restart as different things.
+    let reopened = Store::open(&identity(2).0, Some(&dir.path().join("bob.db"))).unwrap();
+    let row = reopened
+        .messages(&channel)
+        .unwrap()
+        .into_iter()
+        .find(|(seq, ..)| *seq == regret)
+        .unwrap();
+    assert_eq!(row.4, Some(Vec::new()), "a tombstone came back as unopenable");
+}
+
+/// Only the message's own account or an admin may delete it, and the store has
+/// to obey the same rule as the fold. A client that cleared its disk on any
+/// redaction it received would let anybody in a channel destroy anybody's
+/// message — on everybody else's machine.
+#[tokio::test]
+async fn a_forged_redaction_does_not_reach_the_disk() {
+    use sqex_proto::message::Body;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
+
+    // A group, so there is a third party with no authority over the message.
+    let channel = alice
+        .create_group("planning", &[bob_key, carol_key])
+        .await
+        .unwrap();
+    let said = alice.send(&channel, "alice's words").await.unwrap().seq;
+
+    bob.collect_keys(&channel).await.unwrap();
+    let mut bobs = Timeline::new();
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+
+    // Carol is an ordinary member. The exchange would refuse her a redaction,
+    // so she sends only the SIP-19 notice — which nothing at the exchange can
+    // check, because it cannot read it.
+    carol.collect_keys(&channel).await.unwrap();
+    carol
+        .send_body(&channel, Body::Redact { target: said })
+        .await
+        .unwrap();
+
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let held = bob
+        .store()
+        .messages(&channel)
+        .unwrap()
+        .into_iter()
+        .find(|(seq, ..)| *seq == said)
+        .and_then(|(_, _, _, _, plain)| plain);
+    assert!(
+        held.is_some_and(|p| !p.is_empty()),
+        "a member with no authority destroyed somebody else's message on \
+         another member's disk"
+    );
+    assert!(
+        bobs.get(said).is_some_and(|m| !m.redacted),
+        "the fold honoured a forged redaction"
+    );
+}
+
+/// A message deleted before this client knew to clear its disk kept the words
+/// for good: the poll path only helps from the moment it runs. Folding a
+/// history is where those are found, and it happens once per channel at start.
+///
+/// The old state is built directly, because the current code cannot produce it
+/// — which is the point of the fix.
+#[tokio::test]
+async fn words_deleted_before_we_learned_to_forget_them_are_cleared_on_reload() {
+    use sqex_chat::store::Kept;
+    use sqex_proto::channel::KIND_MEMBER;
+    use sqex_proto::message::{Body, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (seed, me) = identity(2);
+    let (_, them) = identity(1);
+    let path = dir.path().join("old.db");
+    let channel = [9u8; 32];
+
+    // What an older client's store looked like: the message with its words
+    // still in it, and the notice that deleted it sitting right after.
+    {
+        let store = Store::open(&seed, Some(&path)).unwrap();
+        let post = Body::Post(SipPost::text("the incriminating words")).encode();
+        store
+            .put_message(
+                &channel,
+                Kept { seq: 1, account: them, posted: 10, kind: KIND_MEMBER, plain: Some(&post) },
+            )
+            .unwrap();
+        let notice = Body::Redact { target: 1 }.encode();
+        store
+            .put_message(
+                &channel,
+                Kept { seq: 2, account: them, posted: 20, kind: KIND_MEMBER, plain: Some(&notice) },
+            )
+            .unwrap();
+        let words = store
+            .messages(&channel)
+            .unwrap()
+            .into_iter()
+            .find(|(s, ..)| *s == 1)
+            .and_then(|(_, _, _, _, p)| p)
+            .unwrap();
+        assert!(!words.is_empty(), "the old state was not built");
+    }
+
+    // Opening it folds the history, which is where the deletion is noticed.
+    let chat = Chat::new(
+        Client::connect_as(addr, &server_pub, &seed).await.unwrap(),
+        seed,
+        me,
+        Store::open(&seed, Some(&path)).unwrap(),
+    );
+    let folded = chat.history(&channel, &[them]).unwrap();
+    assert!(folded.get(1).is_some_and(|m| m.redacted), "the fold missed it");
+
+    assert_eq!(
+        chat.store()
+            .messages(&channel)
+            .unwrap()
+            .into_iter()
+            .find(|(s, ..)| *s == 1)
+            .and_then(|(_, _, _, _, p)| p),
+        Some(Vec::new()),
+        "the words of an already-deleted message survived the reload"
+    );
+}

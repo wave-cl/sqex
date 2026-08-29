@@ -579,6 +579,28 @@ impl Store {
         Ok(())
     }
 
+    /// Throw away the words of a message that has been deleted.
+    ///
+    /// `put_message` keeps a body it already holds, deliberately — a re-fetch
+    /// must not be able to blank a message this client managed to open once.
+    /// The same rule meant a redaction never reached the copy on disk: the
+    /// exchange dropped the bytes, every reader went on holding them, and
+    /// "delete" meant hidden rather than gone.
+    ///
+    /// Set to an empty body rather than to NULL, because NULL means "held and
+    /// could not be opened" and the two must stay distinguishable across a
+    /// restart.
+    pub fn redact_message(&self, channel: &[u8; 32], seq: u64) -> Result<()> {
+        let empty = self.seal_bytes(&[])?;
+        self.db
+            .execute(
+                "UPDATE message SET sealed = ?3 WHERE channel = ?1 AND seq = ?2",
+                params![&channel[..], seq as i64, empty],
+            )
+            .map_err(storage("redact message"))?;
+        Ok(())
+    }
+
     /// Everything we have kept for a channel, oldest first.
     ///
     /// Returns the decrypted body bytes; decoding them is the caller's job,
