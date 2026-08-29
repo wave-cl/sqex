@@ -29,6 +29,10 @@ use sqex_proto::prekey::{
 use sqex_proto::timeline::{Received, Timeline};
 use sqnr::Client;
 use sqnr_core::PubKey;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use crate::store::{Kept, Store, StoreError};
 
@@ -70,6 +74,86 @@ const ADMISSION_LIFETIME: u64 = 7 * 24 * 60 * 60;
 /// binds on a large public channel — where a round trip per person on the
 /// first poll would be felt. The rest arrive on the polls that follow.
 const PROFILES_PER_POLL: usize = 16;
+
+/// How long to wait before each redial, in milliseconds, holding at the last.
+///
+/// Quick at first, because much the commonest interruption is a few seconds of
+/// nothing — a laptop lid, a changed network — and waiting half a minute to
+/// notice it came back would be its own fault. Slow at the end, because an
+/// exchange that has been down a minute is being worked on, and a client
+/// knocking twice a second is not helping.
+const BACKOFF_MS: &[u64] = &[500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+
+/// How long one ordinary request may take before the connection is presumed
+/// dead.
+///
+/// Without this the client hangs. QUIC's idle timeout is 30 s, so a request
+/// issued to an exchange that has just died does not fail — it waits, and the
+/// event loop waits with it, keyboard and all. Thirty seconds of frozen
+/// interface, and the connection light could not turn amber because nothing
+/// was running to turn it. Eight seconds is far longer than any of these
+/// requests takes against a working exchange and far short of the wait that
+/// made the client look broken.
+const PATIENCE: Duration = Duration::from_secs(8);
+
+/// The same, for a request that moves a file.
+///
+/// A blob is as large as somebody chose to send and goes over whatever link
+/// they have. Holding it to a control-plane deadline would fail an upload that
+/// was working perfectly.
+const BLOB_PATIENCE: Duration = Duration::from_secs(300);
+
+/// How much of each tick may be spent advancing a dial in progress.
+///
+/// The interface has a keyboard to serve. `connect_as` allows five seconds for
+/// a handshake, and blocking on it would freeze typing for five seconds — so
+/// the dial is held across ticks and given a slice of each.
+const DIAL_SLICE: Duration = Duration::from_millis(50);
+
+/// A dial in progress: a handshake held across ticks so the interface stays
+/// live while it happens.
+type Dialing = Pin<Box<dyn Future<Output = std::result::Result<Client, String>>>>;
+
+/// A wait with up to a fifth taken off it or added to it.
+///
+/// One client reconnecting has no need of this. A room of them coming back
+/// after an exchange restarts does: without jitter they knock at the same
+/// instant and go on doing it in step, which is the one pattern that turns a
+/// restart into an outage.
+fn jittered(ms: u64) -> u64 {
+    let spread = ms / 5;
+    if spread == 0 {
+        return ms;
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    ms - spread + n % (2 * spread + 1)
+}
+
+/// Whether the exchange is reachable, as far as anything has been able to tell.
+///
+/// Deliberately three states and not two. "Down" covers both a blip and an
+/// outage, and they want opposite things from a reader: one is worth ignoring
+/// and the other is worth doing something about. Nothing here ever stops
+/// trying — [`Link::Gone`] means *this has been failing long enough that you
+/// should not count on it*, not that the client has given up. A chat client
+/// that gives up is worse than one that keeps knocking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Link {
+    /// The last thing we asked for got an answer. A refusal counts: a 403 is
+    /// proof the connection is alive.
+    ///
+    /// The default, because a client draws its first frame having just
+    /// connected. Starting anywhere else would show a fault that is not there.
+    #[default]
+    Up,
+    /// Down, with a redial scheduled or in flight.
+    Retrying,
+    /// Down through the whole backoff ramp — a minute or so. Still retrying.
+    Gone,
+}
 
 #[derive(Debug)]
 pub enum ChatError {
@@ -224,6 +308,20 @@ pub struct Redacted {
 pub struct Chat {
     client: Client,
     seed: [u8; 32],
+    /// Where to dial to get back. `None` when nobody said — a `Chat` that
+    /// cannot reconnect must not pretend to be reconnecting, and must not
+    /// short-circuit its own requests either, so it keeps the behaviour it had
+    /// before any of this existed: every call tries.
+    endpoint: Option<(SocketAddr, [u8; 32])>,
+    link: Link,
+    /// How many redials have failed since the link was last up. Indexes
+    /// `BACKOFF_MS`, and reaching the end of it is what makes the link `Gone`.
+    attempts: usize,
+    /// When the next redial is due.
+    next_dial: Instant,
+    /// A dial in progress, held across ticks so the interface stays live while
+    /// it handshakes.
+    dialing: Option<Dialing>,
     /// The account we act for. Membership, roles, direct-message identifiers
     /// and display are all per account.
     pub me: PubKey,
@@ -244,9 +342,113 @@ impl Chat {
         Chat {
             client,
             seed,
+            endpoint: None,
+            link: Link::Up,
+            attempts: 0,
+            next_dial: Instant::now(),
+            dialing: None,
             me,
             device,
             store,
+        }
+    }
+
+    /// Where to dial when the connection is lost.
+    ///
+    /// Separate from [`new`](Self::new) so that the four test files and the
+    /// one caller that build a `Chat` are unaffected, and because it is a real
+    /// choice: without it there is no reconnection at all, which is what this
+    /// client did until now — one `connect_as` at startup, and a dropped QUIC
+    /// connection meant every request afterwards failed forever.
+    pub fn dials(&mut self, addr: SocketAddr, server_pub: [u8; 32]) {
+        self.endpoint = Some((addr, server_pub));
+    }
+
+    /// Whether the exchange is reachable, as far as anything has been able to
+    /// tell.
+    pub fn link(&self) -> Link {
+        self.link
+    }
+
+    /// Whether requests should be refused without trying.
+    ///
+    /// Only once there is somewhere to dial: otherwise a single dropped packet
+    /// would put a `Chat` into a state nothing could get it out of.
+    fn offline(&self) -> bool {
+        self.endpoint.is_some() && self.link != Link::Up
+    }
+
+    /// Note that something got through.
+    fn up(&mut self) {
+        self.link = Link::Up;
+        self.attempts = 0;
+    }
+
+    /// Note that the connection failed, and decide when to try again.
+    fn down(&mut self) {
+        let wait = BACKOFF_MS[self.attempts.min(BACKOFF_MS.len() - 1)];
+        self.attempts += 1;
+        self.next_dial = Instant::now() + Duration::from_millis(jittered(wait));
+        self.link = if self.attempts >= BACKOFF_MS.len() {
+            Link::Gone
+        } else {
+            Link::Retrying
+        };
+    }
+
+    /// Try again now, whatever the backoff had planned.
+    ///
+    /// What `/reconnect` is for: `Gone` should have an answer that is not
+    /// "restart the client".
+    pub fn reconnect_now(&mut self) {
+        self.dialing = None;
+        self.attempts = 0;
+        self.next_dial = Instant::now();
+        if self.link == Link::Up {
+            self.link = Link::Retrying;
+        }
+    }
+
+    /// Advance the reconnection, if there is one to advance.
+    ///
+    /// Called once per tick of whatever loop owns this. Cheap and immediate
+    /// when the link is up or there is nowhere to dial; otherwise it spends at
+    /// most [`DIAL_SLICE`] on a handshake and comes back, keeping whatever
+    /// progress it made for the next tick.
+    ///
+    /// A reconnect replays nothing. SIP-3 puts the identity in the Initial and
+    /// every command carries its own signature, so a fresh connection is the
+    /// whole of what is needed — there is no session to restore.
+    pub async fn keep_alive(&mut self) {
+        if self.link == Link::Up {
+            return;
+        }
+        let Some((addr, server_pub)) = self.endpoint else {
+            return;
+        };
+        if self.dialing.is_none() {
+            if Instant::now() < self.next_dial {
+                return;
+            }
+            let seed = self.seed;
+            self.dialing = Some(Box::pin(async move {
+                Client::connect_as(addr, &server_pub, &seed).await
+            }));
+        }
+        let dial = self.dialing.as_mut().expect("just set");
+        match tokio::time::timeout(DIAL_SLICE, dial).await {
+            // Still handshaking. The future is kept, so the next tick carries
+            // on rather than starting over.
+            Err(_) => {}
+            Ok(Ok(client)) => {
+                self.dialing = None;
+                self.client = client;
+                self.up();
+            }
+            Ok(Err(_)) => {
+                self.dialing = None;
+                self.down();
+            }
         }
     }
 
@@ -263,15 +465,54 @@ impl Chat {
     /// person can act on. `pub(crate)` so the blob module shares exactly this
     /// handling rather than growing a second, laxer copy of it.
     pub(crate) async fn post_raw(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
-        self.post(path, body).await
+        self.post_within(path, body, BLOB_PATIENCE).await
     }
 
     async fn post(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
-        let (code, body) = self
-            .client
-            .post(path, body)
-            .await
-            .map_err(ChatError::Transport)?;
+        self.post_within(path, body, PATIENCE).await
+    }
+
+    async fn post_within(
+        &mut self,
+        path: &str,
+        body: Vec<u8>,
+        patience: Duration,
+    ) -> Result<Vec<u8>> {
+        // Nothing is attempted while the link is down. The poll loop asks
+        // about every conversation every 700 ms, so writing each of those into
+        // a connection known to be dead costs a round of errors a second and
+        // tells nobody anything the light does not already say.
+        if self.offline() {
+            return Err(ChatError::Transport(
+                "not connected to the exchange".to_string(),
+            ));
+        }
+        let sent = match tokio::time::timeout(patience, self.client.post(path, body)).await {
+            Ok(sent) => sent,
+            // Silence is a failure, and has to be treated as one here rather
+            // than waited out: a connection whose far end has gone reports
+            // nothing at all until QUIC's idle timer expires.
+            Err(_) => {
+                self.down();
+                return Err(ChatError::Transport(format!(
+                    "the exchange stopped answering ({}s)",
+                    patience.as_secs()
+                )));
+            }
+        };
+        let (code, body) = match sent {
+            Ok(got) => {
+                // Any answer at all proves the connection: a refusal is as
+                // good as a success for this purpose, and better evidence than
+                // a success at a route that happens to be cached.
+                self.up();
+                got
+            }
+            Err(e) => {
+                self.down();
+                return Err(ChatError::Transport(e));
+            }
+        };
         if code != 200 {
             let said = String::from_utf8_lossy(&body).into_owned();
             // The router's own 404 for a path it does not have, as against a
@@ -1743,8 +1984,9 @@ impl Chat {
         use sqex_proto::channel::SignalOut;
         use sqex_proto::message::{SIGNAL_TYPING, Signal};
         let body = Signal::Typing(on).encode();
+        // Through `post` like everything else, so that it neither writes into
+        // a dead connection nor misses the chance to notice a live one.
         let _ = self
-            .client
             .post(
                 "/channel/signal",
                 SignalOut {
@@ -1768,8 +2010,12 @@ impl Chat {
         wait_secs: u16,
     ) -> Result<Conversation> {
         let (mut since, _, _) = self.store.cursor(channel)?;
+        // A long poll is *meant* to sit there: `wait_secs` is how long the
+        // exchange may hold the request open with nothing to say. Judging it
+        // by the ordinary deadline would call a working long poll a dead
+        // connection.
         let body = self
-            .post(
+            .post_within(
                 "/channel/fetch",
                 Fetch {
                     channel: *channel,
@@ -1777,6 +2023,7 @@ impl Chat {
                     wait_secs,
                 }
                 .encode(),
+                PATIENCE + Duration::from_secs(u64::from(wait_secs)),
             )
             .await?;
         let mut entries =

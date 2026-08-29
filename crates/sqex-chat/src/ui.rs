@@ -20,8 +20,63 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use sqex_chat::client::Link;
 use sqnr_core::PubKey;
 use unicode_width::UnicodeWidthStr;
+
+/// Every colour the client draws with, in one place.
+///
+/// Truecolour rather than the 256-colour indices this used to hold. The
+/// identicons have always been `Rgb`, so nothing new is being assumed about
+/// the terminal — and an index is a number whose meaning depends on the
+/// terminal's own palette, which is how the outgoing bubble came to be a
+/// muddy `Indexed(24)`: a dark, desaturated teal that reads as sludge next to
+/// the blue it was meant to be.
+///
+/// Named by rôle rather than by hue, so a test can say *which* thing it is
+/// checking the colour of, and so changing one is one edit.
+pub mod palette {
+    use ratatui::style::Color;
+
+    /// Our own bubble. Signal's blue, near enough: saturated and light enough
+    /// that near-white text sits on it cleanly.
+    pub const SENT_BG: Color = Color::Rgb(0x3A, 0x6A, 0xD6);
+    pub const SENT_FG: Color = Color::Rgb(0xF7, 0xF9, 0xFC);
+    /// A step *lighter* than the bubble, so a quotation reads as sitting on
+    /// top of it rather than as a hole cut through it.
+    pub const SENT_QUOTE_BG: Color = Color::Rgb(0x54, 0x82, 0xE8);
+    /// The time, the ticks and the markers, on blue. Dimmer than the words
+    /// and still legible, which one grey for both sides could not manage.
+    pub const SENT_TRAILER: Color = Color::Rgb(0xDC, 0xE6, 0xFA);
+
+    /// Everybody else's.
+    pub const RECV_BG: Color = Color::Rgb(0x30, 0x34, 0x3C);
+    pub const RECV_FG: Color = Color::Rgb(0xE4, 0xE7, 0xED);
+    pub const RECV_QUOTE_BG: Color = Color::Rgb(0x44, 0x4A, 0x54);
+    pub const RECV_TRAILER: Color = Color::Rgb(0x9A, 0xA0, 0xAA);
+
+    /// Reaction chips, and the brighter foreground for one we are part of.
+    pub const CHIP_BG: Color = Color::Rgb(0x3E, 0x43, 0x4C);
+    pub const CHIP_FG: Color = Color::Rgb(0xC8, 0xCD, 0xD6);
+    pub const CHIP_MINE: Color = Color::Rgb(0x7A, 0xA2, 0xF7);
+
+    /// Names, headings, and anything else that identifies somebody.
+    pub const ACCENT: Color = Color::Rgb(0x7A, 0xA2, 0xF7);
+    /// Something to look at: unread counts, the pick cursor, a public channel,
+    /// a refusal.
+    pub const ATTENTION: Color = Color::Rgb(0xE9, 0xB5, 0x5A);
+    /// Ink for text laid *on* `ATTENTION`, which is far too light to take the
+    /// terminal's own foreground.
+    pub const INK: Color = Color::Rgb(0x14, 0x16, 0x1A);
+    /// Present but not being read: hints, timestamps, the keys line.
+    pub const MUTED: Color = Color::Rgb(0x78, 0x7E, 0x8A);
+
+    /// The connection light. Green talking, amber reconnecting, red down for
+    /// long enough that it should not be counted on.
+    pub const LIVE: Color = Color::Rgb(0x5E, 0xC2, 0x7A);
+    pub const TRYING: Color = Color::Rgb(0xE9, 0xB5, 0x5A);
+    pub const GONE: Color = Color::Rgb(0xE2, 0x69, 0x62);
+}
 
 /// One row in the conversation list.
 pub struct Row {
@@ -262,6 +317,13 @@ pub struct App {
     /// Now, so a day separator can leave the year off the current one and put
     /// it on older history, where a bare date is a trap.
     pub now: u64,
+    /// Whether the exchange is reachable. The one thing on screen that is
+    /// about the client rather than about anything anybody said.
+    pub link: Link,
+    /// How many people are in the conversation on screen. Nought until the
+    /// exchange has been asked, and the header says nothing rather than
+    /// claiming an empty room.
+    pub members: usize,
     pub should_quit: bool,
 }
 
@@ -332,7 +394,15 @@ pub fn short(key: &PubKey) -> String {
 /// four pixels of a symmetric pattern, which is not a portrait and is not
 /// meant to be — it is a colour somebody learns to recognise in a list.
 pub fn identicon(key: &str) -> Vec<Span<'static>> {
-    let h = fnv(key.as_bytes());
+    identicon_of(key.as_bytes())
+}
+
+/// The same, from whatever identifies the thing.
+///
+/// A channel has an identifier as good as a key has, and no reason to go
+/// without a mark of its own — see [`identicon`].
+pub fn identicon_of(id: &[u8]) -> Vec<Span<'static>> {
+    let h = fnv(id);
     // Two hues a third of the wheel apart, so the halves stay distinguishable
     // whatever the key, and mid-lightness so both work on dark and light.
     let a = hue((h & 0xFF) as u8);
@@ -433,7 +503,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            // Two rows: the header, and a blank one under it. A title bar
+            // hard against the panes reads as another row of the panes.
+            Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -454,34 +526,148 @@ pub fn draw(f: &mut Frame, app: &App) {
     status(f, app, outer[3]);
 }
 
+/// How much of this account's key the header carries.
+///
+/// Six characters, which is what was asked for and is enough to recognise
+/// yourself by. It is **not** enough to identify anybody by, which is why
+/// `/whoami` exists: this used to be the one place the whole key appeared, and
+/// `short`'s own note says a person comparing keys should be shown all of it.
+const KEY_HEAD: usize = 6;
+
+/// This account, this program, and whether either can reach anything.
+///
+/// Nothing about the conversation: that has a header of its own on its own
+/// pane, which is where somebody looks for it.
 fn header(f: &mut Frame, app: &App, area: Rect) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let mut spans = Vec::new();
-    if !app.topic.is_empty() {
-        spans.push(Span::styled(
-            truncate(&app.topic, 60),
-            Style::default().fg(Color::Cyan),
-        ));
-        spans.push(Span::styled(" · ", dim));
+    let dim = Style::default().fg(palette::MUTED);
+    let (colour, word) = match app.link {
+        Link::Up => (palette::LIVE, ""),
+        Link::Retrying => (palette::TRYING, "reconnecting…"),
+        Link::Gone => (palette::GONE, "offline"),
+    };
+    // A dot on its own can say *that* something is wrong and not *what*. Two
+    // of the three states are wrong in different ways — one is worth ignoring
+    // and one is not — so those two say which. Green stays silent, because a
+    // word that is on screen whenever nothing is happening is not read.
+    let mut left = vec![
+        Span::styled(" ●", Style::default().fg(colour)),
+        Span::styled(
+            format!(" {}", app.me.chars().take(KEY_HEAD).collect::<String>()),
+            dim,
+        ),
+    ];
+    if !word.is_empty() {
+        left.push(Span::styled(format!("  {word}"), Style::default().fg(colour)));
     }
-    if app.has_avatar {
-        spans.push(Span::styled("/avatar save <path> · ", dim));
-    }
-    spans.push(Span::styled(app.me.clone(), dim));
     // The name of the thing goes in the corner, where a title bar puts it and
     // where the eye is not looking for anything else — with the version, so
     // that "which one am I running" never needs asking. It has been the first
     // question of half the problems today.
-    spans.push(Span::styled(
+    let right = format!(" sqex-chat {} ", env!("CARGO_PKG_VERSION"));
+    let used: usize = left.iter().map(|s| s.content.width()).sum();
+    let pad = (area.width as usize).saturating_sub(used + right.width());
+    left.push(Span::raw(" ".repeat(pad)));
+    left.push(Span::styled(
         " sqex-chat ",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    spans.push(Span::styled(
+    left.push(Span::styled(
         format!("{} ", env!("CARGO_PKG_VERSION")),
         dim,
     ));
+    f.render_widget(Paragraph::new(Line::from(left)), area);
+}
+
+/// How many rows the conversation's own header takes: who, what, and a rule.
+const HEAD: u16 = 3;
+
+/// The conversation, headed on its own pane.
+///
+/// Where a chat client puts it, and where the topic belongs: it used to be
+/// squeezed into the window's top strip at a constant sixty columns, next to
+/// this account's key, which is a different subject entirely.
+fn conversation_head(f: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::default().fg(palette::MUTED);
+    let width = area.width as usize;
+    let Some(row) = app.selected_row() else {
+        return;
+    };
+
+    let mut top = vec![Span::raw(" ")];
+    match &row.key {
+        Some(key) => top.extend(identicon(key)),
+        None => top.extend(identicon_of(&row.channel)),
+    }
+    top.push(Span::raw("  "));
+    // A direct message names a person, so it carries their key beside their
+    // name — this is exactly a place where mistaking one person for another
+    // matters, and SIP-21 does not care that the pane is new.
+    let name = match &row.key {
+        Some(key) => author(&row.label, key, false),
+        None => row.label.clone(),
+    };
+    top.push(Span::styled(
+        name,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    // Hard right: how many people can read this, or the one fact that stops a
+    // conversation working before it has started.
+    let corner = if row.waiting {
+        "not started their client yet".to_string()
+    } else if row.group && app.members > 0 {
+        format!(
+            "{} {}",
+            app.members,
+            if app.members == 1 { "person" } else { "people" }
+        )
+    } else {
+        String::new()
+    };
+    let used: usize = top.iter().map(|s| s.content.width()).sum();
+    top.push(Span::raw(
+        " ".repeat(width.saturating_sub(used + corner.width() + 1)),
+    ));
+    top.push(Span::styled(
+        corner,
+        if row.waiting {
+            Style::default().fg(palette::ATTENTION)
+        } else {
+            dim
+        },
+    ));
+
+    let mut under = Vec::new();
+    let mut said = String::new();
+    if row.public {
+        // The single most consequential thing about a room, so it is said
+        // before whatever the room is for.
+        said += "public";
+    }
+    if !app.topic.is_empty() {
+        if !said.is_empty() {
+            said += " · ";
+        }
+        said += &app.topic;
+    }
+    let hint = if app.has_avatar { "/avatar save <path>" } else { "" };
+    let room = width.saturating_sub(hint.width() + 6);
+    under.push(Span::styled(format!("     {}", truncate(&said, room)), dim));
+    if !hint.is_empty() {
+        let used: usize = under.iter().map(|s| s.content.width()).sum();
+        under.push(Span::raw(
+            " ".repeat(width.saturating_sub(used + hint.width() + 1)),
+        ));
+        under.push(Span::styled(hint, dim));
+    }
+
     f.render_widget(
-        Paragraph::new(Line::from(spans).alignment(Alignment::Right)),
+        Paragraph::new(vec![
+            Line::from(top),
+            Line::from(under),
+            // A rule, so the transcript has a top edge to sit under rather
+            // than beginning wherever the header happened to stop.
+            Line::from(Span::styled("─".repeat(width), dim)),
+        ]),
         area,
     );
 }
@@ -521,31 +707,34 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     if r.group { "#" } else { " " }.to_string(),
                     if r.public {
-                        base.fg(Color::Yellow)
+                        base.fg(palette::ATTENTION)
                     } else {
                         base
                     },
                 ),
             ];
-            // A direct message is a person, and gets their identicon. A
-            // channel is not, so it gets the space instead — inventing a face
-            // for a room would say something untrue about what it is.
+            // A direct message is marked by its peer's key, a channel by its
+            // own identifier. This used to leave a channel blank, on the
+            // grounds that inventing a face for a room says something untrue
+            // about it — but the objection was to the *face*, and this is not
+            // one. It is a colour derived from an identifier, and a channel
+            // has an identifier exactly as a person has a key.
             match &r.key {
                 Some(key) => spans.extend(identicon(key)),
-                None => spans.push(Span::styled(" ".repeat(ICON), base)),
+                None => spans.extend(identicon_of(&r.channel)),
             }
             spans.push(Span::styled(" ", base));
             spans.push(Span::styled(format!("{:<w$}", row_label(r, w), w = w), base));
             if r.unread > 0 {
                 spans.push(Span::styled(
                     format!(" {}", r.unread),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(palette::ATTENTION),
                 ));
             }
             if r.waiting {
                 // Not an error: they are a member, they have simply never run
                 // a client, so there is nowhere to send a key yet.
-                spans.push(Span::styled(" ·", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(" ·", Style::default().fg(palette::MUTED)));
             }
             // A second line, the way every chat client does it: when, and the
             // beginning of what was said. Without it the list says only which
@@ -554,14 +743,14 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
             if r.at > 0 {
                 under.push(Span::styled(
                     format!("   {}", clock(r.at)),
-                    if selected { base } else { base.fg(Color::DarkGray) },
+                    if selected { base } else { base.fg(palette::MUTED) },
                 ));
             }
             if !r.preview.is_empty() {
                 let room = (area.width as usize).saturating_sub(11);
                 under.push(Span::styled(
                     truncate(&r.preview, room),
-                    if selected { base } else { base.fg(Color::DarkGray) },
+                    if selected { base } else { base.fg(palette::MUTED) },
                 ));
             }
             ListItem::new(vec![Line::from(spans), Line::from(under)])
@@ -571,7 +760,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
     let list = if items.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
             "no contacts yet — press ^N",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette::MUTED),
         )))])
     } else {
         List::new(items)
@@ -627,7 +816,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
     let mut out = Vec::new();
     let mine = s.mine;
     let align = if mine { Alignment::Right } else { Alignment::Left };
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(palette::MUTED);
 
     // Who spoke, once for a run rather than against every line — but always
     // within a few lines of what they said, because the key is what tells two
@@ -637,7 +826,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             author(&s.who, &s.key, false),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(palette::ACCENT),
         ));
         out.push(Line::from(spans).alignment(align));
     }
@@ -671,14 +860,16 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         // gap and not like something somebody said.
         dim.add_modifier(Modifier::ITALIC)
     } else if mine {
-        Style::default().fg(Color::Indexed(255)).bg(Color::Indexed(24))
+        Style::default().fg(palette::SENT_FG).bg(palette::SENT_BG)
     } else {
-        Style::default().fg(Color::Indexed(253)).bg(Color::Indexed(238))
+        Style::default().fg(palette::RECV_FG).bg(palette::RECV_BG)
     };
     let inside = if s.redacted {
         dim.add_modifier(Modifier::ITALIC)
+    } else if mine {
+        style.fg(palette::SENT_TRAILER)
     } else {
-        style.fg(Color::Indexed(250))
+        style.fg(palette::RECV_TRAILER)
     };
     let last = body.len().saturating_sub(1);
 
@@ -703,7 +894,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
             Receipt::Read => " ✓✓",
         };
     }
-    let content = body
+    let mut content = body
         .iter()
         .enumerate()
         .map(|(n, l)| {
@@ -716,6 +907,19 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
     // The message decides how wide the bubble is; the quotation fits inside
     // it. Sizing the bubble to the quotation instead made a one-line answer as
     // wide as the paragraph it was answering.
+    //
+    // With a floor under it, because the other extreme is no better: "ok" left
+    // the quotation four columns and it came out `↳ Alice (E…`, which names
+    // nobody. The floor is bounded by the pane, so a narrow terminal is never
+    // overrun, and by the quotation itself, so a short quote cannot widen a
+    // short answer — it only ever buys back room there is something to put in.
+    if let Some(q) = &quoted {
+        content = content.max(
+            QUOTE_FLOOR
+                .min(width)
+                .min(UnicodeWidthStr::width(q.as_str())),
+        );
+    }
     let quoted = quoted.map(|q| truncate(&q, content));
 
     // The quotation, a shade off the bubble it belongs to and padded to the
@@ -724,9 +928,9 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         let tint = if s.redacted {
             dim.add_modifier(Modifier::ITALIC)
         } else if mine {
-            Style::default().fg(Color::Indexed(253)).bg(Color::Indexed(25))
+            Style::default().fg(palette::SENT_FG).bg(palette::SENT_QUOTE_BG)
         } else {
-            Style::default().fg(Color::Indexed(253)).bg(Color::Indexed(240))
+            Style::default().fg(palette::RECV_FG).bg(palette::RECV_QUOTE_BG)
         };
         let mut spans = Vec::new();
         if !mine {
@@ -750,7 +954,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         if !mine {
             spans.push(Span::styled(
                 if picked && n == 0 { "▸" } else { " " },
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(palette::ATTENTION),
             ));
         }
         let used = UnicodeWidthStr::width(line.as_str())
@@ -779,7 +983,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         if mine {
             spans.push(Span::styled(
                 if picked && n == 0 { "◂" } else { " " },
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(palette::ATTENTION),
             ));
         }
         out.push(Line::from(spans).alignment(align));
@@ -794,8 +998,8 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         // Their own colour, set on both halves like a bubble, so the chips
         // read as attached to the message on any terminal background rather
         // than as loose text under it.
-        let chip_style = Style::default().fg(Color::Indexed(252)).bg(Color::Indexed(237));
-        let ours = Style::default().fg(Color::Indexed(221)).bg(Color::Indexed(237));
+        let chip_style = Style::default().fg(palette::CHIP_FG).bg(palette::CHIP_BG);
+        let ours = Style::default().fg(palette::CHIP_MINE).bg(palette::CHIP_BG);
 
         let mut row: Vec<Span> = Vec::new();
         let mut used = 0;
@@ -846,7 +1050,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         for (n, emoji) in REACTIONS.iter().enumerate() {
             row.push(Span::styled(
                 format!("{}:{emoji}  ", n + 1),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(palette::ATTENTION),
             ));
         }
         row.push(Span::styled("Esc", dim));
@@ -868,6 +1072,19 @@ fn starts_run(a: Option<&Said>, b: &Said) -> bool {
 /// How long a silence has to be before the next message is a new run.
 const RUN_GAP: u64 = 5 * 60;
 
+/// The narrowest a bubble may be **when it carries a quotation**.
+///
+/// The bubble is otherwise sized by its own words, which is right: an answer
+/// should not inherit the width of the paragraph it answers. But a one-word
+/// answer then left the quotation four columns, and `↳ Alice (E…` identifies
+/// nobody — worse than the sequence number it replaced, which at least named a
+/// message. Thirty columns is about what "a name, its key, and the first words
+/// of what they said" needs.
+///
+/// Bounded twice at the point of use: never past the pane, and never past the
+/// quotation's own width, so a short quote cannot force a wide bubble.
+const QUOTE_FLOOR: usize = 30;
+
 fn transcript(f: &mut Frame, app: &App, area: Rect) {
     if app.helping {
         help(f, area);
@@ -881,13 +1098,22 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
         directory(f, app, area);
         return;
     }
+    // The header belongs to the conversation, so the views that are not the
+    // conversation — the command list, a search, the directory — take the
+    // whole pane and are handled above.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(HEAD), Constraint::Min(0)])
+        .split(area);
+    conversation_head(f, app, rows[0]);
+    let area = rows[1];
     let inner = (area.width as usize).saturating_sub(2);
     // Wide enough to read, narrow enough that the two sides are visibly two
     // sides. A bubble filling the pane would make alignment meaningless.
     let width = (inner * 3 / 5).clamp(16, inner.max(16));
 
     let mut lines: Vec<Line> = Vec::new();
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(palette::MUTED);
     if app.trouble.lost > 0 {
         // In the transcript, above the messages that did survive, because that
         // is where the missing ones would have been. A status line would say
@@ -931,7 +1157,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
             lines.push(
                 Line::from(Span::styled(
                     format!("─── {n} unread ───"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(palette::ATTENTION),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -968,7 +1194,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
 
 /// What a search found, newest first.
 fn results(f: &mut Frame, app: &App, area: Rect) {
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(palette::MUTED);
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -981,7 +1207,7 @@ fn results(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(
                 format!("{:?}", app.query),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(palette::ATTENTION),
             ),
             Span::styled("  ·  Esc to go back", dim),
         ]),
@@ -993,7 +1219,8 @@ fn results(f: &mut Frame, app: &App, area: Rect) {
         // before it joined, or from before a key it never received, is not
         // absent from the conversation — only from us.
         lines.push(Line::from(Span::styled(
-            "nothing here matches. This searches what this client holds, which              is not necessarily everything that was said.",
+            "nothing here matches. This searches what this client holds, which is \
+             not necessarily everything that was said.",
             dim,
         )));
     }
@@ -1006,11 +1233,11 @@ fn results(f: &mut Frame, app: &App, area: Rect) {
             // result you cannot act on is only half an answer.
             Span::styled(format!("{:>4} ", h.seq), dim),
             Span::styled(clock(h.at), dim),
-            Span::styled(format!("{:>AUTHOR$} ", truncate(&h.who, AUTHOR)), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:>AUTHOR$} ", truncate(&h.who, AUTHOR)), Style::default().fg(palette::ACCENT)),
             Span::raw(before.to_string()),
             Span::styled(
                 hit.to_string(),
-                Style::default().fg(Color::Indexed(232)).bg(Color::Yellow),
+                Style::default().fg(palette::INK).bg(palette::ATTENTION),
             ),
             Span::raw(after.to_string()),
         ]));
@@ -1073,6 +1300,8 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     ("you", &[
         ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
         ("/block  /unblock  /blocked", "who may reach you"),
+        ("/whoami", "your key in full — the header carries only the first six"),
+        ("/reconnect", "try the exchange again now, rather than waiting out the backoff"),
     ]),
 ];
 
@@ -1083,9 +1312,9 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
 /// end of it was simply cut off — so the commands that fell off were
 /// undiscoverable and nothing said so.
 fn help(f: &mut Frame, area: Rect) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let key = Style::default().fg(Color::Yellow);
-    let head = Style::default().fg(Color::Cyan);
+    let dim = Style::default().fg(palette::MUTED);
+    let key = Style::default().fg(palette::ATTENTION);
+    let head = Style::default().fg(palette::ACCENT);
     let mut lines = vec![
         Line::from(Span::styled("keys", head)),
         Line::from(vec![
@@ -1134,21 +1363,21 @@ fn directory(f: &mut Frame, app: &App, area: Rect) {
             app.found_total,
             if app.found_total == 1 { "" } else { "s" }
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(palette::MUTED),
     ))];
     for (i, c) in app.found.iter().enumerate() {
         let mut spans = vec![
-            Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("#{}", c.name), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(palette::MUTED)),
+            Span::styled(format!("#{}", c.name), Style::default().fg(palette::ATTENTION)),
             Span::styled(
                 format!("  {} member{}", c.members, if c.members == 1 { "" } else { "s" }),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             ),
         ];
         if !c.topic.is_empty() {
             spans.push(Span::styled(
                 format!("  {}", truncate(&c.topic, 40)),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette::MUTED),
             ));
         }
         lines.push(Line::from(spans));
@@ -1225,17 +1454,17 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
                 " ↑↓ move · a react · r reply{} · d delete · Esc back",
                 if mine { " · e rewrite" } else { "" }
             ),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette::ATTENTION),
         )
     } else if app.trouble.is_quiet() {
         (
             keys_line(area.width as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(palette::MUTED),
         )
     } else {
         (
             format!(" {}", app.trouble.line()),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(palette::ATTENTION),
         )
     };
     f.render_widget(Paragraph::new(text).style(style), area);
@@ -2051,10 +2280,11 @@ mod tests {
         // For each row of the transcript pane, the first and last column
         // holding anything.
         let mut out = Vec::new();
-        // Only the transcript's own rows. The layout puts a header above it
-        // and an input box and status line below, and the box's border spans
-        // the whole width — which is not the transcript overflowing.
-        for y in 1..buf.area.height.saturating_sub(4) {
+        // Only the rows the *messages* are on. Above them sit the window
+        // header, a blank row and the conversation's own header — whose rule
+        // spans the pane on purpose — and below them the input box, whose
+        // border does too. Neither is the transcript overflowing.
+        for y in (2 + HEAD)..buf.area.height.saturating_sub(4) {
             let cells: Vec<String> = (31..buf.area.width)
                 .map(|x| buf[(x, y)].symbol().to_string())
                 .collect();
@@ -2065,6 +2295,251 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The message rows of the transcript, and nothing else.
+    ///
+    /// Read from the buffer a cell at a time rather than sliced out of
+    /// `render`'s string: a wide glyph is one cell whose neighbour is empty,
+    /// so counting characters and counting columns are different things. That
+    /// difference has produced two wrong bug reports here already.
+    fn transcript_text(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        ((2 + HEAD)..buf.area.height.saturating_sub(4))
+            .map(|y| {
+                (31..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+
+    /// A row of cells, as symbols, so a width can be counted in columns.
+    fn row_at(app: &App, w: u16, h: u16, y: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// The colour of the first `●` on screen.
+    fn light(app: &App) -> Option<Color> {
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.width)
+            .find(|x| buf[(*x, 0)].symbol() == "●")
+            .and_then(|x| buf[(x, 0)].style().fg)
+    }
+
+    #[test]
+    fn the_header_leads_with_the_light_and_a_short_key() {
+        let mut app = sample();
+        app.me = "9hSR6S7WabcdefGHIJK".into();
+        let top = row_at(&app, 100, 24, 0);
+        assert!(top.starts_with(" ● 9hSR6S"), "{top:?}");
+        // Six characters and no more. The rest of the key is what `/whoami`
+        // is for — it is not a thing to compare against at a glance, and
+        // sixty-four characters across the top said nothing to anybody.
+        assert!(!top.contains("9hSR6S7"), "the key was not cut: {top:?}");
+    }
+
+    /// Green talking, amber reconnecting, red down for long enough to matter.
+    #[test]
+    fn the_light_says_which_of_the_three() {
+        let mut app = sample();
+        app.link = Link::Up;
+        assert_eq!(light(&app), Some(palette::LIVE));
+        app.link = Link::Retrying;
+        assert_eq!(light(&app), Some(palette::TRYING));
+        app.link = Link::Gone;
+        assert_eq!(light(&app), Some(palette::GONE));
+    }
+
+    /// A dot can say that something is wrong. It cannot say which of two
+    /// wrongs, and those two want opposite things from a reader.
+    #[test]
+    fn a_link_that_is_down_says_what_kind_of_down() {
+        let mut app = sample();
+        app.link = Link::Up;
+        let top = row_at(&app, 100, 24, 0);
+        assert!(!top.contains("reconnecting"), "{top:?}");
+        assert!(!top.contains("offline"), "{top:?}");
+
+        app.link = Link::Retrying;
+        assert!(row_at(&app, 100, 24, 0).contains("reconnecting"));
+
+        app.link = Link::Gone;
+        assert!(row_at(&app, 100, 24, 0).contains("offline"));
+    }
+
+    #[test]
+    fn the_program_and_its_version_end_at_the_right_edge() {
+        let app = sample();
+        for w in [80u16, 100, 200] {
+            let top = row_at(&app, w, 24, 0);
+            assert!(
+                top.trim_end().ends_with(env!("CARGO_PKG_VERSION")),
+                "the version is not against the right edge at {w}: {top:?}"
+            );
+            assert!(top.contains("sqex-chat"), "{top:?}");
+        }
+    }
+
+    /// The margin that was asked for. A title bar hard against the panes reads
+    /// as another row of the panes.
+    #[test]
+    fn a_blank_row_separates_the_header_from_the_panes() {
+        let app = sample();
+        assert_eq!(row_at(&app, 100, 24, 1).trim(), "");
+    }
+
+    /// SIP-21, in a place that did not exist before: choosing what to type
+    /// into is exactly a moment where mistaking one person for another
+    /// matters, and this header is what somebody checks.
+    #[test]
+    fn the_conversation_is_headed_on_its_own_pane() {
+        let app = sample();
+        let head = row_at(&app, 100, 24, 2);
+        assert!(head.contains("bob"), "the header does not name it: {head:?}");
+        assert!(
+            head.contains("8qbHbw2B"),
+            "the header names somebody without their key: {head:?}"
+        );
+    }
+
+    #[test]
+    fn the_pane_header_is_three_rows_over_a_rule() {
+        let app = sample();
+        for w in [40u16, 100, 200] {
+            let rule = row_at(&app, w, 24, 1 + HEAD);
+            let pane: String = rule.chars().skip(31).collect();
+            assert!(
+                !pane.is_empty() && pane.chars().all(|c| c == '─'),
+                "no rule under the header at {w}: {rule:?}"
+            );
+            // And the rule is the pane's, not the window's: the conversation
+            // list keeps its own border.
+            assert!(!rule.starts_with('─'), "the rule ran across the list: {rule:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_topic_is_cut_to_the_pane_and_not_to_a_constant() {
+        let mut app = sample();
+        app.topic = "a topic considerably longer than any terminal anybody would \
+                     sensibly use, going on and on well past sixty columns"
+            .into();
+        for w in [60u16, 80, 100] {
+            let out = render(&app, w, 24);
+            for l in out.lines() {
+                assert!(
+                    UnicodeWidthStr::width(l) <= w as usize,
+                    "the topic ran past a {w}-column screen: {l:?}"
+                );
+            }
+        }
+    }
+
+    /// A count of nought is not a fact about a room, it is not having asked
+    /// yet. Saying "0 people" would be inventing one.
+    #[test]
+    fn the_member_count_waits_until_it_is_known() {
+        let mut app = sample();
+        app.rows[0].key = None;
+        app.rows[0].group = true;
+        app.rows[0].label = "general".into();
+        assert!(!row_at(&app, 100, 24, 2).contains("people"));
+        app.members = 4;
+        assert!(row_at(&app, 100, 24, 2).contains("4 people"));
+        app.members = 1;
+        assert!(row_at(&app, 100, 24, 2).contains("1 person"));
+    }
+
+    /// A channel has an identifier as good as a key, and no reason to go
+    /// without a mark of its own.
+    #[test]
+    fn a_group_is_marked_by_its_channel_and_not_left_blank() {
+        let one = identicon_of(&[7u8; 32]);
+        let same = identicon_of(&[7u8; 32]);
+        let other = identicon_of(&[8u8; 32]);
+        let colours = |v: &Vec<Span<'static>>| {
+            v.iter().map(|s| (s.style.fg, s.style.bg)).collect::<Vec<_>>()
+        };
+        assert_eq!(colours(&one), colours(&same));
+        assert_ne!(colours(&one), colours(&other));
+
+        let mut app = sample();
+        app.rows[0].key = None;
+        app.rows[0].group = true;
+        assert!(
+            row_at(&app, 100, 24, 2).contains('▀'),
+            "a group has no mark of its own"
+        );
+    }
+
+    /// The palette is a matter of taste and a test cannot judge taste. What it
+    /// can hold is the floor: text has to be legible on the thing it is drawn
+    /// on, and every one of these pairs is a decision somebody will change.
+    #[test]
+    fn every_pairing_is_legible() {
+        fn luminance(c: Color) -> f64 {
+            let Color::Rgb(r, g, b) = c else { panic!("not truecolour: {c:?}") };
+            let f = |v: u8| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        }
+        let contrast = |a: Color, b: Color| {
+            let (x, y) = (luminance(a), luminance(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        // What somebody is actually reading.
+        for (name, fg, bg) in [
+            ("sent", palette::SENT_FG, palette::SENT_BG),
+            ("received", palette::RECV_FG, palette::RECV_BG),
+            ("received quote", palette::RECV_FG, palette::RECV_QUOTE_BG),
+            ("chip", palette::CHIP_FG, palette::CHIP_BG),
+            ("a search hit", palette::INK, palette::ATTENTION),
+        ] {
+            let got = contrast(fg, bg);
+            assert!(got >= 4.5, "{name} is at {got:.1}:1, which is not readable");
+        }
+        // And what rides alongside it, deliberately quieter: the time, the
+        // ticks, a reaction we are part of.
+        //
+        // A lower bar, and it has to be. White on this blue is 4.7:1, so
+        // *nothing* dimmer than the body text can reach 4.5 on it — that is a
+        // fact about the colour rather than about the choice of grey, and the
+        // honest thing is to hold secondary text to the floor it belongs to
+        // rather than to raise it until it stops being secondary.
+        for (name, fg, bg) in [
+            // The quotation is a reference to another message rather than the
+            // message: already cut, already elided. It is a step *lighter*
+            // than the bubble, which is what makes it read as sitting on top —
+            // and a lighter blue takes light text worse than the bubble does,
+            // so this is the ceiling that choice comes with.
+            ("sent quote", palette::SENT_FG, palette::SENT_QUOTE_BG),
+            ("sent trailer", palette::SENT_TRAILER, palette::SENT_BG),
+            ("received trailer", palette::RECV_TRAILER, palette::RECV_BG),
+            ("chip of ours", palette::CHIP_MINE, palette::CHIP_BG),
+        ] {
+            let got = contrast(fg, bg);
+            assert!(got >= 3.0, "{name} is at {got:.1}:1, which is not readable");
+        }
+        // And the two sides have to be told apart at a glance, which is the
+        // whole of why they are coloured at all.
+        assert!(
+            contrast(palette::SENT_BG, palette::RECV_BG) >= 1.5,
+            "the two sides are nearly the same colour"
+        );
     }
 
     fn said(who: &str, key: &str, mine: bool, text: &str, at: u64) -> Said {
@@ -2146,18 +2621,18 @@ mod tests {
             said("bob", "8qbHbw2B", false, "two", 3671),
             said("bob", "8qbHbw2B", false, "three", 3681),
         ];
-        let out = render(&app, 100, 24);
+        let out = transcript_text(&app, 100, 24);
         assert_eq!(
             out.matches("8qbHbw2B").count(),
-            2,
-            "expected one header in the transcript and one row in the list:\n{out}"
+            1,
+            "expected exactly one run header:\n{out}"
         );
 
         // A long enough silence starts a new run, because by then the reader
         // has lost the thread of who is speaking.
         app.said[2].at = 3681 + RUN_GAP + 1;
-        let out = render(&app, 100, 24);
-        assert_eq!(out.matches("8qbHbw2B").count(), 3, "{out}");
+        let out = transcript_text(&app, 100, 24);
+        assert_eq!(out.matches("8qbHbw2B").count(), 2, "{out}");
     }
 
     #[test]
@@ -2264,7 +2739,7 @@ mod tests {
         let mut widths = Vec::new();
         for y in 0..buf.area.height {
             let painted: Vec<u16> = (31..buf.area.width)
-                .filter(|x| buf[(*x, y)].style().bg == Some(Color::Indexed(238)))
+                .filter(|x| buf[(*x, y)].style().bg == Some(palette::RECV_BG))
                 .collect();
             if !painted.is_empty() {
                 widths.push((painted[0], painted.len()));
@@ -2313,7 +2788,7 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let painted = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
-            .any(|(x, y)| buf[(x, y)].style().bg == Some(Color::Indexed(238)));
+            .any(|(x, y)| buf[(x, y)].style().bg == Some(palette::RECV_BG));
         assert!(!painted, "a deleted message was drawn as a bubble");
     }
 
@@ -2495,10 +2970,52 @@ mod tests {
         let out = render(&app, 110, 24);
         assert!(out.contains("0 messages matching"), "{out}");
         assert!(out.contains("banana"), "{out}");
-        assert!(
-            out.contains("not necessarily everything"),
-            "an empty result implied the words were never said:\n{out}"
-        );
+        // Read as the sentence it is, across however many rows it took.
+        //
+        // Asserted whole rather than on a phrase, because the whole is what
+        // was wrong with it: the literal carried fourteen spaces in the middle
+        // of "which is", and they were on screen. A phrase either side of the
+        // gap would have passed happily.
+        // At several widths, and wide ones especially. The literal used to
+        // carry fourteen spaces in the middle of "which is", and at 110
+        // columns the wrap happened to break inside the run and swallow it —
+        // so the one width this was first tested at was the one width that
+        // hid the defect. At 120 and above they sat in the middle of the
+        // sentence, on screen, for anybody with a wide terminal.
+        for w in [110u16, 120, 160] {
+            let flow = flowed(&app, w, 24);
+            assert!(
+                flow.contains(
+                    "This searches what this client holds, which is not necessarily \
+                     everything that was said."
+                ),
+                "the sentence does not read as one at {w} columns:\n{flow}"
+            );
+        }
+    }
+
+    /// The transcript pane as prose: each row trimmed, and the rows joined
+    /// with one space. Wrapping is invisible to it, and a gap inside a line is
+    /// not.
+    ///
+    /// The pane only. The conversation list has a border down its right edge,
+    /// and joining whole rows threaded a `│` through the middle of every
+    /// sentence that wrapped.
+    fn flowed(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (30..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The matching part is picked out, or a result in a long message is a
@@ -2514,7 +3031,7 @@ mod tests {
         let buf = t.backend().buffer().clone();
         let marked: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(Color::Yellow))
+            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(palette::ATTENTION))
             .map(|(x, y)| buf[(x, y)].symbol().to_string())
             .collect();
         assert_eq!(marked, "friday", "the match was not picked out: {marked:?}");
@@ -2542,8 +3059,8 @@ mod tests {
                     .max()
             };
             (
-                right_of(if mine { Color::Indexed(24) } else { Color::Indexed(238) }),
-                right_of(Color::Indexed(237)),
+                right_of(if mine { palette::SENT_BG } else { palette::RECV_BG }),
+                right_of(palette::CHIP_BG),
             )
         };
 
@@ -2573,7 +3090,7 @@ mod tests {
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
             .find(|(x, y)| buf[(*x, *y)].symbol() == "👍")
             .expect("no reaction drawn");
-        assert_eq!(buf[chip].style().bg, Some(Color::Indexed(237)));
+        assert_eq!(buf[chip].style().bg, Some(palette::CHIP_BG));
         assert!(buf[chip].style().fg.is_some(), "the chip took the terminal's colour");
     }
 
@@ -2606,7 +3123,7 @@ mod tests {
         // No cell inside the chip run is left without a background.
         let run: Vec<(u16, u16)> = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(Color::Indexed(237)))
+            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(palette::CHIP_BG))
             .collect();
         assert!(!run.is_empty(), "no chip drawn");
         let y = run[0].1;
@@ -2614,7 +3131,7 @@ mod tests {
         for x in lo..=hi {
             assert_eq!(
                 buf[(x, y)].style().bg,
-                Some(Color::Indexed(237)),
+                Some(palette::CHIP_BG),
                 "a hole at x={x}: {:?}",
                 buf[(x, y)].symbol()
             );
@@ -2643,8 +3160,8 @@ mod tests {
                 .map(|(x, _)| x)
                 .max()
         };
-        let quote = right_of(Color::Indexed(240)).expect("the quotation has no tint");
-        let body = right_of(Color::Indexed(238)).expect("no bubble");
+        let quote = right_of(palette::RECV_QUOTE_BG).expect("the quotation has no tint");
+        let body = right_of(palette::RECV_BG).expect("no bubble");
         assert_eq!(quote, body, "the quotation and the message are different widths");
     }
 
@@ -2701,7 +3218,7 @@ mod tests {
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
             t.draw(|f| draw(f, &app)).unwrap();
             let buf = t.backend().buffer().clone();
-            let bg = if mine { Color::Indexed(24) } else { Color::Indexed(238) };
+            let bg = if mine { palette::SENT_BG } else { palette::RECV_BG };
 
             // The last row of the bubble is the one carrying the trailer.
             let y = (0..buf.area.height)
@@ -2738,7 +3255,7 @@ mod tests {
     /// inside it. Sizing the bubble to the quotation instead made a one-line
     /// answer as wide as the paragraph it was answering.
     #[test]
-    fn a_quotation_never_widens_the_bubble() {
+    fn a_quotation_never_widens_the_bubble_past_the_floor() {
         let mut short = said("bob", "8qbHbw2B", false, "yes, that is right", 3661);
         short.reply_to = Some((
             "Alice (E4LUkjrZ)".into(),
@@ -2755,16 +3272,69 @@ mod tests {
             let buf = t.backend().buffer().clone();
             (0..buf.area.height)
                 .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
-                .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(Color::Indexed(238)))
+                .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(palette::RECV_BG))
                 .map(|(x, _)| x)
                 .max()
                 .expect("no bubble")
         };
-        assert_eq!(
-            width_of(short),
-            width_of(plain),
-            "the quotation stretched the bubble"
+        // The floor may widen a narrow bubble up to `QUOTE_FLOOR`. What it
+        // must never do is size the bubble to the *quotation*, which is what
+        // made a one-line answer as wide as the paragraph it answered.
+        let plain = width_of(plain);
+        let short = width_of(short);
+        assert!(short <= plain.max(plain_start() + QUOTE_FLOOR as u16), "the quotation stretched the bubble: {short} > {plain}");
+        assert!(short >= plain, "the floor should never narrow a bubble");
+    }
+
+    /// Where an incoming bubble begins: the pane's left edge plus its gutter.
+    /// The widths above are absolute columns, so the floor has to be measured
+    /// from the same origin.
+    fn plain_start() -> u16 {
+        31 + GUTTER as u16
+    }
+
+    /// The whole point of the floor. Without it a one-word answer cut the
+    /// quotation to `↳ Alice (E…`, which names nobody — the sequence number it
+    /// replaced at least identified a message.
+    #[test]
+    fn a_short_answer_still_names_who_it_answers() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "ok", 3661);
+        s.reply_to = Some(("Alice (E4LUkjrZ)".into(), "shall we ship on friday?".into()));
+        app.said = vec![s];
+        let out = render(&app, 110, 24);
+        let line = out.lines().find(|l| l.contains("↳")).expect("no quotation");
+        assert!(
+            line.contains("Alice (E4LUkjrZ)"),
+            "the quotation does not say who is being answered: {line:?}"
         );
+    }
+
+    /// The floor is bounded by the pane as well as by the quotation. A narrow
+    /// terminal has no thirty columns to give.
+    ///
+    /// Asserted on the **clock**, not on where the colour stops. ratatui clips
+    /// a paragraph at its pane, so a bubble wider than the pane paints no
+    /// further right than one that fits — "did it run off the edge" is a
+    /// question the buffer cannot answer. What overflow actually costs is the
+    /// end of the line, and the end of the line is the time.
+    #[test]
+    fn the_floor_never_pushes_the_clock_off_a_narrow_pane() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "ok", 3661);
+        s.reply_to = Some((
+            "Alice (E4LUkjrZ)".into(),
+            "a question much longer than the pane is wide".into(),
+        ));
+        app.said = vec![s];
+        let time = clock(3661).trim_end().to_string();
+        for w in [60u16, 70, 80] {
+            let out = render(&app, w, 24);
+            assert!(
+                out.contains(&time),
+                "the floor pushed the time off a {w}-column terminal:\n{out}"
+            );
+        }
     }
 
     /// The cost of that rule, written down: an answer of one word leaves the

@@ -17,7 +17,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use sqex_chat::attach::describe;
-use sqex_chat::client::{Chat, ChatError};
+use sqex_chat::client::{Chat, ChatError, Link};
 use sqex_chat::store::{Store, store_path};
 use std::collections::HashMap;
 
@@ -203,6 +203,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await
         .map_err(|e| format!("could not reach {addr}: {e}"))?;
     let mut chat = Chat::new(client, seed, me, store);
+    // Where to dial when this connection is lost — which, until now, was
+    // nowhere: the client connected once here and a dropped connection meant
+    // every request afterwards failed for as long as it stayed open.
+    chat.dials(addr, *server.as_bytes());
     chat.top_up_prekeys()
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
@@ -404,6 +408,10 @@ struct Open {
     /// When something last happened here, for ordering the list. The newest
     /// message's time, or when we joined if nothing has been said.
     last_at: u64,
+    /// How many people are in it. Nought means *not asked yet* rather than
+    /// empty — a channel with no members is not a thing — so the header says
+    /// nothing rather than claiming a number.
+    members: usize,
     /// Messages arrived while this conversation was not the one on screen.
     unread: usize,
     /// They have published no prekeys, so nothing can be sealed to them yet.
@@ -479,7 +487,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
         // The exchange is authoritative about who administers a channel; the
         // store is what makes that survive being offline.
         let public = m.visibility == Visibility::Public;
-        let (admins, given_name) = match chat.info(&m.channel).await {
+        let (admins, given_name, members) = match chat.info(&m.channel).await {
             Ok(info) => (
                 info.members
                     .iter()
@@ -487,8 +495,13 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
                     .map(|mem| mem.account)
                     .collect(),
                 info.name,
+                info.members.len(),
             ),
-            Err(_) => (remembered.map(|k| k.3.clone()).unwrap_or_default(), String::new()),
+            Err(_) => (
+                remembered.map(|k| k.3.clone()).unwrap_or_default(),
+                String::new(),
+                0,
+            ),
         };
 
         let label = match &peer {
@@ -519,6 +532,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
         // lets the client be closed and reopened and still say where you were.
         let read_to = m.read;
         open.push(Open {
+            members,
             peer: peer.map(|(a, _)| a),
             public,
             label,
@@ -565,6 +579,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             // Nothing has happened here yet, so it sorts below anything that
             // has rather than claiming a time it does not have.
             last_at: 0,
+            members: 0,
             unread: 0,
             waiting: false,
         });
@@ -642,6 +657,7 @@ async fn event_loop(
     loop {
         let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
         refresh(app, open, &chat.me, &names);
+        app.link = chat.link();
         terminal
             .draw(|f| ui::draw(f, app))
             .map_err(|e| e.to_string())?;
@@ -660,6 +676,11 @@ async fn event_loop(
         }
 
         if tokio::time::Instant::now() >= poll_at {
+            // Before anything is asked for: if the link is down this is what
+            // brings it back, and if it is up it costs nothing. It never
+            // blocks for long — a handshake is advanced a slice at a time, so
+            // the keyboard stays served while it happens.
+            chat.keep_alive().await;
             // A short wait rather than the full long poll: the loop also has a
             // keyboard to serve, and parking 20 s here would make the interface
             // feel broken. The long poll is the right tool for a client with
@@ -742,7 +763,12 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
         }
         Err(e) => {
             conv.timeline = timeline;
-            conv.trouble.message = Some(e.to_string());
+            // Said once, by the light in the corner, rather than by every
+            // conversation. The loop asks about all of them every 700 ms, so
+            // while the exchange is unreachable this line would be rewritten
+            // roughly twice a second per conversation with the same words —
+            // which is not a status line, it is a flicker.
+            conv.trouble.message = (chat.link() == Link::Up).then(|| e.to_string());
         }
     }
 }
@@ -816,6 +842,16 @@ async fn account_command(
                     .map(|()| Some(format!("unblocked {}", short(&who)))),
                 Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
             },
+            Command::Whoami => Ok(Some(format!(
+                "{} — your key in full. The header shows the first six, which \
+                 is for recognising yourself and not for comparing against \
+                 anybody",
+                chat.me
+            ))),
+            Command::Reconnect => {
+                chat.reconnect_now();
+                Ok(Some("trying the exchange again now".to_string()))
+            }
             Command::Blocked => chat.blocked().await.map(|who| {
                 Some(if who.is_empty() {
                     "you have blocked nobody".to_string()
@@ -883,6 +919,18 @@ async fn receipts(chat: &mut Chat, conv: &mut Open) {
     conv.marks_at = Some(std::time::Instant::now());
     if let Ok(marks) = chat.marks(&conv.channel).await {
         conv.marks = marks;
+    }
+    // And who is here, on the same cadence and for the same reason: the poll
+    // carries no membership, so without this the header's count would be
+    // whatever it was when the client started.
+    if let Ok(info) = chat.info(&conv.channel).await {
+        conv.members = info.members.len();
+        conv.admins = info
+            .members
+            .iter()
+            .filter(|m| m.role == Role::Admin)
+            .map(|m| m.account)
+            .collect();
     }
 }
 
@@ -1199,7 +1247,12 @@ async fn handle_key(
             }
             if matches!(
                 cmd,
-                Command::Profile(_) | Command::Block(_) | Command::Unblock(_) | Command::Blocked
+                Command::Profile(_)
+                    | Command::Block(_)
+                    | Command::Unblock(_)
+                    | Command::Blocked
+                    | Command::Whoami
+                    | Command::Reconnect
             ) {
                 let note = match account_command(chat, cmd).await {
                     Ok(note) => note,
@@ -1225,6 +1278,11 @@ async fn handle_key(
             // rather than patched — the exchange is the authority on what we
             // are in, and guessing at it here is how the two drift apart.
             let restructured = matches!(cmd, Command::Leave | Command::CloseConfirmed);
+            // What was typed, kept back in case sending it fails. `text` was
+            // taken out of the input line before any of this, so a refusal or
+            // a dropped connection destroyed it — the one loss in this client
+            // that trying again cannot undo.
+            let typed = matches!(cmd, Command::Send(_)).then(|| text.clone());
             let outcome = match cmd {
                 Command::Send(text) => chat.send(&channel, &text).await.map(|_| None),
                 Command::File(path) => send_file(chat, &channel, &path).await.map(Some),
@@ -1238,6 +1296,8 @@ async fn handle_key(
                 | Command::Block(_)
                 | Command::Unblock(_)
                 | Command::Blocked
+                | Command::Whoami
+                | Command::Reconnect
                 | Command::Help => Ok(None),
                 Command::Name(name) => match chat.set_name(&channel, &name).await {
                     Ok(_) => Ok(Some(format!("renamed to {name}"))),
@@ -1487,6 +1547,11 @@ async fn handle_key(
                 }
                 Err(e) => {
                     open[i].note = Some((e.to_string(), std::time::Instant::now()));
+                    // Back into the composer, where somebody can press Enter
+                    // again once the light is green.
+                    if let Some(text) = typed {
+                        app.input = text;
+                    }
                     None
                 }
             };
@@ -1555,6 +1620,15 @@ enum Command {
     Blocked,
     /// `/help` — everything the client can do, over the transcript.
     Help,
+    /// `/whoami` — this account's key, in full.
+    ///
+    /// The header carries six characters of it, which is enough to recognise
+    /// yourself by and not enough to be compared against anything. This is
+    /// where the whole key lives now.
+    Whoami,
+    /// `/reconnect` — try the exchange again now, whatever the backoff had
+    /// planned. So that a red light has an answer that is not "restart it".
+    Reconnect,
     /// `/search <text>` — find it in this conversation.
     Search(String),
     /// `/op <key>` — make somebody an admin here, so they can rename it,
@@ -1671,6 +1745,8 @@ impl Command {
             "/unblock" => Command::Unknown("/unblock needs a public key".into()),
             "/blocked" => Command::Blocked,
             "/help" | "/?" => Command::Help,
+            "/whoami" => Command::Whoami,
+            "/reconnect" => Command::Reconnect,
             "/search" if !rest.is_empty() => Command::Search(rest.to_string()),
             "/search" => Command::Unknown("/search needs something to look for".into()),
             "/op" if !first.is_empty() => Command::Op(first.to_string()),
@@ -1987,6 +2063,7 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         label,
         channel,
         last_at: now(),
+        members: 0,
         marks: Vec::new(),
         marks_at: None,
         read_to: 0,
@@ -2094,14 +2171,30 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 .messages()
                 .last()
                 .map(|m| {
-                    if m.redacted {
+                    let said = if m.redacted {
                         "message deleted".to_string()
                     } else {
                         m.post
                             .body_text()
                             .map(str::to_string)
                             .unwrap_or_else(|| "a file".to_string())
+                    };
+                    // In a group, half of what the line is worth is *who*: the
+                    // row already names the channel, so "lol" on its own says
+                    // nothing about whether it is worth opening. A direct
+                    // message needs no prefix — the row is the person.
+                    if o.peer.is_some() {
+                        return said;
                     }
+                    let who = if m.account == *me {
+                        "you".to_string()
+                    } else {
+                        names
+                            .get(&m.account)
+                            .cloned()
+                            .unwrap_or_else(|| short(&m.account))
+                    };
+                    format!("{who}: {said}")
                 })
                 .unwrap_or_default(),
             at: o.last_at,
@@ -2121,6 +2214,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         app.picked = None;
         app.peer_typing = false;
         app.topic.clear();
+        app.members = 0;
         app.has_avatar = false;
         return;
     };
@@ -2227,6 +2321,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         })
         .collect();
     app.peer_typing = conv.typing;
+    app.members = conv.members;
     app.topic = conv.timeline.topic.clone();
     app.divider = conv.divider;
     app.now = now();
@@ -2381,6 +2476,7 @@ mod tests {
             public: false,
             label: label.to_string(),
             channel: [7; 32],
+            members: 2,
             admins: vec![PubKey::new([1; 32]), PubKey::new([peer; 32])],
             timeline: Timeline::new(),
             timeline_len: 0,
