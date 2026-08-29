@@ -384,6 +384,15 @@ struct Open {
     /// than a second, which is to say it was never read.
     note: Option<(String, std::time::Instant)>,
     typing: bool,
+    /// Where everybody's cursor is, as of the last time we asked. Fetched
+    /// only for the conversation on screen, and not on every poll: it is one
+    /// more round trip and nobody is reading a receipt in a channel they are
+    /// not looking at.
+    marks: Vec<sqex_proto::channel::Mark>,
+    marks_at: Option<std::time::Instant>,
+    /// How far we have told the exchange we have read, so the same mark is not
+    /// posted on every pass.
+    read_to: u64,
     /// When something last happened here, for ordering the list. The newest
     /// message's time, or when we joined if nothing has been said.
     last_at: u64,
@@ -509,6 +518,9 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            marks: Vec::new(),
+            marks_at: None,
+            read_to: 0,
             last_at,
             unread: 0,
             waiting: false,
@@ -534,6 +546,9 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            marks: Vec::new(),
+            marks_at: None,
+            read_to: 0,
             // Nothing has happened here yet, so it sorts below anything that
             // has rather than claiming a time it does not have.
             last_at: 0,
@@ -638,6 +653,15 @@ async fn event_loop(
             // nothing else to do, which this is not.
             for conv in open.iter_mut() {
                 poll_one(chat, conv, app).await;
+            }
+            // Receipts, for the conversation on screen only.
+            //
+            // Reading is what somebody does to the channel they are looking
+            // at, so that is the only one to say so about — and telling the
+            // exchange you have read a conversation you are not looking at
+            // would be publishing something untrue about yourself.
+            if let Some(at) = selected_index(open, app) {
+                receipts(chat, &mut open[at]).await;
             }
             poll_at = tokio::time::Instant::now() + Duration::from_millis(700);
         }
@@ -780,6 +804,37 @@ async fn account_command(
         _ => Ok(None),
     }?;
     Ok(note.unwrap_or_default())
+}
+
+/// Publish how far we have read here, and collect how far everybody else has.
+///
+/// Both halves, because they are reciprocal: the exchange withholds everyone
+/// else's reading from an account that withholds its own, and this client
+/// published no read mark at all until now — which is why `/read` had only
+/// ever reported "delivered", for everybody, forever.
+///
+/// The fetch is throttled. It is one more round trip and a receipt is not
+/// something anybody watches change second by second.
+async fn receipts(chat: &mut Chat, conv: &mut Open) {
+    const EVERY: Duration = Duration::from_secs(3);
+
+    if let Some(newest) = conv.timeline.messages().map(|m| m.seq).max()
+        && newest > conv.read_to
+    {
+        // Best effort. A receipt nobody could publish is a cosmetic loss, and
+        // it must not be able to stop the conversation working.
+        if chat.mark_read(&conv.channel, newest).await.is_ok() {
+            conv.read_to = newest;
+        }
+    }
+
+    if conv.marks_at.is_some_and(|at| at.elapsed() < EVERY) {
+        return;
+    }
+    conv.marks_at = Some(std::time::Instant::now());
+    if let Ok(marks) = chat.marks(&conv.channel).await {
+        conv.marks = marks;
+    }
 }
 
 /// Poll the conversation just acted on and redraw from it.
@@ -1615,7 +1670,12 @@ fn read_marks(marks: &[sqex_proto::channel::Mark], me: &PubKey, conv: &Open) -> 
             };
             match (m.read, m.delivered) {
                 (0, 0) => format!("{who}: nothing delivered"),
-                (0, d) => format!("{who}: delivered to {d}, reading not shared"),
+                // Zero is ambiguous and has to be reported as ambiguous: it is
+                // somebody who has read nothing, somebody who has opted out of
+                // saying, and somebody whose client does not publish a mark,
+                // all rendered identically by the exchange — on purpose, since
+                // a refusal you can detect is not a refusal.
+                (0, d) => format!("{who}: delivered to {d}, no read mark"),
                 (r, _) => format!("{who}: read to {r}"),
             }
         })
@@ -1820,6 +1880,9 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         label,
         channel,
         last_at: now(),
+        marks: Vec::new(),
+        marks_at: None,
+        read_to: 0,
         admins: vec![chat.me, account],
         timeline: Timeline::new(),
         timeline_len: 0,
@@ -1993,6 +2056,25 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 at: m.posted,
                 edited: m.edited.is_some(),
                 redacted: m.redacted,
+                // Only on ours: a receipt says what became of something you
+                // sent. `Read` requires everybody, because a member who has
+                // opted out reports having read nothing and cannot be told
+                // apart from one who has — so a message that stops at
+                // delivered may well have been read by somebody who declined
+                // to say, and claiming otherwise would be inventing a fact.
+                receipt: (m.account == *me).then(|| {
+                    let others: Vec<_> =
+                        conv.marks.iter().filter(|k| k.account != *me).collect();
+                    if others.is_empty() {
+                        ui::Receipt::Sent
+                    } else if others.iter().all(|k| k.read >= m.seq) {
+                        ui::Receipt::Read
+                    } else if others.iter().all(|k| k.delivered >= m.seq) {
+                        ui::Receipt::Delivered
+                    } else {
+                        ui::Receipt::Sent
+                    }
+                }),
                 // The stub is resolved here rather than in the renderer, which
                 // has no timeline to look the target up in. A target we do not
                 // hold — pruned, or from before we joined — still shows the
@@ -2193,6 +2275,9 @@ mod tests {
             admins: vec![PubKey::new([1; 32]), PubKey::new([peer; 32])],
             timeline: Timeline::new(),
             timeline_len: 0,
+            marks: Vec::new(),
+            marks_at: None,
+            read_to: 0,
             last_at: 0,
             trouble: Trouble::default(),
             note: None,
@@ -2394,6 +2479,122 @@ mod tests {
         };
         refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
         assert!(app.trouble.line().contains("403"));
+    }
+
+    /// `Read` means everybody, and it has to. A member who has opted out of
+    /// receipts reports having read nothing and is indistinguishable from one
+    /// who has read nothing — so a tick that needed only one reader would show
+    /// "read" for a group where one person has looked and the rest have not.
+    #[test]
+    fn a_read_receipt_waits_for_everybody() {
+        use sqex_proto::channel::Mark;
+
+        let me = PubKey::new([1; 32]);
+        let (bob, carol) = (PubKey::new([2; 32]), PubKey::new([3; 32]));
+        let mut c = conv(2, "group");
+        c.peer = None;
+        c.timeline = Timeline::fold(
+            &[Received {
+                seq: 5,
+                account: me,
+                posted: 10,
+                kind: sqex_proto::channel::KIND_MEMBER,
+                tombstone: false,
+                body: Some(Body::Post(SipPost::text("did you see this?"))),
+            }],
+            &[me],
+        );
+
+        let receipt = |marks: Vec<Mark>| {
+            let mut conv = conv(2, "group");
+            conv.peer = None;
+            conv.timeline = c.timeline.clone();
+            conv.marks = marks;
+            let open = vec![conv];
+            let mut app = App {
+                selected: Some([7; 32]),
+                ..Default::default()
+            };
+            refresh(&mut app, &open, &me, &HashMap::new());
+            app.said[0].receipt
+        };
+
+        let mark = |a, d, r| Mark { account: a, delivered: d, read: r };
+
+        // Nobody has fetched it.
+        assert_eq!(
+            receipt(vec![mark(bob, 0, 0), mark(carol, 0, 0)]),
+            Some(ui::Receipt::Sent)
+        );
+        // Both hold it, neither has said they read it.
+        assert_eq!(
+            receipt(vec![mark(bob, 5, 0), mark(carol, 5, 0)]),
+            Some(ui::Receipt::Delivered)
+        );
+        // One has read it. That is not "read".
+        assert_eq!(
+            receipt(vec![mark(bob, 5, 5), mark(carol, 5, 0)]),
+            Some(ui::Receipt::Delivered),
+            "one reader was reported as everybody"
+        );
+        // Both have.
+        assert_eq!(
+            receipt(vec![mark(bob, 5, 5), mark(carol, 5, 5)]),
+            Some(ui::Receipt::Read)
+        );
+        // Our own mark is not part of the question. The case that shows it is
+        // ours lagging behind theirs: everybody else has read it, and whether
+        // we have is beside the point.
+        assert_eq!(
+            receipt(vec![mark(me, 5, 0), mark(bob, 5, 5), mark(carol, 5, 5)]),
+            Some(ui::Receipt::Read),
+            "our own unread mark held back a receipt about other people"
+        );
+    }
+
+    /// A receipt belongs on what you sent. Somebody else's message carries
+    /// none — you are not waiting to hear what became of it.
+    #[test]
+    fn somebody_elses_message_carries_no_receipt() {
+        use sqex_proto::channel::Mark;
+
+        let me = PubKey::new([1; 32]);
+        let bob = PubKey::new([2; 32]);
+        let mut c = conv(2, "bob");
+        c.marks = vec![
+            Mark { account: me, delivered: 9, read: 9 },
+            Mark { account: bob, delivered: 9, read: 9 },
+        ];
+        c.timeline = Timeline::fold(
+            &[
+                Received {
+                    seq: 1,
+                    account: bob,
+                    posted: 10,
+                    kind: sqex_proto::channel::KIND_MEMBER,
+                    tombstone: false,
+                    body: Some(Body::Post(SipPost::text("theirs"))),
+                },
+                Received {
+                    seq: 2,
+                    account: me,
+                    posted: 11,
+                    kind: sqex_proto::channel::KIND_MEMBER,
+                    tombstone: false,
+                    body: Some(Body::Post(SipPost::text("mine"))),
+                },
+            ],
+            &[me, bob],
+        );
+        let open = vec![c];
+        let mut app = App {
+            selected: Some([7; 32]),
+            ..Default::default()
+        };
+        refresh(&mut app, &open, &me, &HashMap::new());
+        assert_eq!(app.said.len(), 2);
+        assert_eq!(app.said[0].receipt, None, "a receipt on somebody else's message");
+        assert_eq!(app.said[1].receipt, Some(ui::Receipt::Read));
     }
 
     /// Signal's ordering: whatever happened last is at the top. The exchange

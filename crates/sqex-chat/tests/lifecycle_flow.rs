@@ -215,9 +215,10 @@ async fn reading_is_reported_back_and_declining_to_say_is_not_the_same_as_not_re
     bob.open_dm(&alice_key).await.unwrap();
     let last = alice.send(&channel, "did you see this?").await.unwrap().seq;
 
-    // Nobody has read it yet. This client has published its own cursor since
-    // it was written and never once read anybody else's, so until now the
-    // receipts went out and nothing came back.
+    // Nobody has read it yet. This client published its own cursor since it
+    // was written and never once read anybody else's — and, it turned out,
+    // never published a read mark either, so every receipt anybody could have
+    // seen was stuck at delivered for good.
     let before = alice.marks(&channel).await.unwrap();
     let bobs_mark = before.iter().find(|m| m.account == bob_key);
     assert!(
@@ -227,6 +228,15 @@ async fn reading_is_reported_back_and_declining_to_say_is_not_the_same_as_not_re
 
     let mut bobs = Timeline::new();
     bob.poll(&channel, &mut bobs, 0).await.unwrap();
+
+    // Delivered but not read: Bob has the message and has said nothing about
+    // having looked at it. That is the state a tick has to be able to show,
+    // and the one it used to be stuck in.
+    let mid = alice.marks(&channel).await.unwrap();
+    let m = mid.iter().find(|m| m.account == bob_key).expect("no mark");
+    assert!(m.delivered >= last, "the fetch was not recorded");
+    assert!(m.read < last, "reading was claimed before it happened");
+
     bob.mark_read(&channel, last).await.unwrap();
 
     let after = alice.marks(&channel).await.unwrap();
@@ -236,6 +246,49 @@ async fn reading_is_reported_back_and_declining_to_say_is_not_the_same_as_not_re
         .expect("bob has no mark at all");
     assert_eq!(mark.read, last, "reading was not reported back");
     assert!(mark.delivered >= last);
+}
+
+/// The exchange withholds everybody else's reading from an account that
+/// withholds its own. So a receipt is never a thing you can take without
+/// giving, and a client must not present the resulting zero as "they have not
+/// read it".
+#[tokio::test]
+async fn withholding_your_own_reading_withholds_everyone_elses() {
+    use sqex_proto::channel::Cursor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    let last = alice.send(&channel, "did you see this?").await.unwrap().seq;
+    let mut bobs = Timeline::new();
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    bob.mark_read(&channel, last).await.unwrap();
+
+    // Alice can see it, because she shares her own.
+    let seen = alice.marks(&channel).await.unwrap();
+    assert_eq!(
+        seen.iter().find(|m| m.account == bob_key).map(|m| m.read),
+        Some(last)
+    );
+
+    // She opts out, and immediately cannot see his either — enforced at the
+    // exchange rather than left to a client that might not honour it.
+    alice
+        .post_cursor(&channel, Cursor { channel, read: last, receipts: false })
+        .await
+        .unwrap();
+    let withheld = alice.marks(&channel).await.unwrap();
+    assert_eq!(
+        withheld.iter().find(|m| m.account == bob_key).map(|m| m.read),
+        Some(0),
+        "reading was still visible to somebody who stopped sharing their own"
+    );
 }
 
 /// SIP-18 forwarding: the reference moves, the bytes do not.

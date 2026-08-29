@@ -71,6 +71,9 @@ pub struct Said {
     pub has_file: bool,
     pub at: u64,
     pub edited: bool,
+    /// How far this message of ours has got, if we can tell. `None` on
+    /// somebody else's — a receipt is about what happened to what you sent.
+    pub receipt: Option<Receipt>,
     /// Deleted by its sender or an admin. Shown as a tombstone rather than
     /// dropped: SIP-16 keeps the entry precisely so a reader can see that
     /// something was removed, instead of finding a conversation that silently
@@ -91,6 +94,24 @@ pub struct Said {
     /// in a mention on purpose — a name inside a message is one the sender
     /// controls, rendered where a reader looks for identity.
     pub mentions: Vec<String>,
+}
+
+/// How far a message of ours has travelled.
+///
+/// Deliberately never claims more than the exchange can show. An account that
+/// has opted out of receipts reports having read nothing, and is
+/// indistinguishable from one that has read nothing — that is what opting out
+/// is for. So `Read` means *everybody* here is known to have read it, and a
+/// message that stays at `Delivered` may well have been read by somebody who
+/// declined to say. Under-claiming is the only safe direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Receipt {
+    /// The exchange took it. Nobody has fetched it yet.
+    Sent,
+    /// Everybody here has it.
+    Delivered,
+    /// Everybody here has read it.
+    Read,
 }
 
 /// What the status line has to say, in the order it says it.
@@ -643,6 +664,13 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         tail += &format!("  @{m}");
     }
     tail += &format!("  {}", clock(s.at).trim_end());
+    if let Some(r) = s.receipt {
+        tail += match r {
+            Receipt::Sent => " ·",
+            Receipt::Delivered => " ✓",
+            Receipt::Read => " ✓✓",
+        };
+    }
     let content = body
         .iter()
         .enumerate()
@@ -2046,6 +2074,51 @@ mod tests {
             out.contains(clock(3661).trim()),
             "no time against the preview:\n{out}"
         );
+    }
+
+    /// A receipt says what became of something *you* sent, so it goes on your
+    /// messages and nobody else's.
+    #[test]
+    fn a_receipt_is_shown_on_our_own_messages_only() {
+        let mut app = sample();
+        let mut mine = said("you", "9hSR6S7W", true, "sent this", 3661);
+        mine.receipt = Some(Receipt::Read);
+        app.said = vec![said("bob", "8qbHbw2B", false, "theirs", 3661), mine];
+        let out = render(&app, 100, 24);
+        let theirs = out.lines().find(|l| l.contains("theirs")).unwrap();
+        let ours = out.lines().find(|l| l.contains("sent this")).unwrap();
+        assert!(ours.contains("✓✓"), "no receipt on our message: {ours:?}");
+        assert!(
+            !theirs.contains('✓'),
+            "a receipt was put on somebody else's message: {theirs:?}"
+        );
+    }
+
+    #[test]
+    fn the_three_stages_read_differently() {
+        let mut app = sample();
+        let mark = |r| {
+            let mut s = said("you", "9hSR6S7W", true, "hello", 3661);
+            s.receipt = Some(r);
+            s
+        };
+        let line = |app: &App| {
+            render(app, 100, 24)
+                .lines()
+                .find(|l| l.contains("hello"))
+                .unwrap()
+                .to_string()
+        };
+        app.said = vec![mark(Receipt::Sent)];
+        let sent = line(&app);
+        app.said = vec![mark(Receipt::Delivered)];
+        let delivered = line(&app);
+        app.said = vec![mark(Receipt::Read)];
+        let read = line(&app);
+        assert_ne!(sent, delivered);
+        assert_ne!(delivered, read);
+        assert!(delivered.contains('✓'));
+        assert!(read.contains("✓✓"));
     }
 
     #[test]

@@ -2000,6 +2000,22 @@ impl Chat {
         })
     }
 
+    /// Post a cursor exactly as given, including whether to share reading.
+    ///
+    /// Exposed for the test that shows reciprocity: the exchange withholds
+    /// everybody else's reading from an account that withholds its own, and
+    /// that is worth proving rather than trusting.
+    pub async fn post_cursor(
+        &mut self,
+        channel: &[u8; 32],
+        cursor: sqex_proto::channel::Cursor,
+    ) -> Result<()> {
+        let _ = channel;
+        let body = self.post("/channel/cursor", cursor.encode()).await?;
+        Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok(())
+    }
+
     /// Mark everything up to `seq` read, so the other side's client can say so.
     pub async fn mark_read(&mut self, channel: &[u8; 32], seq: u64) -> Result<()> {
         use sqex_proto::channel::Cursor;
