@@ -4434,7 +4434,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-admin"
-version = "0.17.2"
+version = "0.18.0"
 dependencies = [
  "bs58",
  "card-backend-pcsc",
@@ -4455,7 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-chat"
-version = "0.17.2"
+version = "0.18.0"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -4485,7 +4485,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-cli"
-version = "0.17.2"
+version = "0.18.0"
 dependencies = [
  "clap",
  "rand_core 0.6.4",
@@ -4500,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-proto"
-version = "0.17.2"
+version = "0.18.0"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-voice"
-version = "0.17.2"
+version = "0.18.0"
 dependencies = [
  "clap",
  "cpal",
@@ -4538,7 +4538,7 @@ dependencies = [
 
 [[package]]
 name = "sqexd"
-version = "0.17.2"
+version = "0.18.0"
 dependencies = [
  "bs58",
  "bytes",
@@ -4572,8 +4572,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr"
-version = "0.6.0"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.6.0#7236ee062e6582a99821d5ee8694602ac8823578"
+version = "0.7.0"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.7.0#4fd2805f360811ad27d01301dee725e1d7b0f373"
 dependencies = [
  "argon2",
  "bs58",
@@ -4603,8 +4603,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr-core"
-version = "0.6.0"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.6.0#7236ee062e6582a99821d5ee8694602ac8823578"
+version = "0.7.0"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.7.0#4fd2805f360811ad27d01301dee725e1d7b0f373"
 dependencies = [
  "bs58",
  "ed25519-dalek",

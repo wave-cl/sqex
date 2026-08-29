@@ -23,12 +23,13 @@ use ratatui::backend::CrosstermBackend;
 use sqex_chat::attach::describe;
 use sqex_chat::client::{Chat, ChatError, Link};
 use sqex_chat::store::{self, Store, store_path};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How long the answer to a command stays on screen. Long enough to read a
 /// sentence, short enough not to sit over the next thing that goes wrong.
 const NOTE_LINGER: Duration = Duration::from_secs(8);
 
+use sqex_proto::events::Event as ChatEvent;
 use sqex_proto::message::Post as SipPost;
 use sqex_proto::timeline::Timeline;
 use sqnr::{Client, config::Config, identity};
@@ -698,12 +699,15 @@ async fn event_loop(
         }
     }
 
-    let mut poll_at = tokio::time::Instant::now();
-    // Deliberately slower than the poll: somebody starting a conversation with
-    // you is rare next to a message arriving in one you already have, and this
-    // is a whole extra round trip.
-    const ARRIVALS: Duration = Duration::from_secs(5);
-    let mut arrivals_at = tokio::time::Instant::now() + ARRIVALS;
+    // The floor, not the cadence. Everything below is normally driven by SIP-30
+    // events; this is what repairs a client that missed one — a dropped stream,
+    // a resync, an exchange too old to push at all. It is deliberately slow
+    // enough that an idle client is silent and fast enough that "missed
+    // something" is a hiccup rather than a bug report.
+    const IDLE_SWEEP: Duration = Duration::from_secs(30);
+    let mut sweep_at = tokio::time::Instant::now();
+    let mut dirty = Dirty::default();
+    let mut was_selected: Option<usize> = None;
     let mut hover = ui::Drawn::default();
     loop {
         let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
@@ -795,63 +799,190 @@ async fn event_loop(
             continue;
         }
 
-        if tokio::time::Instant::now() >= poll_at {
-            // Before anything is asked for: if the link is down this is what
-            // brings it back, and if it is up it costs nothing. It never
-            // blocks for long — a handshake is advanced a slice at a time, so
-            // the keyboard stays served while it happens.
-            chat.keep_alive().await;
-            // A short wait rather than the full long poll: the loop also has a
-            // keyboard to serve, and parking 20 s here would make the interface
-            // feel broken. The long poll is the right tool for a client with
-            // nothing else to do, which this is not.
-            for conv in open.iter_mut() {
-                poll_one(chat, conv, app).await;
+        // If the link is down this is what brings it back, and if it is up it
+        // costs nothing. It never blocks for long — a handshake is advanced a
+        // slice at a time, so the keyboard stays served while it happens.
+        chat.keep_alive().await;
+
+        // Subscribe, then reconcile — in that order, always. The exchange has
+        // the subscription registered by the time `subscribe` returns, so
+        // anything that changes while we are catching up is queued behind us
+        // rather than lost in the gap. Reconciling first would drop exactly the
+        // window in between and say nothing about it.
+        if chat.link() == Link::Up && !chat.subscribed() {
+            // A refusal is survivable and needs no branch of its own: the
+            // sweep below still runs, so the client degrades to polling rather
+            // than to silence — which is also what it does against an exchange
+            // too old to push at all.
+            if let Ok(true) = chat.subscribe().await {
+                dirty.everything(open);
             }
-            // Where the unread divider goes, decided once on arriving at a
-            // conversation and left alone after — reading advances the mark
-            // immediately, so a divider recomputed from it would disappear the
-            // instant it was wanted.
-            let here = selected_index(open, app);
-            let me = chat.me;
-            for (i, conv) in open.iter_mut().enumerate() {
-                place_divider(conv, &me, Some(i) == here);
+        }
+
+        for event in chat.take_events() {
+            dirty.note(event, &chat.me, open);
+        }
+
+        // The floor. Everything, on a slow tick, whatever the stream did or
+        // did not say.
+        if tokio::time::Instant::now() >= sweep_at {
+            sweep_at = tokio::time::Instant::now() + IDLE_SWEEP;
+            dirty.everything(open);
+        }
+
+        // Moving to a conversation is a reason to look at it: the read mark we
+        // owe is published from `receipts`, and without this it would wait for
+        // somebody else to do something.
+        let here = selected_index(open, app);
+        if here != was_selected {
+            was_selected = here;
+            if let Some(i) = here {
+                dirty.channels.insert(open[i].channel);
+                dirty.receipts.insert(open[i].channel);
             }
-            // Has anybody started talking to us since we last looked?
-            //
-            // `discover` and `sync_channels` used to run once, before the loop
-            // — so a conversation somebody else opened never appeared at all
-            // until the client was restarted, and nothing said so. A direct
-            // message needs no invitation and no acceptance, which makes it
-            // exactly the thing that arrives without warning.
-            //
-            // One request on a slow cadence, and a rebuild only when the
-            // answer contains something we do not hold: rebuilding on every
-            // pass would be a round trip per conversation for nothing.
-            if tokio::time::Instant::now() >= arrivals_at {
-                arrivals_at = tokio::time::Instant::now() + ARRIVALS;
-                if let Ok(mine) = chat.mine().await
-                    && mine
-                        .iter()
-                        .any(|m| !open.iter().any(|o| o.channel == m.channel))
-                {
-                    let _ = discover(chat).await;
-                    if let Ok(mut rebuilt) = sync_channels(chat).await {
-                        carry_over(open, &mut rebuilt);
-                        *open = rebuilt;
-                    }
+        }
+
+        if dirty.is_empty() {
+            continue;
+        }
+
+        for channel in std::mem::take(&mut dirty.channels) {
+            match open.iter().position(|c| c.channel == channel) {
+                Some(i) => poll_one(chat, &mut open[i], app).await,
+                // A channel we were told about and do not hold. That is a
+                // conversation somebody else started, and the rebuild below is
+                // what makes it appear.
+                None => dirty.arrivals = true,
+            }
+        }
+
+        if !dirty.profiles.is_empty() {
+            let who: Vec<PubKey> = std::mem::take(&mut dirty.profiles).into_iter().collect();
+            // `refetch`, not `refresh`: the exchange has just said this changed,
+            // and honouring an hour-long cache against a fact we were handed
+            // would be caching the answer to a question nobody asked.
+            let _ = chat.refetch_profiles(&who, now()).await;
+        }
+
+        // Where the unread divider goes, decided once on arriving at a
+        // conversation and left alone after — reading advances the mark
+        // immediately, so a divider recomputed from it would disappear the
+        // instant it was wanted.
+        let me = chat.me;
+        for (i, conv) in open.iter_mut().enumerate() {
+            place_divider(conv, &me, Some(i) == here);
+        }
+
+        // Has anybody started talking to us since we last looked?
+        //
+        // A direct message needs no invitation and no acceptance, which makes
+        // it exactly the thing that arrives without warning. This used to run
+        // on a five-second timer; now it runs when the exchange says a
+        // membership changed, and on the sweep.
+        if std::mem::take(&mut dirty.arrivals)
+            && let Ok(mine) = chat.mine().await
+            && mine
+                .iter()
+                .any(|m| !open.iter().any(|o| o.channel == m.channel))
+        {
+            let _ = discover(chat).await;
+            if let Ok(mut rebuilt) = sync_channels(chat).await {
+                carry_over(open, &mut rebuilt);
+                *open = rebuilt;
+            }
+        }
+
+        // Receipts, for the conversation on screen only.
+        //
+        // Reading is what somebody does to the channel they are looking at, so
+        // that is the only one to say so about — and telling the exchange you
+        // have read a conversation you are not looking at would be publishing
+        // something untrue about yourself.
+        let wanted = std::mem::take(&mut dirty.receipts);
+        if let Some(at) = selected_index(open, app)
+            && wanted.contains(&open[at].channel)
+        {
+            receipts(chat, &mut open[at]).await;
+        }
+    }
+}
+
+/// What the exchange has said needs doing, and nothing about how.
+///
+/// A SIP-30 event carries no news, only the name of something that moved, so
+/// the client's whole reaction is to remember what to go and ask about. Keeping
+/// that as a set rather than acting per event is what makes a burst of twenty
+/// messages in one channel cost one fetch instead of twenty.
+#[derive(Default)]
+struct Dirty {
+    /// Fetch these conversations.
+    channels: HashSet<[u8; 32]>,
+    /// Refetch these profiles, ignoring the cache.
+    profiles: HashSet<PubKey>,
+    /// Read marks moved here; refresh them if this is the one on screen.
+    receipts: HashSet<[u8; 32]>,
+    /// The conversation list itself may have changed.
+    arrivals: bool,
+}
+
+impl Dirty {
+    fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+            && self.profiles.is_empty()
+            && self.receipts.is_empty()
+            && !self.arrivals
+    }
+
+    /// Everything this client holds, as if it had just connected.
+    ///
+    /// Used on the slow sweep and after every subscribe. It is the repair for
+    /// anything the stream did not deliver, and it must stay cheap enough to
+    /// run unconditionally — which is why it is a set of names and not a set of
+    /// requests.
+    fn everything(&mut self, open: &[Open]) {
+        for conv in open {
+            self.channels.insert(conv.channel);
+            self.receipts.insert(conv.channel);
+        }
+        self.arrivals = true;
+    }
+
+    /// File one event.
+    fn note(&mut self, event: ChatEvent, me: &PubKey, open: &[Open]) {
+        match event {
+            // A signal is typing, which lives in the fetch alongside entries.
+            ChatEvent::Channel { channel, .. } | ChatEvent::Signal { channel } => {
+                self.channels.insert(channel);
+            }
+            ChatEvent::Cursor { channel } => {
+                self.receipts.insert(channel);
+            }
+            ChatEvent::Membership {
+                channel, account, ..
+            } => {
+                // Somebody else coming or going changes a member count, which
+                // the fetch carries. Us coming or going changes which
+                // conversations exist, which only a rebuild can find.
+                if account == *me {
+                    self.arrivals = true;
+                } else {
+                    self.channels.insert(channel);
                 }
             }
-            // Receipts, for the conversation on screen only.
-            //
-            // Reading is what somebody does to the channel they are looking
-            // at, so that is the only one to say so about — and telling the
-            // exchange you have read a conversation you are not looking at
-            // would be publishing something untrue about yourself.
-            if let Some(at) = here {
-                receipts(chat, &mut open[at]).await;
+            ChatEvent::Profile { account } => {
+                self.profiles.insert(account);
             }
-            poll_at = tokio::time::Instant::now() + Duration::from_millis(700);
+            // Nothing here can act on either. The heartbeat has already done
+            // its job by arriving — it is what tells a live stream from a
+            // silent exchange, and that is read where the stream is drained.
+            // An admission request needs an admin tool this client is not.
+            ChatEvent::Admission | ChatEvent::Heartbeat => {}
+            // Everything, because we do not know what we missed.
+            ChatEvent::Resync => self.everything(open),
+            // SIP-19's rule, and the reason a later kind of event needs no flag
+            // day: a client that refused what it did not recognise would make
+            // every addition a breaking change.
+            ChatEvent::Unknown(_) => {}
         }
     }
 }
@@ -3457,5 +3588,144 @@ mod tests {
         // Only at the front, and only as a path component.
         assert_eq!(expand("/tmp/~x"), std::path::PathBuf::from("/tmp/~x"));
         assert_eq!(expand("~notuser/x"), std::path::PathBuf::from("~notuser/x"));
+    }
+
+    // ---- SIP-30: what the client does with what it is told ----
+
+    /// A conversation on a named channel.
+    ///
+    /// `conv` above gives every conversation the same channel, which is fine
+    /// for the layout tests it was written for and useless here — half of what
+    /// `Dirty` does is tell one channel from another.
+    fn on_channel(c: u8) -> Open {
+        let mut o = conv(2, "somebody");
+        o.channel = [c; 32];
+        o
+    }
+
+    fn me() -> PubKey {
+        PubKey::new([1; 32])
+    }
+
+    /// The reason events are filed into a set instead of acted on one by one:
+    /// twenty messages landing in a burst are one thing to go and fetch.
+    #[test]
+    fn a_burst_in_one_channel_is_one_fetch() {
+        let open = vec![on_channel(9)];
+        let mut dirty = Dirty::default();
+        for seq in 1..=20 {
+            dirty.note(
+                ChatEvent::Channel {
+                    channel: [9; 32],
+                    last_seq: seq,
+                },
+                &me(),
+                &open,
+            );
+        }
+        assert_eq!(dirty.channels.len(), 1);
+        assert!(dirty.channels.contains(&[9; 32]));
+    }
+
+    /// Somebody else joining changes a member count, which the fetch carries.
+    /// *Us* joining changes which conversations exist, which only a rebuild
+    /// finds — and a client that treated the two alike would never notice a
+    /// conversation it had just been added to.
+    #[test]
+    fn our_own_membership_rebuilds_and_somebody_elses_does_not() {
+        let open = vec![on_channel(9)];
+
+        let mut ours = Dirty::default();
+        ours.note(
+            ChatEvent::Membership {
+                channel: [9; 32],
+                account: me(),
+                what: sqex_proto::events::MEMBER_JOINED,
+            },
+            &me(),
+            &open,
+        );
+        assert!(ours.arrivals, "being added to something rebuilt nothing");
+
+        let mut theirs = Dirty::default();
+        theirs.note(
+            ChatEvent::Membership {
+                channel: [9; 32],
+                account: PubKey::new([5; 32]),
+                what: sqex_proto::events::MEMBER_JOINED,
+            },
+            &me(),
+            &open,
+        );
+        assert!(!theirs.arrivals, "somebody else joining rebuilt the world");
+        assert!(theirs.channels.contains(&[9; 32]));
+    }
+
+    /// A resync means "you missed things and we are not saying which".
+    #[test]
+    fn a_resync_marks_everything_that_is_open() {
+        let open = vec![on_channel(1), on_channel(2), on_channel(3)];
+        let mut dirty = Dirty::default();
+        dirty.note(ChatEvent::Resync, &me(), &open);
+
+        assert!(dirty.arrivals);
+        for c in [1u8, 2, 3] {
+            assert!(dirty.channels.contains(&[c; 32]), "channel {c} was left stale");
+            assert!(dirty.receipts.contains(&[c; 32]));
+        }
+    }
+
+    /// SIP-19's rule, at the receiving end. A client that treated an unknown
+    /// kind as a reason to do anything — including to resync — would make every
+    /// new kind of event a stampede.
+    #[test]
+    fn an_unknown_event_asks_for_nothing() {
+        let open = vec![on_channel(9)];
+        let mut dirty = Dirty::default();
+        dirty.note(ChatEvent::Unknown(0x7f), &me(), &open);
+        assert!(dirty.is_empty(), "an unrecognised event caused work");
+    }
+
+    /// A heartbeat has already done its job by arriving; it is read where the
+    /// stream is drained, not here.
+    #[test]
+    fn a_heartbeat_asks_for_nothing() {
+        let open = vec![on_channel(9)];
+        let mut dirty = Dirty::default();
+        dirty.note(ChatEvent::Heartbeat, &me(), &open);
+        assert!(dirty.is_empty());
+    }
+
+    /// The two facts are not the same request, and filing a read mark as a
+    /// fetch would put the exchange back to a round trip per receipt.
+    #[test]
+    fn a_read_mark_is_not_a_reason_to_refetch_the_conversation() {
+        let open = vec![on_channel(9)];
+        let mut dirty = Dirty::default();
+        dirty.note(ChatEvent::Cursor { channel: [9; 32] }, &me(), &open);
+        assert!(dirty.receipts.contains(&[9; 32]));
+        assert!(
+            dirty.channels.is_empty(),
+            "a moved read mark refetched the whole conversation"
+        );
+    }
+
+    /// Typing arrives with entries on the same fetch, so a signal is a fetch.
+    #[test]
+    fn typing_is_fetched_with_the_conversation() {
+        let open = vec![on_channel(9)];
+        let mut dirty = Dirty::default();
+        dirty.note(ChatEvent::Signal { channel: [9; 32] }, &me(), &open);
+        assert!(dirty.channels.contains(&[9; 32]));
+    }
+
+    /// Nothing to do means nothing is done: the loop skips its whole network
+    /// section on an empty set, which is what makes an idle client silent.
+    #[test]
+    fn an_idle_client_has_nothing_to_ask_for() {
+        assert!(Dirty::default().is_empty());
+        let mut dirty = Dirty::default();
+        dirty.note(ChatEvent::Profile { account: me() }, &me(), &[]);
+        assert!(!dirty.is_empty());
     }
 }

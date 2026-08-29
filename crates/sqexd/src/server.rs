@@ -20,6 +20,8 @@ use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::Config;
 use crate::device::Registry;
+use crate::events::Subscribers;
+use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
 use crate::mailbox::Mailbox;
 use crate::prekey::Prekeys;
 use crate::profile::Profiles;
@@ -73,6 +75,18 @@ const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// everywhere else. Uniformity is worth something — one number bounding every
 /// request is easy to reason about — so the exception is exactly one path.
 const MAX_CHUNK_BODY: usize = sqex_proto::blob_store::CHUNK + 1024;
+
+/// Content type of a SIP-30 event stream. Not JSON and not a document: a
+/// sequence of length-prefixed frames with no end.
+const EVENT_STREAM: &str = "application/vnd.sqex.events";
+
+/// How often a quiet event stream says it is still there.
+///
+/// Under the transport's 60 s idle timeout, so a stream cannot be reaped for
+/// having nothing to say, and beside SIP-16's 25 s `MAX_WAIT` for the same
+/// reason that number was chosen. Its real job is at the client: silence and a
+/// dead exchange are indistinguishable without it.
+const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Largest admin-command body we will read.
 const MAX_BODY: usize = 64 * 1024;
@@ -151,8 +165,18 @@ pub struct Server {
     admissions: Admissions,
     sessions: Sessions,
     live_conns: Connections,
+    /// SIP-30 event streams, by the identity that opened them.
+    pub events: Subscribers,
     started: Instant,
     connections: AtomicU64,
+    /// Requests served since boot.
+    ///
+    /// Counted because nothing else could say how much this exchange is being
+    /// asked, and "how much" is the whole argument for SIP-30: a polling client
+    /// costs requests proportional to how long it has been running, and an
+    /// event-driven one costs them proportional to what has happened. Without a
+    /// number, the difference between those is a claim.
+    requests: AtomicU64,
     /// The channel every account is put into the first time it is seen.
     ///
     /// Resolved once at boot rather than looked up per request: it is a name
@@ -165,6 +189,49 @@ pub struct Server {
 impl Server {
     fn is_admin(&self, key: &PubKey) -> bool {
         self.admins.read().unwrap().iter().any(|a| a == key)
+    }
+
+    /// Requests served since boot, event streams included — one per stream
+    /// opened, not one per frame written, which is the distinction that makes
+    /// this number mean anything.
+    pub fn requests(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
+    }
+
+    /// Tell everybody present in a channel that it changed (SIP-30).
+    ///
+    /// The member list is read here, at the route layer, and that placement is
+    /// load-bearing rather than tidy. `Channels::wake` — the long poll's
+    /// notifier — looks like the obvious home for this, but it is called at
+    /// seven sites with the caller's `Mutex<Connection>` guard still in scope,
+    /// and reading a member list takes that same non-reentrant lock. Publishing
+    /// from inside `wake` would deadlock the daemon. Nothing here holds the
+    /// database, and `Channels` stays unaware that subscriptions exist.
+    fn tell(&self, channel: &[u8; 32], event: EventKind) {
+        let to = self.channels.members_of(channel);
+        self.events.publish(&to, event);
+    }
+
+    /// The same, less one account — for a change that account made itself and
+    /// already knows about.
+    fn tell_others(&self, channel: &[u8; 32], not: &PubKey, event: EventKind) {
+        let to: Vec<PubKey> = self
+            .channels
+            .members_of(channel)
+            .into_iter()
+            .filter(|m| m != not)
+            .collect();
+        self.events.publish(&to, event);
+    }
+
+    /// The same, plus one account who may no longer be present — somebody
+    /// removed needs to hear about it more than anybody left behind does.
+    fn tell_including(&self, channel: &[u8; 32], also: &PubKey, event: EventKind) {
+        let mut to = self.channels.members_of(channel);
+        if !to.contains(also) {
+            to.push(*also);
+        }
+        self.events.publish(&to, event);
     }
 }
 
@@ -282,8 +349,10 @@ pub async fn bind(
         admissions: Admissions::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
+        events: Subscribers::default(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
+        requests: AtomicU64::new(0),
     });
 
     // The front door, made once and found by name thereafter. An exchange
@@ -483,6 +552,8 @@ async fn handle_stream(
         .await
         .map_err(|e| Error::Malformed(format!("resolve: {e}")))?;
 
+    server.requests.fetch_add(1, Ordering::Relaxed);
+
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
@@ -508,10 +579,132 @@ async fn handle_stream(
         }
     }
 
+    // The one route whose answer never finishes. It is handled here rather
+    // than in `route` because `route` returns a body and this one does not
+    // have one — it has a stream that stays open for as long as the client
+    // does (SIP-30).
+    if method == http::Method::POST && path == "/events" {
+        return serve_events(&server, &body, peer, &mut stream).await;
+    }
+
     let (status, content_type, out) =
         route(&server, method.as_str(), &path, &body, peer).await;
     respond(&mut stream, status, content_type, out).await
 }
+
+/// Hold a response stream open and write SIP-30 events to it until the client
+/// goes away.
+///
+/// The shape matters more than the code. The subscription is registered
+/// **before** the response head is sent, and the client does not begin its
+/// reconciling fetch until it has that head — so anything happening in between
+/// is queued rather than missed. Reversed, a client would silently lose every
+/// change that landed while it was catching up, and nothing at either end would
+/// say so. This is the same ordering `fetch_waiting` states for the long poll:
+/// take the notifier before the first read.
+async fn serve_events(
+    server: &Arc<Server>,
+    body: &[u8],
+    peer: Peer,
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+) -> Result<()> {
+    // The **account**, not the device on the connection. Every publisher
+    // addresses accounts — membership, profiles and admission all are — so a
+    // subscription filed under a device key would simply never be found. It
+    // costs one registry lookup and it is the same resolution `route` does for
+    // every other chat route; an account with no registered devices is its own
+    // device, which is why the single-client tests could not tell the two
+    // apart and why this only showed up against a store that had seen a
+    // linked device (SIP-22).
+    let Some(me) = peer.identity.map(|d| server.devices.account_for(&d)) else {
+        let (status, ct, out) = no_identity("an event stream");
+        return respond(stream, status, ct, out).await;
+    };
+    match sqex_proto::events::Subscribe::decode(body) {
+        Ok(sub) if sub.version == sqex_proto::events::VERSION => {}
+        Ok(sub) => {
+            return respond(
+                stream,
+                400,
+                "application/json",
+                json!({
+                    "error": "unsupported_version",
+                    "detail": format!(
+                        "this exchange speaks event version {}, not {}",
+                        sqex_proto::events::VERSION, sub.version
+                    ),
+                })
+                .to_string()
+                .into_bytes(),
+            )
+            .await;
+        }
+        Err(e) => {
+            return respond(
+                stream,
+                400,
+                "application/json",
+                json!({ "error": "malformed", "detail": e.to_string() })
+                    .to_string()
+                    .into_bytes(),
+            )
+            .await;
+        }
+    }
+
+    let Some(mut feed) = server.events.subscribe(me) else {
+        return respond(
+            stream,
+            429,
+            "application/json",
+            json!({
+                "error": "too_many_streams",
+                "detail": format!(
+                    "an identity may hold {} event streams at once",
+                    crate::events::MAX_PER_IDENTITY
+                ),
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await;
+    };
+
+    // No content-length, and no `finish`: `respond` sets one and ends the
+    // stream, which is right for every other route and fatal to this one.
+    let head = http::Response::builder()
+        .status(200)
+        .header("content-type", EVENT_STREAM)
+        .body(())
+        .map_err(|e| Error::Malformed(format!("response build: {e}")))?;
+    let opened = stream.send_response(head).await;
+    if opened.is_err() {
+        server.events.unsubscribe(&feed);
+        return Ok(());
+    }
+
+    crate::events::pump(&mut feed, &mut H3Sink { stream }, HEARTBEAT).await;
+    server.events.unsubscribe(&feed);
+    Ok(())
+}
+
+/// Where the h3 response stream meets the pump. The pump itself lives in
+/// [`crate::events`] with the thing it drains, so its two rules — a resync
+/// replaces a backlog, silence is broken by a heartbeat — can be tested without
+/// standing up a QUIC connection to watch them.
+struct H3Sink<'a> {
+    stream: &'a mut h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+}
+
+impl crate::events::Sink for H3Sink<'_> {
+    async fn write(&mut self, event: EventKind) -> std::result::Result<(), ()> {
+        self.stream
+            .send_data(bytes::Bytes::from(event.frame()))
+            .await
+            .map_err(|_| ())
+    }
+}
+
 
 /// Pure-ish routing: all state access, no stream I/O.
 async fn route(
@@ -622,6 +815,10 @@ async fn route(
                 server
                     .admissions
                     .request(&me, peer.key.as_ref(), &req.credential, &req.label, siblings);
+                // Whoever can act on it. An admission request that waits for
+                // an admin to think of refreshing is the case this replaces.
+                let admins: Vec<PubKey> = server.admins.read().unwrap().clone();
+                server.events.publish(&admins, EventKind::Admission);
                 // `now` is the only field, and it is here for the reason SIP-4
                 // gives: a client with a wrong clock has something to notice it
                 // against. It is identical for every caller.
@@ -636,7 +833,24 @@ async fn route(
             (None, _) => no_identity("publishing a profile"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.profiles.put(&me, &req.profile) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => {
+                    // SIP-21 scopes a profile to the people you are already in
+                    // a room with, so that is exactly who may be told it
+                    // changed — less anybody blocking, or blocked by, the
+                    // publisher. What they learn is that it changed; whether
+                    // they may *see* it is still decided at `/profile/get`.
+                    let to: Vec<PubKey> = server
+                        .channels
+                        .peers_of(&me)
+                        .into_iter()
+                        .filter(|other| {
+                            !server.profiles.has_blocked(other, &me)
+                                && !server.profiles.has_blocked(&me, other)
+                        })
+                        .collect();
+                    server.events.publish(&to, EventKind::Profile { account: me });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
                 Err(e) => (
                     e.status(),
                     "application/json",
@@ -901,11 +1115,19 @@ async fn route(
             (Some(me), Ok(req)) => {
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
                 match server.channels.create(&me, &req, &blocked) {
-                    Ok((created, epoch)) => (
-                        200,
-                        "application/octet-stream",
-                        Created { created, epoch, now: now_unix() }.encode(),
-                    ),
+                    Ok((created, epoch)) => {
+                        // Everybody invited learns of a channel that did not
+                        // exist when they last looked, which is the whole of
+                        // how a conversation somebody else started arrives.
+                        server.tell(&req.channel, EventKind::Membership {
+                            channel: req.channel, account: me, what: MEMBER_JOINED,
+                        });
+                        (
+                            200,
+                            "application/octet-stream",
+                            Created { created, epoch, now: now_unix() }.encode(),
+                        )
+                    }
                     Err(e) => refused(e),
                 }
             }
@@ -914,7 +1136,12 @@ async fn route(
             (None, _) => no_identity("joining a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.join(&me, &req.channel) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => {
+                    server.tell(&req.channel, EventKind::Membership {
+                        channel: req.channel, account: me, what: MEMBER_JOINED,
+                    });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
                 Err(e) => refused(e),
             },
         },
@@ -922,7 +1149,12 @@ async fn route(
             (None, _) => no_identity("leaving a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.leave(&me, &req.channel) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => {
+                    server.tell_including(&req.channel, &me, EventKind::Membership {
+                        channel: req.channel, account: me, what: MEMBER_LEFT,
+                    });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
                 Err(e) => refused(e),
             },
         },
@@ -936,7 +1168,13 @@ async fn route(
                 &device.unwrap_or(me),
                 &req,
             ) {
-                Ok(posted) => (200, "application/octet-stream", posted.encode()),
+                Ok(posted) => {
+                    server.tell(
+                        &req.channel,
+                        EventKind::Channel { channel: req.channel, last_seq: posted.seq },
+                    );
+                    (200, "application/octet-stream", posted.encode())
+                }
                 Err(e) => refused(e),
             },
         },
@@ -1002,7 +1240,12 @@ async fn route(
                     .channels
                     .invite(&me, &channel, &who.account, who.role, &blocked)
                 {
-                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Ok(()) => {
+                        server.tell(&channel, EventKind::Membership {
+                            channel, account: who.account, what: MEMBER_JOINED,
+                        });
+                        (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                    }
                     Err(e) => refused(e),
                 }
             }
@@ -1011,7 +1254,14 @@ async fn route(
             (None, _) => no_identity("removing from a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.remove(&me, &req.channel, &req.account) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => {
+                    // The removed account is told too. It is the one party to
+                    // this that cannot find out by asking again.
+                    server.tell_including(&req.channel, &req.account, EventKind::Membership {
+                        channel: req.channel, account: req.account, what: MEMBER_REMOVED,
+                    });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
                 Err(e) => refused(e),
             },
         },
@@ -1087,7 +1337,10 @@ async fn route(
                     .channels
                     .set_cursor(&me, &req.channel, req.read, req.receipts)
                 {
-                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Ok(()) => {
+                        server.tell_others(&req.channel, &me, EventKind::Cursor { channel: req.channel });
+                        (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                    }
                     Err(e) => refused(e),
                 }
             }
@@ -1104,7 +1357,13 @@ async fn route(
             (None, _) => no_identity("redacting an entry"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.redact(&me, &req.channel, req.target) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => {
+                    // No sequence number to name: a redaction changes an entry
+                    // that is already numbered. Zero is the wire's word for
+                    // "fetch and see".
+                    server.tell(&req.channel, EventKind::Channel { channel: req.channel, last_seq: 0 });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
                 Err(e) => refused(e),
             },
         },
@@ -1115,7 +1374,12 @@ async fn route(
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
                 match server.channels.signal(&me, &req.channel, req.kind, &req.body) {
-                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Ok(()) => {
+                        // Not to the sender: a client does not need telling
+                        // that its own keyboard is being used.
+                        server.tell_others(&req.channel, &me, EventKind::Signal { channel: req.channel });
+                        (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                    }
                     Err(e) => refused(e),
                 }
             }
@@ -1297,6 +1561,8 @@ impl Server {
             "whitelist_enabled": state.enabled(),
             "whitelist_count": state.keys().len(),
             "beacons": self.beacons.len(),
+            "requests": self.requests(),
+            "event_streams": self.events.total(),
             "mail_waiting": self.mailbox.waiting(),
             "sessions": self.sessions.len(),
             "rooms": self.rooms.len(),

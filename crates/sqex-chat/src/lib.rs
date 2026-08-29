@@ -26,6 +26,7 @@
 
 pub mod attach;
 pub mod client;
+pub mod events;
 pub mod store;
 
 pub use attach::{Prepared, describe, file_name, kind_of};

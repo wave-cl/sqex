@@ -17,6 +17,7 @@ pub mod channel;
 pub mod channel_key;
 pub mod credential;
 pub mod device;
+pub mod events;
 pub mod mailbox;
 pub mod message;
 pub mod prekey;

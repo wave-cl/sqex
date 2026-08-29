@@ -160,7 +160,13 @@ async fn we_learn_our_own_name_too() {
     let (_, alice_key) = identity(1);
 
     alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
-    let now = 1_000_000;
+    // An hour and a second after the write-through `set_profile` does, so the
+    // cached copy is stale and a fetch is actually made. The clock is what
+    // makes the fetch happen; what is under test is *whose* profile is
+    // fetched. Skipping our own account — which is what this client used to do,
+    // on the reasoning that you know what you called yourself — answers 0 here
+    // whatever the time is, so the assertion still catches it.
+    let now = real_now() + 3601;
     assert_eq!(alice.refresh_profiles(&[alice_key], now).await.unwrap(), 1);
     assert_eq!(
         alice.display_name(&alice_key).as_deref(),
@@ -168,6 +174,46 @@ async fn we_learn_our_own_name_too() {
         "the client would not learn its own name"
     );
     assert_eq!(alice.title_of(&alice_key).as_deref(), Some("shipping"));
+}
+
+/// Publishing a name shows it to the publisher at once.
+///
+/// Everybody who shares a channel with an account is told by a SIP-30 event
+/// when its profile moves, and refetches. The publisher is the one account that
+/// gets no event about itself, so without a write-through it would read its own
+/// name out of a cache an hour old — the header still showing the old name to
+/// the one person who just changed it.
+#[tokio::test]
+async fn publishing_a_name_is_visible_to_the_publisher_without_asking() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+
+    assert_eq!(alice.display_name(&alice_key), None);
+    alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
+
+    // No refresh_profiles, no round trip, no cache to wait out.
+    assert_eq!(
+        alice.display_name(&alice_key).as_deref(),
+        Some("Alice Byrne"),
+        "the publisher was the last to know"
+    );
+    assert_eq!(alice.title_of(&alice_key).as_deref(), Some("shipping"));
+
+    // And clearing it clears it, rather than leaving the old name behind
+    // because an empty write looked like nothing to do.
+    alice.set_profile(named("", "")).await.unwrap();
+    assert_eq!(alice.display_name(&alice_key), None);
+}
+
+/// Wall clock, for tests that have to line up with a write-through taken at
+/// the same clock rather than at a made-up number.
+fn real_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// `/who` is somebody asking who these people are. Answering out of a cache is

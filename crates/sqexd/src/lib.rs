@@ -6,6 +6,7 @@ pub mod challenge;
 pub mod channel;
 pub mod config;
 pub mod device;
+pub mod events;
 pub mod mailbox;
 pub mod prekey;
 pub mod profile;

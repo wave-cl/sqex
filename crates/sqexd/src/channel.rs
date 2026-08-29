@@ -1938,6 +1938,53 @@ impl Channels {
         .flatten()
         .is_some()
     }
+
+    /// Everybody present in a channel.
+    ///
+    /// Narrower than [`info`](Self::info) on purpose: a SIP-30 fan-out wants a
+    /// list of recipients and nothing else, and `info` reads the window, the
+    /// high-water mark, the name and the topic to produce one.
+    ///
+    /// It takes no caller and performs no authorization, because it *is* the
+    /// authorization: what it returns is exactly the set of accounts entitled
+    /// to be told that this channel changed. A caller that filtered this list
+    /// further would be narrowing an answer that is already the right one; a
+    /// caller that added to it would be leaking.
+    pub fn members_of(&self, channel: &[u8; 32]) -> Vec<PubKey> {
+        let db = self.db.lock().unwrap();
+        let Ok(mut stmt) =
+            db.prepare("SELECT account FROM member WHERE channel = ?1 AND present = 1")
+        else {
+            return Vec::new();
+        };
+        stmt.query_map(params![&channel[..]], |r| {
+            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .unwrap_or_default()
+    }
+
+    /// Everybody who shares a channel with `account`, not counting them.
+    ///
+    /// This is the reach of a profile change: SIP-21 says a profile is for the
+    /// people you are already in a room with, so it is also exactly who may be
+    /// told that one changed. The caller still has to drop blocks in either
+    /// direction — this module knows about membership and nothing about who is
+    /// willing to hear from whom.
+    pub fn peers_of(&self, account: &PubKey) -> Vec<PubKey> {
+        let db = self.db.lock().unwrap();
+        let Ok(mut stmt) = db.prepare(
+            "SELECT DISTINCT y.account FROM member x JOIN member y ON x.channel = y.channel
+             WHERE x.account = ?1 AND y.account != ?1 AND x.present = 1 AND y.present = 1",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![account.as_bytes()], |r| {
+            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+        })
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .unwrap_or_default()
+    }
 }
 
 /// Whether a channel's identifier is the derivation over its two members.

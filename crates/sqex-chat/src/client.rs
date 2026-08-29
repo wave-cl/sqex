@@ -322,6 +322,10 @@ pub struct Chat {
     /// A dial in progress, held across ticks so the interface stays live while
     /// it handshakes.
     dialing: Option<Dialing>,
+    /// The SIP-30 event stream, when one is open. `None` means nothing is
+    /// pushing, and the caller is on its own cadence until it resubscribes —
+    /// which is exactly the state a fresh connection starts in.
+    events: Option<crate::events::Stream>,
     /// The account we act for. Membership, roles, direct-message identifiers
     /// and display are all per account.
     pub me: PubKey,
@@ -347,6 +351,7 @@ impl Chat {
             attempts: 0,
             next_dial: Instant::now(),
             dialing: None,
+            events: None,
             me,
             device,
             store,
@@ -443,6 +448,10 @@ impl Chat {
             Ok(Ok(client)) => {
                 self.dialing = None;
                 self.client = client;
+                // The old subscription belonged to the old connection. Dropping
+                // it here rather than letting it error out is what makes
+                // `subscribed()` mean "there is a stream on *this* connection".
+                self.events = None;
                 self.up();
             }
             Ok(Err(_)) => {
@@ -450,6 +459,68 @@ impl Chat {
                 self.down();
             }
         }
+    }
+
+    /// Whether a SIP-30 event stream is open.
+    ///
+    /// False after every reconnect, which is the signal to resubscribe.
+    pub fn subscribed(&self) -> bool {
+        self.events.is_some()
+    }
+
+    /// Open an event stream, if there is not one already.
+    ///
+    /// **A caller must reconcile after this returns, not before.** The exchange
+    /// has the subscription registered by the time this comes back, so anything
+    /// that changes during the reconcile is queued and delivered afterwards. A
+    /// client that read first and subscribed second would lose every change
+    /// that landed in between, and nothing at either end would report it.
+    ///
+    /// Returns whether a new stream was opened, so a caller can tell "already
+    /// subscribed" from "just subscribed, go and reconcile".
+    pub async fn subscribe(&mut self) -> Result<bool> {
+        if self.events.is_some() {
+            return Ok(false);
+        }
+        if self.offline() {
+            return Err(ChatError::Transport("the exchange is unreachable".into()));
+        }
+        match crate::events::Stream::open(&self.client).await {
+            Ok(stream) => {
+                self.events = Some(stream);
+                self.up();
+                Ok(true)
+            }
+            // A refusal came *from* the exchange, so the connection is fine and
+            // must not be put into backoff. There is nothing to retry quickly
+            // either: a client holding too many streams will still hold too
+            // many a second later.
+            Err(crate::events::Refusal::Status(code)) => Err(ChatError::Refused(
+                code,
+                "the exchange would not open an event stream".into(),
+            )),
+            Err(crate::events::Refusal::Transport(e)) => {
+                self.down();
+                Err(ChatError::Transport(e))
+            }
+        }
+    }
+
+    /// Everything the exchange has pushed since this was last called.
+    ///
+    /// Never waits. A stream that has ended, or that has gone quiet for longer
+    /// than its heartbeat allows, is dropped here — so the next
+    /// [`subscribed`](Self::subscribed) reports false and the caller
+    /// resubscribes and reconciles.
+    pub fn take_events(&mut self) -> Vec<sqex_proto::events::Event> {
+        let Some(stream) = self.events.as_mut() else {
+            return Vec::new();
+        };
+        let drained = stream.drain();
+        if drained.ended || stream.stale() {
+            self.events = None;
+        }
+        drained.events
     }
 
     /// This client's own key, as against the account it acts for.
@@ -1715,10 +1786,22 @@ impl Chat {
                 profile::MAX_TITLE
             )));
         }
+        let (name, title) = (profile.name.clone(), profile.title.clone());
         let body = self
             .post("/profile/put", ProfilePut { profile }.encode())
             .await?;
         Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        // Written through to our own store, because nobody will tell us.
+        // Everybody who shares a channel with this account gets a SIP-30
+        // profile event and refetches; the publisher is the one account that
+        // gets no such event about itself, and reading its own name back out
+        // of the cache would have shown the old one until the hour was up.
+        // The publisher being the last to know is a silly way to fail.
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.store.put_profile(&self.me, &name, &title, at)?;
         Ok(())
     }
 

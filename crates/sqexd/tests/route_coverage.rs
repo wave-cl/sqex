@@ -93,6 +93,11 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/channel/redact", Chat("/redact")),
     ("POST", "/channel/signal", Chat("Chat::typing")),
     ("POST", "/channel/fetch", Chat("Chat::poll")),
+    // Not in the dispatch match: an event stream has no body to return, so
+    // it is answered in `handle_stream` before `route` is reached. `served()`
+    // scans for that shape too, or this route would be invisible here — which
+    // is the exact failure this file exists to prevent.
+    ("POST", "/events", Chat("Chat::subscribe")),
     ("POST", "/room/join", Voice("sqex-voice rooms")),
     ("POST", "/room/leave", Voice("sqex-voice rooms")),
     ("POST", "/mailbox/send", Cli("sqex mail send")),
@@ -134,8 +139,43 @@ fn served() -> Vec<(String, String)> {
             from = close;
         }
     }
+    out.extend(handled_early(src));
     out.sort();
     out.dedup();
+    out
+}
+
+/// Routes answered before the dispatch match is reached.
+///
+/// `/events` is one: it holds its response stream open and writes to it for
+/// hours, so it cannot go through a `route` that returns a finished body. That
+/// put it outside the scan this file was built on, and a route this test cannot
+/// see is precisely the thing it exists to catch — so the scan follows.
+///
+/// Matched on the full `method == http::Method::X && path == "..."` shape
+/// rather than on `path ==` alone, because `handle_stream` also compares the
+/// path to pick a body limit, and a body limit is not a route.
+fn handled_early(src: &str) -> Vec<(String, String)> {
+    let start = src
+        .find("async fn handle_stream(")
+        .expect("handle_stream moved or was renamed");
+    let end = src[start..]
+        .find("/// Pure-ish routing")
+        .expect("handle_stream lost the routing doc comment that ends it")
+        + start;
+    let body = &src[start..end];
+
+    let mut out = Vec::new();
+    for method in ["GET", "POST"] {
+        let needle = format!("method == http::Method::{method} && path == \"");
+        let mut from = 0;
+        while let Some(i) = body[from..].find(&needle) {
+            let open = from + i + needle.len();
+            let close = open + body[open..].find('"').expect("unterminated route path");
+            out.push((method.to_string(), body[open..close].to_string()));
+            from = close;
+        }
+    }
     out
 }
 
