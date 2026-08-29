@@ -720,9 +720,9 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         let tint = if s.redacted {
             dim.add_modifier(Modifier::ITALIC)
         } else if mine {
-            Style::default().fg(Color::Indexed(250)).bg(Color::Indexed(18))
+            Style::default().fg(Color::Indexed(253)).bg(Color::Indexed(25))
         } else {
-            Style::default().fg(Color::Indexed(248)).bg(Color::Indexed(236))
+            Style::default().fg(Color::Indexed(253)).bg(Color::Indexed(240))
         };
         let mut spans = Vec::new();
         if !mine {
@@ -752,6 +752,18 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         let used = UnicodeWidthStr::width(line.as_str())
             + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 };
         spans.push(Span::styled(format!(" {line}"), style));
+        // The padding goes *before* what trails the message, so the time ends
+        // at the bubble's right edge rather than trailing off wherever the
+        // words happened to stop. On a message of several lines that is the
+        // difference between a corner and a ragged middle.
+        //
+        // A deleted message needs no special case: it is always one line, so
+        // `content` and `used` are equal and this is the single space of inset
+        // that keeps its words in line with everybody else's.
+        spans.push(Span::styled(
+            " ".repeat(content.saturating_sub(used)),
+            style,
+        ));
         // The time and the markers ride on the last line rather than taking
         // one of their own: a line per message halves how much of a
         // conversation fits on screen, for information most people read only
@@ -759,15 +771,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         if n == last {
             spans.push(Span::styled(tail.clone(), inside));
         }
-        // One space of inset either side, and the rest padding out to the
-        // bubble's width. A deleted message needs no special case here: it is
-        // always one line, so `content` and `used` are equal and this is the
-        // single space — which is what keeps its words in line with everybody
-        // else's rather than flush against the edge.
-        spans.push(Span::styled(
-            " ".repeat(content.saturating_sub(used) + 1),
-            style,
-        ));
+        spans.push(Span::styled(" ", style));
         if mine {
             spans.push(Span::styled(
                 if picked && n == 0 { "◂" } else { " " },
@@ -2630,7 +2634,7 @@ mod tests {
                 .map(|(x, _)| x)
                 .max()
         };
-        let quote = right_of(Color::Indexed(236)).expect("the quotation has no tint");
+        let quote = right_of(Color::Indexed(240)).expect("the quotation has no tint");
         let body = right_of(Color::Indexed(238)).expect("no bubble");
         assert_eq!(quote, body, "the quotation and the message are different widths");
     }
@@ -2658,6 +2662,67 @@ mod tests {
             right_edge(false),
             "a deleted message did not line up with the others"
         );
+    }
+
+    /// Whatever trails a message — the time, and the tick on your own — sits
+    /// against the bubble's right edge, however long the last line is. It used
+    /// to stop wherever the words did, which on a message of several lines is
+    /// a ragged middle rather than a corner.
+    ///
+    /// Measured in columns. Indexing the rendered string instead would be
+    /// wrong wherever a wide character sits earlier in the row, because such a
+    /// character is one symbol and two columns.
+    #[test]
+    fn what_trails_a_message_is_flush_with_the_bubbles_edge() {
+        for mine in [false, true] {
+            let mut app = sample();
+            // Long enough to wrap, so the last line is much shorter than the
+            // bubble is wide — where the old layout left the time in mid-air.
+            let mut s = said(
+                "bob",
+                "8qbHbw2B",
+                mine,
+                "one two three four five six seven eight nine ten eleven twelve thirteen ok",
+                3661,
+            );
+            if mine {
+                s.receipt = Some(Receipt::Read);
+            }
+            app.said = vec![s];
+            let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            t.draw(|f| draw(f, &app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let bg = if mine { Color::Indexed(24) } else { Color::Indexed(238) };
+
+            // The last row of the bubble is the one carrying the trailer.
+            let y = (0..buf.area.height)
+                .rfind(|y| (0..buf.area.width).any(|x| buf[(x, *y)].style().bg == Some(bg)))
+                .expect("no bubble drawn");
+            let painted: Vec<u16> = (0..buf.area.width)
+                .filter(|x| buf[(*x, y)].style().bg == Some(bg))
+                .collect();
+            let edge = *painted.last().unwrap();
+            let last_ink = painted
+                .iter()
+                .copied()
+                .rfind(|x| buf[(*x, y)].symbol().trim() != "")
+                .expect("nothing written in the bubble");
+
+            // One space of inset, and no more: the trailer is against the edge.
+            assert_eq!(
+                last_ink + 1,
+                edge,
+                "what trails the message is not against the bubble's edge \
+                 (mine = {mine}): {:?}",
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            );
+            if mine {
+                // And the tick is the last thing on it.
+                assert_eq!(buf[(last_ink, y)].symbol(), "✓");
+            }
+        }
     }
 
     #[test]
