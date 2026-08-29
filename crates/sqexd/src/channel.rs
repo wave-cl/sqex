@@ -33,12 +33,13 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::channel::{
-    ABANDON_SECS, Invitee, ChannelInfo, Create, Entries, Entry, KIND_MEMBER, KIND_SYSTEM, Listing,
+    ABANDON_SECS, Invitee, ChannelInfo, Create, Directory, Entries, Entry, KIND_MEMBER,
+    KIND_SYSTEM, Listing,
     EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
     EVENT_RETENTION, EVENT_ROTATED, MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled,
     System, direct_message_id,
     ENTRY_HEADER, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
-    MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
+    MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_NAME, MAX_TOPIC,
     MAX_MINE, MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Membership, Mines, Post,
     Posted, Public, Retain, Role, Visibility,
 };
@@ -228,6 +229,15 @@ CREATE TABLE IF NOT EXISTS channel (
     -- admin advance the epoch when it revoked one of its own devices *since*
     -- this moment, so the exchange has to hold the moment.
     epoch_at       INTEGER NOT NULL DEFAULT 0
+);
+-- Accounts this exchange has already shown the front door to.
+--
+-- Kept so that welcoming happens once and not on every request: somebody who
+-- leaves the welcome channel has to stay left, and an exchange that put them
+-- back on their next poll would be arguing with them.
+CREATE TABLE IF NOT EXISTS welcomed (
+    account BLOB PRIMARY KEY,
+    at      INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS member (
     channel BLOB    NOT NULL,
@@ -569,6 +579,111 @@ impl Channels {
 
     /// Join a public channel. A private one MUST refuse, which is what stops an
     /// identifier being a way in.
+    /// The public channel with this name, making it if it is not there.
+    ///
+    /// For the exchange's own use at boot, not for a caller: it takes a name
+    /// rather than an identifier, which no route does, because the whole point
+    /// is that nobody has to be told the identifier to find it.
+    ///
+    /// `founder` becomes its admin. Without one the channel still works —
+    /// anybody may join, read and post — but nothing can rename it or set its
+    /// topic, because SIP-16 puts those behind the admin role and there would
+    /// be no admin. An exchange with `admins` configured has somebody to hand
+    /// it to; one without does not, and a room nobody administers is better
+    /// than no room.
+    pub fn ensure_public(
+        &self,
+        name: &str,
+        founder: Option<&PubKey>,
+    ) -> Result<[u8; 32], ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin ensure_public"))?;
+
+        // By name, because that is what an operator writes in a config file
+        // and what a person types into `/find`. Public names are in the clear,
+        // so this is a question the exchange can answer.
+        let found: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT id FROM channel WHERE visibility = ?1 AND name = ?2
+                 ORDER BY created ASC LIMIT 1",
+                params![Visibility::Public as i64, name],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("look for the welcome channel"))?;
+        if let Some(id) = found {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&id);
+            return Ok(out);
+        }
+
+        let mut channel = [0u8; 32];
+        {
+            use rand::RngCore;
+            rand::rng().fill_bytes(&mut channel);
+        }
+        tx.execute(
+            "INSERT INTO channel
+                (id, visibility, retention_secs, max_entries, name, topic,
+                 epoch, next_seq, creator, created, epoch_at)
+             VALUES (?1, ?2, ?3, 0, ?4, '', 0, 1, ?5, ?6, 0)",
+            params![
+                &channel[..],
+                Visibility::Public as i64,
+                // Thirty days, as a direct message keeps, and inside SIP-16's
+                // bounds. An admin can widen or narrow it with `/retain`.
+                (30 * 24 * 60 * 60_i64),
+                name,
+                founder.map(|f| f.as_bytes().to_vec()).unwrap_or_default(),
+                now as i64,
+            ],
+        )
+        .map_err(storage("create the welcome channel"))?;
+        if let Some(founder) = founder {
+            tx.execute(
+                "INSERT INTO member (channel, account, role, joined, present)
+                 VALUES (?1, ?2, 1, ?3, 1)",
+                params![&channel[..], founder.as_bytes(), now as i64],
+            )
+            .map_err(storage("seat the founder"))?;
+        }
+        tx.commit().map_err(storage("commit ensure_public"))?;
+        Ok(channel)
+    }
+
+    /// Put an account into `channel` the first time it is ever seen.
+    ///
+    /// Returns whether this was that first time. Once only, on purpose:
+    /// leaving has to stick, and an exchange that put somebody back on their
+    /// next request would be overruling them rather than welcoming them.
+    pub fn welcome(&self, account: &PubKey, channel: &[u8; 32]) -> Result<bool, ChannelError> {
+        {
+            let db = self.db.lock().unwrap();
+            let seen: Option<i64> = db
+                .query_row(
+                    "SELECT at FROM welcomed WHERE account = ?1",
+                    params![account.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("look up welcomed"))?;
+            if seen.is_some() {
+                return Ok(false);
+            }
+            db.execute(
+                "INSERT OR IGNORE INTO welcomed (account, at) VALUES (?1, ?2)",
+                params![account.as_bytes(), now_unix() as i64],
+            )
+            .map_err(storage("record welcomed"))?;
+        }
+        // Outside the lock above, because `join` takes it itself. Recorded
+        // first: a join that fails must not leave this account to be welcomed
+        // again on its next request, which would retry for ever.
+        self.join(account, channel)?;
+        Ok(true)
+    }
+
     pub fn join(&self, caller: &PubKey, channel: &[u8; 32]) -> Result<(), ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
@@ -1123,6 +1238,42 @@ impl Channels {
     /// Change a channel's retention policy. Shortening applies to entries
     /// already stored and takes effect at the next prune, not only for new
     /// ones — so this prunes now.
+    /// Rewrite a public channel's directory entry.
+    ///
+    /// Only `create` ever wrote it before, so a public channel renamed by its
+    /// admin changed for everybody in the room and stayed advertised under its
+    /// old name to everybody outside it — two names for one place, and the one
+    /// strangers saw was the stale one.
+    ///
+    /// Public only. A private channel's name is deliberately never given to
+    /// the exchange, because a membership graph with a name on it says
+    /// considerably more than the graph; this refuses rather than stores.
+    pub fn set_directory(
+        &self,
+        caller: &PubKey,
+        req: &Directory,
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin set_directory"))?;
+        if visibility_of(&tx, &req.channel)? != Visibility::Public {
+            return Err(ChannelError::NotPublic);
+        }
+        if !is_admin(&tx, &req.channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        tx.execute(
+            "UPDATE channel SET name = ?2, topic = ?3 WHERE id = ?1",
+            params![
+                &req.channel[..],
+                req.name.chars().take(MAX_NAME).collect::<String>(),
+                req.topic.chars().take(MAX_TOPIC).collect::<String>(),
+            ],
+        )
+        .map_err(storage("update directory"))?;
+        tx.commit().map_err(storage("commit set_directory"))?;
+        Ok(())
+    }
+
     pub fn retain(&self, caller: &PubKey, req: &Retain) -> Result<(), ChannelError> {
         if req.retention_secs < MIN_RETENTION || req.retention_secs > MAX_RETENTION {
             return Err(ChannelError::BadRetention);
@@ -1763,14 +1914,23 @@ fn attached_blobs(db: &Connection, channel: &[u8; 32]) -> Result<Vec<[u8; 32]>, 
 /// relationship the exchange already knows: a per-account visibility list would
 /// be an address book at the exchange, a much larger disclosure than the
 /// profile it protected.
+///
+/// `ignoring` is the welcome channel, and leaving it out is not a detail. A
+/// room every account is put into on sight is shared by *everybody*, so
+/// counting it would make every pair of accounts acquainted and a withheld
+/// profile withheld from nobody — the flag would still be there, still be
+/// settable, and mean nothing. Sharing a lobby is not evidence that two people
+/// know each other, which is the whole of what this predicate is for.
 impl Channels {
-    pub fn share_a_channel(&self, a: &PubKey, b: &PubKey) -> bool {
+    pub fn share_a_channel(&self, a: &PubKey, b: &PubKey, ignoring: Option<&[u8; 32]>) -> bool {
         let db = self.db.lock().unwrap();
+        let skip = ignoring.map(|c| c.to_vec()).unwrap_or_default();
         db.query_row(
             "SELECT 1 FROM member x JOIN member y ON x.channel = y.channel
              WHERE x.account = ?1 AND y.account = ?2 AND x.present = 1 AND y.present = 1
+               AND x.channel != ?3
              LIMIT 1",
-            params![a.as_bytes(), b.as_bytes()],
+            params![a.as_bytes(), b.as_bytes(), skip],
             |r| r.get::<_, i64>(0),
         )
         .optional()

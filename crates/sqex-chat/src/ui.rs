@@ -329,6 +329,14 @@ pub struct App {
     /// make on somebody's behalf. Not drawn — kept here because `/mouse`
     /// toggles it and something has to remember which way it went.
     pub mouse: bool,
+    /// How much a page of scrolling moves, set from the last frame's pane.
+    /// One line short of a screenful either way, so a page keeps a line of
+    /// what was already read and the reader can join the two up.
+    pub page: usize,
+    /// How far back through the conversation the reader has scrolled, in
+    /// lines. Nought is the bottom, which is where a conversation opens and
+    /// where it stays while somebody is reading the newest of it.
+    pub scroll: usize,
     /// The message the pointer is over, as an index into `said`.
     ///
     /// Detail on demand, and only detail: nothing a reader *needs* may live
@@ -552,20 +560,31 @@ pub fn author(name: &str, key: &str, mine: bool) -> String {
     truncate(name, AUTHOR)
 }
 
-/// Which message each row of the screen belongs to.
+/// What the last frame drew, for the caller that has to act on it.
 ///
 /// Returned by [`draw`] rather than recomputed, because a second copy of the
 /// layout is a second copy that can drift from the first — and a pointer that
 /// reports the message above the one under it is worse than no pointer.
 #[derive(Default)]
-pub struct Hover {
+pub struct Drawn {
     /// The transcript's pane. A pointer anywhere else is over nothing.
     pub pane: Rect,
-    /// Indexed by absolute screen row.
+    /// Indexed by absolute screen row: which message is on it.
     pub rows: Vec<Option<usize>>,
+    /// How far back the transcript actually went, after clamping. The caller
+    /// keeps a wish; this is what came of it, and storing it back is what
+    /// stops a held key winding the number up for ever against a short
+    /// conversation.
+    pub scroll: usize,
+    /// Lines in the whole conversation, and how many of them fit. The
+    /// difference in `total` between two frames is how much arrived — which is
+    /// what a reader looking at history has to be moved by in order to stay
+    /// still.
+    pub total: usize,
+    pub room: usize,
 }
 
-impl Hover {
+impl Drawn {
     pub fn at(&self, column: u16, row: u16) -> Option<usize> {
         if !self.pane.contains(Position { x: column, y: row }) {
             return None;
@@ -574,7 +593,7 @@ impl Hover {
     }
 }
 
-pub fn draw(f: &mut Frame, app: &App) -> Hover {
+pub fn draw(f: &mut Frame, app: &App) -> Drawn {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -778,7 +797,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            let mut spans = vec![
+            let mut spans: Vec<Span<'static>> = vec![
                 // Yellow for public: anybody may join and read it, and that is
                 // the one thing about a row worth seeing before you type.
                 Span::styled(
@@ -802,16 +821,20 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
             }
             spans.push(Span::styled(" ", base));
             spans.push(Span::styled(format!("{:<w$}", row_label(r, w), w = w), base));
+            // `base`, not a bare style. The selected row is drawn reversed,
+            // and a span that sets only a foreground keeps the terminal's own
+            // background — so the count and the marker came out as holes
+            // punched through the highlight.
             if r.unread > 0 {
                 spans.push(Span::styled(
                     format!(" {}", r.unread),
-                    Style::default().fg(palette::ATTENTION),
+                    base.fg(palette::ATTENTION),
                 ));
             }
             if r.waiting {
                 // Not an error: they are a member, they have simply never run
                 // a client, so there is nowhere to send a key yet.
-                spans.push(Span::styled(" ·", Style::default().fg(palette::MUTED)));
+                spans.push(Span::styled(" ·", base.fg(palette::MUTED)));
             }
             // A second line, the way every chat client does it: when, and the
             // beginning of what was said. Without it the list says only which
@@ -830,7 +853,23 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
                     if selected { base } else { base.fg(palette::MUTED) },
                 ));
             }
-            ListItem::new(vec![Line::from(spans), Line::from(under)])
+            // Both lines run to the pane's edge, so a selected row is a bar
+            // rather than a highlight that stops wherever the words did.
+            let inner = area.width.saturating_sub(1) as usize;
+            let fill = |line: &mut Vec<Span<'static>>| {
+                let used: usize = line.iter().map(|s| s.content.width()).sum();
+                line.push(Span::styled(" ".repeat(inner.saturating_sub(used)), base));
+            };
+            fill(&mut spans);
+            fill(&mut under);
+            ListItem::new(vec![
+                Line::from(spans),
+                Line::from(under),
+                // A row of air between conversations. Two lines each with
+                // nothing between them read as one block of text; the eye has
+                // to count to work out where one conversation ends.
+                Line::from(""),
+            ])
         })
         .collect();
 
@@ -1162,20 +1201,20 @@ const RUN_GAP: u64 = 5 * 60;
 /// quotation's own width, so a short quote cannot force a wide bubble.
 const QUOTE_FLOOR: usize = 30;
 
-fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Hover {
+fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // The views that are not the conversation have nothing to hover: no rows
     // of theirs belong to a message.
     if app.helping {
         help(f, area);
-        return Hover::default();
+        return Drawn::default();
     }
     if app.searching {
         results(f, app, area);
-        return Hover::default();
+        return Drawn::default();
     }
     if !app.found.is_empty() {
         directory(f, app, area);
-        return Hover::default();
+        return Drawn::default();
     }
     // The header belongs to the conversation, so the views that are not the
     // conversation — the command list, a search, the directory — take the
@@ -1269,8 +1308,23 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Hover {
         owners.push(None);
     }
 
-    let room = area.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(room);
+    let total = lines.len();
+    // A scrolled transcript gives up its last row to say so. Without that,
+    // reading history while messages arrive is silent: they land below the
+    // bottom of the view and nothing on screen says anything came.
+    let scrolled = app.scroll > 0 && total > area.height.saturating_sub(2) as usize;
+    let pane = if scrolled {
+        Rect { height: area.height.saturating_sub(1), ..area }
+    } else {
+        area
+    };
+    let room = pane.height.saturating_sub(2) as usize;
+    // How far back it is possible to go, and how far back we actually went.
+    // The caller's number is a wish: it may be left over from a longer
+    // conversation, or from before the window was resized.
+    let furthest = total.saturating_sub(room);
+    let scroll = app.scroll.min(furthest);
+    let skip = furthest - scroll;
     // A short conversation sits at the bottom, against the input box, rather
     // than floating at the top of an empty pane — where the next message would
     // appear a long way from where somebody is typing.
@@ -1286,17 +1340,27 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Hover {
         // No `Wrap`: the text is already wrapped above, and a wrapped
         // paragraph ignores per-line alignment.
         Paragraph::new(shown).block(Block::default().borders(Borders::NONE)),
-        area,
+        pane,
     );
+    if scrolled {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("─── {scroll} more below · PgDn, or End for the newest ───"),
+                Style::default().fg(palette::ATTENTION),
+            ))
+            .alignment(Alignment::Center)),
+            Rect { y: area.y + area.height - 1, height: 1, ..area },
+        );
+    }
 
     let mut rows = vec![None; height as usize];
     for (n, owner) in owners.into_iter().enumerate() {
-        let y = area.y as usize + n;
+        let y = pane.y as usize + n;
         if y < rows.len() {
             rows[y] = owner;
         }
     }
-    Hover { pane: area, rows }
+    Drawn { pane, rows, scroll, total, room }
 }
 
 /// What a search found, newest first.
@@ -2812,9 +2876,9 @@ mod tests {
     }
 
     /// The screen, and the map from its rows back to the messages on them.
-    fn drawn(app: &App, w: u16, h: u16) -> (Vec<String>, Hover) {
+    fn drawn_at(app: &App, w: u16, h: u16) -> (Vec<String>, Drawn) {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let mut hover = Hover::default();
+        let mut hover = Drawn::default();
         t.draw(|f| hover = draw(f, app)).unwrap();
         let buf = t.backend().buffer().clone();
         let rows = (0..buf.area.height)
@@ -2833,7 +2897,7 @@ mod tests {
     /// header names the same person the run header does, and a search over the
     /// whole screen finds that one — which belongs to no message, and made
     /// this look like a bug in the map.
-    fn row_of(rows: &[String], hover: &Hover, text: &str) -> u16 {
+    fn row_of(rows: &[String], hover: &Drawn, text: &str) -> u16 {
         rows.iter()
             .enumerate()
             .skip(hover.pane.y as usize)
@@ -2842,13 +2906,177 @@ mod tests {
             .0 as u16
     }
 
+    /// The selected row is drawn reversed, and a span that sets only a
+    /// foreground keeps the terminal's own background — so the unread count
+    /// and the waiting marker came out as holes punched through the
+    /// highlight, and the highlight itself stopped wherever the words did.
+    #[test]
+    fn a_selected_row_is_a_solid_bar_across_the_list() {
+        let mut app = sample();
+        app.rows[0].unread = 3;
+        app.rows[0].waiting = true;
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
+        let buf = t.backend().buffer().clone();
+
+        // The row the cursor is on: every cell up to the list's border has to
+        // be part of the same bar.
+        // Asserted on the *reversal*, which is what selection is drawn with.
+        // Not on whether a cell has a background: the widget leaves one on
+        // very nearly every cell, so that question is answered yes almost
+        // wherever it is asked and a test built on it cannot fail.
+        //
+        // Columns 3 onwards: 0 is the public marker, 1 and 2 are the
+        // identicon — which has colours of its own and must keep them — and
+        // 29 is the list's border.
+        let y = 2;
+        let reversed = |x: u16| {
+            buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(reversed(4), "the row is not highlighted at all");
+        let holes: Vec<u16> = (3..29).filter(|x| !reversed(*x)).collect();
+        assert!(
+            holes.is_empty(),
+            "the highlight has holes in it at columns {holes:?}"
+        );
+    }
+
+    /// Two lines each, with nothing between them, read as one block of text:
+    /// the eye has to count to find where a conversation ends.
+    #[test]
+    fn conversations_are_separated_by_a_blank_line() {
+        let mut app = sample();
+        // Both rows need a second line with something on it, or the blank one
+        // this is looking for is just an empty preview and the test cannot
+        // tell the margin from its absence.
+        app.rows[0].at = 3661;
+        app.rows[0].preview = "see you then".into();
+        app.rows.push(Row {
+            channel: [9; 32],
+            label: "carol".into(),
+            key: Some(CAROL.into()),
+            group: false,
+            public: false,
+            unread: 0,
+            preview: "hello".into(),
+            at: 3661,
+            waiting: false,
+        });
+        let rows: Vec<String> = render(&app, 100, 24)
+            .lines()
+            .map(|l| l.chars().take(29).collect::<String>())
+            .collect();
+        let first = rows.iter().position(|r| r.contains("bob")).unwrap();
+        let second = rows.iter().position(|r| r.contains("carol")).unwrap();
+        assert!(
+            rows[second - 1].trim().is_empty(),
+            "no air between the conversations: {:?}",
+            &rows[first..=second]
+        );
+    }
+
+    /// A long conversation used to show only its tail, and there was no way
+    /// back: not the wheel, not a key, nothing.
+    #[test]
+    fn scrolling_back_reaches_what_the_tail_hid() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .collect();
+        let bottom = render(&app, 100, 24);
+        assert!(bottom.contains("message number 59"), "{bottom}");
+        assert!(!bottom.contains("message number 0 "), "nothing was hidden to find");
+
+        // Far enough back to reach the first of them.
+        app.scroll = 500;
+        let top = render(&app, 100, 24);
+        assert!(
+            top.contains("message number 0 "),
+            "scrolling did not reach the oldest:\n{top}"
+        );
+        assert!(!top.contains("message number 59"), "it did not move at all");
+    }
+
+    /// A wish, not an instruction: it may be left from a longer conversation
+    /// or a taller window, and a held key would otherwise wind it up for ever.
+    #[test]
+    fn scrolling_stops_at_the_oldest_line() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .collect();
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        app.scroll = usize::MAX;
+        let mut drawn = Drawn::default();
+        t.draw(|f| drawn = draw(f, &app)).unwrap();
+        let far = drawn.scroll;
+        assert!(far > 0 && far < 500, "clamped to {far}");
+
+        // Asking for more does not go further, and the screen does not change.
+        app.scroll = far;
+        let a = render(&app, 100, 24);
+        app.scroll = far + 50;
+        assert_eq!(a, render(&app, 100, 24), "it moved past the oldest line");
+    }
+
+    /// Reading history while messages arrive has to say they arrived: they
+    /// land below the bottom of the view, where nothing shows them.
+    #[test]
+    fn a_scrolled_transcript_says_there_is_more_below() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .collect();
+        assert!(!render(&app, 100, 24).contains("more below"), "at the bottom");
+        app.scroll = 20;
+        let out = render(&app, 100, 24);
+        assert!(out.contains("more below"), "no mark of being scrolled:\n{out}");
+        assert!(out.contains("End"), "and nothing says how to get back:\n{out}");
+    }
+
+    /// The map from rows to messages has to move with the view, or hovering
+    /// scrolled-back history names whatever happens to be at that row now.
+    #[test]
+    fn the_map_follows_the_scroll() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .collect();
+        app.scroll = 20;
+        let (rows, drawn) = drawn_at(&app, 100, 24);
+        // Whatever is on screen at this depth — asked of the screen rather
+        // than worked out here, since how many lines a message takes is the
+        // layout's business and not this test's.
+        let mut checked = 0;
+        for (y, row) in rows.iter().enumerate() {
+            // The pane only: a row is the whole screen, and the conversation
+            // list down the left has words of its own.
+            let pane: String = row.chars().skip(drawn.pane.x as usize).collect();
+            let Some(rest) = pane.trim().strip_prefix("message number ") else {
+                continue;
+            };
+            let n: usize = rest.split_whitespace().next().unwrap().parse().unwrap();
+            assert_eq!(
+                drawn.at(drawn.pane.x + 1, y as u16),
+                Some(n),
+                "row {y} shows message {n} and the map says otherwise"
+            );
+            checked += 1;
+        }
+        assert!(checked > 3, "only {checked} messages were on screen to check");
+    }
+
     /// The map has to come from the frame that drew it. A second copy of the
     /// layout can disagree with the first, and a pointer that names the
     /// message above the one under it is worse than no pointer.
     #[test]
     fn the_row_a_message_is_drawn_on_names_that_message() {
         let app = sample();
-        let (rows, hover) = drawn(&app, 100, 24);
+        let (rows, hover) = drawn_at(&app, 100, 24);
         let x = hover.pane.x + 1;
         for (want, text) in [(0usize, "are you there?"), (1, "i am")] {
             let y = row_of(&rows, &hover, text);
@@ -2866,7 +3094,7 @@ mod tests {
     fn the_whole_bubble_belongs_to_its_message() {
         let mut app = sample();
         app.said[0].reactions = vec![("🧡".into(), 1, false)];
-        let (rows, hover) = drawn(&app, 100, 24);
+        let (rows, hover) = drawn_at(&app, 100, 24);
         let x = hover.pane.x + 1;
         for text in ["bob", "are you there?", "🧡"] {
             let y = row_of(&rows, &hover, text);
@@ -2892,7 +3120,7 @@ mod tests {
                 )
             })
             .collect();
-        let (rows, hover) = drawn(&app, 100, 24);
+        let (rows, hover) = drawn_at(&app, 100, 24);
         let x = hover.pane.x + 1;
         // The newest is on screen; the oldest has scrolled off.
         let y = row_of(&rows, &hover, "message number 39");
@@ -2910,7 +3138,7 @@ mod tests {
     fn what_is_not_a_message_belongs_to_nobody() {
         let mut app = sample();
         app.said[1].at = app.said[0].at + 60 * 60 * 30;
-        let (rows, hover) = drawn(&app, 100, 24);
+        let (rows, hover) = drawn_at(&app, 100, 24);
         let x = hover.pane.x + 1;
         let y = row_of(&rows, &hover, "───");
         assert_eq!(hover.at(x, y), None, "a day separator claimed to be a message");

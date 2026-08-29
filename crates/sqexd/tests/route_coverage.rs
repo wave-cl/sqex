@@ -77,6 +77,9 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/channel/post", Chat("Chat::send_body")),
     ("POST", "/channel/info", Chat("Chat::info")),
     ("POST", "/channel/retain", Chat("/retain")),
+    // `/name` and `/topic` on a public channel: the sealed entry members fold
+    // goes to `/channel/post`, and this is the directory copy strangers search.
+    ("POST", "/channel/directory", Chat("/name")),
     ("POST", "/channel/close", Chat("/close yes")),
     ("POST", "/channel/mine", Chat("Chat::mine")),
     ("POST", "/channel/list", Chat("/find")),

@@ -31,7 +31,8 @@ use sqex_proto::channel::{
     Ack as ChannelAck, ByChannel, ByTarget, Cursor as ChannelCursor, Invitee,
     SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
     ByAccount as ChannelByAccount, Invite as ChannelInvite, List as ChannelList, Mine as ChannelMine,
-    Post as ChannelPost, TYPE_REMOVE as CH_REMOVE, Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
+    Directory as ChannelDirectory, Post as ChannelPost, TYPE_REMOVE as CH_REMOVE,
+    Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
 use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
@@ -152,6 +153,13 @@ pub struct Server {
     live_conns: Connections,
     started: Instant,
     connections: AtomicU64,
+    /// The channel every account is put into the first time it is seen.
+    ///
+    /// Resolved once at boot rather than looked up per request: it is a name
+    /// in a config file and an identifier everywhere else, and doing that
+    /// translation on the request path would be a query per request for an
+    /// answer that never changes.
+    welcome: Option<[u8; 32]>,
 }
 
 impl Server {
@@ -225,11 +233,14 @@ pub async fn bind(
         .local_addr()
         .map_err(|e| Error::Malformed(format!("cannot read local address: {e}")))?;
 
+    let welcome_name = config.welcome_channel.clone();
+    let founder = config.admins.first().copied();
     let server = Arc::new(Server {
         public_key,
         config_path,
         state: Mutex::new(state),
         admins: RwLock::new(config.admins),
+        welcome: None,
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
         mailbox: Mailbox::new(),
@@ -274,6 +285,36 @@ pub async fn bind(
         started: Instant::now(),
         connections: AtomicU64::new(0),
     });
+
+    // The front door, made once and found by name thereafter. An exchange
+    // with nothing in it is a room with no doors: a new account can reach
+    // nobody, and be reached by nobody, until somebody hands it a sixty-four
+    // character identifier out of band.
+    //
+    // The first configured administrator becomes its admin. Without one the
+    // channel is still a channel — anybody may join, read and post — but
+    // nothing can rename it or set its topic, because SIP-16 puts those behind
+    // a role there would be nobody to hold. A room nobody administers beats no
+    // room.
+    let mut server = server;
+    if !welcome_name.is_empty() {
+        match server.channels.ensure_public(&welcome_name, founder.as_ref()) {
+            Ok(channel) => {
+                Arc::get_mut(&mut server)
+                    .expect("nothing else holds this yet")
+                    .welcome = Some(channel);
+                tracing::info!(
+                    channel = %bs58::encode(channel).into_string(),
+                    admin = ?founder.map(|f| f.to_string()),
+                    "welcome channel #{welcome_name}"
+                );
+            }
+            // Not fatal. An exchange that refused to start because it could
+            // not make a convenience would be trading the whole service for
+            // part of one.
+            Err(e) => tracing::warn!("no welcome channel: {e:?}"),
+        }
+    }
 
     Ok(Bound {
         listener,
@@ -488,6 +529,19 @@ async fn route(
     let device = peer.identity;
     let account = device.map(|d| server.devices.account_for(&d));
 
+    // The front door, held open once per account.
+    //
+    // Here rather than on one particular route because there is no single
+    // request a new account always makes first — a client publishes prekeys, a
+    // CLI might list channels, a linked device registers. `welcome` is a
+    // no-op after the first time, and it is the only thing on this path that
+    // touches an account's membership without being asked to.
+    if let (Some(me), Some(channel)) = (account, server.welcome)
+        && let Err(e) = server.channels.welcome(&me, &channel)
+    {
+        tracing::warn!("could not welcome {me}: {e:?}");
+    }
+
     match (method, path) {
         ("GET", "/health") => (
             200,
@@ -594,7 +648,12 @@ async fn route(
             (None, _) => no_identity("reading a profile"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => {
-                let shares = |a: &PubKey, b: &PubKey| server.channels.share_a_channel(a, b);
+                // The welcome channel does not count towards knowing
+                // somebody: everybody is in it, so counting it would leave a
+                // withheld profile withheld from nobody.
+                let shares = |a: &PubKey, b: &PubKey| {
+                    server.channels.share_a_channel(a, b, server.welcome.as_ref())
+                };
                 match server.profiles.get(&me, &req.account, &shares) {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
                     Err(e) => (
@@ -893,6 +952,14 @@ async fn route(
             (None, _) => no_identity("setting retention"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
             (Some(me), Ok(req)) => match server.channels.retain(&me, &req) {
+                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/directory") => match (account, ChannelDirectory::decode(body)) {
+            (None, _) => no_identity("naming a channel"),
+            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (Some(me), Ok(req)) => match server.channels.set_directory(&me, &req) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
             },

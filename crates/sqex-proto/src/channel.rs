@@ -48,6 +48,12 @@ pub const TYPE_CURSORS: u8 = 0x0d;
 pub const TYPE_REDACT: u8 = 0x0e;
 pub const TYPE_CLOSE: u8 = 0x0f;
 pub const TYPE_MINE: u8 = 0x10;
+/// Set a **public** channel's name and topic in the exchange's directory.
+///
+/// Only public. A private channel's name is deliberately never given to the
+/// exchange — a membership graph with a name on it says considerably more than
+/// the graph — and this route refuses one rather than storing it.
+pub const TYPE_DIRECTORY: u8 = 0x11;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.
@@ -461,6 +467,69 @@ impl Fetch {
             // the exchange will is not making an error, and answering early is
             // always permitted.
             wait_secs: u16at(b, 41).min(MAX_WAIT),
+        })
+    }
+}
+
+/// A public channel's directory entry: what strangers see before they join.
+///
+/// Separate from the sealed metadata entry that members fold, and it has to
+/// be. The entry is what a member sees; this is what the *directory* holds,
+/// and until now only `create` ever wrote it — so renaming a public channel
+/// changed it for everybody in it and left the room advertised under its old
+/// name for everybody who was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Directory {
+    pub channel: [u8; 32],
+    pub name: String,
+    pub topic: String,
+}
+
+impl Directory {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(36 + self.name.len() + self.topic.len());
+        out.push(TYPE_DIRECTORY);
+        out.extend_from_slice(&self.channel);
+        out.push(self.name.len() as u8);
+        out.extend_from_slice(self.name.as_bytes());
+        out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.topic.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Directory> {
+        if b.len() < 36 {
+            return Err(Error::Malformed(format!(
+                "directory is {} bytes, want at least 36",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_DIRECTORY {
+            return Err(Error::Malformed(format!(
+                "not a directory entry (type {:#x})",
+                b[0]
+            )));
+        }
+        let channel: [u8; 32] = b[1..33].try_into().unwrap();
+        let name_len = b[33] as usize;
+        let after_name = 34 + name_len;
+        if b.len() < after_name + 2 {
+            return Err(Error::Malformed("directory name runs past the end".into()));
+        }
+        let name = String::from_utf8(b[34..after_name].to_vec())
+            .map_err(|_| Error::Malformed("directory name is not utf-8".into()))?;
+        let topic_len =
+            u16::from_be_bytes([b[after_name], b[after_name + 1]]) as usize;
+        let start = after_name + 2;
+        if b.len() != start + topic_len {
+            return Err(Error::Malformed("directory topic runs past the end".into()));
+        }
+        let topic = String::from_utf8(b[start..start + topic_len].to_vec())
+            .map_err(|_| Error::Malformed("directory topic is not utf-8".into()))?;
+        Ok(Directory {
+            channel,
+            name,
+            topic,
         })
     }
 }

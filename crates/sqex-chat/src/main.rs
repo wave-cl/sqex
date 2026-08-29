@@ -667,7 +667,7 @@ async fn event_loop(
     }
 
     let mut poll_at = tokio::time::Instant::now();
-    let mut hover = ui::Hover::default();
+    let mut hover = ui::Drawn::default();
     loop {
         let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
         refresh(app, open, &chat.me, &names);
@@ -676,9 +676,22 @@ async fn event_loop(
         // second copy of the layout could disagree with the first, and a
         // pointer that names the message above the one under it is worse than
         // no pointer at all.
+        let was = (hover.total, app.scroll);
         terminal
             .draw(|f| hover = ui::draw(f, app))
             .map_err(|e| e.to_string())?;
+        // What the wish came to. Storing it back is what keeps a held PgUp
+        // from winding the number past the top of a short conversation, and
+        // what makes `Home` — which asks for `usize::MAX` — land exactly at
+        // the oldest line rather than somewhere unrepresentable.
+        app.scroll = hover.scroll;
+        app.page = hover.room.saturating_sub(2).max(1);
+        // Somebody reading history stays where they are when a message
+        // arrives. The lines all sit below them, so without this the text
+        // would creep upward under their eyes at every poll.
+        if was.1 > 0 && hover.total > was.0 {
+            app.scroll += hover.total - was.0;
+        }
         if app.should_quit {
             return Ok(());
         }
@@ -704,6 +717,23 @@ async fn event_loop(
                         continue;
                     }
                     app.hovered = over;
+                }
+                // The wheel, when the client has the mouse. Three lines a
+                // notch is what a terminal pager does and what a hand
+                // expects; one is treacle and a page is a jump.
+                Event::Mouse(m)
+                    if app.mouse
+                        && matches!(
+                            m.kind,
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        ) =>
+                {
+                    let back = m.kind == MouseEventKind::ScrollUp;
+                    app.scroll = if back {
+                        app.scroll + 3
+                    } else {
+                        app.scroll.saturating_sub(3)
+                    };
                 }
                 // Click a message to take its author's key. The transcript
                 // stopped showing keys, so this is one of the three ways back
@@ -1181,14 +1211,26 @@ async fn handle_key(
     }
 
     match code {
+        // Changing conversation lands at the newest of the new one. Carrying
+        // a line offset across would put somebody at an arbitrary depth in a
+        // conversation they have just arrived in.
         KeyCode::Tab | KeyCode::Down => {
             app.select_next();
+            app.scroll = 0;
             clear_unread(open, app);
         }
         KeyCode::BackTab | KeyCode::Up => {
             app.select_previous();
+            app.scroll = 0;
             clear_unread(open, app);
         }
+        // Scrolling from the keyboard, because the wheel needs `/mouse on`
+        // and the mouse stays the terminal's until it is asked for. A feature
+        // that only exists in a mode nobody has turned on is not one.
+        KeyCode::PageUp => app.scroll += app.page,
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(app.page),
+        KeyCode::End => app.scroll = 0,
+        KeyCode::Home => app.scroll = usize::MAX,
         KeyCode::Backspace => {
             app.input.pop();
         }

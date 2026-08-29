@@ -25,7 +25,14 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n",
+        // No welcome channel here. Every test in this file counts what an
+        // account is a member of, and an exchange that puts everybody into
+        // `general` on sight moves that baseline by one — which would be
+        // measuring the front door rather than what these are about. It has
+        // its own file. The other flow tests are left on the default, so the
+        // ordinary configuration is still the one most of the suite runs.
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );

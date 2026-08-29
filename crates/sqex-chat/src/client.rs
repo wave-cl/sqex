@@ -1317,15 +1317,43 @@ impl Chat {
         let mut scratch = Timeline::new();
         let _ = self.poll(channel, &mut scratch, 0).await;
         let held = self.history(channel, &admins)?;
-        self.send_body(
-            channel,
-            Body::Metadata {
-                name: name.unwrap_or(&held.name).to_string(),
-                topic: topic.unwrap_or(&held.topic).to_string(),
-                avatar: avatar.unwrap_or_else(|| held.avatar.clone()),
-            },
-        )
-        .await
+        let name = name.unwrap_or(&held.name).to_string();
+        let topic = topic.unwrap_or(&held.topic).to_string();
+        let posted = self
+            .send_body(
+                channel,
+                Body::Metadata {
+                    name: name.clone(),
+                    topic: topic.clone(),
+                    avatar: avatar.unwrap_or_else(|| held.avatar.clone()),
+                },
+            )
+            .await?;
+
+        // And the directory, for a public channel only.
+        //
+        // The entry above is what members fold; the directory is what somebody
+        // who has never been here searches. Until now only `create` wrote the
+        // second, so renaming a public channel changed it for everybody in the
+        // room and left it advertised under its old name to everybody outside
+        // — two names for one place, and strangers got the stale one.
+        //
+        // Public only, and the exchange refuses otherwise: a private channel's
+        // name is deliberately never given to it, because a membership graph
+        // with a name on it says considerably more than the graph.
+        if info.visibility == Visibility::Public {
+            self.post(
+                "/channel/directory",
+                sqex_proto::channel::Directory {
+                    channel: *channel,
+                    name,
+                    topic,
+                }
+                .encode(),
+            )
+            .await?;
+        }
+        Ok(posted)
     }
 
     /// Add somebody, and give them the key.

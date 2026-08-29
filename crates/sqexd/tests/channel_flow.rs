@@ -27,7 +27,12 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
         std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
     }
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n",
+        // No welcome channel: these count what an account is in and what the
+        // directory holds, and one that puts everybody into `general` on
+        // sight moves both baselines. The front door has its own tests, in
+        // sqex-chat's `public_join_flow`.
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );

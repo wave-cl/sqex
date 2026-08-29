@@ -22,6 +22,10 @@ fn default_challenge_ttl() -> u64 {
     30
 }
 
+fn default_welcome_channel() -> String {
+    "general".to_string()
+}
+
 /// The TOML file's shape. Every field except `key_file` has a default.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +50,15 @@ pub struct FileConfig {
     #[serde(default = "default_challenge_ttl")]
     pub challenge_ttl_secs: u64,
 
+    /// A public channel every account is put into the first time it appears,
+    /// created on first boot if it is not there. Empty turns it off.
+    ///
+    /// An exchange with nothing in it is a room with no doors: a new account
+    /// can find nobody and be found by nobody until somebody hands it a
+    /// sixty-four character key out of band. This is the front door.
+    #[serde(default = "default_welcome_channel")]
+    pub welcome_channel: String,
+
     /// The sQUIC envelope versions this server parses (SIP-29). Omitted means
     /// squic's own default, which is both. Narrowing it to `[2]` retires
     /// version 1, after which clients older than sqex v0.11.0 cannot reach
@@ -67,6 +80,8 @@ pub struct Config {
     pub admins: Vec<PubKey>,
     pub seed_whitelist: Vec<PubKey>,
     pub challenge_ttl: std::time::Duration,
+    /// The channel every account joins on first sight. Empty is off.
+    pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
 }
 
@@ -96,6 +111,7 @@ impl FileConfig {
             admins,
             seed_whitelist,
             challenge_ttl: std::time::Duration::from_secs(self.challenge_ttl_secs.max(1)),
+            welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
         })
     }
