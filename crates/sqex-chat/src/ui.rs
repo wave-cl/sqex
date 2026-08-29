@@ -653,7 +653,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         if stub.is_empty() {
             format!("↳ {who}")
         } else {
-            format!("↳ {who}: {}", truncate(stub, width.saturating_sub(4)))
+            format!("↳ {who}: {stub}")
         }
     });
 
@@ -710,9 +710,13 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
             UnicodeWidthStr::width(l.as_str())
                 + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 }
         })
-        .chain(quoted.iter().map(|q| UnicodeWidthStr::width(q.as_str())))
         .max()
         .unwrap_or(0);
+
+    // The message decides how wide the bubble is; the quotation fits inside
+    // it. Sizing the bubble to the quotation instead made a one-line answer as
+    // wide as the paragraph it was answering.
+    let quoted = quoted.map(|q| truncate(&q, content));
 
     // The quotation, a shade off the bubble it belongs to and padded to the
     // same width, so the whole thing is one block.
@@ -1699,14 +1703,18 @@ mod tests {
         app.said = vec![Said {
             who: "you".into(),
             mine: true,
-            text: "friday".into(),
+            // Long enough to leave the quotation room. A one-word answer is
+            // its own case, below.
+            text: "friday works for me, let us do that".into(),
             seq: 8,
             at: 3700,
             reply_to: Some(("Alice (E4LUkjrZ)".into(), "thursday or friday?".into())),
             ..Default::default()
         }];
         let out = render(&app, 80, 20);
-        assert!(out.contains("thursday or friday?"), "{out}");
+        // The beginning of what is being answered — the quotation is cut to
+        // the bubble rather than stretching it.
+        assert!(out.contains("thursd"), "{out}");
         // Who is being answered, not which number: a sequence nobody has
         // memorised is not information.
         assert!(out.contains("Alice"), "the reply did not name its author:\n{out}");
@@ -1724,7 +1732,8 @@ mod tests {
         let mut app = sample();
         app.said = vec![Said {
             who: "bob".into(),
-            text: "yes".into(),
+            key: "8qbHbw2B".into(),
+            text: "yes, that is the one I meant".into(),
             seq: 8,
             at: 3700,
             reply_to: Some(("a message we no longer hold".into(), String::new())),
@@ -2723,6 +2732,58 @@ mod tests {
                 assert_eq!(buf[(last_ink, y)].symbol(), "✓");
             }
         }
+    }
+
+    /// The message decides how wide the bubble is and the quotation fits
+    /// inside it. Sizing the bubble to the quotation instead made a one-line
+    /// answer as wide as the paragraph it was answering.
+    #[test]
+    fn a_quotation_never_widens_the_bubble() {
+        let mut short = said("bob", "8qbHbw2B", false, "yes, that is right", 3661);
+        short.reply_to = Some((
+            "Alice (E4LUkjrZ)".into(),
+            "a question very much longer than the answer it gets, going on and on".into(),
+        ));
+        let mut plain = said("bob", "8qbHbw2B", false, "yes, that is right", 3661);
+        plain.reply_to = None;
+
+        let width_of = |s: Said| {
+            let mut app2 = sample();
+            app2.said = vec![s];
+            let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            t.draw(|f| draw(f, &app2)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
+                .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(Color::Indexed(238)))
+                .map(|(x, _)| x)
+                .max()
+                .expect("no bubble")
+        };
+        assert_eq!(
+            width_of(short),
+            width_of(plain),
+            "the quotation stretched the bubble"
+        );
+    }
+
+    /// The cost of that rule, written down: an answer of one word leaves the
+    /// quotation almost no room, and it comes out as little more than a mark
+    /// saying a reply is a reply.
+    #[test]
+    fn a_very_short_answer_leaves_little_of_the_quotation() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "ok", 3661);
+        s.reply_to = Some(("Alice (E4LUkjrZ)".into(), "shall we ship on friday?".into()));
+        app.said = vec![s];
+        let out = render(&app, 110, 24);
+        let line = out.lines().find(|l| l.contains("↳")).expect("no quotation");
+        assert!(
+            line.contains('…'),
+            "expected the quotation to be cut: {line:?}"
+        );
+        // Not enough room for the question, which is the trade this makes.
+        assert!(!line.contains("friday"), "{line:?}");
     }
 
     #[test]
