@@ -21,6 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use sqnr_core::PubKey;
+use unicode_width::UnicodeWidthStr;
 
 /// One row in the conversation list.
 pub struct Row {
@@ -491,17 +492,40 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(spans));
 
         if !s.reactions.is_empty() && !s.redacted {
-            let mut row = vec![Span::raw(
-                " ".repeat(clock(s.at).chars().count() + AUTHOR + 2),
-            )];
+            let indent = clock(s.at).chars().count() + AUTHOR + 2;
+            let mut row = vec![Span::raw(" ".repeat(indent))];
+            // A reaction is up to 32 bytes chosen by whoever sent it, and a
+            // message can carry a distinct one per emoji per account — so both
+            // the width of a chip and the number of them are somebody else's
+            // decision. Fit what fits and count the rest, measuring the way
+            // ratatui lays out rather than by counting characters, or an emoji
+            // is reckoned one column and the row runs off the end.
+            let budget = (area.width as usize).saturating_sub(indent + 8);
+            let mut used = 0;
+            let mut shown = 0;
             for (emoji, count, mine) in &s.reactions {
+                let chip = format!("{emoji} {count}  ");
+                let w = UnicodeWidthStr::width(chip.as_str());
+                if used + w > budget {
+                    break;
+                }
+                used += w;
+                shown += 1;
                 row.push(Span::styled(
-                    format!("{emoji} {count}  "),
+                    chip,
                     if *mine {
                         Style::default().fg(Color::Yellow)
                     } else {
                         Style::default().fg(Color::DarkGray)
                     },
+                ));
+            }
+            // Said, not dropped: a count that quietly omitted some would be
+            // telling the reader a number that is not the number.
+            if shown < s.reactions.len() {
+                row.push(Span::styled(
+                    format!("+{}", s.reactions.len() - shown),
+                    Style::default().fg(Color::DarkGray),
                 ));
             }
             lines.push(Line::from(row));
@@ -1304,6 +1328,60 @@ mod tests {
                 "a long name pushed the key out at width {width}: {line}"
             );
         }
+    }
+
+    /// A reaction is up to 32 bytes chosen by another client, and a message
+    /// can carry one per emoji per account — so how wide the row gets is
+    /// somebody else's decision unless this bounds it.
+    #[test]
+    fn a_reaction_row_cannot_be_pushed_off_the_screen() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "bob".into(),
+            key: "8qbHbw2B".into(),
+            text: "x".into(),
+            seq: 1,
+            at: 0,
+            reactions: (0..40)
+                .map(|i| (format!("{}\u{fe0f}", char::from(b'a' + i as u8 % 26)), 1, false))
+                .collect(),
+            ..Default::default()
+        }];
+        let out = render(&app, 80, 12);
+        for l in out.lines() {
+            assert!(
+                UnicodeWidthStr::width(l) <= 80,
+                "a line ran past the screen ({} cols): {l:?}",
+                UnicodeWidthStr::width(l)
+            );
+        }
+        // And the ones that did not fit are counted rather than dropped in
+        // silence.
+        assert!(out.contains('+'), "the hidden reactions were not counted:\n{out}");
+    }
+
+    /// The ordinary case still draws every reaction, with no "+n".
+    #[test]
+    fn a_few_reactions_all_fit() {
+        let mut app = sample();
+        app.said = vec![Said {
+            who: "bob".into(),
+            key: "8qbHbw2B".into(),
+            text: "x".into(),
+            seq: 1,
+            at: 0,
+            reactions: vec![
+                ("👍".into(), 2, true),
+                ("🎉".into(), 1, false),
+                ("👀".into(), 3, false),
+            ],
+            ..Default::default()
+        }];
+        let out = render(&app, 100, 12);
+        for e in ["👍", "🎉", "👀"] {
+            assert!(out.contains(e), "{e} was dropped:\n{out}");
+        }
+        assert!(!out.contains('+'), "a full row claimed to be truncated:\n{out}");
     }
 
     #[test]

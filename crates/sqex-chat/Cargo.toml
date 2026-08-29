@@ -30,6 +30,9 @@ sha2 = "0.10"
 rpassword = "7"
 ratatui = "0.29"
 crossterm = "0.28"
+# The same crate ratatui lays out with, so what this client measures and what
+# it draws agree. Used to keep a reaction row from drifting.
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
