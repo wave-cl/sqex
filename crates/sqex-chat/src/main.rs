@@ -2121,6 +2121,15 @@ fn name_map(chat: &Chat, open: &[Open], conv: Option<&Open>) -> HashMap<PubKey, 
         if let Some(peer) = o.peer {
             want(peer, &mut out);
         }
+        // And whoever spoke last in a group, because the row previews them by
+        // name. Without this the name resolved only for the conversation on
+        // screen, so the same row read "Tim: Hey" while you were in it and
+        // "9kSYePuJ: Hey" while you were anywhere else.
+        if o.peer.is_none()
+            && let Some(last) = o.timeline.messages().last()
+        {
+            want(last.account, &mut out);
+        }
     }
     // And whoever spoke in the conversation on screen.
     if let Some(conv) = conv {
