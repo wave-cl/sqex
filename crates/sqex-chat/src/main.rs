@@ -1027,8 +1027,12 @@ async fn handle_key(
         return;
     }
 
-    // The directory is a view over the transcript, so Esc puts it away rather
-    // than leaving the reader stuck looking at a search.
+    // The directory and the command list are views over the transcript, so Esc
+    // puts them away rather than leaving the reader stuck looking at one.
+    if code == KeyCode::Esc && app.helping {
+        app.helping = false;
+        return;
+    }
     if code == KeyCode::Esc && !app.found.is_empty() {
         app.found.clear();
         return;
@@ -1183,6 +1187,10 @@ async fn handle_key(
             // than about a conversation, and blocking in particular must work
             // when there is nothing open: somebody being written to by a
             // stranger should not have to open the conversation to stop it.
+            if matches!(cmd, Command::Help) {
+                app.helping = true;
+                return;
+            }
             if matches!(
                 cmd,
                 Command::Profile(_) | Command::Block(_) | Command::Unblock(_) | Command::Blocked
@@ -1223,7 +1231,8 @@ async fn handle_key(
                 | Command::Profile(_)
                 | Command::Block(_)
                 | Command::Unblock(_)
-                | Command::Blocked => Ok(None),
+                | Command::Blocked
+                | Command::Help => Ok(None),
                 Command::Name(name) => match chat.set_name(&channel, &name).await {
                     Ok(_) => Ok(Some(format!("renamed to {name}"))),
                     Err(e) => Err(e),
@@ -1502,6 +1511,8 @@ enum Command {
     Unblock(String),
     /// `/blocked` — who we have blocked. Answered to nobody else.
     Blocked,
+    /// `/help` — everything the client can do, over the transcript.
+    Help,
     /// `/op <key>` — make somebody an admin here, so they can rename it,
     /// invite, remove and set retention.
     Op(String),
@@ -1615,6 +1626,7 @@ impl Command {
             "/unblock" if !first.is_empty() => Command::Unblock(first.to_string()),
             "/unblock" => Command::Unknown("/unblock needs a public key".into()),
             "/blocked" => Command::Blocked,
+            "/help" | "/?" => Command::Help,
             "/op" if !first.is_empty() => Command::Op(first.to_string()),
             "/op" => Command::Unknown("/op needs a public key".into()),
             "/deop" if !first.is_empty() => Command::Deop(first.to_string()),

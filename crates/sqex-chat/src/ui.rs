@@ -236,6 +236,8 @@ pub struct App {
     /// The selected channel has a picture. Said rather than drawn: a terminal
     /// cannot show one, and a coloured-block approximation is not the picture.
     pub has_avatar: bool,
+    /// The command list is on screen, over the transcript.
+    pub helping: bool,
     /// The first message not read when this conversation was opened, if there
     /// was one. A line goes above it.
     pub divider: Option<u64>,
@@ -781,6 +783,10 @@ fn starts_run(a: Option<&Said>, b: &Said) -> bool {
 const RUN_GAP: u64 = 5 * 60;
 
 fn transcript(f: &mut Frame, app: &App, area: Rect) {
+    if app.helping {
+        help(f, area);
+        return;
+    }
     if !app.found.is_empty() {
         directory(f, app, area);
         return;
@@ -870,6 +876,89 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// How wide the command column is. Every command has to fit inside it with
+/// room to spare, or it runs into what it means — which is a thing a test can
+/// check only if the commands are data rather than a wall of `push`.
+pub const COMMAND: usize = 28;
+
+/// The command list, by section.
+pub const HELP: &[(&str, &[(&str, &str)])] = &[
+    ("messages", &[
+        ("/file <path>", "send a file"),
+        ("/save <n> <path>", "keep one somebody sent"),
+        ("/forward <n> <m>", "send a file on to conversation m, without re-uploading"),
+        ("/redact <n>", "delete a message you posted, and the file it carried"),
+    ]),
+    ("conversations", &[
+        ("/new <name>", "a private group"),
+        ("/public <name>", "a channel anybody may find and join"),
+        ("/find [query]  /join <n>", "search the directory, and enter one"),
+        ("/invite <key>  /kick <key>", "add somebody; remove them and rotate the key"),
+        ("/op <key>  /deop <key>", "grant or withdraw admin here"),
+        ("/leave  /close", "leave it; or end it for everyone, permanently"),
+    ]),
+    ("this channel", &[
+        ("/name  /topic  /avatar", "what it is called, what it is for, its picture"),
+        ("/retain <secs> [max]", "how long it keeps what is said"),
+        ("/who  /read", "who is here; how far each of them has read"),
+        ("/rotate", "mint a new key for everyone currently here"),
+    ]),
+    ("you", &[
+        ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
+        ("/block  /unblock  /blocked", "who may reach you"),
+    ]),
+];
+
+/// Everything the client can do, over the transcript.
+///
+/// A view rather than a line, because the status line is one row and there are
+/// forty of these. It was the only list there was, and at eighty columns the
+/// end of it was simply cut off — so the commands that fell off were
+/// undiscoverable and nothing said so.
+fn help(f: &mut Frame, area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let key = Style::default().fg(Color::Yellow);
+    let head = Style::default().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::from(Span::styled("keys", head)),
+        Line::from(vec![
+            Span::styled("  Tab ↑↓ ", key),
+            Span::styled("move between conversations    ", dim),
+            Span::styled("^N ", key),
+            Span::styled("add somebody    ", dim),
+            Span::styled("^C ", key),
+            Span::styled("quit", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc    ", key),
+            Span::styled("pick a message, and then:  ", dim),
+            Span::styled("↑↓ ", key),
+            Span::styled("move  ", dim),
+            Span::styled("a ", key),
+            Span::styled("react  ", dim),
+            Span::styled("r ", key),
+            Span::styled("reply  ", dim),
+            Span::styled("e ", key),
+            Span::styled("rewrite  ", dim),
+            Span::styled("d ", key),
+            Span::styled("delete", dim),
+        ]),
+        Line::from(""),
+    ];
+    for (title, rows) in HELP {
+        lines.push(Line::from(Span::styled((*title).to_string(), head)));
+        for (cmd, what) in *rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {cmd:<COMMAND$}"), key),
+                Span::styled((*what).to_string(), dim),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled("  Esc to go back", dim)));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 /// The directory, numbered so `/join <n>` can act on it.
 fn directory(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::from(Span::styled(
@@ -937,20 +1026,12 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 /// so. Ordered by how often each is wanted, and a group is either shown whole
 /// or not at all — half of "/file /save" helps nobody.
 fn keys_line(width: usize) -> String {
-    const GROUPS: &[&str] = &[
-        "^C quit",
-        "Tab",
-        "Esc pick",
-        "^N add",
-        "/file /save /redact",
-        "/public /find /join",
-        "/new /invite /kick",
-        "/name /topic /avatar",
-        "/profile /block /blocked",
-        "/op /deop",
-        "/retain /close /read",
-        "/forward",
-    ];
+    // Short, and it stays short. This used to be the only command list there
+    // was, and it grew until the end of it was cut off at eighty columns —
+    // which left the commands that fell off undiscoverable, with nothing to
+    // say they existed. `/help` carries the list now, and this only has to
+    // point at it.
+    const GROUPS: &[&str] = &["^C quit", "Tab", "Esc pick", "^N add", "/help"];
     let mut out = String::new();
     for g in GROUPS {
         let sep = if out.is_empty() { " " } else { " · " };
@@ -1268,8 +1349,7 @@ mod tests {
         // A quiet status shows the keys, not a warning.
         assert!(out.contains("^C quit"));
         assert!(out.contains("^N add"));
-        assert!(out.contains("/file"));
-        assert!(out.contains("/find"));
+        assert!(out.contains("/help"));
     }
 
     #[test]
@@ -1347,27 +1427,16 @@ mod tests {
             );
             for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
                 assert!(
-                    [
-                        "^C quit",
-                        "Tab",
-                        "^N add",
-                        "Esc pick",
-                        "/file /save /redact",
-                        "/public /find /join",
-                        "/new /invite /kick",
-                        "/name /topic /avatar",
-                        "/profile /block /blocked",
-                        "/op /deop",
-                        "/retain /close /read",
-                        "/forward",
-                    ]
-                    .contains(&group),
+                    ["^C quit", "Tab", "Esc pick", "^N add", "/help"].contains(&group),
                     "a group was cut in half at width {width}: {group:?}"
                 );
             }
         }
         // And a wide terminal gets all of them.
-        assert!(keys_line(200).contains("/retain /close /read"));
+        // And it fits at eighty columns whole, which the command list it
+        // replaced had stopped doing.
+        assert_eq!(keys_line(200), keys_line(80));
+        assert!(keys_line(80).contains("/help"));
     }
 
     #[test]
@@ -2167,6 +2236,49 @@ mod tests {
         app.divider = None;
         let out = render(&app, 100, 24);
         assert!(!out.contains("unread"), "a divider appeared with nothing new:\n{out}");
+    }
+
+    /// The status line stopped being the command list, so the list has to be
+    /// somewhere. It goes over the transcript, like the directory does.
+    #[test]
+    fn help_lists_the_commands_and_the_keys() {
+        let mut app = sample();
+        app.helping = true;
+        let out = render(&app, 110, 40);
+        // A sample from each section, and the keys that are not commands at
+        // all — which were the least discoverable thing in the client.
+        for want in [
+            "Esc", "react", "rewrite", "/file", "/forward", "/op", "/close", "/retain",
+            "/profile", "/blocked", "/who", "/read",
+        ] {
+            assert!(out.contains(want), "{want} is not in the help:\n{out}");
+        }
+        // And it is a view over the transcript, not a line under it.
+        assert!(!out.contains("are you there?"), "the transcript showed through");
+    }
+
+    #[test]
+    fn help_fits_a_small_terminal_without_losing_its_head() {
+        let mut app = sample();
+        app.helping = true;
+        // The top is what matters: the keys, which nothing else documents.
+        let out = render(&app, 80, 24);
+        assert!(out.contains("keys"), "the help lost its top:\n{out}");
+        // Checked against the table rather than against the rendering. The
+        // rendered version of this test looked for the first double space and
+        // found one *inside* a command like "/invite <key>  /kick <key>" — so
+        // it passed on exactly the line that was broken.
+        for (_, rows) in HELP {
+            for (cmd, _) in *rows {
+                assert!(
+                    UnicodeWidthStr::width(*cmd) + 2 <= COMMAND,
+                    "{cmd:?} fills the column and runs into what it means"
+                );
+            }
+        }
+        for l in out.lines() {
+            assert!(UnicodeWidthStr::width(l) <= 80, "help overflowed: {l:?}");
+        }
     }
 
     #[test]
