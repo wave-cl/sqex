@@ -150,6 +150,26 @@ async fn an_account_that_publishes_nothing_is_not_asked_about_forever() {
     assert_eq!(bob.display_name(&alice_key).as_deref(), Some("Alice Byrne"));
 }
 
+/// `/who` lists you among the members. Naming everybody else while showing
+/// yourself as a bare key leaves one row a reader cannot account for.
+#[tokio::test]
+async fn we_learn_our_own_name_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+
+    alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
+    let now = 1_000_000;
+    assert_eq!(alice.refresh_profiles(&[alice_key], now).await.unwrap(), 1);
+    assert_eq!(
+        alice.display_name(&alice_key).as_deref(),
+        Some("Alice Byrne"),
+        "the client would not learn its own name"
+    );
+    assert_eq!(alice.title_of(&alice_key).as_deref(), Some("shipping"));
+}
+
 /// `/who` is somebody asking who these people are. Answering out of a cache is
 /// refusing to answer the question that was put.
 #[tokio::test]

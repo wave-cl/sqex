@@ -1455,9 +1455,10 @@ impl Chat {
     ) -> Result<usize> {
         let mut asked = 0;
         for account in accounts {
-            if *account == self.me {
-                continue;
-            }
+            // Our own included. It was skipped as a pointless round trip —
+            // you know what you called yourself — but `/who` lists you among
+            // the members, and naming everybody else while showing yourself as
+            // a bare key is the one row a reader cannot account for.
             let held = self.store.profile(account)?;
             // Two ages, because the two facts are not equally strong. "They
             // are called X" is worth keeping for an hour — SIP-21 caps updates
