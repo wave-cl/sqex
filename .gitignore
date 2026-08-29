@@ -16,3 +16,7 @@
 
 # Runtime state (whitelist + audit snapshots)
 *.state
+
+# Python bytecode from the scripts in scripts/harness.
+__pycache__/
+*.pyc
