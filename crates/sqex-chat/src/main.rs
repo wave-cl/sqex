@@ -600,7 +600,7 @@ async fn event_loop(
 
     let mut poll_at = tokio::time::Instant::now();
     loop {
-        let names = name_map(chat, selected_index(open, app).map(|i| &open[i]));
+        let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
         refresh(app, open, &chat.me, &names);
         terminal
             .draw(|f| ui::draw(f, app))
@@ -670,17 +670,6 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
                     &conv.admins,
                 );
             }
-            // Whoever spoke here, asked for once and then read from the store.
-            // Silent on failure: a name is decoration, and a conversation that
-            // stopped working because one could not be fetched would be the
-            // tail wagging the dog.
-            let mut who: Vec<PubKey> = Vec::new();
-            for m in conv.timeline.messages() {
-                if !who.contains(&m.account) {
-                    who.push(m.account);
-                }
-            }
-            let _ = chat.refresh_profiles(&who, now()).await;
         }
         Err(ChatError::NoKey(epoch)) => {
             conv.timeline = timeline;
@@ -733,13 +722,17 @@ async fn account_command(
                     avatar: Vec::new(),
                 };
                 chat.set_profile(profile).await.map(|()| {
-                    // Said back with a reminder of what it is. A display
-                    // name is a claim, not a credential, and a client that
-                    // reported "you are now X" would be agreeing with it.
-                    Some(format!(
-                        "published {name:?} — a name is a claim, and readers see \
-                         your key beside it"
-                    ))
+                    Some(if name.is_empty() {
+                        "your profile is empty again — readers see your key".to_string()
+                    } else {
+                        // Said back with a reminder of what it is. A display
+                        // name is a claim, not a credential, and a client that
+                        // reported "you are now X" would be agreeing with it.
+                        format!(
+                            "published {name:?} — a name is a claim, and readers see \
+                             your key beside it"
+                        )
+                    })
                 })
             }
             Command::Block(key) => match key.parse::<PubKey>() {
@@ -781,7 +774,7 @@ async fn account_command(
 async fn settle_here(chat: &mut Chat, open: &mut [Open], app: &mut App, at: usize) {
     let me = chat.me;
     poll_one(chat, &mut open[at], app).await;
-    let names = name_map(chat, open.get(at));
+    let names = name_map(chat, open, open.get(at));
     refresh(app, open, &me, &names);
 }
 
@@ -1243,19 +1236,31 @@ async fn handle_key(
                     }
                 }
                 Command::Who => match chat.info(&channel).await {
-                    Ok(info) => Ok(Some(
-                        info.members
-                            .iter()
-                            .map(|m| {
-                                format!(
-                                    "{}{}",
-                                    short(&m.account),
-                                    if m.role == Role::Admin { "*" } else { "" }
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    )),
+                    Ok(info) => {
+                        // Ask about anybody we have no name for. `/who` is the
+                        // one place a member who has never spoken is listed,
+                        // and they are exactly who somebody runs it to
+                        // identify.
+                        let members: Vec<PubKey> =
+                            info.members.iter().map(|m| m.account).collect();
+                        let _ = chat.refresh_profiles(&members, now()).await;
+                        Ok(Some(
+                            info.members
+                                .iter()
+                                .map(|m| {
+                                    let name = chat
+                                        .display_name(&m.account)
+                                        .unwrap_or_default();
+                                    format!(
+                                        "{}{}",
+                                        ui::author(&name, &short(&m.account), false),
+                                        if m.role == Role::Admin { "*" } else { "" }
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("  "),
+                        ))
+                    }
                     Err(e) => Err(e),
                 },
                 Command::Unknown(word) => Err(ChatError::Protocol(format!(
@@ -1435,6 +1440,11 @@ impl Command {
             // by a character neither would contain rather than by a space —
             // `/profile Ada Lovelace` is a name, not a name and a title.
             "/profile" if rest.is_empty() => Command::Profile(None),
+            // Publishing an empty record, which is how a name is taken back.
+            // Without this a name could be set and never unset.
+            "/profile" if first == "off" => {
+                Command::Profile(Some((String::new(), String::new())))
+            }
             "/profile" => {
                 let (name, title) = match rest.split_once('|') {
                     Some((n, t)) => (n.trim().to_string(), t.trim().to_string()),
@@ -1788,14 +1798,26 @@ fn clear_unread(open: &mut [Open], app: &App) {
 /// Built here rather than looked up in the renderer, which has no store — and
 /// deliberately a map of *names only*: `ui::author` pairs each with a key, and
 /// cannot be handed a name with no key to pair it with.
-fn name_map(chat: &Chat, conv: Option<&Open>) -> HashMap<PubKey, String> {
+fn name_map(chat: &Chat, open: &[Open], conv: Option<&Open>) -> HashMap<PubKey, String> {
     let mut out = HashMap::new();
-    let Some(conv) = conv else { return out };
-    for m in conv.timeline.messages() {
-        if let std::collections::hash_map::Entry::Vacant(e) = out.entry(m.account)
-            && let Some(name) = chat.display_name(&m.account)
+    let want = |account: PubKey, out: &mut HashMap<PubKey, String>| {
+        if let std::collections::hash_map::Entry::Vacant(e) = out.entry(account)
+            && let Some(name) = chat.display_name(&account)
         {
             e.insert(name);
+        }
+    };
+    // Every direct message's peer, because the conversation list names all of
+    // them at once and a row is where somebody chooses who to write to.
+    for o in open {
+        if let Some(peer) = o.peer {
+            want(peer, &mut out);
+        }
+    }
+    // And whoever spoke in the conversation on screen.
+    if let Some(conv) = conv {
+        for m in conv.timeline.messages() {
+            want(m.account, &mut out);
         }
     }
     out
@@ -1806,7 +1828,19 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         .iter()
         .map(|o| Row {
             channel: o.channel,
-            label: o.label.clone(),
+            // For a direct message the row names a *person*, so a published
+            // name wins over the local label — and the label is dropped when
+            // it is only the key repeated, which is what an unnamed contact
+            // gets. For a group the label is the channel's own name.
+            label: match o.peer {
+                Some(peer) => names
+                    .get(&peer)
+                    .cloned()
+                    .unwrap_or_else(|| o.label.clone())
+                    .to_string(),
+                None => o.label.clone(),
+            },
+            key: o.peer.map(|p| ui::short(&p)),
             group: o.peer.is_none(),
             public: o.public,
             unread: o.unread,
@@ -1855,11 +1889,6 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                     .get(&m.account)
                     .cloned()
                     .or_else(|| conv.peer.map(|_| conv.label.clone()))
-                    // A contact with no chosen label is labelled with its own
-                    // short key, and pairing that with itself renders
-                    // "E4LUkjrZ (E4LUkjrZ)". A name that *is* the key is not a
-                    // name.
-                    .filter(|name| *name != short(&m.account))
                     .unwrap_or_default(),
                 key: short(&m.account),
                 mine: m.account == *me,
@@ -2085,6 +2114,7 @@ mod tests {
             rows: vec![Row {
                 channel: [7; 32],
                 label: "bob".into(),
+                key: Some("8qbHbw2B".into()),
                 group: false,
                 public: false,
                 unread: 0,
@@ -2137,6 +2167,7 @@ mod tests {
             rows: vec![Row {
                 channel: [7; 32],
                 label: ui::short(&bob),
+                key: Some(ui::short(&bob)),
                 group: false,
                 public: false,
                 unread: 0,
@@ -2167,6 +2198,7 @@ mod tests {
             rows: vec![Row {
                 channel: [7; 32],
                 label: "bob".into(),
+                key: Some("8qbHbw2B".into()),
                 group: false,
                 public: false,
                 unread: 0,
@@ -2206,6 +2238,7 @@ mod tests {
             rows: vec![Row {
                 channel: [7; 32],
                 label: "bob".into(),
+                key: Some("8qbHbw2B".into()),
                 group: false,
                 public: false,
                 unread: 0,
@@ -2229,6 +2262,7 @@ mod tests {
             rows: vec![Row {
                 channel: [7; 32],
                 label: "bob".into(),
+                key: Some("8qbHbw2B".into()),
                 group: false,
                 public: false,
                 unread: 0,

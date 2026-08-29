@@ -57,6 +57,13 @@ const PROFILE_TTL: u64 = 60 * 60;
 /// as a standing grant.
 const ADMISSION_LIFETIME: u64 = 7 * 24 * 60 * 60;
 
+/// How many profiles one poll will ask about.
+///
+/// A direct message has two members and a group a handful, so this only ever
+/// binds on a large public channel — where a round trip per person on the
+/// first poll would be felt. The rest arrive on the polls that follow.
+const PROFILES_PER_POLL: usize = 16;
+
 #[derive(Debug)]
 pub enum ChatError {
     Store(StoreError),
@@ -1818,6 +1825,31 @@ impl Chat {
         // the judgement onto each row as it arrived, which went stale the
         // moment a rotation changed the answer and left rows nothing would
         // ever revisit.
+        // Learn who these people call themselves, before the caller has to
+        // render them. Doing it here rather than in the interface means every
+        // client gets it, and means a name is known from the moment a
+        // conversation exists rather than from the moment somebody speaks —
+        // which is what a list of conversations needs.
+        //
+        // Members rather than speakers, and capped: the exchange already
+        // returned the member list, but a large public channel would otherwise
+        // make the first poll do a round trip per person. What is left over is
+        // picked up by the next poll.
+        let members: Vec<PubKey> = info
+            .members
+            .iter()
+            .map(|m| m.account)
+            .take(PROFILES_PER_POLL)
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Silent on failure. A name is decoration, and a conversation that
+        // stopped working because one could not be fetched would be the tail
+        // wagging the dog.
+        let _ = self.refresh_profiles(&members, now).await;
+
         let have_current = self.store.key(channel, info.epoch)?.is_some();
         let shut: Vec<u64> = timeline.unreadable().to_vec();
         Ok(Conversation {

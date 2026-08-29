@@ -25,7 +25,17 @@ use sqnr_core::PubKey;
 /// One row in the conversation list.
 pub struct Row {
     pub channel: [u8; 32],
+    /// What to call this conversation: a person's display name or the local
+    /// label for a direct message, the channel's own name for a group. Empty
+    /// when a direct message's peer has published no name and we chose none.
     pub label: String,
+    /// The peer's key, short, for a direct message. `None` for a group, whose
+    /// name belongs to the channel and not to a person.
+    ///
+    /// Present so the list can obey SIP-21 the same way the transcript does:
+    /// choosing which conversation to type into is exactly a moment where
+    /// mistaking one person for another matters.
+    pub key: Option<String>,
     /// A group rather than a direct message. Marked, because "who am I talking
     /// to" and "who can read this" are the same question in one and not in the
     /// other.
@@ -255,7 +265,11 @@ pub fn author(name: &str, key: &str, mine: bool) -> String {
     if mine {
         return "you".to_string();
     }
-    if name.is_empty() {
+    // A contact nobody has named is labelled with its own short key, and
+    // pairing that with itself renders "E4LUkjrZ (E4LUkjrZ)". A name that *is*
+    // the key is not a name. Handled here rather than at each call site,
+    // because it is a property of the pairing.
+    if name.is_empty() || name == key {
         return key.to_string();
     }
     // The key, the brackets and a space: what the name may have is whatever is
@@ -314,7 +328,23 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// What a row is called: a name and a key, or whichever of the two there is.
+///
+/// The key is not dropped to make room for the name, for the reason SIP-21
+/// gives — two accounts may publish the same name — and picking the wrong
+/// conversation to type into is precisely the harm that rule is about.
+fn row_label(r: &Row, width: usize) -> String {
+    match &r.key {
+        Some(key) => author(&r.label, key, false),
+        // A group's name is the channel's, not a person's. There is no key it
+        // could be confused with.
+        None => truncate(&r.label, width),
+    }
+}
+
 fn conversations(f: &mut Frame, app: &App, area: Rect) {
+    // The marker, the border, and room for an unread count.
+    let w = (area.width as usize).saturating_sub(6).clamp(8, AUTHOR);
     let items: Vec<ListItem> = app
         .rows
         .iter()
@@ -337,7 +367,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
                         base
                     },
                 ),
-                Span::styled(format!("{:<15}", truncate(&r.label, 15)), base),
+                Span::styled(format!("{:<w$}", row_label(r, w), w = w), base),
             ];
             if r.unread > 0 {
                 spans.push(Span::styled(
@@ -708,6 +738,7 @@ mod tests {
                 .map(|i| Row {
                     channel: [i; 32],
                     label: format!("p{i}"),
+                    key: None,
                     group: false,
                     public: false,
                     unread: 0,
@@ -771,6 +802,7 @@ mod tests {
             rows: vec![Row {
                 channel: [2; 32],
                 label: "bob".into(),
+                key: Some("8qbHbw2B".into()),
                 group: false,
                 public: false,
                 unread: 2,
@@ -1192,6 +1224,86 @@ mod tests {
             out.contains("9hMLdY3V"),
             "a name reached the screen with no key beside it:\n{out}"
         );
+    }
+
+    /// Choosing which conversation to type into is exactly a moment where
+    /// mistaking one person for another matters, so SIP-21's rule applies to
+    /// the list as much as to the transcript. The name shipped in the
+    /// transcript only, and the list went on showing a bare key.
+    #[test]
+    fn the_conversation_list_shows_a_name_with_its_key() {
+        let mut app = sample();
+        app.rows = vec![
+            Row {
+                channel: [1; 32],
+                label: "Alice Byrne".into(),
+                key: Some("E4LUkjrZ".into()),
+                group: false,
+                public: false,
+                unread: 0,
+                waiting: false,
+            },
+            Row {
+                channel: [2; 32],
+                label: "shipping".into(),
+                key: None,
+                group: true,
+                public: false,
+                unread: 0,
+                waiting: false,
+            },
+        ];
+        let out = render(&app, 100, 20);
+        assert!(out.contains("Alice Byrne"), "the list dropped the name:\n{out}");
+        assert!(
+            out.contains("E4LUkjrZ"),
+            "the list showed a name with no key beside it:\n{out}"
+        );
+        // A group's name belongs to the channel, not to a person, so there is
+        // no key it could be confused with and none is invented.
+        assert!(out.contains("shipping"), "{out}");
+    }
+
+    #[test]
+    fn a_conversation_with_nobody_named_shows_the_key_once() {
+        let mut app = sample();
+        app.rows = vec![Row {
+            channel: [1; 32],
+            // What an unnamed contact is labelled with: its own short key.
+            label: "E4LUkjrZ".into(),
+            key: Some("E4LUkjrZ".into()),
+            group: false,
+            public: false,
+            unread: 0,
+            waiting: false,
+        }];
+        let out = render(&app, 100, 20);
+        assert!(
+            !out.contains("E4LUkjrZ (E4LUkjrZ)"),
+            "the key was rendered twice:\n{out}"
+        );
+        assert!(out.contains("E4LUkjrZ"), "{out}");
+    }
+
+    /// A narrow sidebar loses the name, never the key.
+    #[test]
+    fn a_narrow_list_keeps_the_key() {
+        let r = Row {
+            channel: [1; 32],
+            label: "Alexandra Bartholomew".into(),
+            key: Some("E4LUkjrZ".into()),
+            group: false,
+            public: false,
+            unread: 0,
+            waiting: false,
+        };
+        for width in 8..=AUTHOR {
+            let line = row_label(&r, width);
+            assert!(
+                line.contains("E4LUkjrZ"),
+                "a long name pushed the key out at width {width}: {line}"
+            );
+        }
     }
 
     #[test]

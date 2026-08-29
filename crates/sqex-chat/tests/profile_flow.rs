@@ -224,6 +224,67 @@ async fn the_block_list_is_ours_and_nobody_elses() {
     );
 }
 
+/// A name has to reach every place a person is identified, not just the
+/// transcript. It shipped in the transcript alone, and the conversation list
+/// — where somebody chooses who to write to — went on showing a bare key.
+#[tokio::test]
+async fn a_name_is_known_before_its_owner_has_said_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    alice.set_profile(named("Alice Byrne", "")).await.unwrap();
+
+    // Bob starts the conversation. Alice has published a name and has said
+    // nothing — which is the state a list is in the moment a conversation
+    // appears, so a client that only learns names from the transcript shows a
+    // key until she speaks.
+    let channel = bob.open_dm(&alice_key).await.unwrap();
+    alice.open_dm(&bob_key).await.unwrap();
+
+    let mut bobs = Timeline::new();
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert_eq!(
+        bob.display_name(&alice_key).as_deref(),
+        Some("Alice Byrne"),
+        "the peer's name was not fetched until they spoke"
+    );
+}
+
+/// A name that cannot be taken back is a name published once and for good.
+#[tokio::test]
+async fn a_published_name_can_be_taken_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, "hello").await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    assert!(bob.profile_of(&alice_key).await.unwrap().found);
+
+    // An empty record, which is what `/profile off` publishes.
+    alice.set_profile(named("", "")).await.unwrap();
+    let got = bob.profile_of(&alice_key).await.unwrap();
+    assert!(
+        got.profile.name.is_empty() && got.profile.title.is_empty(),
+        "the name could not be taken back: {:?}",
+        got.profile
+    );
+
+    // And a client that had cached it stops using it once it asks again.
+    let now = 1_000_000;
+    bob.refresh_profiles(&[alice_key], now).await.unwrap();
+    assert_eq!(bob.display_name(&alice_key), None);
+}
+
 /// SIP-24: an exchange that does not know you can be asked to let you in, and
 /// it answers every request the same way whatever it decides.
 #[tokio::test]
