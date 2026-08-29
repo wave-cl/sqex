@@ -672,8 +672,9 @@ async fn event_loop(
             // immediately, so a divider recomputed from it would disappear the
             // instant it was wanted.
             let here = selected_index(open, app);
+            let me = chat.me;
             for (i, conv) in open.iter_mut().enumerate() {
-                place_divider(conv, Some(i) == here);
+                place_divider(conv, &me, Some(i) == here);
             }
             // Receipts, for the conversation on screen only.
             //
@@ -834,7 +835,7 @@ async fn account_command(
 /// disappear the instant it appeared — which is exactly when somebody wants to
 /// see it. Leaving the conversation clears it, so coming back later marks the
 /// new place.
-fn place_divider(conv: &mut Open, selected: bool) {
+fn place_divider(conv: &mut Open, me: &PubKey, selected: bool) {
     if !selected {
         conv.divider = None;
         return;
@@ -845,6 +846,11 @@ fn place_divider(conv: &mut Open, selected: bool) {
     conv.divider = conv
         .timeline
         .messages()
+        // Somebody else's. A message you wrote is not one you have not seen,
+        // and the read mark only catches up to your own on the next poll —
+        // so quitting straight after sending would otherwise greet you with
+        // your own words under a line saying they were unread.
+        .filter(|m| m.account != *me)
         .map(|m| m.seq)
         .find(|seq| *seq > conv.read_to);
 }
@@ -2663,25 +2669,57 @@ mod tests {
         c.read_to = 1;
 
         // Arriving: the line goes above the first one not yet read.
-        place_divider(&mut c, true);
+        place_divider(&mut c, &me, true);
         assert_eq!(c.divider, Some(2));
 
         // Reading them advances the mark. The line does not move.
         c.read_to = 3;
-        place_divider(&mut c, true);
+        place_divider(&mut c, &me, true);
         assert_eq!(c.divider, Some(2), "the divider moved as it was read past");
 
         // Leaving clears it, so coming back marks the new place.
-        place_divider(&mut c, false);
+        place_divider(&mut c, &me, false);
         assert_eq!(c.divider, None);
-        place_divider(&mut c, true);
+        place_divider(&mut c, &me, true);
         assert_eq!(c.divider, None, "a divider appeared with nothing unread");
 
         // And something new arriving later gets its own line.
         c.timeline.apply(&entry(4), &[me]);
-        place_divider(&mut c, false);
-        place_divider(&mut c, true);
+        place_divider(&mut c, &me, false);
+        place_divider(&mut c, &me, true);
         assert_eq!(c.divider, Some(4));
+    }
+
+    /// A message you wrote is not one you have not seen. The read mark only
+    /// catches up to your own on the next poll, so quitting straight after
+    /// sending would otherwise greet you with your own words under a line
+    /// saying they were unread.
+    #[test]
+    fn your_own_message_is_never_unread() {
+        let me = PubKey::new([1; 32]);
+        let bob = PubKey::new([2; 32]);
+        let entry = |seq, who| Received {
+            seq,
+            account: who,
+            posted: 10 + seq,
+            kind: sqex_proto::channel::KIND_MEMBER,
+            tombstone: false,
+            body: Some(Body::Post(SipPost::text("hello"))),
+        };
+
+        // Only our own is newer than the mark: nothing to come back to.
+        let mut c = conv(2, "bob");
+        c.timeline = Timeline::fold(&[entry(1, bob), entry(2, me)], &[me]);
+        c.read_to = 1;
+        place_divider(&mut c, &me, true);
+        assert_eq!(c.divider, None, "our own message was called unread");
+
+        // Somebody else's after it, and the line goes above theirs.
+        let mut c = conv(2, "bob");
+        c.timeline = Timeline::fold(&[entry(1, bob), entry(2, me), entry(3, bob)], &[me]);
+        c.read_to = 1;
+        place_divider(&mut c, &me, true);
+        assert_eq!(c.divider, Some(3));
     }
 
     /// Signal's ordering: whatever happened last is at the top. The exchange
