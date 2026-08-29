@@ -114,6 +114,19 @@ pub enum Receipt {
     Read,
 }
 
+/// One message a search turned up.
+pub struct Hit {
+    pub seq: u64,
+    /// Composed the same way the transcript composes an author, so a result
+    /// carries the key beside the name like everywhere else (SIP-21).
+    pub who: String,
+    pub at: u64,
+    pub text: String,
+    /// Where the query matched, so it can be picked out of the line.
+    pub at_byte: usize,
+    pub len: usize,
+}
+
 /// What the status line has to say, in the order it says it.
 #[derive(Default)]
 pub struct Trouble {
@@ -238,6 +251,11 @@ pub struct App {
     pub has_avatar: bool,
     /// The command list is on screen, over the transcript.
     pub helping: bool,
+    /// What a search turned up, and what was searched for. A view over the
+    /// transcript, like the directory and the command list.
+    pub hits: Vec<Hit>,
+    pub query: String,
+    pub searching: bool,
     /// The first message not read when this conversation was opened, if there
     /// was one. A line goes above it.
     pub divider: Option<u64>,
@@ -451,10 +469,16 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     }
     spans.push(Span::styled(app.me.clone(), dim));
     // The name of the thing goes in the corner, where a title bar puts it and
-    // where the eye is not looking for anything else.
+    // where the eye is not looking for anything else — with the version, so
+    // that "which one am I running" never needs asking. It has been the first
+    // question of half the problems today.
     spans.push(Span::styled(
         " sqex-chat ",
         Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("{} ", env!("CARGO_PKG_VERSION")),
+        dim,
     ));
     f.render_widget(
         Paragraph::new(Line::from(spans).alignment(Alignment::Right)),
@@ -725,32 +749,52 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         // message can carry a distinct one per emoji per account — so both
         // the width of a chip and the number of them are somebody else's
         // decision. Fit what fits and count the rest.
+        // Their own colour, set on both halves like a bubble, so the chips
+        // read as attached to the message on any terminal background rather
+        // than as loose text under it.
+        let chip_style = Style::default().fg(Color::Indexed(252)).bg(Color::Indexed(237));
+        let ours = Style::default().fg(Color::Indexed(221)).bg(Color::Indexed(237));
+
         let mut row: Vec<Span> = Vec::new();
         let mut used = 0;
         let mut shown = 0;
         for (emoji, count, is_mine) in &s.reactions {
-            let chip = format!("{emoji} {count}  ");
+            let chip = format!(" {emoji} {count} ");
             let w = UnicodeWidthStr::width(chip.as_str());
             if used + w > width {
                 break;
             }
             used += w;
             shown += 1;
-            row.push(Span::styled(
-                chip,
-                if *is_mine {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    dim
-                },
-            ));
+            row.push(Span::styled(chip, if *is_mine { ours } else { chip_style }));
         }
         // Said, not dropped: a count that quietly omitted some would be
         // telling the reader a number that is not the number.
         if shown < s.reactions.len() {
-            row.push(Span::styled(format!("+{}", s.reactions.len() - shown), dim));
+            let more = format!(" +{} ", s.reactions.len() - shown);
+            used += UnicodeWidthStr::width(more.as_str());
+            row.push(Span::styled(more, chip_style));
         }
-        out.push(Line::from(row).alignment(align));
+
+        // Under the bubble's *right* corner, whichever side the bubble is on.
+        // Taking the message's alignment put an incoming message's reactions
+        // against the far edge of the pane, yards from the thing they were
+        // reacting to.
+        if mine {
+            // The same gutter, on the other side: our own bubble leaves a
+            // column past its edge for the cursor, so the chips need one too
+            // or they hang a column further out than the bubble.
+            row.push(Span::raw(" ".repeat(GUTTER)));
+            out.push(Line::from(row).alignment(Alignment::Right));
+        } else {
+            // The bubble is one column in from the edge on this side: an
+            // incoming message carries a gutter for the pick cursor. Line up
+            // with the bubble, not with the pane.
+            let pad = (content + 2 + GUTTER).saturating_sub(used);
+            let mut padded = vec![Span::raw(" ".repeat(pad))];
+            padded.extend(row);
+            out.push(Line::from(padded).alignment(Alignment::Left));
+        }
     }
     // The reaction picker, open over the message the cursor is on. Dropped in
     // an earlier draft of this layout, which is exactly the kind of thing a
@@ -785,6 +829,10 @@ const RUN_GAP: u64 = 5 * 60;
 fn transcript(f: &mut Frame, app: &App, area: Rect) {
     if app.helping {
         help(f, area);
+        return;
+    }
+    if app.searching {
+        results(f, app, area);
         return;
     }
     if !app.found.is_empty() {
@@ -876,6 +924,63 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// What a search found, newest first.
+fn results(f: &mut Frame, app: &App, area: Rect) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{} message{} matching ",
+                    app.hits.len(),
+                    if app.hits.len() == 1 { "" } else { "s" }
+                ),
+                dim,
+            ),
+            Span::styled(
+                format!("{:?}", app.query),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled("  ·  Esc to go back", dim),
+        ]),
+        Line::from(""),
+    ];
+    if app.hits.is_empty() {
+        // Said plainly, and said where the results would have been. Searching
+        // here only ever reaches what this client has kept: history from
+        // before it joined, or from before a key it never received, is not
+        // absent from the conversation — only from us.
+        lines.push(Line::from(Span::styled(
+            "nothing here matches. This searches what this client holds, which              is not necessarily everything that was said.",
+            dim,
+        )));
+    }
+    for h in &app.hits {
+        let before = &h.text[..h.at_byte];
+        let hit = &h.text[h.at_byte..h.at_byte + h.len];
+        let after = &h.text[h.at_byte + h.len..];
+        lines.push(Line::from(vec![
+            // The number, because it is what /save and /redact take and a
+            // result you cannot act on is only half an answer.
+            Span::styled(format!("{:>4} ", h.seq), dim),
+            Span::styled(clock(h.at), dim),
+            Span::styled(format!("{:>AUTHOR$} ", truncate(&h.who, AUTHOR)), Style::default().fg(Color::Cyan)),
+            Span::raw(before.to_string()),
+            Span::styled(
+                hit.to_string(),
+                Style::default().fg(Color::Indexed(232)).bg(Color::Yellow),
+            ),
+            Span::raw(after.to_string()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// The column an incoming message leaves for the pick cursor, before its
+/// bubble starts. Anything meant to line up with that bubble has to allow for
+/// it — the reaction row did not, and sat a column short of the corner.
+const GUTTER: usize = 1;
+
 /// How wide the command column is. Every command has to fit inside it with
 /// room to spare, or it runs into what it means — which is a thing a test can
 /// check only if the commands are data rather than a wall of `push`.
@@ -902,6 +1007,9 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("/retain <secs> [max]", "how long it keeps what is said"),
         ("/who  /read", "who is here; how far each of them has read"),
         ("/rotate", "mint a new key for everyone currently here"),
+    ]),
+    ("finding things", &[
+        ("/search <text>", "find it in this conversation"),
     ]),
     ("you", &[
         ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
@@ -2279,6 +2387,130 @@ mod tests {
         for l in out.lines() {
             assert!(UnicodeWidthStr::width(l) <= 80, "help overflowed: {l:?}");
         }
+    }
+
+    fn hit(who: &str, text: &str, needle: &str, at: u64) -> Hit {
+        let at_byte = text.to_lowercase().find(&needle.to_lowercase()).unwrap();
+        Hit {
+            seq: 1,
+            who: who.into(),
+            at,
+            text: text.into(),
+            at_byte,
+            len: needle.len(),
+        }
+    }
+
+    #[test]
+    fn a_search_shows_what_matched_and_who_said_it() {
+        let mut app = sample();
+        app.searching = true;
+        app.query = "friday".into();
+        app.hits = vec![hit("Alice (E4LUkjrZ)", "we ship on friday", "friday", 3661)];
+        let out = render(&app, 110, 24);
+        assert!(out.contains("we ship on friday"), "{out}");
+        // The author, with the key beside the name like everywhere else.
+        assert!(out.contains("Alice"), "{out}");
+        assert!(out.contains("E4LUkjrZ"), "the result dropped the key:\n{out}");
+        assert!(out.contains("1 message matching"), "{out}");
+        // The sequence number, which is what /save and /redact take.
+        assert!(out.contains("  1 "), "no number to act on:\n{out}");
+        // A view over the transcript, not a line under it.
+        assert!(!out.contains("are you there?"), "the transcript showed through");
+    }
+
+    /// Nothing found says so where the results would have been, and says what
+    /// was searched: this reaches what the client holds, which is not
+    /// necessarily everything that was said in the channel.
+    #[test]
+    fn an_empty_search_says_what_it_looked_through() {
+        let mut app = sample();
+        app.searching = true;
+        app.query = "banana".into();
+        app.hits = vec![];
+        let out = render(&app, 110, 24);
+        assert!(out.contains("0 messages matching"), "{out}");
+        assert!(out.contains("banana"), "{out}");
+        assert!(
+            out.contains("not necessarily everything"),
+            "an empty result implied the words were never said:\n{out}"
+        );
+    }
+
+    /// The matching part is picked out, or a result in a long message is a
+    /// paragraph to re-read rather than an answer.
+    #[test]
+    fn the_match_itself_is_marked() {
+        let mut app = sample();
+        app.searching = true;
+        app.query = "friday".into();
+        app.hits = vec![hit("bob (8qbHbw2B)", "we ship on friday, not thursday", "friday", 3661)];
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let marked: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(Color::Yellow))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert_eq!(marked, "friday", "the match was not picked out: {marked:?}");
+    }
+
+    /// Reactions hang under the bubble's right corner on both sides. Taking
+    /// the message's own alignment put an incoming message's reactions against
+    /// the far edge of the pane, yards from the thing they reacted to.
+    #[test]
+    fn reactions_hang_under_the_right_corner_of_their_bubble() {
+        let edges = |mine: bool| {
+            let mut app = sample();
+            let mut s = said("bob", "8qbHbw2B", mine, "a short message", 3661);
+            s.reactions = vec![("👍".into(), 2, false)];
+            app.said = vec![s];
+            let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+            t.draw(|f| draw(f, &app)).unwrap();
+            let buf = t.backend().buffer().clone();
+            // The bubble's right edge, and the reaction chips' right edge.
+            let right_of = |bg: Color| {
+                (0..buf.area.height)
+                    .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
+                    .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(bg))
+                    .map(|(x, _)| x)
+                    .max()
+            };
+            (
+                right_of(if mine { Color::Indexed(24) } else { Color::Indexed(238) }),
+                right_of(Color::Indexed(237)),
+            )
+        };
+
+        for mine in [false, true] {
+            let (bubble, chips) = edges(mine);
+            let bubble = bubble.expect("no bubble drawn");
+            let chips = chips.expect("no reaction chips drawn");
+            assert_eq!(
+                bubble, chips,
+                "reactions did not line up with the bubble's right edge (mine = {mine})"
+            );
+        }
+    }
+
+    /// The chips set both halves of their colour, like a bubble, so they read
+    /// as attached to the message rather than as loose text under it.
+    #[test]
+    fn reaction_chips_carry_their_own_colour() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "hello", 3661);
+        s.reactions = vec![("👍".into(), 1, true)];
+        app.said = vec![s];
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let chip = (0..buf.area.height)
+            .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
+            .find(|(x, y)| buf[(*x, *y)].symbol() == "👍")
+            .expect("no reaction drawn");
+        assert_eq!(buf[chip].style().bg, Some(Color::Indexed(237)));
+        assert!(buf[chip].style().fg.is_some(), "the chip took the terminal's colour");
     }
 
     #[test]

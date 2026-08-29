@@ -1033,6 +1033,12 @@ async fn handle_key(
         app.helping = false;
         return;
     }
+    if code == KeyCode::Esc && app.searching {
+        app.searching = false;
+        app.hits.clear();
+        app.query.clear();
+        return;
+    }
     if code == KeyCode::Esc && !app.found.is_empty() {
         app.found.clear();
         return;
@@ -1394,6 +1400,42 @@ async fn handle_key(
                         ))),
                     }
                 }
+                Command::Search(query) => {
+                    // Here, against what this client holds, because that is
+                    // the only place it can happen: the exchange cannot read a
+                    // sealed entry, so it could not search one if it wanted
+                    // to. The side effect is that it never learns what
+                    // somebody looked for.
+                    let needle = query.to_lowercase();
+                    let names = name_map(chat, open, open.get(i));
+                    app.hits = open[i]
+                        .timeline
+                        .messages()
+                        .filter(|m| !m.redacted)
+                        .filter_map(|m| {
+                            let text = m.post.body_text()?;
+                            let at_byte = text.to_lowercase().find(&needle)?;
+                            Some(ui::Hit {
+                                seq: m.seq,
+                                who: ui::author(
+                                    &names.get(&m.account).cloned().unwrap_or_default(),
+                                    &short(&m.account),
+                                    m.account == chat.me,
+                                ),
+                                at: m.posted,
+                                text: text.to_string(),
+                                at_byte,
+                                len: needle.len(),
+                            })
+                        })
+                        .collect();
+                    // Newest first: the thing somebody is looking for is more
+                    // often recent than ancient.
+                    app.hits.reverse();
+                    app.query = query.clone();
+                    app.searching = true;
+                    return;
+                }
                 Command::Who => match chat.info(&channel).await {
                     Ok(info) => {
                         // Ask about anybody we have no name for. `/who` is the
@@ -1513,6 +1555,8 @@ enum Command {
     Blocked,
     /// `/help` — everything the client can do, over the transcript.
     Help,
+    /// `/search <text>` — find it in this conversation.
+    Search(String),
     /// `/op <key>` — make somebody an admin here, so they can rename it,
     /// invite, remove and set retention.
     Op(String),
@@ -1627,6 +1671,8 @@ impl Command {
             "/unblock" => Command::Unknown("/unblock needs a public key".into()),
             "/blocked" => Command::Blocked,
             "/help" | "/?" => Command::Help,
+            "/search" if !rest.is_empty() => Command::Search(rest.to_string()),
+            "/search" => Command::Unknown("/search needs something to look for".into()),
             "/op" if !first.is_empty() => Command::Op(first.to_string()),
             "/op" => Command::Unknown("/op needs a public key".into()),
             "/deop" if !first.is_empty() => Command::Deop(first.to_string()),
