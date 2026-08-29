@@ -277,6 +277,13 @@ pub struct Found {
 #[derive(Default)]
 pub struct App {
     pub me: String,
+    /// The display name this account has published, if it has published one.
+    ///
+    /// Shown in the header in place of the key, the same way `author` shows a
+    /// name in place of one everywhere else — an account that has published
+    /// none falls back to a stub of the key, because a header naming nobody is
+    /// worse than one naming them roughly.
+    pub name: String,
     pub rows: Vec<Row>,
     /// Which conversation is open, **by channel** rather than by position.
     ///
@@ -647,12 +654,18 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         Link::Retrying => (palette::TRYING, "reconnecting…"),
         Link::Gone => (palette::GONE, "offline"),
     };
+    // Who this is: the published name, or a stub of the key when there is
+    // none. The same rule as `author`, and for the same reason — a name is
+    // what a person knows themselves by, and `/whoami` is where the whole key
+    // lives.
+    let me = if app.name.is_empty() {
+        app.me.chars().take(KEY_HEAD).collect::<String>()
+    } else {
+        truncate(&app.name, AUTHOR)
+    };
     let mut left = vec![
         Span::styled(" ●", Style::default().fg(colour)),
-        Span::styled(
-            format!(" {}", app.me.chars().take(KEY_HEAD).collect::<String>()),
-            dim,
-        ),
+        Span::styled(format!(" {me}"), dim),
         Span::styled(format!("  {word}"), Style::default().fg(colour)),
     ];
     // The name of the thing goes in the corner, where a title bar puts it and
@@ -2597,9 +2610,20 @@ mod tests {
     }
 
     #[test]
-    fn the_header_leads_with_the_light_and_a_short_key() {
+    fn the_header_leads_with_the_light_and_who_you_are() {
         let mut app = sample();
         app.me = "9hSR6S7WabcdefGHIJK".into();
+
+        // With a name published, that is who you are — the same rule the rest
+        // of the client follows since names stopped carrying their keys.
+        app.name = "Alice".into();
+        let top = row_at(&app, 100, 24, 0);
+        assert!(top.starts_with(" ● Alice"), "{top:?}");
+        assert!(!top.contains("9hSR6S"), "the key is still there too: {top:?}");
+
+        // With none, a stub of the key: a header naming nobody is worse than
+        // one naming them roughly.
+        app.name.clear();
         let top = row_at(&app, 100, 24, 0);
         assert!(top.starts_with(" ● 9hSR6S"), "{top:?}");
         // Six characters and no more. The rest of the key is what `/whoami`

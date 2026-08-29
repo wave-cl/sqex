@@ -709,6 +709,10 @@ async fn event_loop(
         let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
         refresh(app, open, &chat.me, &names);
         app.link = chat.link();
+        // Ours arrives with everybody else's, on the profile poll: it is not
+        // known at startup, so the header shows the key stub until the first
+        // one comes back and the name after.
+        app.name = chat.display_name(&chat.me).unwrap_or_default();
         // Where each message ended up, kept from the frame that drew it: a
         // second copy of the layout could disagree with the first, and a
         // pointer that names the message above the one under it is worse than
