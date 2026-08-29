@@ -614,10 +614,6 @@ async fn interface(mut chat: Chat) -> Result<(), String> {
 
     let mut app = App {
         me: format!("{}", chat.me),
-        // Capture is on from the start, because it is what makes hovering
-        // work and hovering is the reason it is here at all. `/mouse off`
-        // hands it back.
-        mouse: true,
         ..Default::default()
     };
 
@@ -696,7 +692,12 @@ async fn event_loop(
                 // pane is dozens of these. Only a change of *message* is worth
                 // a redraw; the rest are dropped here rather than costing a
                 // frame each and starving the poll below.
-                Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                // Guarded on our own state as well as on the terminal's.
+                // A terminal that was never asked does not send these, but
+                // saying so here is what makes the flag mean something rather
+                // than describe something: a multiplexer with its own mouse
+                // settings is not a thing to be surprised by.
+                Event::Mouse(m) if app.mouse && m.kind == MouseEventKind::Moved => {
                     let over = hover.at(m.column, m.row);
                     if over == app.hovered {
                         continue;
@@ -1287,7 +1288,8 @@ async fn handle_key(
                         app.mouse = on;
                         if on {
                             "the mouse is the client's — hover a message for its full \
-                             time. Selecting text now needs Shift (Option on macOS)"
+                             time. Selecting text now needs Shift (Option on macOS), \
+                             and /mouse off gives it back"
                                 .to_string()
                         } else {
                             "the mouse is the terminal's again — selection and copy work \
@@ -2453,7 +2455,11 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
 fn start_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // The mouse stays the terminal's until somebody asks for it. Capture
+    // stops native text selection, and copying what somebody said is a more
+    // ordinary thing to want than the seconds a message was sent at — so the
+    // client does not take that away by default. `/mouse on` trades it.
+    crossterm::execute!(out, EnterAlternateScreen)?;
     Terminal::new(CrosstermBackend::new(out))
 }
 
@@ -2467,12 +2473,12 @@ fn stop_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
     terminal.show_cursor()
 }
 
-/// Hand the mouse back to the terminal, or take it again.
+/// Take the mouse from the terminal, or hand it back.
 ///
 /// Capture costs something real: with it on, the terminal's own selection stops
 /// working and copying a message means holding Shift — or Option, on macOS.
-/// That is a poor trade for somebody who never points at anything, so it can be
-/// given back. `/mouse` is the whole of the interface to it.
+/// That is a poor trade to make on somebody's behalf, so it is off until asked
+/// for. `/mouse` is the whole of the interface to it.
 fn set_mouse(on: bool) -> io::Result<()> {
     let mut out = io::stdout();
     if on {

@@ -322,8 +322,10 @@ pub struct App {
     pub searching: bool,
     /// Whether the client has taken the mouse from the terminal.
     ///
-    /// Not drawn. Kept here because `/mouse` toggles it and something has to
-    /// remember which way it went.
+    /// False until asked for, which is why `Default` is right here: capture
+    /// stops the terminal's own text selection, and that is not a trade to
+    /// make on somebody's behalf. Not drawn — kept here because `/mouse`
+    /// toggles it and something has to remember which way it went.
     pub mouse: bool,
     /// The message the pointer is over, as an index into `said`.
     ///
@@ -1376,7 +1378,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
         ("/block  /unblock  /blocked", "who may reach you"),
         ("/whoami", "your key in full — the header carries only the first six"),
-        ("/mouse [on|off]", "hover a message for its full time, or hand the mouse back"),
+        ("/mouse [on|off]", "take the mouse, so hovering a message gives its full time; off by default"),
         ("/reconnect", "try the exchange again now, rather than waiting out the backoff"),
     ]),
 ];
