@@ -44,11 +44,18 @@ const RETENTION_SECS: u32 = 30 * 24 * 60 * 60;
 /// Under SIP-16's `MAX_WAIT` of 25 s, so the exchange never has to clamp it.
 pub const WAIT_SECS: u16 = 20;
 
-/// How long a cached profile is used before it is asked for again.
+/// How long a name we hold is used before it is asked for again.
 ///
-/// SIP-21 caps updates at 32 an hour, so an hour is the shortest interval at
-/// which asking more often could tell us anything new.
+/// SIP-21 caps updates at 32 an hour, so an hour is about the shortest
+/// interval at which asking oftener could tell us much.
 const PROFILE_TTL: u64 = 60 * 60;
+
+/// How long "we asked and were told nothing" is believed.
+///
+/// Much shorter, because it is much weaker: everybody starts out with no
+/// profile, so this is the entry that stands between somebody publishing a
+/// name and anybody seeing it.
+const PROFILE_MISS_TTL: u64 = 3 * 60;
 
 /// How long the credential in an admission request stays valid.
 ///
@@ -1429,13 +1436,47 @@ impl Chat {
     /// stopped working because a name could not be fetched would be the tail
     /// wagging the dog.
     pub async fn refresh_profiles(&mut self, accounts: &[PubKey], now: u64) -> Result<usize> {
+        self.fetch_profiles(accounts, now, false).await
+    }
+
+    /// The same, ignoring what we already hold.
+    ///
+    /// For when somebody has *asked* who these people are. Honouring a cache
+    /// there is refusing to answer the question that was put.
+    pub async fn refetch_profiles(&mut self, accounts: &[PubKey], now: u64) -> Result<usize> {
+        self.fetch_profiles(accounts, now, true).await
+    }
+
+    async fn fetch_profiles(
+        &mut self,
+        accounts: &[PubKey],
+        now: u64,
+        force: bool,
+    ) -> Result<usize> {
         let mut asked = 0;
         for account in accounts {
             if *account == self.me {
                 continue;
             }
             let held = self.store.profile(account)?;
-            if held.is_some_and(|(_, _, at)| now.saturating_sub(at) < PROFILE_TTL) {
+            // Two ages, because the two facts are not equally strong. "They
+            // are called X" is worth keeping for an hour — SIP-21 caps updates
+            // at 32 an hour, so asking oftener could not learn much. "We asked
+            // and were told nothing" is barely a fact at all, and it is the
+            // state *everybody* starts in: caching it for an hour meant a
+            // freshly published name was invisible to everyone who had ever
+            // looked, which is exactly when somebody publishes one and wonders
+            // why nothing happened.
+            let age = |name: &str| {
+                if name.is_empty() {
+                    PROFILE_MISS_TTL
+                } else {
+                    PROFILE_TTL
+                }
+            };
+            if !force
+                && held.is_some_and(|(name, _, at)| now.saturating_sub(at) < age(&name))
+            {
                 continue;
             }
             let got = match self.profile_of(account).await {
@@ -1443,9 +1484,8 @@ impl Chat {
                 Err(_) => continue,
             };
             // A profile withheld from us and one never published answer the
-            // same way. Both are stored as empty: we asked, and were told
-            // nothing, and asking again in an hour is the whole of what we can
-            // do about it.
+            // same way, and both are stored as empty: we asked, and were told
+            // nothing.
             let (name, title) = if got.found {
                 (got.profile.name, got.profile.title)
             } else {

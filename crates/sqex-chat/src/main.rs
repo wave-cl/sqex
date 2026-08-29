@@ -1243,7 +1243,10 @@ async fn handle_key(
                         // identify.
                         let members: Vec<PubKey> =
                             info.members.iter().map(|m| m.account).collect();
-                        let _ = chat.refresh_profiles(&members, now()).await;
+                        // Asked for, not cached: somebody typing /who is
+                        // putting the question, and answering it out of an
+                        // hour-old note is refusing to answer it.
+                        let _ = chat.refetch_profiles(&members, now()).await;
                         Ok(Some(
                             info.members
                                 .iter()

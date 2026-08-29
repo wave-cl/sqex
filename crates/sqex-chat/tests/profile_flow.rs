@@ -140,6 +140,43 @@ async fn an_account_that_publishes_nothing_is_not_asked_about_forever() {
     // "Asked and told nothing" is remembered, or the client asks again on
     // every poll for the rest of the conversation.
     assert_eq!(bob.refresh_profiles(&[alice_key], now + 60).await.unwrap(), 0);
+
+    // But it is believed for minutes, not for an hour. Everybody starts with
+    // no profile, so this entry is the thing standing between somebody
+    // publishing a name and anybody seeing it — cached for an hour, a name
+    // set now is invisible to everyone who has already looked.
+    alice.set_profile(named("Alice Byrne", "")).await.unwrap();
+    assert_eq!(bob.refresh_profiles(&[alice_key], now + 200).await.unwrap(), 1);
+    assert_eq!(bob.display_name(&alice_key).as_deref(), Some("Alice Byrne"));
+}
+
+/// `/who` is somebody asking who these people are. Answering out of a cache is
+/// refusing to answer the question that was put.
+#[tokio::test]
+async fn asking_who_somebody_is_does_not_answer_from_a_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    alice.send(&channel, "hello").await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+
+    let now = 1_000_000;
+    bob.refresh_profiles(&[alice_key], now).await.unwrap();
+    assert_eq!(bob.display_name(&alice_key), None);
+
+    // Alice names herself a second later. The cache says otherwise.
+    alice.set_profile(named("Alice Byrne", "")).await.unwrap();
+    assert_eq!(bob.refresh_profiles(&[alice_key], now + 1).await.unwrap(), 0);
+    assert_eq!(bob.display_name(&alice_key), None);
+
+    // Asking outright looks anyway.
+    assert_eq!(bob.refetch_profiles(&[alice_key], now + 1).await.unwrap(), 1);
+    assert_eq!(bob.display_name(&alice_key).as_deref(), Some("Alice Byrne"));
 }
 
 #[tokio::test]
