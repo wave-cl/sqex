@@ -271,7 +271,7 @@ pub struct App {
 /// would be a scrolling grid nobody wants. Any emoji can still be sent by a
 /// client that offers more — the wire carries the string, not an index into
 /// this.
-pub const REACTIONS: &[&str] = &["👍", "🎉", "❤️", "😂", "🤔", "👀"];
+pub const REACTIONS: &[&str] = &["👍", "🎉", "💜", "😂", "🤔", "👀"];
 
 impl App {
     pub fn selected_row(&self) -> Option<&Row> {
@@ -642,17 +642,20 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         out.push(Line::from(spans).alignment(align));
     }
 
-    if let Some((who, stub)) = &s.reply_to {
-        // A target we no longer hold has neither an author nor any words, so
-        // it says that once rather than pairing an empty name with an empty
-        // quotation.
-        let text = if stub.is_empty() {
+    // What is being answered, as the first line *of* the bubble rather than a
+    // dim line floating above it. A quotation that is not visibly attached to
+    // the message quoting it is just another message.
+    //
+    // A target we no longer hold has neither an author nor any words, so it
+    // says that once rather than pairing an empty name with an empty
+    // quotation.
+    let quoted = s.reply_to.as_ref().map(|(who, stub)| {
+        if stub.is_empty() {
             format!("↳ {who}")
         } else {
             format!("↳ {who}: {}", truncate(stub, width.saturating_sub(4)))
-        };
-        out.push(Line::from(Span::styled(text, dim)).alignment(align));
-    }
+        }
+    });
 
     let body = if s.redacted {
         vec!["message deleted".to_string()]
@@ -707,8 +710,34 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
             UnicodeWidthStr::width(l.as_str())
                 + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 }
         })
+        .chain(quoted.iter().map(|q| UnicodeWidthStr::width(q.as_str())))
         .max()
         .unwrap_or(0);
+
+    // The quotation, a shade off the bubble it belongs to and padded to the
+    // same width, so the whole thing is one block.
+    if let Some(q) = &quoted {
+        let tint = if s.redacted {
+            dim.add_modifier(Modifier::ITALIC)
+        } else if mine {
+            Style::default().fg(Color::Indexed(250)).bg(Color::Indexed(18))
+        } else {
+            Style::default().fg(Color::Indexed(248)).bg(Color::Indexed(236))
+        };
+        let mut spans = Vec::new();
+        if !mine {
+            spans.push(Span::raw(" ".repeat(GUTTER)));
+        }
+        spans.push(Span::styled(format!(" {q}"), tint));
+        spans.push(Span::styled(
+            " ".repeat(content.saturating_sub(UnicodeWidthStr::width(q.as_str())) + 1),
+            tint,
+        ));
+        if mine {
+            spans.push(Span::raw(" ".repeat(GUTTER)));
+        }
+        out.push(Line::from(spans).alignment(align));
+    }
     for (n, line) in body.iter().enumerate() {
         let mut spans = Vec::new();
         // The cursor sits on the leading edge, which is a different edge for
@@ -730,6 +759,11 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         if n == last {
             spans.push(Span::styled(tail.clone(), inside));
         }
+        // One space of inset either side, and the rest padding out to the
+        // bubble's width. A deleted message needs no special case here: it is
+        // always one line, so `content` and `used` are equal and this is the
+        // single space — which is what keeps its words in line with everybody
+        // else's rather than flush against the edge.
         spans.push(Span::styled(
             " ".repeat(content.saturating_sub(used) + 1),
             style,
@@ -759,7 +793,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         let mut used = 0;
         let mut shown = 0;
         for (emoji, count, is_mine) in &s.reactions {
-            let chip = format!(" {emoji} {count} ");
+            let chip = format!(" {} {count} ", plain_emoji(emoji));
             let w = UnicodeWidthStr::width(chip.as_str());
             if used + w > width {
                 break;
@@ -974,6 +1008,23 @@ fn results(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// An emoji without its presentation selector.
+///
+/// U+FE0F asks for the colourful form of a character that also has a text
+/// form. `unicode-width` calls the sequence two columns wide and ratatui lays
+/// it out as two, but a good many terminals paint it in one — and the cell
+/// ratatui reserved for the second half is left with no background, so a
+/// coloured chip comes out with a hole punched through it. ❤️ is the one that
+/// does this in practice; every other emoji in the picker is a single code
+/// point in the emoji block, where nobody disagrees.
+///
+/// Dropping the selector gives up the colourful glyph for a monochrome one and
+/// gets an emoji whose width everything agrees on. In a layout made of columns
+/// that is the better trade.
+fn plain_emoji(s: &str) -> String {
+    s.chars().filter(|c| *c != '\u{fe0f}' && *c != '\u{fe0e}').collect()
 }
 
 /// The column an incoming message leaves for the pick cursor, before its
@@ -2511,6 +2562,102 @@ mod tests {
             .expect("no reaction drawn");
         assert_eq!(buf[chip].style().bg, Some(Color::Indexed(237)));
         assert!(buf[chip].style().fg.is_some(), "the chip took the terminal's colour");
+    }
+
+    /// Every emoji the picker offers is one whose width nothing argues about.
+    /// A presentation selector makes unicode-width say two and many terminals
+    /// paint one, and the cell ratatui reserved for the second half keeps no
+    /// background — so a coloured chip comes out with a hole in it.
+    #[test]
+    fn the_picker_offers_no_emoji_of_disputed_width() {
+        for e in REACTIONS {
+            assert_eq!(
+                e.chars().count(),
+                1,
+                "{e:?} is a sequence, not a single code point"
+            );
+            assert_eq!(UnicodeWidthStr::width(*e), 2, "{e:?} is not two columns");
+        }
+    }
+
+    #[test]
+    fn a_reaction_that_arrives_with_a_selector_is_drawn_without_one() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "hi", 3661);
+        // What an older client, or another client, may send.
+        s.reactions = vec![("\u{2764}\u{fe0f}".into(), 1, false)];
+        app.said = vec![s];
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        // No cell inside the chip run is left without a background.
+        let run: Vec<(u16, u16)> = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(Color::Indexed(237)))
+            .collect();
+        assert!(!run.is_empty(), "no chip drawn");
+        let y = run[0].1;
+        let (lo, hi) = (run[0].0, run[run.len() - 1].0);
+        for x in lo..=hi {
+            assert_eq!(
+                buf[(x, y)].style().bg,
+                Some(Color::Indexed(237)),
+                "a hole at x={x}: {:?}",
+                buf[(x, y)].symbol()
+            );
+        }
+    }
+
+    /// The quotation is part of the bubble, not a dim line above it, and the
+    /// bubble is as wide as the wider of the two — a long quotation used to
+    /// stick out past the message quoting it.
+    #[test]
+    fn a_reply_quotes_inside_the_bubble() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "yes", 3661);
+        s.reply_to = Some((
+            "Alice (E4LUkjrZ)".into(),
+            "a much longer question than the answer".into(),
+        ));
+        app.said = vec![s];
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let right_of = |bg: Color| {
+            (0..buf.area.height)
+                .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
+                .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(bg))
+                .map(|(x, _)| x)
+                .max()
+        };
+        let quote = right_of(Color::Indexed(236)).expect("the quotation has no tint");
+        let body = right_of(Color::Indexed(238)).expect("no bubble");
+        assert_eq!(quote, body, "the quotation and the message are different widths");
+    }
+
+    /// A deleted message gets no bubble, and so no padding shaped like one:
+    /// invisible spaces make a line longer than it looks.
+    #[test]
+    fn a_tombstone_carries_no_invisible_padding() {
+        // The observable is alignment: padding in the shape of a bubble it
+        // does not have would push a deleted message of ours in from the right
+        // edge, out of line with everything else we said.
+        let right_edge = |redacted: bool| {
+            let mut app = sample();
+            let mut s = said("you", "9hSR6S7W", true, "message deleted", 3661);
+            s.redacted = redacted;
+            app.said = vec![s];
+            let out = render(&app, 110, 24);
+            out.lines()
+                .find(|l| l.contains("message deleted"))
+                .map(|l| l.trim_end().chars().count())
+                .expect("not on screen")
+        };
+        assert_eq!(
+            right_edge(true),
+            right_edge(false),
+            "a deleted message did not line up with the others"
+        );
     }
 
     #[test]
