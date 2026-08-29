@@ -94,12 +94,12 @@ pub struct Row {
     /// label for a direct message, the channel's own name for a group. Empty
     /// when a direct message's peer has published no name and we chose none.
     pub label: String,
-    /// The peer's key, short, for a direct message. `None` for a group, whose
-    /// name belongs to the channel and not to a person.
+    /// The peer's key **in full**, for a direct message. `None` for a group,
+    /// whose name belongs to the channel and not to a person.
     ///
-    /// Present so the list can obey SIP-21 the same way the transcript does:
-    /// choosing which conversation to type into is exactly a moment where
-    /// mistaking one person for another matters.
+    /// In full because it is what hover, click and `/who` hand over, and a
+    /// truncated key is not one. What is *drawn* is [`short_key`] of it, and
+    /// only when the peer has no name.
     pub key: Option<String>,
     /// A group rather than a direct message. Marked, because "who am I talking
     /// to" and "who can read this" are the same question in one and not in the
@@ -123,7 +123,9 @@ pub struct Said {
     /// The display name its author published, if any. **Never shown without
     /// `key`** — see [`author`].
     pub who: String,
-    /// The author's key, short. Always present, always drawn.
+    /// The author's key, in full. Always present; drawn only as far as
+    /// [`author`] shows it, which since the SIP-21 deviation is not at all
+    /// when they have a name.
     pub key: String,
     pub mine: bool,
     pub text: String,
@@ -488,39 +490,51 @@ fn hue(byte: u8) -> Color {
 /// [`author`] will not drop the key to make room.
 const AUTHOR: usize = 22;
 
-/// The author of a line: a name **and** a key, or a key alone.
+/// How much of a key stands in for it when there is no name.
 ///
-/// SIP-21, on display names: "A client MUST show the key alongside the name
-/// wherever the distinction could matter … and MUST NOT let a name be the only
-/// thing a person sees at those moments. This is the one requirement in this
-/// SIP that is load-bearing."
+/// Eight base58 characters, as the admin CLI truncates to. Never enough to
+/// identify anybody by — see [`author`] for where the whole of it lives.
+pub fn short_key(key: &str) -> String {
+    key.chars().take(8).collect()
+}
+
+/// The author of a line: their name, or a stub of their key if they have none.
 ///
-/// A name is a claim its subject makes. Two accounts may publish the same one,
-/// or names differing by a homoglyph, a combining mark or a bidirectional
-/// override, and the key is the only thing that tells them apart. So when the
-/// column is too narrow for both, it is the **name** that is cut — never the
-/// key, which is what makes this function the whole of the rule.
+/// **This departs from SIP-21, deliberately and on the record.** That SIP says
+/// a client MUST show the key alongside the name wherever the distinction
+/// could matter, and MUST NOT let a name be the only thing a person sees at
+/// those moments — "the one requirement in this SIP that is load-bearing".
+/// This client now shows the name alone.
 ///
-/// `mine` is the exception, and a narrow one: our own messages are the one
-/// place impersonation is not a question a reader has.
+/// The reason the rule exists does not go away by being deviated from: a name
+/// is a claim its subject makes, two accounts may publish the same one, and
+/// names differing by a homoglyph, a combining mark or a bidirectional
+/// override are indistinguishable on screen. The key is still the only thing
+/// that tells them apart. So it is not removed, only moved, and three routes
+/// to it are kept — two of which need no mouse, because mouse capture is off
+/// until asked for:
+///
+/// - **hover** a message and the status line gives the whole key;
+/// - **click** one and it goes to the clipboard;
+/// - **pick** one with Esc and the status line gives the whole key, and `c`
+///   copies it. `/who` lists every member's key in full.
+///
+/// What that trades is the reader who never does any of those things and is
+/// therefore never told. That is the risk SIP-21 names, and it is being taken
+/// knowingly rather than overlooked.
+///
+/// `mine` is our own messages, where impersonation is not a question a reader
+/// has.
 pub fn author(name: &str, key: &str, mine: bool) -> String {
     if mine {
         return "you".to_string();
     }
-    // A contact nobody has named is labelled with its own short key, and
-    // pairing that with itself renders "E4LUkjrZ (E4LUkjrZ)". A name that *is*
-    // the key is not a name. Handled here rather than at each call site,
-    // because it is a property of the pairing.
-    if name.is_empty() || name == key {
-        return key.to_string();
+    // A contact nobody has named goes by a stub of its key. A name that *is*
+    // the key is not a name — that is what an unnamed contact's label holds.
+    if name.is_empty() || name == key || name == short_key(key) {
+        return short_key(key);
     }
-    // The key, the brackets and a space: what the name may have is whatever is
-    // left, and never less than nothing.
-    let room = AUTHOR.saturating_sub(key.chars().count() + 3);
-    if room < 2 {
-        return key.to_string();
-    }
-    format!("{} ({key})", truncate(name, room))
+    truncate(name, AUTHOR)
 }
 
 /// Which message each row of the screen belongs to.
@@ -1369,7 +1383,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
     ("this channel", &[
         ("/name  /topic  /avatar", "what it is called, what it is for, its picture"),
         ("/retain <secs> [max]", "how long it keeps what is said"),
-        ("/who  /read", "who is here; how far each of them has read"),
+        ("/who  /read", "who is here and their keys in full; how far each has read"),
         ("/rotate", "mint a new key for everyone currently here"),
     ]),
     ("finding things", &[
@@ -1415,9 +1429,25 @@ fn help(f: &mut Frame, area: Rect) {
             Span::styled("reply  ", dim),
             Span::styled("e ", key),
             Span::styled("rewrite  ", dim),
+            Span::styled("c ", key),
+            Span::styled("copy their key  ", dim),
             Span::styled("d ", key),
             Span::styled("delete", dim),
         ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  a key", head),
+            Span::styled(
+                "  a name is a claim anybody can make, and two accounts may publish the \
+                 same one. The key is",
+                dim,
+            ),
+        ]),
+        Line::from(Span::styled(
+            "         what tells them apart: pick a message for it, hover or click one, \
+             or /who for everybody's.",
+            dim,
+        )),
         Line::from(""),
     ];
     for (title, rows) in HELP {
@@ -1520,32 +1550,46 @@ fn keys_line(width: usize) -> String {
 }
 
 fn status(f: &mut Frame, app: &App, area: Rect) {
-    let (text, style) = if app.picked.is_some() {
-        // The mode's own keys, and only them. A person who has just entered a
-        // mode by pressing Esc needs to be told what it does, and the general
-        // command list is the wrong answer to that question.
-        let mine = app
-            .picked
-            .and_then(|i| app.said.get(i))
-            .is_some_and(|s| s.mine);
-        (
-            format!(
-                " ↑↓ move · a react · r reply{} · d delete · Esc back",
-                if mine { " · e rewrite" } else { "" }
-            ),
-            Style::default().fg(palette::ATTENTION),
-        )
-    } else if !app.trouble.is_quiet() {
+    // Anything the client has to say outranks every hint, including the
+    // mode's own. `c` in pick mode copies a key and the answer — whether it
+    // reached a clipboard at all — arrives this way; behind the hints it was
+    // invisible, so a copy that silently failed looked exactly like one that
+    // worked, and the difference is only discovered at the paste.
+    let (text, style) = if !app.trouble.is_quiet() {
         (
             format!(" {}", app.trouble.line()),
             Style::default().fg(palette::ATTENTION),
         )
+    } else if let Some(picked) = app.picked.and_then(|i| app.said.get(i)) {
+        // The picked message's author, in full, and then the mode's own keys.
+        //
+        // The key leads for the same reason it does on hover: it is what the
+        // name stopped saying, and picking a message is the keyboard's way of
+        // asking about one. Somebody who never touches a mouse reaches it
+        // here, which is what makes the deviation in `author` survivable.
+        let hints = if picked.mine {
+            " · a react · r reply · e rewrite · d delete · Esc"
+        } else {
+            " · a react · r reply · c copy key · d delete · Esc"
+        };
+        let key = if picked.mine {
+            String::new()
+        } else {
+            format!(" {}", picked.key)
+        };
+        (format!("{key}{hints}"), Style::default().fg(palette::ATTENTION))
     } else if let Some(s) = app.hovered.and_then(|i| app.said.get(i)) {
         // In the status line rather than floating by the pointer. A tooltip
         // over a transcript covers the message it is describing, and this line
         // is already where the client puts a detail somebody asked for. It
         // gives way to trouble, which is not a detail.
-        (format!(" {}", stamp(s.at)), Style::default().fg(palette::MUTED))
+        //
+        // The key leads. It is the thing the name no longer says, and if the
+        // line is cut by a narrow terminal it is the half that has to survive.
+        (
+            format!(" {} · {}", s.key, stamp(s.at)),
+            Style::default().fg(palette::MUTED),
+        )
     } else {
         (
             keys_line(area.width as usize),
@@ -1773,6 +1817,15 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// Keys the length of real ones.
+    ///
+    /// The short fixtures elsewhere are fine where a key is only something to
+    /// print, and no use at all where the question is whether the *whole* key
+    /// survived: eight characters look identical before and after a truncation
+    /// that would lose thirty-six.
+    const ALICE: &str = "9hMLdY3VpKcR2wNtSbXgFzUqE7vJmA4dHyL8nCxTZk6Q";
+    const CAROL: &str = "E4LUkjrZ7mWvTpN3sQhBxYdGcF9aKzUt2LnRe5JqXM8V";
 
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -2086,7 +2139,7 @@ mod tests {
         // The mode's own keys replace the command list: somebody who just
         // pressed Esc needs to be told what the mode does.
         assert!(out.contains("a react"), "{out}");
-        assert!(out.contains("Esc back"), "{out}");
+        assert!(out.contains("Esc"), "{out}");
         // The second message is ours, so rewriting is offered.
         assert!(out.contains("e rewrite"), "{out}");
 
@@ -2176,47 +2229,66 @@ mod tests {
     /// same one. If this ever passes with the key absent, the client has become
     /// a thing that can be impersonated by typing.
     #[test]
-    fn a_display_name_never_appears_without_its_key() {
+    fn a_display_name_stands_alone_and_a_nameless_one_shows_a_stub() {
+        // The deviation from SIP-21, stated as a test so it cannot happen by
+        // accident: a name that is published is the whole of what is drawn.
+        assert_eq!(author("Alice", "9hMLdY3V", false), "Alice");
+
+        // Somebody who has published no name goes by a stub of their key,
+        // because a row with nothing in it names nobody at all.
         assert_eq!(author("", "9hMLdY3V", false), "9hMLdY3V");
-        let line = author("Alice", "9hMLdY3V", false);
-        assert!(line.contains("Alice"), "{line}");
-        assert!(line.contains("9hMLdY3V"), "{line}");
+        assert_eq!(author("", ALICE, false), short_key(ALICE));
+        // And a label that is only the key repeated is not a name.
+        assert_eq!(author(&short_key(ALICE), ALICE, false), short_key(ALICE));
 
-        // Two accounts, the same claimed name. Only the key separates them, so
-        // only the key can be the thing that is always there.
-        let one = author("Alice", "9hMLdY3V", false);
-        let two = author("Alice", "E4LUkjrZ", false);
-        assert_ne!(one, two, "two accounts named Alice rendered identically");
-
-        // A name that will not fit is cut. The key is not.
+        // A name too long for the column is cut, as any name always was.
         let long = author(&"n".repeat(200), "9hMLdY3V", false);
-        assert!(
-            long.contains("9hMLdY3V"),
-            "a long name pushed the key off the line: {long}"
-        );
         assert!(long.chars().count() <= AUTHOR, "{long}");
-
-        // Including one made of characters that are wide, combining, or
-        // right-to-left — the exact material an impersonation is built from.
-        for name in ["🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈", "e\u{301}\u{301}\u{301}\u{301}", "\u{202e}ecilA"] {
-            let line = author(name, "9hMLdY3V", false);
-            assert!(
-                line.contains("9hMLdY3V"),
-                "the key was lost rendering {name:?}: {line}"
-            );
-        }
 
         // Our own messages are the one place impersonation is not a question a
         // reader has.
         assert_eq!(author("Alice", "9hMLdY3V", true), "you");
     }
 
+    /// What the deviation costs, written down where it will be read.
+    ///
+    /// Two accounts publishing one name are now indistinguishable on the line
+    /// itself — that is the risk SIP-21 names, taken knowingly. What must not
+    /// happen is the key becoming unreachable, so every route to it is held
+    /// here: the message carries it whole, hovering says it, picking says it,
+    /// and neither of the last two needs a mouse for the keyboard one.
     #[test]
-    fn the_transcript_shows_a_name_with_the_key_it_belongs_to() {
+    fn two_accounts_with_one_name_are_told_apart_by_something() {
+        assert_eq!(author("Alice", ALICE, false), author("Alice", CAROL, false));
+
+        let mut app = sample();
+        app.said = vec![
+            said("Alice", ALICE, false, "it is me", 3661),
+            said("Alice", CAROL, false, "no, me", 3700),
+        ];
+        // Hovering one and then the other says two different things, and each
+        // says the whole key rather than a stub of it.
+        for (i, key) in [(0, ALICE), (1, CAROL)] {
+            app.hovered = Some(i);
+            let out = render(&app, 130, 24);
+            assert!(out.contains(key), "hovering did not give the whole key:\n{out}");
+        }
+        app.hovered = None;
+        // And picking, which is the same answer without a mouse.
+        for (i, key) in [(0, ALICE), (1, CAROL)] {
+            app.picked = Some(i);
+            let out = render(&app, 130, 24);
+            assert!(out.contains(key), "picking did not give the whole key:\n{out}");
+            assert!(out.contains("c copy key"), "no way to take it:\n{out}");
+        }
+    }
+
+    #[test]
+    fn the_transcript_names_who_spoke() {
         let mut app = sample();
         app.said = vec![Said {
             who: "Alice".into(),
-            key: "9hMLdY3V".into(),
+            key: ALICE.into(),
             text: "hello".into(),
             seq: 3,
             at: 3661,
@@ -2224,10 +2296,9 @@ mod tests {
         }];
         let out = render(&app, 100, 20);
         assert!(out.contains("Alice"), "{out}");
-        assert!(
-            out.contains("9hMLdY3V"),
-            "a name reached the screen with no key beside it:\n{out}"
-        );
+        // And nothing else: a forty-four character key across every run header
+        // is what this change was about.
+        assert!(!out.contains(ALICE), "the key is back on the line:\n{out}");
     }
 
     /// Choosing which conversation to type into is exactly a moment where
@@ -2235,13 +2306,13 @@ mod tests {
     /// the list as much as to the transcript. The name shipped in the
     /// transcript only, and the list went on showing a bare key.
     #[test]
-    fn the_conversation_list_shows_a_name_with_its_key() {
+    fn the_conversation_list_names_each_conversation() {
         let mut app = sample();
         app.rows = vec![
             Row {
                 channel: [1; 32],
                 label: "Alice Byrne".into(),
-                key: Some("E4LUkjrZ".into()),
+                key: Some(CAROL.into()),
                 group: false,
                 public: false,
                 unread: 0,
@@ -2263,9 +2334,11 @@ mod tests {
         ];
         let out = render(&app, 100, 20);
         assert!(out.contains("Alice Byrne"), "the list dropped the name:\n{out}");
+        // The key is not on the row. It is a Tab and an Esc away, and on the
+        // conversation once one is open — see the SIP-21 note on `author`.
         assert!(
-            out.contains("E4LUkjrZ"),
-            "the list showed a name with no key beside it:\n{out}"
+            !out.contains(CAROL),
+            "the list is carrying a whole key across the pane:\n{out}"
         );
         // A group's name belongs to the channel, not to a person, so there is
         // no key it could be confused with and none is invented.
@@ -2297,11 +2370,11 @@ mod tests {
 
     /// A narrow sidebar loses the name, never the key.
     #[test]
-    fn a_narrow_list_keeps_the_key() {
+    fn a_narrow_list_cuts_the_name_and_never_half_a_key() {
         let r = Row {
             channel: [1; 32],
             label: "Alexandra Bartholomew".into(),
-            key: Some("E4LUkjrZ".into()),
+            key: Some(CAROL.into()),
             group: false,
             public: false,
             unread: 0,
@@ -2311,9 +2384,13 @@ mod tests {
         };
         for width in 8..=AUTHOR {
             let line = row_label(&r, width);
+            assert!(line.chars().count() <= AUTHOR, "{line}");
+            // A name, cut. Never a fragment of the key, which would look like
+            // a key and identify nobody — the row shows the name or, for
+            // somebody unnamed, a stub that is deliberately eight characters.
             assert!(
-                line.contains("E4LUkjrZ"),
-                "a long name pushed the key out at width {width}: {line}"
+                line.starts_with("Alexandra") || line == short_key(CAROL),
+                "at width {width} the row reads {line:?}"
             );
         }
     }
@@ -2513,10 +2590,6 @@ mod tests {
         let app = sample();
         let head = row_at(&app, 100, 24, 2);
         assert!(head.contains("bob"), "the header does not name it: {head:?}");
-        assert!(
-            head.contains("8qbHbw2B"),
-            "the header names somebody without their key: {head:?}"
-        );
     }
 
     #[test]
@@ -2713,7 +2786,7 @@ mod tests {
         app.said[0].reactions = vec![("🧡".into(), 1, false)];
         let (rows, hover) = drawn(&app, 100, 24);
         let x = hover.pane.x + 1;
-        for text in ["bob (8qbHbw2B)", "are you there?", "🧡"] {
+        for text in ["bob", "are you there?", "🧡"] {
             let y = row_of(&rows, &hover, text);
             assert_eq!(hover.at(x, y), Some(0), "{text:?} is not part of its message");
         }
@@ -2779,6 +2852,20 @@ mod tests {
         // And it stands down for the keys line when nothing is under it.
         app.hovered = None;
         assert!(!render(&app, 100, 24).contains(&want));
+    }
+
+    /// A copy either reached a clipboard or did not, and that answer has to
+    /// get past the mode's own hints — it is only otherwise discovered at the
+    /// paste, when the key is no longer on screen to try again.
+    #[test]
+    fn what_the_client_has_to_say_outranks_every_hint() {
+        let mut app = sample();
+        app.picked = Some(0);
+        assert!(render(&app, 110, 24).contains("a react"), "no hints when quiet");
+
+        app.trouble.message = Some("could not reach the clipboard. their key: abc".into());
+        let out = render(&app, 110, 24);
+        assert!(out.contains("could not reach the clipboard"), "{out}");
     }
 
     /// Trouble is not a detail somebody asked for, and it wins.
@@ -2871,7 +2958,7 @@ mod tests {
     /// One header per run, and it carries the key — SIP-21 applies however the
     /// messages are arranged.
     #[test]
-    fn a_run_is_headed_once_and_the_header_carries_the_key() {
+    fn a_run_is_headed_once_and_the_header_names_who_spoke() {
         let mut app = sample();
         app.said = vec![
             said("bob", "8qbHbw2B", false, "one", 3661),
@@ -2880,7 +2967,7 @@ mod tests {
         ];
         let out = transcript_text(&app, 100, 24);
         assert_eq!(
-            out.matches("8qbHbw2B").count(),
+            out.matches("bob").count(),
             1,
             "expected exactly one run header:\n{out}"
         );
@@ -2889,7 +2976,7 @@ mod tests {
         // has lost the thread of who is speaking.
         app.said[2].at = 3681 + RUN_GAP + 1;
         let out = transcript_text(&app, 100, 24);
-        assert_eq!(out.matches("8qbHbw2B").count(), 2, "{out}");
+        assert_eq!(out.matches("bob").count(), 2, "{out}");
     }
 
     #[test]

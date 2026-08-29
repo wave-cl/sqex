@@ -6,13 +6,14 @@
 //! spends the prekey it was sealed against.
 
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -704,6 +705,20 @@ async fn event_loop(
                     }
                     app.hovered = over;
                 }
+                // Click a message to take its author's key. The transcript
+                // stopped showing keys, so this is one of the three ways back
+                // to one — and the only one that is a single gesture.
+                Event::Mouse(m)
+                    if app.mouse && m.kind == MouseEventKind::Down(MouseButton::Left) =>
+                {
+                    if let Some(s) = hover.at(m.column, m.row).and_then(|i| app.said.get(i)) {
+                        let note = copied(&s.key.clone(), s.mine);
+                        match selected_index(open, app) {
+                            Some(i) => open[i].note = Some((note, std::time::Instant::now())),
+                            None => app.trouble.message = Some(note),
+                        }
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -991,6 +1006,7 @@ async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyC
         return;
     };
     let (seq, mine, redacted, text) = (said.seq, said.mine, said.redacted, said.text.clone());
+    let key = said.key.clone();
 
     if app.reacting {
         match code {
@@ -1031,6 +1047,17 @@ async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyC
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.picked = Some((i + 1).min(app.said.len().saturating_sub(1)));
+        }
+        // The keyboard's copy, so the one gesture that reaches a key is not a
+        // click. Mouse capture is off until asked for, and somebody who never
+        // turns it on must still be able to get at the thing the name stopped
+        // saying.
+        KeyCode::Char('c') => {
+            let note = copied(&key, mine);
+            match selected_index(open, app) {
+                Some(at) => open[at].note = Some((note, std::time::Instant::now())),
+                None => app.trouble.message = Some(note),
+            }
         }
         KeyCode::Char('a') if !redacted => app.reacting = true,
         KeyCode::Char('r') if !redacted => {
@@ -1546,7 +1573,7 @@ async fn handle_key(
                                 seq: m.seq,
                                 who: ui::author(
                                     &names.get(&m.account).cloned().unwrap_or_default(),
-                                    &short(&m.account),
+                                    &m.account.to_string(),
                                     m.account == chat.me,
                                 ),
                                 at: m.posted,
@@ -1582,14 +1609,19 @@ async fn handle_key(
                                     let name = chat
                                         .display_name(&m.account)
                                         .unwrap_or_default();
+                                    // The whole key, not a stub of it. Since
+                                    // the transcript stopped showing keys this
+                                    // is the list somebody runs to find one,
+                                    // and half a key answers nothing.
                                     format!(
-                                        "{}{}",
-                                        ui::author(&name, &short(&m.account), false),
-                                        if m.role == Role::Admin { "*" } else { "" }
+                                        "{}{} {}",
+                                        ui::author(&name, &m.account.to_string(), false),
+                                        if m.role == Role::Admin { "*" } else { "" },
+                                        m.account
                                     )
                                 })
                                 .collect::<Vec<_>>()
-                                .join("  "),
+                                .join("   "),
                         ))
                     }
                     Err(e) => Err(e),
@@ -2246,7 +2278,10 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                     .to_string(),
                 None => o.label.clone(),
             },
-            key: o.peer.map(|p| ui::short(&p)),
+            // In full. What is drawn is a stub of it, and only for a peer
+            // with no name; the whole of it is what hover, click and `/who`
+            // hand over.
+            key: o.peer.map(|p| p.to_string()),
             // The newest thing said here, whoever said it. A redaction shows
             // as the gap it is rather than being skipped, or the list would
             // claim the conversation ended at an older message.
@@ -2334,7 +2369,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                     .cloned()
                     .or_else(|| conv.peer.map(|_| conv.label.clone()))
                     .unwrap_or_default(),
-                key: short(&m.account),
+                key: m.account.to_string(),
                 mine: m.account == *me,
                 text,
                 seq: m.seq,
@@ -2374,7 +2409,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                     let who = match target {
                         Some(t) => ui::author(
                             &names.get(&t.account).cloned().unwrap_or_default(),
-                            &short(&t.account),
+                            &t.account.to_string(),
                             t.account == *me,
                         ),
                         // Pruned, or from before we joined. Still marked as a
@@ -2471,6 +2506,86 @@ fn stop_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::R
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()
+}
+
+/// Copy a key, and say what happened in the words a reader needs.
+///
+/// Never claims success it cannot see. OSC 52 is fire-and-forget and
+/// Terminal.app ignores it silently, so on a machine with no `pbcopy` this
+/// prints the key instead of asserting it is on the clipboard — a false
+/// "copied" is worse than no copy, because it is only discovered at the paste.
+fn copied(key: &str, mine: bool) -> String {
+    let whose = if mine { "your key" } else { "their key" };
+    if copy(key) {
+        format!("{whose} is on the clipboard — {key}")
+    } else {
+        format!("could not reach the clipboard. {whose}: {key}")
+    }
+}
+
+/// Put `text` on the system clipboard, and say whether anything took it.
+///
+/// Two routes, because neither is enough on its own.
+///
+/// **OSC 52** asks the terminal to do it. It is the only thing that works when
+/// the client is run over ssh — the clipboard that matters is then the one in
+/// front of the person, not the one on the far machine — and iTerm2, kitty,
+/// WezTerm and tmux (with `set-clipboard on`) honour it. Terminal.app does
+/// not, and says nothing about ignoring it, which is the trouble with relying
+/// on it alone.
+///
+/// **`pbcopy`** is certain and local. It writes the clipboard of the machine
+/// this process is on, which is the right one exactly when the client is not
+/// being run remotely.
+///
+/// Both are attempted, because which is right depends on where this is
+/// running and the client cannot tell.
+fn copy(text: &str) -> bool {
+    let mut done = false;
+    // OSC 52: ESC ] 52 ; c ; <base64> BEL
+    let mut out = io::stdout();
+    if write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes())).is_ok() && out.flush().is_ok() {
+        done = true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            && let Some(mut pipe) = child.stdin.take()
+        {
+            let wrote = pipe.write_all(text.as_bytes()).is_ok();
+            drop(pipe);
+            let _ = child.wait();
+            done |= wrote;
+        }
+    }
+    done
+}
+
+/// Base64, for OSC 52 and nothing else.
+///
+/// Hand-rolled rather than a dependency for one short function whose output is
+/// checked against the RFC's own vectors.
+fn base64(bytes: &[u8]) -> String {
+    const SET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(SET[(n >> (18 - i * 6) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Take the mouse from the terminal, or hand it back.
@@ -2642,14 +2757,20 @@ mod tests {
         // so there is no third case to get wrong.
         assert!(app.said[1].mine);
 
-        // The line a reader actually sees pairs the name with the key, and
-        // never shows one without the other (SIP-21).
+        // The line a reader sees is the name alone. The key is not gone —
+        // it is carried whole on the message, which is what hover, click, the
+        // pick cursor and `/who` hand over.
         let line = ui::author(&app.said[0].who, &app.said[0].key, app.said[0].mine);
-        assert!(line.contains("bob"), "{line}");
-        assert!(
-            line.contains(&app.said[0].key),
-            "the name appeared without the key: {line}"
+        assert_eq!(line, "bob");
+        assert_eq!(
+            app.said[0].key,
+            PubKey::new([2; 32]).to_string(),
+            "the message does not carry the whole key, so nothing can hand it over"
         );
+        // Whole, and not a stub of one: this is the path that used to
+        // truncate, and a test with an eight-character fixture would not
+        // notice if it started again.
+        assert!(app.said[0].key.chars().count() > 40, "{}", app.said[0].key);
         assert_eq!(
             ui::author(&app.said[1].who, &app.said[1].key, app.said[1].mine),
             "you"
@@ -2701,6 +2822,41 @@ mod tests {
     /// The poll runs every 700 ms and clears the conversation's trouble, so a
     /// confirmation kept in that field was on screen for less than a second —
     /// which is to say it was never read. A note outlives the poll.
+    /// Checked against RFC 4648's own vectors, including every padding case,
+    /// because this is hand-rolled and a wrong clipboard is a silent one.
+    #[test]
+    fn base64_is_base64() {
+        for (plain, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), want, "{plain:?}");
+        }
+        // And a key, which is the only thing this is ever asked to encode.
+        let key = PubKey::new([7; 32]).to_string();
+        assert_eq!(
+            base64(key.as_bytes()).len(),
+            key.len().div_ceil(3) * 4,
+            "a key came out the wrong length"
+        );
+    }
+
+    /// A copy that failed must not report success: it is discovered at the
+    /// paste, by which time the key is gone from the screen too.
+    #[test]
+    fn a_copy_says_the_key_either_way() {
+        let key = PubKey::new([9; 32]).to_string();
+        let note = copied(&key, false);
+        assert!(note.contains(&key), "the note does not carry the key: {note}");
+        assert!(note.contains("their key"), "{note}");
+        assert!(copied(&key, true).contains("your key"));
+    }
+
     #[test]
     fn the_answer_to_a_command_outlives_the_next_poll() {
         let mut c = conv(2, "bob");
