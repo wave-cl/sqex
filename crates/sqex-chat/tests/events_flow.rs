@@ -504,3 +504,43 @@ async fn a_linked_device_receives_its_accounts_events() {
     .await;
     assert!(got.is_some(), "a linked device was not told about a rename");
 }
+
+/// Dropping a stream that is being read must not panic.
+///
+/// This is the shape that shipped broken. `h3-quinn` takes the inner
+/// `quinn::RecvStream` out of its option while a read is pending and only puts
+/// it back when the read finishes, so a stream being read in a loop — which is
+/// every event stream — has `None` there almost all the time. A `Drop` impl
+/// that called `stop_sending` therefore unwrapped `None` and panicked on a
+/// worker thread, and `Chat::take_events` drops the stream on every reconnect.
+///
+/// The old test that dropped a stream could not see it: those streams had never
+/// been read, so the option was still `Some`. A read has to actually be in
+/// flight, which is what the timeout below arranges.
+#[tokio::test]
+async fn a_stream_being_read_can_be_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _srv, _h) = server_in(dir.path()).await;
+    let (seed, _me) = identity(1);
+    let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
+
+    let body = sqex_proto::events::Subscribe {
+        version: sqex_proto::events::VERSION,
+    }
+    .encode();
+    let mut raw = client.stream("POST", "/events", body).await.unwrap();
+    assert_eq!(raw.status(), 200);
+
+    // Start a read and abandon it. The exchange has nothing to say, so this
+    // times out with the read still holding the inner stream — exactly where
+    // the pump task sits for all of its life.
+    let waited = tokio::time::timeout(Duration::from_millis(150), raw.next()).await;
+    assert!(waited.is_err(), "control: the read completed, so nothing was in flight");
+
+    // The line that used to panic.
+    drop(raw);
+
+    // Still usable afterwards, which is what a reconnect needs.
+    let again = sqex_chat::events::Stream::open(&client).await;
+    assert!(again.is_ok(), "could not resubscribe after dropping a stream");
+}
