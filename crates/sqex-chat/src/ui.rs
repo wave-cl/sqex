@@ -47,6 +47,10 @@ pub struct Row {
     pub unread: usize,
     /// They have never run a client, so nothing can be sealed to them yet.
     pub waiting: bool,
+    /// The last thing said here, and when — the line that makes a list of
+    /// conversations answer "what is going on" rather than only "what exists".
+    pub preview: String,
+    pub at: u64,
 }
 
 /// One line of conversation, already resolved to what the reader should see.
@@ -407,26 +411,29 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn header(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![
-        Span::styled(" sqex-chat ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!("· {}", app.me),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans = Vec::new();
     if !app.topic.is_empty() {
         spans.push(Span::styled(
-            format!(" · {}", truncate(&app.topic, 60)),
+            truncate(&app.topic, 60),
             Style::default().fg(Color::Cyan),
         ));
+        spans.push(Span::styled(" · ", dim));
     }
     if app.has_avatar {
-        spans.push(Span::styled(
-            " · /avatar save <path>",
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled("/avatar save <path> · ", dim));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    spans.push(Span::styled(app.me.clone(), dim));
+    // The name of the thing goes in the corner, where a title bar puts it and
+    // where the eye is not looking for anything else.
+    spans.push(Span::styled(
+        " sqex-chat ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(
+        Paragraph::new(Line::from(spans).alignment(Alignment::Right)),
+        area,
+    );
 }
 
 /// What a row is called: a name and a key, or whichever of the two there is.
@@ -490,7 +497,24 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
                 // a client, so there is nowhere to send a key yet.
                 spans.push(Span::styled(" ·", Style::default().fg(Color::DarkGray)));
             }
-            ListItem::new(Line::from(spans))
+            // A second line, the way every chat client does it: when, and the
+            // beginning of what was said. Without it the list says only which
+            // conversations exist.
+            let mut under = Vec::new();
+            if r.at > 0 {
+                under.push(Span::styled(
+                    format!("   {}", clock(r.at)),
+                    if selected { base } else { base.fg(Color::DarkGray) },
+                ));
+            }
+            if !r.preview.is_empty() {
+                let room = (area.width as usize).saturating_sub(11);
+                under.push(Span::styled(
+                    truncate(&r.preview, room),
+                    if selected { base } else { base.fg(Color::DarkGray) },
+                ));
+            }
+            ListItem::new(vec![Line::from(spans), Line::from(under)])
         })
         .collect();
 
@@ -503,7 +527,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
         List::new(items)
     };
     f.render_widget(
-        list.block(Block::default().borders(Borders::RIGHT).title("people")),
+        list.block(Block::default().borders(Borders::RIGHT)),
         area,
     );
 }
@@ -585,14 +609,49 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
     } else {
         wrap_to(&s.text, width)
     };
+    // A bubble sets both halves of its own colour rather than only one. Taking
+    // the terminal's background and painting text on it would read fine on a
+    // dark theme and be unreadable on a light one, and the client has no way
+    // to ask which it is in.
     let style = if s.redacted {
+        // A deleted message is not given a bubble: a gap should look like a
+        // gap and not like something somebody said.
         dim.add_modifier(Modifier::ITALIC)
     } else if mine {
-        Style::default().fg(Color::Green)
+        Style::default().fg(Color::Indexed(255)).bg(Color::Indexed(24))
     } else {
-        Style::default()
+        Style::default().fg(Color::Indexed(253)).bg(Color::Indexed(238))
+    };
+    let inside = if s.redacted {
+        dim.add_modifier(Modifier::ITALIC)
+    } else {
+        style.fg(Color::Indexed(250))
     };
     let last = body.len().saturating_sub(1);
+
+    // What trails the message shares its last line, and the whole block is
+    // padded to one width so the colour forms a rectangle rather than a ragged
+    // edge.
+    let mut tail = String::new();
+    if s.has_file && !s.redacted {
+        tail += &format!("  /save {}", s.seq);
+    }
+    if s.edited && !s.redacted {
+        tail += "  (edited)";
+    }
+    for m in &s.mentions {
+        tail += &format!("  @{m}");
+    }
+    tail += &format!("  {}", clock(s.at).trim_end());
+    let content = body
+        .iter()
+        .enumerate()
+        .map(|(n, l)| {
+            UnicodeWidthStr::width(l.as_str())
+                + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 }
+        })
+        .max()
+        .unwrap_or(0);
     for (n, line) in body.iter().enumerate() {
         let mut spans = Vec::new();
         // The cursor sits on the leading edge, which is a different edge for
@@ -604,29 +663,20 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
                 Style::default().fg(Color::Yellow),
             ));
         }
-        spans.push(Span::styled(line.clone(), style));
+        let used = UnicodeWidthStr::width(line.as_str())
+            + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 };
+        spans.push(Span::styled(format!(" {line}"), style));
         // The time and the markers ride on the last line rather than taking
         // one of their own: a line per message halves how much of a
         // conversation fits on screen, for information most people read only
         // when they want it.
         if n == last {
-            if s.has_file && !s.redacted {
-                spans.push(Span::styled(format!("  /save {}", s.seq), dim));
-            }
-            if s.edited && !s.redacted {
-                spans.push(Span::styled("  (edited)", dim));
-            }
-            for m in &s.mentions {
-                spans.push(Span::styled(
-                    format!("  @{m}"),
-                    Style::default().fg(Color::Magenta),
-                ));
-            }
-            spans.push(Span::styled(
-                format!("  {}", clock(s.at).trim_end()),
-                dim,
-            ));
+            spans.push(Span::styled(tail.clone(), inside));
         }
+        spans.push(Span::styled(
+            " ".repeat(content.saturating_sub(used) + 1),
+            style,
+        ));
         if mine {
             spans.push(Span::styled(
                 if picked && n == 0 { "◂" } else { " " },
@@ -824,7 +874,10 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
             replying = format!("replying to {seq}: {} — Esc to stop", truncate(stub, 40));
             (replying.as_str(), app.input.as_str())
         }
-        (None, None, None) => ("message", app.input.as_str()),
+        // Nothing to say about an empty composer: "message" is the same kind
+        // of label as the "people" that used to head the list, naming a thing
+        // that is already obvious from looking at it.
+        (None, None, None) => ("", app.input.as_str()),
     };
     f.render_widget(
         Paragraph::new(content)
@@ -1027,6 +1080,8 @@ mod tests {
                     group: false,
                     public: false,
                     unread: 0,
+                    preview: String::new(),
+                    at: 0,
                     waiting: false,
                 })
                 .collect(),
@@ -1122,6 +1177,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 2,
+                preview: String::new(),
+                at: 0,
                 waiting: false,
             }],
             selected: Some([2; 32]),
@@ -1574,6 +1631,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: false,
             },
             Row {
@@ -1583,6 +1642,8 @@ mod tests {
                 group: true,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: false,
             },
         ];
@@ -1608,6 +1669,8 @@ mod tests {
             group: false,
             public: false,
             unread: 0,
+            preview: String::new(),
+            at: 0,
             waiting: false,
         }];
         let out = render(&app, 100, 20);
@@ -1628,6 +1691,8 @@ mod tests {
             group: false,
             public: false,
             unread: 0,
+            preview: String::new(),
+            at: 0,
             waiting: false,
         };
         for width in 8..=AUTHOR {
@@ -1893,6 +1958,94 @@ mod tests {
         for l in out.lines() {
             assert!(UnicodeWidthStr::width(l) <= 100, "overflowed: {l:?}");
         }
+    }
+
+    /// A bubble is a rectangle, so every line of a message carries the same
+    /// background — a ragged edge would look like damage rather than a shape.
+    #[test]
+    fn a_bubble_is_a_rectangle() {
+        let mut app = sample();
+        app.said = vec![said(
+            "bob",
+            "8qbHbw2B",
+            false,
+            "one two three four five six seven eight nine ten eleven twelve",
+            3661,
+        )];
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+
+        // Every row holding part of the message has the same run of coloured
+        // cells, and they all start in the same column.
+        let mut widths = Vec::new();
+        for y in 0..buf.area.height {
+            let painted: Vec<u16> = (31..buf.area.width)
+                .filter(|x| buf[(*x, y)].style().bg == Some(Color::Indexed(238)))
+                .collect();
+            if !painted.is_empty() {
+                widths.push((painted[0], painted.len()));
+            }
+        }
+        assert!(widths.len() >= 2, "the message did not wrap: {widths:?}");
+        assert!(
+            widths.iter().all(|(x, _)| *x == widths[0].0),
+            "the bubble has a ragged left edge: {widths:?}"
+        );
+        assert!(
+            widths.iter().all(|(_, n)| *n == widths[0].1),
+            "the bubble has a ragged right edge: {widths:?}"
+        );
+    }
+
+    /// A bubble sets both halves of its own colour. Painting text on whatever
+    /// the terminal's background happens to be reads on a dark theme and is
+    /// unreadable on a light one, and the client cannot ask which it is in.
+    #[test]
+    fn a_bubble_sets_its_foreground_as_well_as_its_background() {
+        let mut app = sample();
+        app.said = vec![said("bob", "8qbHbw2B", false, "hello", 3661)];
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let painted = (0..buf.area.height)
+            .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
+            .find(|(x, y)| buf[(*x, *y)].symbol() == "h")
+            .expect("the message is not on screen");
+        let cell = &buf[painted];
+        assert!(cell.style().bg.is_some(), "no bubble behind the text");
+        assert!(cell.style().fg.is_some(), "the text took the terminal's colour");
+    }
+
+    /// A deleted message is not given a bubble: a gap should look like a gap,
+    /// not like something somebody said.
+    #[test]
+    fn a_tombstone_is_not_dressed_as_a_message() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "", 3661);
+        s.redacted = true;
+        app.said = vec![s];
+        let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        t.draw(|f| draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let painted = (0..buf.area.height)
+            .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
+            .any(|(x, y)| buf[(x, y)].style().bg == Some(Color::Indexed(238)));
+        assert!(!painted, "a deleted message was drawn as a bubble");
+    }
+
+    /// The list says what is going on, not only what exists.
+    #[test]
+    fn the_conversation_list_previews_the_last_thing_said() {
+        let mut app = sample();
+        app.rows[0].preview = "see you at six".into();
+        app.rows[0].at = 3661;
+        let out = render(&app, 100, 24);
+        assert!(out.contains("see you at six"), "no preview in the list:\n{out}");
+        assert!(
+            out.contains(clock(3661).trim()),
+            "no time against the preview:\n{out}"
+        );
     }
 
     #[test]

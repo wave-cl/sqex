@@ -1915,6 +1915,25 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 None => o.label.clone(),
             },
             key: o.peer.map(|p| ui::short(&p)),
+            // The newest thing said here, whoever said it. A redaction shows
+            // as the gap it is rather than being skipped, or the list would
+            // claim the conversation ended at an older message.
+            preview: o
+                .timeline
+                .messages()
+                .last()
+                .map(|m| {
+                    if m.redacted {
+                        "message deleted".to_string()
+                    } else {
+                        m.post
+                            .body_text()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "a file".to_string())
+                    }
+                })
+                .unwrap_or_default(),
+            at: o.last_at,
             group: o.peer.is_none(),
             public: o.public,
             unread: o.unread,
@@ -2211,6 +2230,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: false,
             }],
             ..Default::default()
@@ -2264,6 +2285,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: false,
             }],
             ..Default::default()
@@ -2295,6 +2318,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: false,
             }],
             ..Default::default()
@@ -2335,6 +2360,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: true,
             }],
             ..Default::default()
@@ -2359,6 +2386,8 @@ mod tests {
                 group: false,
                 public: false,
                 unread: 0,
+                preview: String::new(),
+                at: 0,
                 waiting: true,
             }],
             ..Default::default()
