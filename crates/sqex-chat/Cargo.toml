@@ -25,6 +25,9 @@ ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 x25519-dalek = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# For `flock` on the store. A lock the kernel releases when the process dies,
+# rather than a file somebody has to remember to delete.
+libc = { workspace = true }
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
 rpassword = "7"

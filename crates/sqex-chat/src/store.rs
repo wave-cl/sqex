@@ -149,6 +149,8 @@ pub enum StoreError {
     /// A sealed row would not open. The store belongs to a different identity,
     /// or the file has been altered.
     Sealed(String),
+    /// Another interactive client already holds this account's store.
+    InUse(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -156,6 +158,20 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Storage(e) => write!(f, "chat store: {e}"),
             StoreError::Sealed(e) => write!(f, "chat store will not open: {e}"),
+            StoreError::InUse(who) => write!(
+                f,
+                "this account's store is already open — {who}.\n\n\
+                 Two clients under one identity share a device key and a \
+                 prekey pool, and neither can see the other. SIP-17 counters \
+                 must never repeat under one key, and each client keeps its \
+                 own idea of what the next one is. Opening an epoch key \
+                 spends a SIP-23 prekey, and the copy on disk is the only \
+                 copy — so each can consume what the other needed, and the \
+                 loser cannot get that key again.\n\n\
+                 Quit the other client. If you want two at once, link a \
+                 second device (`sqex-chat device link`), which gives it a \
+                 key and a pool of its own."
+            ),
         }
     }
 }
@@ -885,12 +901,106 @@ impl Store {
     }
 }
 
+/// An exclusive hold on one account's store, for as long as a session lasts.
+///
+/// Dropping it releases the hold, and so does the process ending — however it
+/// ends. That is the whole reason for `flock` rather than a file somebody has
+/// to remember to delete: a client that was killed, or that panicked, leaves
+/// nothing behind to lock its owner out of their own account tomorrow.
+///
+/// The pid written inside is not the lock. It is there only so a refusal can
+/// name which process to go and close.
+#[derive(Debug)]
+pub struct Lock {
+    /// Held, not read. Closing the file is what releases the lock.
+    _file: std::fs::File,
+}
+
+/// Take the store's lock, or say who has it.
+///
+/// Deliberately **not** called from [`Store::open`]. The hazard is two
+/// *interactive* clients — long-running, polling, sealing, each with its own
+/// idea of the next SIP-17 counter. A one-shot `sqex-chat list` or `add` is
+/// none of that, and SQLite's own locking is enough for it; refusing those
+/// while a client is up would be paying for a problem they do not have.
+pub fn lock(path: &std::path::Path) -> Result<Lock> {
+    use std::io::{Read, Seek, Write};
+
+    let at = path.with_extension("lock");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&at)
+        .map_err(storage("open the store lock"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `file` owns the descriptor and outlives the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let mut held = String::new();
+            let _ = file.read_to_string(&mut held);
+            let who = held.trim();
+            return Err(StoreError::InUse(match who.parse::<u32>() {
+                Ok(pid) => format!("another sqex-chat is running as pid {pid}"),
+                // The pid is best effort: the holder may not have written it
+                // yet. Not knowing which process it is does not make the
+                // refusal any less correct.
+                Err(_) => "another sqex-chat is running".to_string(),
+            }));
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let _ = file.set_len(0);
+    let _ = file.rewind();
+    let _ = write!(file, "{}", std::process::id());
+    let _ = file.flush();
+    Ok(Lock { _file: file })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn seed(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    /// Two clients under one identity share a device key and a prekey pool,
+    /// and neither can see the other. This is the only thing that can tell
+    /// them apart.
+    ///
+    /// `flock` is held per open file description rather than per process, so
+    /// a second `lock` in this very process is refused exactly as a second
+    /// client would be — which is what makes this testable at all.
+    #[test]
+    fn a_second_client_on_one_store_is_refused_and_told_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+
+        let first = lock(&path).unwrap();
+        let second = lock(&path);
+        let Err(StoreError::InUse(who)) = &second else {
+            panic!("a second client was allowed in: {:?}", second.is_ok());
+        };
+        // Named, so somebody with two terminals open knows which to close.
+        assert!(
+            who.contains(&std::process::id().to_string()),
+            "the refusal does not say which process holds it: {who:?}"
+        );
+        // And the reason travels with it: "in use" alone would read as a bug
+        // in the client rather than as a thing the reader has to decide.
+        let said = second.unwrap_err().to_string();
+        assert!(said.contains("prekey"), "{said}");
+        assert!(said.contains("device link"), "{said}");
+
+        // And it is a hold, not a record: closing the first hands it over.
+        drop(first);
+        lock(&path).expect("the lock outlived the client that took it");
     }
 
     fn key(b: u8) -> PubKey {

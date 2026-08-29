@@ -18,7 +18,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use sqex_chat::attach::describe;
 use sqex_chat::client::{Chat, ChatError, Link};
-use sqex_chat::store::{Store, store_path};
+use sqex_chat::store::{self, Store, store_path};
 use std::collections::HashMap;
 
 /// How long the answer to a command stays on screen. Long enough to read a
@@ -157,8 +157,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 
     let (seed, me) = load_identity(&cli, &cfg)?;
-    let store = Store::open(&seed, Some(&store_path(&me).map_err(|e| e.to_string())?))
-        .map_err(|e| e.to_string())?;
+    let path = store_path(&me).map_err(|e| e.to_string())?;
+    let store = Store::open(&seed, Some(&path)).map_err(|e| e.to_string())?;
 
     // The three commands that never touch the network. Doing them without
     // connecting means `add` works while the exchange is down, which is when
@@ -241,6 +241,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         ));
     }
 
+    // One interactive client per account, and this is the only thing that can
+    // enforce it: two of them share a device key and a prekey pool and cannot
+    // see each other. Taken here rather than in `Store::open` so that the
+    // one-shot commands — `list`, `add`, `whoami` — go on working while a
+    // client is up, which is when somebody is most likely to want them.
+    //
+    // Held for the length of the session: dropping the guard, or the process
+    // ending however it ends, hands it on.
+    let _lock = store::lock(&path).map_err(|e| e.to_string())?;
     interface(chat).await
 }
 
