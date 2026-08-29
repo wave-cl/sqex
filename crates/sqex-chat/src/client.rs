@@ -970,6 +970,27 @@ impl Chat {
         self.set_metadata(channel, None, Some(topic)).await
     }
 
+    /// Give somebody the admin role, or take it back.
+    ///
+    /// The exchange's invite is what does this: inviting an account that is
+    /// already a member updates its role rather than adding it again, and it
+    /// deliberately does not consult the invitation quota when it does. Admin
+    /// only, and refused in a direct message, where both parties are admins
+    /// from the start and there is nobody to promote.
+    pub async fn grant(&mut self, channel: &[u8; 32], who: &PubKey, role: Role) -> Result<()> {
+        self.post(
+            "/channel/invite",
+            Invite {
+                channel: *channel,
+                account: *who,
+                role,
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Set a channel's picture, or take it away with `None`.
     pub async fn set_avatar(
         &mut self,
@@ -1022,6 +1043,38 @@ impl Chat {
             .filter(|m| m.role == Role::Admin)
             .map(|m| m.account)
             .collect();
+
+        // Refused here, because nothing downstream will refuse it visibly.
+        // A metadata entry from a member is accepted by the exchange — which
+        // cannot read it — posted, and then discarded by every reader's fold,
+        // which honours only an admin's. Sending it and reporting success was
+        // telling somebody a channel had been renamed when nothing had.
+        if !is_admin(&info, &self.me) {
+            return Err(ChatError::Protocol(format!(
+                "only an admin can change this channel's name, topic or picture, \
+                 and you are not one here — {}",
+                match admins.len() {
+                    0 => "and neither is anybody: this channel has no admin".to_string(),
+                    1 => format!("ask {}", admins[0]),
+                    _ => format!(
+                        "ask one of {}",
+                        admins
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            )));
+        }
+
+        // Catch up before reading the record, not after. `history` folds what
+        // is in the store, and a client that has not polled since somebody set
+        // the topic holds none of it — so it would publish an empty one and
+        // destroy the field it was not asked to touch. That is the same bug
+        // this carrying-over was written to fix, one step further back.
+        let mut scratch = Timeline::new();
+        let _ = self.poll(channel, &mut scratch, 0).await;
         let held = self.history(channel, &admins)?;
         self.send_body(
             channel,

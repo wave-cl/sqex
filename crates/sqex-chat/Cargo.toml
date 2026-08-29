@@ -33,6 +33,9 @@ crossterm = "0.28"
 # The same crate ratatui lays out with, so what this client measures and what
 # it draws agree. Used to keep a reaction row from drifting.
 unicode-width = "0.2"
+# Local time. `at % 86_400` printed UTC, which is not the time anywhere the
+# person reading it is sitting, and was wrong by an hour here all day.
+jiff = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

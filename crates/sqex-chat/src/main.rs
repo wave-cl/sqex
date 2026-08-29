@@ -384,6 +384,9 @@ struct Open {
     /// than a second, which is to say it was never read.
     note: Option<(String, std::time::Instant)>,
     typing: bool,
+    /// When something last happened here, for ordering the list. The newest
+    /// message's time, or when we joined if nothing has been said.
+    last_at: u64,
     /// Messages arrived while this conversation was not the one on screen.
     unread: usize,
     /// They have published no prekeys, so nothing can be sealed to them yet.
@@ -490,6 +493,11 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
 
         let timeline = chat.history(&m.channel, &admins).unwrap_or_default();
         let timeline_len = timeline.messages().count();
+        let last_at = timeline
+            .messages()
+            .map(|msg| msg.posted)
+            .max()
+            .unwrap_or(m.joined);
         open.push(Open {
             peer: peer.map(|(a, _)| a),
             public,
@@ -501,6 +509,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            last_at,
             unread: 0,
             waiting: false,
         });
@@ -525,6 +534,9 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            // Nothing has happened here yet, so it sorts below anything that
+            // has rather than claiming a time it does not have.
+            last_at: 0,
             unread: 0,
             waiting: false,
         });
@@ -654,6 +666,9 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             }
             conv.timeline_len = after;
             conv.waiting = false;
+            if let Some(newest) = conv.timeline.messages().map(|m| m.posted).max() {
+                conv.last_at = conv.last_at.max(newest);
+            }
             // A group's name lives in a sealed entry, so it is only known once
             // the log has been read — and it changes when an admin renames it.
             let named = conv.timeline.name.clone();
@@ -1185,6 +1200,37 @@ async fn handle_key(
                 Command::Leave => chat.leave(&channel).await.map(|()| {
                     Some("left — it will be gone from the list next time".to_string())
                 }),
+                Command::Op(ref key) | Command::Deop(ref key) => {
+                    let admin = matches!(cmd, Command::Op(_));
+                    match key.parse::<PubKey>() {
+                        Ok(who) => {
+                            let role = if admin { Role::Admin } else { Role::Member };
+                            match chat.grant(&channel, &who, role).await {
+                                Ok(()) if admin => Ok(Some(format!(
+                                    "{} is an admin here — they can rename it, invite, \
+                                     remove and set retention",
+                                    short(&who)
+                                ))),
+                                Ok(()) => Ok(Some(format!("{} is an ordinary member again", short(&who)))),
+                                // The exchange refuses this in a direct
+                                // message, where both parties are admins from
+                                // the start; say that rather than pass on a
+                                // bare refusal.
+                                Err(ChatError::Refused(_, body))
+                                    if body.contains("direct_message") =>
+                                {
+                                    Err(ChatError::Protocol(
+                                        "a direct message has no roles to give — both of \
+                                         you are admins of it already"
+                                            .into(),
+                                    ))
+                                }
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+                    }
+                }
                 Command::Retain(secs, max) => {
                     chat.set_retention(&channel, secs, max).await.map(|()| {
                         Some(format!(
@@ -1298,7 +1344,7 @@ async fn handle_key(
                 {
                     last.note = Some((n, std::time::Instant::now()));
                 }
-                app.selected = open.len().saturating_sub(1);
+                app.selected = open.last().map(|o| o.channel);
             }
         }
         _ => {}
@@ -1352,6 +1398,11 @@ enum Command {
     Unblock(String),
     /// `/blocked` — who we have blocked. Answered to nobody else.
     Blocked,
+    /// `/op <key>` — make somebody an admin here, so they can rename it,
+    /// invite, remove and set retention.
+    Op(String),
+    /// `/deop <key>` — take that back.
+    Deop(String),
     /// `/retain <secs> [max]` — how long this channel keeps what is said here.
     Retain(u32, u32),
     /// `/close` — end this channel. Irreversible, so it asks first.
@@ -1460,6 +1511,10 @@ impl Command {
             "/unblock" if !first.is_empty() => Command::Unblock(first.to_string()),
             "/unblock" => Command::Unknown("/unblock needs a public key".into()),
             "/blocked" => Command::Blocked,
+            "/op" if !first.is_empty() => Command::Op(first.to_string()),
+            "/op" => Command::Unknown("/op needs a public key".into()),
+            "/deop" if !first.is_empty() => Command::Deop(first.to_string()),
+            "/deop" => Command::Unknown("/deop needs a public key".into()),
             "/retain" => {
                 let mut words = rest.split_whitespace();
                 match (
@@ -1729,12 +1784,12 @@ async fn settle(
     match (channel, sync_channels(chat).await) {
         (Some(channel), Ok(fresh)) => {
             *open = fresh;
-            app.selected = open
-                .iter()
-                .position(|o| o.channel == channel)
-                .unwrap_or(open.len().saturating_sub(1));
-            if let Some(o) = open.get_mut(app.selected) {
-                o.note = Some((note, std::time::Instant::now()));
+            app.selected = Some(channel);
+            match open.iter_mut().find(|o| o.channel == channel) {
+                Some(o) => o.note = Some((note, std::time::Instant::now())),
+                // The channel we were told to land on is not in the list —
+                // left, or closed under us. The note still has to be said.
+                None => app.trouble.message = Some(note),
             }
         }
         _ => app.trouble.message = Some(note),
@@ -1764,6 +1819,7 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         public: false,
         label,
         channel,
+        last_at: now(),
         admins: vec![chat.me, account],
         timeline: Timeline::new(),
         timeline_len: 0,
@@ -1778,8 +1834,9 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         Err(ChatError::NotReady(_)) => conv.waiting = true,
         Err(e) => conv.trouble.message = Some(e.to_string()),
     }
+    let landed = conv.channel;
     open.push(conv);
-    app.selected = open.len() - 1;
+    app.selected = Some(landed);
 }
 
 fn selected_index(open: &[Open], app: &App) -> Option<usize> {
@@ -1788,7 +1845,7 @@ fn selected_index(open: &[Open], app: &App) -> Option<usize> {
 }
 
 fn clear_unread(open: &mut [Open], app: &App) {
-    if let Some(row) = app.rows.get(app.selected)
+    if let Some(row) = app.selected_row()
         && let Some(o) = open.iter_mut().find(|o| o.channel == row.channel)
     {
         o.unread = 0;
@@ -1827,8 +1884,22 @@ fn name_map(chat: &Chat, open: &[Open], conv: Option<&Open>) -> HashMap<PubKey, 
 }
 
 fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, String>) {
-    app.rows = open
-        .iter()
+    // Most recent first, the way every chat client orders a conversation
+    // list. `mine()` hands them back in join order, which says nothing about
+    // where anything is happening.
+    //
+    // The cursor is a channel and not a position (see `App::selected`), so
+    // reordering under somebody's cursor moves the row and not the reader.
+    let mut order: Vec<&Open> = open.iter().collect();
+    order.sort_by(|a, b| {
+        b.last_at
+            .cmp(&a.last_at)
+            // A stable tie-break, or two conversations with the same time
+            // would swap places on every redraw.
+            .then_with(|| a.channel.cmp(&b.channel))
+    });
+    app.rows = order
+        .into_iter()
         .map(|o| Row {
             channel: o.channel,
             // For a direct message the row names a *person*, so a published
@@ -1850,8 +1921,10 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
             waiting: o.waiting,
         })
         .collect();
-    if app.selected >= app.rows.len() {
-        app.selected = app.rows.len().saturating_sub(1);
+    // A conversation that has gone — left, or closed — leaves the cursor
+    // naming nothing, so it falls to the top of the list rather than nowhere.
+    if app.selected_row().is_none() {
+        app.selected = app.rows.first().map(|r| r.channel);
     }
     let Some(conv) = selected_index(open, app).map(|i| &open[i]) else {
         app.said.clear();
@@ -1907,16 +1980,31 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 // number: "answering something we cannot see" is the truth,
                 // and dropping the marker would hide that a reply is a reply.
                 reply_to: m.post.reply_to().map(|t| {
-                    let stub = conv
-                        .timeline
-                        .get(t)
-                        .map(|target| match (target.redacted, target.post.body_text()) {
+                    let target = conv.timeline.get(t);
+                    // Named the same way the author column names anybody, so a
+                    // reply carries the key with the name (SIP-21) rather than
+                    // a sequence number nobody has memorised.
+                    let who = match target {
+                        Some(t) => ui::author(
+                            &names.get(&t.account).cloned().unwrap_or_default(),
+                            &short(&t.account),
+                            t.account == *me,
+                        ),
+                        // Pruned, or from before we joined. Still marked as a
+                        // reply: hiding that would make the answer a
+                        // non-sequitur with nothing to explain it.
+                        None => "a message we no longer hold".to_string(),
+                    };
+                    let stub = target
+                        .map(|t| match (t.redacted, t.post.body_text()) {
                             (true, _) => "message deleted".to_string(),
                             (_, Some(text)) => text.to_string(),
                             (_, None) => "(nothing to show)".to_string(),
                         })
-                        .unwrap_or_else(|| "(not held)".to_string());
-                    (t, stub)
+                        // Nothing to quote, and the author line above already
+                        // says why.
+                        .unwrap_or_default();
+                    (who, stub)
                 }),
                 reactions: m
                     .reactions
@@ -1931,6 +2019,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         .collect();
     app.peer_typing = conv.typing;
     app.topic = conv.timeline.topic.clone();
+    app.now = now();
     app.has_avatar = conv.timeline.avatar.is_some();
     // The cursor holds a position in a list that has just been rebuilt. A
     // message can arrive or be deleted between one frame and the next, and a
@@ -2085,6 +2174,7 @@ mod tests {
             admins: vec![PubKey::new([1; 32]), PubKey::new([peer; 32])],
             timeline: Timeline::new(),
             timeline_len: 0,
+            last_at: 0,
             trouble: Trouble::default(),
             note: None,
             typing: false,
@@ -2277,23 +2367,80 @@ mod tests {
         assert!(app.trouble.line().contains("403"));
     }
 
+    /// Signal's ordering: whatever happened last is at the top. The exchange
+    /// hands conversations back in join order, which says nothing about where
+    /// anything is happening.
     #[test]
-    fn a_selection_past_the_end_is_pulled_back() {
-        // Contacts can go away underneath the cursor.
+    fn the_list_is_ordered_by_what_happened_last() {
+        let mut a = conv(2, "alice");
+        a.channel = [1; 32];
+        a.last_at = 100;
+        let mut b = conv(3, "bob");
+        b.channel = [2; 32];
+        b.last_at = 300;
+        let mut c = conv(4, "carol");
+        c.channel = [3; 32];
+        c.last_at = 200;
+
+        let open = vec![a, b, c];
+        let mut app = App::default();
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+        assert_eq!(
+            app.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+            vec!["bob", "carol", "alice"]
+        );
+    }
+
+    /// And the cursor stays on the conversation being read while the list
+    /// moves around it. An index would put somebody in a channel they did not
+    /// choose the moment a message arrived somewhere else.
+    #[test]
+    fn a_message_elsewhere_reorders_the_list_and_not_the_reader() {
+        let mut a = conv(2, "alice");
+        a.channel = [1; 32];
+        a.last_at = 300;
+        let mut b = conv(3, "bob");
+        b.channel = [2; 32];
+        b.last_at = 100;
+
+        let mut open = vec![a, b];
+        let mut app = App::default();
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+        assert_eq!(app.rows[0].label, "alice");
+
+        // Reading alice, at the top.
+        app.selected = Some([1; 32]);
+        // Bob says something, which puts bob first.
+        open[1].last_at = 400;
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+
+        assert_eq!(app.rows[0].label, "bob", "the list did not reorder");
+        assert_eq!(
+            app.selected,
+            Some([1; 32]),
+            "the reader was moved into a conversation they did not choose"
+        );
+        assert_eq!(app.selected_row().map(|r| r.label.as_str()), Some("alice"));
+        assert_eq!(app.selected_at(), Some(1), "the cursor followed the row");
+    }
+
+    #[test]
+    fn a_selection_naming_a_channel_that_has_gone_falls_to_the_top() {
+        // A conversation can be left or closed underneath the cursor.
         let open = vec![conv(2, "bob")];
         let mut app = App {
-            selected: 7,
+            selected: Some([99; 32]),
             ..Default::default()
         };
         refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, Some([7; 32]), "the cursor named nothing");
         assert_eq!(app.said.len(), 0);
     }
 
     #[test]
     fn no_contacts_leaves_an_empty_transcript_rather_than_a_panic() {
         let mut app = App {
-            selected: 0,
+            selected: Some([7; 32]),
             ..Default::default()
         };
         refresh(&mut app, &[], &PubKey::new([1; 32]), &HashMap::new());

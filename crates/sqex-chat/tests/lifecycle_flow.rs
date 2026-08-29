@@ -16,7 +16,7 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use sqex_chat::client::Chat;
 use sqex_chat::store::Store;
-use sqex_proto::channel::MIN_RETENTION;
+use sqex_proto::channel::{MIN_RETENTION, Role};
 use sqex_proto::timeline::Timeline;
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -343,4 +343,77 @@ async fn a_blob_we_cannot_fetch_cannot_be_attached() {
         mallory.attach(&mine, &attachment.blob).await.is_err(),
         "a blob was attached by somebody with no claim on it"
     );
+}
+
+/// Renaming a channel is an admin's to do, and the fold discards a metadata
+/// entry from anybody else. The client used to post it anyway and report
+/// success — so somebody was told a channel had been renamed when nothing had
+/// happened at all.
+#[tokio::test]
+async fn a_member_who_is_not_an_admin_is_told_so_instead_of_being_humoured() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let channel = alice.create_group("planning", &[bob_key]).await.unwrap();
+    alice.set_topic(&channel, "what we ship").await.unwrap();
+    bob.collect_keys(&channel).await.unwrap();
+
+    let err = bob
+        .set_name(&channel, "bob's channel")
+        .await
+        .expect_err("a member renamed a channel");
+    let said = err.to_string();
+    assert!(said.contains("admin"), "unhelpful refusal: {said}");
+    // And it names somebody who can, rather than leaving them stuck.
+    assert!(said.contains(&alice_key.to_string()), "no admin named: {said}");
+
+    // Nothing was sent, so nothing changed for anybody.
+    let held = alice.history(&channel, &[alice_key]).unwrap();
+    assert_eq!(held.name, "planning");
+    assert_eq!(held.topic, "what we ship");
+
+    // Made an admin, the same call works. The exchange's invite updates an
+    // existing member's role rather than adding them again.
+    alice.grant(&channel, &bob_key, Role::Admin).await.unwrap();
+    bob.set_name(&channel, "shipping").await.unwrap();
+
+    let mut bobs = Timeline::new();
+    bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let held = bob.history(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(held.name, "shipping", "the rename did not take");
+    assert_eq!(held.topic, "what we ship", "the rename ate the topic");
+
+    // And it can be taken back.
+    alice.grant(&channel, &bob_key, Role::Member).await.unwrap();
+    assert!(bob.set_name(&channel, "mine again").await.is_err());
+}
+
+/// A direct message has no roles to give: both parties are admins of it from
+/// the moment it exists.
+#[tokio::test]
+async fn a_direct_message_has_nobody_to_promote() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    // Bob has to have run a client at least once, or nothing can be sealed to
+    // him and the rename below fails for an unrelated reason.
+    let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, bob_key) = identity(2);
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let err = alice
+        .grant(&channel, &bob_key, Role::Admin)
+        .await
+        .expect_err("a direct message accepted a role change");
+    assert!(
+        err.to_string().contains("direct_message"),
+        "refused for the wrong reason: {err}"
+    );
+
+    // Both can rename it, because both are admins.
+    alice.set_name(&channel, "our thread").await.unwrap();
 }

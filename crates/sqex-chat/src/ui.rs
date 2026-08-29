@@ -16,7 +16,7 @@
 //!   (SIP-16).
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
@@ -72,11 +72,12 @@ pub struct Said {
     /// something was removed, instead of finding a conversation that silently
     /// does not follow.
     pub redacted: bool,
-    /// The message this one answers, and a stub of what it said. Carried
-    /// because a reply shown without its target is a non-sequitur, and the
-    /// fold has always kept `Part::Reply` while this struct had nowhere to put
-    /// it.
-    pub reply_to: Option<(u64, String)>,
+    /// What this one answers: who wrote it, and a stub of what they said.
+    ///
+    /// The author matters more than the number. "↳ 57: llll" names a sequence
+    /// nobody has memorised; "↳ Alice (6xhq7AJ4): llll" says who is being
+    /// answered, and carries the key with the name like everywhere else.
+    pub reply_to: Option<(String, String)>,
     /// Emoji, how many reacted with it, and whether we are one of them. The
     /// timeline has counted these since it was written and nothing has ever
     /// drawn them, so somebody could react to your message and you would never
@@ -173,7 +174,13 @@ pub struct Found {
 pub struct App {
     pub me: String,
     pub rows: Vec<Row>,
-    pub selected: usize,
+    /// Which conversation is open, **by channel** rather than by position.
+    ///
+    /// The list is ordered by what happened last, so it reorders under the
+    /// cursor whenever a message arrives anywhere. An index would then point
+    /// at a different conversation than the one being read — and would move
+    /// somebody mid-sentence into a channel they had not chosen.
+    pub selected: Option<[u8; 32]>,
     pub said: Vec<Said>,
     pub input: String,
     pub trouble: Trouble,
@@ -204,6 +211,9 @@ pub struct App {
     /// The selected channel has a picture. Said rather than drawn: a terminal
     /// cannot show one, and a coloured-block approximation is not the picture.
     pub has_avatar: bool,
+    /// Now, so a day separator can leave the year off the current one and put
+    /// it on older history, where a bare date is a trap.
+    pub now: u64,
     pub should_quit: bool,
 }
 
@@ -217,19 +227,36 @@ pub const REACTIONS: &[&str] = &["👍", "🎉", "❤️", "😂", "🤔", "👀
 
 impl App {
     pub fn selected_row(&self) -> Option<&Row> {
-        self.rows.get(self.selected)
+        self.rows.iter().find(|r| Some(r.channel) == self.selected)
+    }
+
+    /// Where the cursor is now, or the top of the list if what it named has
+    /// gone — left, closed, or never there.
+    pub fn selected_at(&self) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        Some(
+            self.rows
+                .iter()
+                .position(|r| Some(r.channel) == self.selected)
+                .unwrap_or(0),
+        )
     }
 
     pub fn select_next(&mut self) {
-        if !self.rows.is_empty() {
-            self.selected = (self.selected + 1) % self.rows.len();
-        }
+        self.select_by(1);
     }
 
     pub fn select_previous(&mut self) {
-        if !self.rows.is_empty() {
-            self.selected = (self.selected + self.rows.len() - 1) % self.rows.len();
-        }
+        self.select_by(-1);
+    }
+
+    fn select_by(&mut self, step: isize) {
+        let Some(at) = self.selected_at() else { return };
+        let n = self.rows.len();
+        let next = (at as isize + step).rem_euclid(n as isize) as usize;
+        self.selected = Some(self.rows[next].channel);
     }
 }
 
@@ -241,6 +268,78 @@ impl App {
 pub fn short(key: &PubKey) -> String {
     let full = bs58::encode(key.as_bytes()).into_string();
     full.chars().take(8).collect()
+}
+
+/// A small block of colour derived from an account key.
+///
+/// Derived, not uploaded. SIP-21 is explicit that an avatar is a claim like a
+/// display name — two accounts may publish the same picture, and one of them
+/// may have taken it from the other — so a picture is exactly the wrong thing
+/// to identify somebody by. A pattern computed from the key differs whenever
+/// the key does, cannot be chosen, and so reinforces the key-beside-name rule
+/// instead of competing with it.
+///
+/// Two cells wide and one tall, each cell carrying two pixels: `▀` painted
+/// with a foreground for the top half and a background for the bottom. That is
+/// four pixels of a symmetric pattern, which is not a portrait and is not
+/// meant to be — it is a colour somebody learns to recognise in a list.
+pub fn identicon(key: &str) -> Vec<Span<'static>> {
+    let h = fnv(key.as_bytes());
+    // Two hues a third of the wheel apart, so the halves stay distinguishable
+    // whatever the key, and mid-lightness so both work on dark and light.
+    let a = hue((h & 0xFF) as u8);
+    let b = hue(((h >> 8) & 0xFF) as u8 / 3 * 2);
+    // Four bits choose which of the four pixels take the second colour. The
+    // pattern is mirrored across the vertical axis, which is what makes these
+    // read as a shape rather than as noise.
+    let bits = ((h >> 16) & 0b11) as u8;
+    let pick = |on: bool| if on { b } else { a };
+    vec![
+        Span::styled(
+            "▀",
+            Style::default()
+                .fg(pick(bits & 0b01 != 0))
+                .bg(pick(bits & 0b10 != 0)),
+        ),
+        Span::styled(
+            "▀",
+            Style::default()
+                .fg(pick(bits & 0b10 != 0))
+                .bg(pick(bits & 0b01 != 0)),
+        ),
+    ]
+}
+
+/// How wide an identicon is on screen, so callers can leave room for it.
+pub const ICON: usize = 2;
+
+/// FNV-1a. Not a security choice — nothing here is secret, and the key it is
+/// derived from is public — only a cheap way to spread keys across colours.
+fn fnv(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// A byte to a colour, going round the wheel at a fixed saturation so no key
+/// lands on something unreadably dark or washed out.
+fn hue(byte: u8) -> Color {
+    let sector = byte as u32 * 6 / 256;
+    let within = (byte as u32 * 6 % 256) * 255 / 256;
+    let (lo, hi) = (70u8, 220u8);
+    let up = (lo as u32 + within * (hi - lo) as u32 / 255) as u8;
+    let down = (hi as u32 - within * (hi - lo) as u32 / 255) as u8;
+    match sector {
+        0 => Color::Rgb(hi, up, lo),
+        1 => Color::Rgb(down, hi, lo),
+        2 => Color::Rgb(lo, hi, up),
+        3 => Color::Rgb(lo, down, hi),
+        4 => Color::Rgb(up, lo, hi),
+        _ => Color::Rgb(hi, lo, down),
+    }
 }
 
 /// How wide the author column is. A name and a key both have to fit, because
@@ -297,7 +396,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(20)])
+        // Wide enough for an identicon, a name and the key beside it.
+        .constraints([Constraint::Length(30), Constraint::Min(20)])
         .split(outer[1]);
 
     conversations(f, app, panes[0]);
@@ -344,14 +444,15 @@ fn row_label(r: &Row, width: usize) -> String {
 }
 
 fn conversations(f: &mut Frame, app: &App, area: Rect) {
-    // The marker, the border, and room for an unread count.
-    let w = (area.width as usize).saturating_sub(6).clamp(8, AUTHOR);
+    // The marker, the identicon, the border, and room for an unread count.
+    let w = (area.width as usize)
+        .saturating_sub(7 + ICON)
+        .clamp(8, AUTHOR);
     let items: Vec<ListItem> = app
         .rows
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let selected = i == app.selected;
+        .map(|r| {
+            let selected = Some(r.channel) == app.selected;
             let base = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -368,8 +469,16 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
                         base
                     },
                 ),
-                Span::styled(format!("{:<w$}", row_label(r, w), w = w), base),
             ];
+            // A direct message is a person, and gets their identicon. A
+            // channel is not, so it gets the space instead — inventing a face
+            // for a room would say something untrue about what it is.
+            match &r.key {
+                Some(key) => spans.extend(identicon(key)),
+                None => spans.push(Span::styled(" ".repeat(ICON), base)),
+            }
+            spans.push(Span::styled(" ", base));
+            spans.push(Span::styled(format!("{:<w$}", row_label(r, w), w = w), base));
             if r.unread > 0 {
                 spans.push(Span::styled(
                     format!(" {}", r.unread),
@@ -399,12 +508,209 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Break `text` into lines no wider than `width` columns.
+///
+/// Done here rather than by `Paragraph`'s own wrapping because ratatui cannot
+/// align individual lines inside a wrapped paragraph, and the whole point of
+/// this layout is that your messages sit on one side and everybody else's on
+/// the other. Measured with `UnicodeWidthStr`, the crate ratatui lays out
+/// with, so a line that fits here fits on screen.
+fn wrap_to(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_inclusive(' ') {
+            let w = UnicodeWidthStr::width(word.trim_end());
+            if !line.is_empty() && UnicodeWidthStr::width(line.as_str()) + w > width {
+                out.push(line.trim_end().to_string());
+                line = String::new();
+            }
+            // A single word longer than the bubble is cut rather than allowed
+            // to run off: a URL should not push the whole conversation wide.
+            if w > width {
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if UnicodeWidthStr::width(chunk.as_str()) + 1 > width {
+                        out.push(std::mem::take(&mut chunk));
+                    }
+                    chunk.push(ch);
+                }
+                line = chunk;
+                continue;
+            }
+            line.push_str(word);
+        }
+        out.push(line.trim_end().to_string());
+    }
+    out
+}
+
+/// One message, laid out as a run of lines on its own side of the pane.
+fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mine = s.mine;
+    let align = if mine { Alignment::Right } else { Alignment::Left };
+    let dim = Style::default().fg(Color::DarkGray);
+
+    // Who spoke, once for a run rather than against every line — but always
+    // within a few lines of what they said, because the key is what tells two
+    // people with the same display name apart (SIP-21).
+    if head && !mine {
+        let mut spans = identicon(&s.key);
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            author(&s.who, &s.key, false),
+            Style::default().fg(Color::Cyan),
+        ));
+        out.push(Line::from(spans).alignment(align));
+    }
+
+    if let Some((who, stub)) = &s.reply_to {
+        // A target we no longer hold has neither an author nor any words, so
+        // it says that once rather than pairing an empty name with an empty
+        // quotation.
+        let text = if stub.is_empty() {
+            format!("↳ {who}")
+        } else {
+            format!("↳ {who}: {}", truncate(stub, width.saturating_sub(4)))
+        };
+        out.push(Line::from(Span::styled(text, dim)).alignment(align));
+    }
+
+    let body = if s.redacted {
+        vec!["message deleted".to_string()]
+    } else {
+        wrap_to(&s.text, width)
+    };
+    let style = if s.redacted {
+        dim.add_modifier(Modifier::ITALIC)
+    } else if mine {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default()
+    };
+    let last = body.len().saturating_sub(1);
+    for (n, line) in body.iter().enumerate() {
+        let mut spans = Vec::new();
+        // The cursor sits on the leading edge, which is a different edge for
+        // each side. Marking only the first line keeps a long message from
+        // looking like several picked ones.
+        if !mine {
+            spans.push(Span::styled(
+                if picked && n == 0 { "▸" } else { " " },
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        spans.push(Span::styled(line.clone(), style));
+        // The time and the markers ride on the last line rather than taking
+        // one of their own: a line per message halves how much of a
+        // conversation fits on screen, for information most people read only
+        // when they want it.
+        if n == last {
+            if s.has_file && !s.redacted {
+                spans.push(Span::styled(format!("  /save {}", s.seq), dim));
+            }
+            if s.edited && !s.redacted {
+                spans.push(Span::styled("  (edited)", dim));
+            }
+            for m in &s.mentions {
+                spans.push(Span::styled(
+                    format!("  @{m}"),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  {}", clock(s.at).trim_end()),
+                dim,
+            ));
+        }
+        if mine {
+            spans.push(Span::styled(
+                if picked && n == 0 { "◂" } else { " " },
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        out.push(Line::from(spans).alignment(align));
+    }
+
+
+    if !s.reactions.is_empty() && !s.redacted {
+        // A reaction is up to 32 bytes chosen by whoever sent it, and a
+        // message can carry a distinct one per emoji per account — so both
+        // the width of a chip and the number of them are somebody else's
+        // decision. Fit what fits and count the rest.
+        let mut row: Vec<Span> = Vec::new();
+        let mut used = 0;
+        let mut shown = 0;
+        for (emoji, count, is_mine) in &s.reactions {
+            let chip = format!("{emoji} {count}  ");
+            let w = UnicodeWidthStr::width(chip.as_str());
+            if used + w > width {
+                break;
+            }
+            used += w;
+            shown += 1;
+            row.push(Span::styled(
+                chip,
+                if *is_mine {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    dim
+                },
+            ));
+        }
+        // Said, not dropped: a count that quietly omitted some would be
+        // telling the reader a number that is not the number.
+        if shown < s.reactions.len() {
+            row.push(Span::styled(format!("+{}", s.reactions.len() - shown), dim));
+        }
+        out.push(Line::from(row).alignment(align));
+    }
+    // The reaction picker, open over the message the cursor is on. Dropped in
+    // an earlier draft of this layout, which is exactly the kind of thing a
+    // rewrite loses quietly.
+    if picked && app.reacting {
+        let mut row: Vec<Span> = Vec::new();
+        for (n, emoji) in REACTIONS.iter().enumerate() {
+            row.push(Span::styled(
+                format!("{}:{emoji}  ", n + 1),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        row.push(Span::styled("Esc", dim));
+        out.push(Line::from(row).alignment(align));
+    }
+    out
+}
+
+/// Whether `b` starts a new run: a different author, or long enough after the
+/// one before that the reader has lost the thread of who is speaking.
+fn starts_run(a: Option<&Said>, b: &Said) -> bool {
+    match a {
+        None => true,
+        Some(a) => a.mine != b.mine || a.who != b.who || a.key != b.key
+            || b.at.saturating_sub(a.at) > RUN_GAP,
+    }
+}
+
+/// How long a silence has to be before the next message is a new run.
+const RUN_GAP: u64 = 5 * 60;
+
 fn transcript(f: &mut Frame, app: &App, area: Rect) {
     if !app.found.is_empty() {
         directory(f, app, area);
         return;
     }
+    let inner = (area.width as usize).saturating_sub(2);
+    // Wide enough to read, narrow enough that the two sides are visibly two
+    // sides. A bubble filling the pane would make alignment meaningless.
+    let width = (inner * 3 / 5).clamp(16, inner.max(16));
+
     let mut lines: Vec<Line> = Vec::new();
+    let dim = Style::default().fg(Color::DarkGray);
     if app.trouble.lost > 0 {
         // In the transcript, above the messages that did survive, because that
         // is where the missing ones would have been. A status line would say
@@ -416,153 +722,57 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
                 if app.trouble.lost == 1 { "" } else { "s" },
                 if app.trouble.lost == 1 { "was" } else { "were" }
             ),
-            Style::default().fg(Color::DarkGray),
+            dim,
         )));
     }
     if app.trouble.gap {
         lines.push(Line::from(Span::styled(
             "─── older messages are past the retention window and cannot be recovered ───",
-            Style::default().fg(Color::DarkGray),
+            dim,
         )));
     }
+
+    let mut day: Option<String> = None;
     for (i, s) in app.said.iter().enumerate() {
-        let picked = app.picked == Some(i);
-        let who = Style::default().fg(if s.mine { Color::Green } else { Color::Cyan });
-
-        // What is being answered goes above the answer, indented under the
-        // author column. A reply rendered without it reads as a non-sequitur,
-        // and the reader has no way to find the target by hand.
-        if let Some((seq, stub)) = &s.reply_to {
-            lines.push(Line::from(vec![
-                Span::raw(" ".repeat(clock(s.at).chars().count() + AUTHOR + 1)),
-                Span::styled(
-                    format!("↳ {seq}: {}", truncate(stub, 48)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+        // A conversation that runs over days showed 17:50 then 06:10 with
+        // nothing to say a night had passed.
+        let this_day = day_of(s.at);
+        if this_day.is_some() && this_day != day {
+            lines.push(
+                Line::from(Span::styled(
+                    format!("─── {} ───", day_label(s.at, app.now)),
+                    dim,
+                ))
+                .alignment(Alignment::Center),
+            );
+            day = this_day;
         }
-
-        let body = if s.redacted {
-            Span::styled(
-                "message deleted",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )
-        } else {
-            Span::raw(s.text.clone())
-        };
-        let mut spans = vec![
-            // The cursor is a character in the gutter rather than a reversed
-            // line: the transcript already uses colour to say who spoke, and
-            // inverting it would take that away exactly where it is needed.
-            Span::styled(
-                if picked { "▸" } else { " " },
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(clock(s.at), Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:>AUTHOR$} ", author(&s.who, &s.key, s.mine)),
-                who,
-            ),
-            body,
-        ];
-        if s.has_file && !s.redacted {
-            spans.push(Span::styled(
-                format!("  /save {} ", s.seq),
-                Style::default().fg(Color::DarkGray),
-            ));
+        let head = starts_run(i.checked_sub(1).and_then(|p| app.said.get(p)), s);
+        if head && i > 0 {
+            lines.push(Line::from(""));
         }
-        if s.edited && !s.redacted {
-            spans.push(Span::styled(
-                " (edited)",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        // Mentions as keys, never as names. SIP-19 leaves the display name out
-        // of a mention deliberately, and putting one in here from a profile
-        // would be showing the reader a name the *sender* chose at the moment
-        // they are working out who is being talked about.
-        for m in &s.mentions {
-            spans.push(Span::styled(
-                format!(" @{m}"),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-        lines.push(Line::from(spans));
-
-        if !s.reactions.is_empty() && !s.redacted {
-            let indent = clock(s.at).chars().count() + AUTHOR + 2;
-            let mut row = vec![Span::raw(" ".repeat(indent))];
-            // A reaction is up to 32 bytes chosen by whoever sent it, and a
-            // message can carry a distinct one per emoji per account — so both
-            // the width of a chip and the number of them are somebody else's
-            // decision. Fit what fits and count the rest, measuring the way
-            // ratatui lays out rather than by counting characters, or an emoji
-            // is reckoned one column and the row runs off the end.
-            let budget = (area.width as usize).saturating_sub(indent + 8);
-            let mut used = 0;
-            let mut shown = 0;
-            for (emoji, count, mine) in &s.reactions {
-                let chip = format!("{emoji} {count}  ");
-                let w = UnicodeWidthStr::width(chip.as_str());
-                if used + w > budget {
-                    break;
-                }
-                used += w;
-                shown += 1;
-                row.push(Span::styled(
-                    chip,
-                    if *mine {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ));
-            }
-            // Said, not dropped: a count that quietly omitted some would be
-            // telling the reader a number that is not the number.
-            if shown < s.reactions.len() {
-                row.push(Span::styled(
-                    format!("+{}", s.reactions.len() - shown),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            lines.push(Line::from(row));
-        }
-
-        if picked && app.reacting {
-            let mut row = vec![Span::raw(" ".repeat(clock(s.at).chars().count() + AUTHOR + 2))];
-            for (n, emoji) in REACTIONS.iter().enumerate() {
-                row.push(Span::styled(
-                    format!("{}:{emoji}  ", n + 1),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            row.push(Span::styled(
-                "Esc",
-                Style::default().fg(Color::DarkGray),
-            ));
-            lines.push(Line::from(row));
-        }
+        lines.extend(bubble(app, s, app.picked == Some(i), head, width));
     }
+
     if app.said.is_empty() && app.trouble.is_quiet() {
-        lines.push(Line::from(Span::styled(
-            "nothing here yet",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("nothing here yet", dim)));
     }
     if app.peer_typing {
-        lines.push(Line::from(Span::styled(
-            "             typing…",
-            Style::default().fg(Color::DarkGray),
-        )));
+        lines.push(Line::from(Span::styled("typing…", dim)));
     }
+
     let height = area.height.saturating_sub(2) as usize;
     let skip = lines.len().saturating_sub(height);
+    // A short conversation sits at the bottom, against the input box, rather
+    // than floating at the top of an empty pane — where the next message would
+    // appear a long way from where somebody is typing.
+    for _ in lines.len()..height {
+        lines.insert(0, Line::from(""));
+    }
     f.render_widget(
+        // No `Wrap`: the text is already wrapped above, and a wrapped
+        // paragraph ignores per-line alignment.
         Paragraph::new(lines.split_off(skip.min(lines.len())))
-            .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::NONE)),
         area,
     );
@@ -642,6 +852,7 @@ fn keys_line(width: usize) -> String {
         "/new /invite /kick",
         "/name /topic /avatar",
         "/profile /block /blocked",
+        "/op /deop",
         "/retain /close /read",
         "/forward",
     ];
@@ -693,9 +904,59 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
 /// characters that distinguish two messages, and pulling in a timezone database
 /// to render a chat line is not a trade worth making. The full timestamp is on
 /// the entry for anybody who needs it.
+/// The local time of day, as the person reading it keeps time.
+///
+/// This was `at % 86_400`, which is UTC and is the correct time in exactly one
+/// timezone. Everywhere else the client was quietly showing the wrong hour —
+/// here, an hour behind, all day, in every screen anybody looked at.
 fn clock(at: u64) -> String {
-    let secs_today = at % 86_400;
-    format!("{:02}:{:02} ", secs_today / 3600, (secs_today % 3600) / 60)
+    match local(at) {
+        Some(z) => clock_of(&z),
+        // A clock that cannot be worked out is left blank rather than guessed
+        // at: a plausible wrong time is worse than none.
+        None => "      ".to_string(),
+    }
+}
+
+/// The formatting alone, given a moment already placed in a zone.
+///
+/// Separate so it can be tested without asking where this machine is: a test
+/// that asserts "01:01" passes in one timezone and fails in the rest.
+fn clock_of(z: &jiff::Zoned) -> String {
+    format!("{} ", z.strftime("%H:%M"))
+}
+
+/// The day a moment falls on, for deciding where a separator goes.
+///
+/// Compared rather than displayed, so the format only has to be unambiguous.
+fn day_of(at: u64) -> Option<String> {
+    Some(local(at)?.strftime("%Y-%m-%d").to_string())
+}
+
+/// How a day separator reads: "Friday, 28 August", and the year when it is not
+/// the current one — a bare date is a trap on old history.
+fn day_label(at: u64, now: u64) -> String {
+    match (local(at), local(now)) {
+        (Some(z), n) => day_label_of(&z, n.map(|n| n.year())),
+        _ => String::new(),
+    }
+}
+
+fn day_label_of(z: &jiff::Zoned, this_year: Option<i16>) -> String {
+    if this_year == Some(z.year()) {
+        z.strftime("%A, %-d %B").to_string()
+    } else {
+        z.strftime("%A, %-d %B %Y").to_string()
+    }
+}
+
+fn local(at: u64) -> Option<jiff::Zoned> {
+    let secs = i64::try_from(at).ok()?;
+    Some(
+        jiff::Timestamp::from_second(secs)
+            .ok()?
+            .to_zoned(jiff::tz::TimeZone::system()),
+    )
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -771,10 +1032,12 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
+        // Starts at the top, wraps to the bottom and back.
+        app.selected = Some([0; 32]);
         app.select_previous();
-        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected, Some([2; 32]));
         app.select_next();
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected, Some([0; 32]));
     }
 
     #[test]
@@ -785,14 +1048,43 @@ mod tests {
         assert!(app.selected_row().is_none());
     }
 
+    /// Fixed offsets, so this says the same thing on every machine. Asserting
+    /// a wall clock against the system zone passes where it was written and
+    /// fails everywhere else.
+    fn at(secs: i64, offset_hours: i8) -> jiff::Zoned {
+        jiff::Timestamp::from_second(secs)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(offset_hours)))
+    }
+
     #[test]
     fn the_clock_wraps_at_midnight_and_not_before() {
-        assert_eq!(clock(0), "00:00 ");
-        assert_eq!(clock(60), "00:01 ");
-        assert_eq!(clock(23 * 3600 + 59 * 60), "23:59 ");
+        assert_eq!(clock_of(&at(0, 0)), "00:00 ");
+        assert_eq!(clock_of(&at(60, 0)), "00:01 ");
+        assert_eq!(clock_of(&at(23 * 3600 + 59 * 60, 0)), "23:59 ");
         // The next second is the next day's midnight, not 24:00.
-        assert_eq!(clock(86_400), "00:00 ");
-        assert_eq!(clock(86_400 + 3661), "01:01 ");
+        assert_eq!(clock_of(&at(86_400, 0)), "00:00 ");
+        assert_eq!(clock_of(&at(86_400 + 3661, 0)), "01:01 ");
+    }
+
+    /// The bug this replaced: the clock was `at % 86_400`, which is UTC, and
+    /// so was the right time in exactly one zone and an hour or more out in
+    /// most of the others.
+    #[test]
+    fn the_clock_is_local_and_not_utc() {
+        let noon_utc = 12 * 3600;
+        assert_eq!(clock_of(&at(noon_utc, 0)), "12:00 ");
+        assert_eq!(clock_of(&at(noon_utc, 1)), "13:00 ");
+        assert_eq!(clock_of(&at(noon_utc, -5)), "07:00 ");
+        // And the offset can carry a moment into the day before or after.
+        assert_eq!(clock_of(&at(30 * 60, -1)), "23:30 ");
+    }
+
+    #[test]
+    fn a_day_separator_says_which_day_and_only_says_the_year_when_it_differs() {
+        let d = at(1_787_961_600, 0); // 2026-08-29
+        assert_eq!(day_label_of(&d, Some(2026)), "Saturday, 29 August");
+        assert_eq!(day_label_of(&d, Some(2027)), "Saturday, 29 August 2026");
     }
 
     #[test]
@@ -832,10 +1124,11 @@ mod tests {
                 unread: 2,
                 waiting: false,
             }],
-            selected: 0,
+            selected: Some([2; 32]),
             said: vec![
                 Said {
                     who: "bob".into(),
+                    key: "8qbHbw2B".into(),
                     mine: false,
                     text: "are you there?".into(),
                     seq: 3,
@@ -847,6 +1140,7 @@ mod tests {
                 },
                 Said {
                     who: "you".into(),
+                    key: "9hSR6S7W".into(),
                     mine: true,
                     text: "i am".into(),
                     seq: 4,
@@ -867,7 +1161,10 @@ mod tests {
         assert!(out.contains("sqex-chat"), "{out}");
         assert!(out.contains("bob"));
         assert!(out.contains("are you there?"));
-        assert!(out.contains("01:01"), "the clock is missing:\n{out}");
+        assert!(
+            out.contains(clock(3661).trim()),
+            "the clock is missing:\n{out}"
+        );
         assert!(out.contains("(edited)"));
         // A quiet status shows the keys, not a warning.
         assert!(out.contains("^C quit"));
@@ -961,6 +1258,7 @@ mod tests {
                         "/new /invite /kick",
                         "/name /topic /avatar",
                         "/profile /block /blocked",
+                        "/op /deop",
                         "/retain /close /read",
                         "/forward",
                     ]
@@ -1073,12 +1371,18 @@ mod tests {
             text: "friday".into(),
             seq: 8,
             at: 3700,
-            reply_to: Some((3, "thursday or friday?".into())),
+            reply_to: Some(("Alice (E4LUkjrZ)".into(), "thursday or friday?".into())),
             ..Default::default()
         }];
         let out = render(&app, 80, 20);
         assert!(out.contains("thursday or friday?"), "{out}");
-        assert!(out.contains("friday"), "{out}");
+        // Who is being answered, not which number: a sequence nobody has
+        // memorised is not information.
+        assert!(out.contains("Alice"), "the reply did not name its author:\n{out}");
+        assert!(
+            out.contains("E4LUkjrZ"),
+            "the reply named somebody with no key beside it:\n{out}"
+        );
     }
 
     /// A target we no longer hold still shows the marker. "Answering something
@@ -1092,19 +1396,22 @@ mod tests {
             text: "yes".into(),
             seq: 8,
             at: 3700,
-            reply_to: Some((3, "(not held)".into())),
+            reply_to: Some(("a message we no longer hold".into(), String::new())),
             ..Default::default()
         }];
         let out = render(&app, 80, 20);
-        assert!(out.contains("↳ 3"), "the reply marker was dropped:\n{out}");
+        assert!(out.contains("↳"), "the reply marker was dropped:\n{out}");
+        assert!(out.contains("no longer"), "{out}");
     }
 
     #[test]
     fn the_picked_message_is_visibly_picked_and_the_keys_change() {
         let mut app = sample();
+        // The second message is ours, and sits on the right — so its cursor is
+        // on the right edge too, pointing in at it.
         app.picked = Some(1);
         let out = render(&app, 80, 20);
-        assert!(out.contains('▸'), "nothing marks the picked message:\n{out}");
+        assert!(out.contains('◂'), "nothing marks the picked message:\n{out}");
         // The mode's own keys replace the command list: somebody who just
         // pressed Esc needs to be told what the mode does.
         assert!(out.contains("a react"), "{out}");
@@ -1117,6 +1424,8 @@ mod tests {
         app.picked = Some(0);
         let out = render(&app, 80, 20);
         assert!(!out.contains("e rewrite"), "offered to rewrite bob's message:\n{out}");
+        // Bob's is on the left, so its cursor is on the left edge.
+        assert!(out.contains('▸'), "nothing marks an incoming picked message:\n{out}");
     }
 
     #[test]
@@ -1382,6 +1691,208 @@ mod tests {
             assert!(out.contains(e), "{e} was dropped:\n{out}");
         }
         assert!(!out.contains('+'), "a full row claimed to be truncated:\n{out}");
+    }
+
+    /// Read cell by cell, because that is what the terminal is handed. A
+    /// homemade emulator counting characters made a correct layout look broken
+    /// twice; `TestBackend` settles it.
+    fn columns(app: &App, w: u16, h: u16) -> Vec<(usize, usize)> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        // For each row of the transcript pane, the first and last column
+        // holding anything.
+        let mut out = Vec::new();
+        // Only the transcript's own rows. The layout puts a header above it
+        // and an input box and status line below, and the box's border spans
+        // the whole width — which is not the transcript overflowing.
+        for y in 1..buf.area.height.saturating_sub(4) {
+            let cells: Vec<String> = (31..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            let first = cells.iter().position(|c| c.trim() != "");
+            let last = cells.iter().rposition(|c| c.trim() != "");
+            if let (Some(a), Some(b)) = (first, last) {
+                out.push((a, b));
+            }
+        }
+        out
+    }
+
+    fn said(who: &str, key: &str, mine: bool, text: &str, at: u64) -> Said {
+        Said {
+            who: who.into(),
+            key: key.into(),
+            mine,
+            text: text.into(),
+            at,
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of the layout: mine on one side, everyone else's on the
+    /// other, so you can tell at a glance who is speaking without reading.
+    #[test]
+    fn my_messages_sit_on_the_right_and_everyone_elses_on_the_left() {
+        let mut app = sample();
+        app.said = vec![
+            said("bob", "8qbHbw2B", false, "short", 3661),
+            said("you", "9hSR6S7W", true, "also short", 3661),
+        ];
+        let cols = columns(&app, 100, 20);
+        let pane = 100 - 31;
+        let incoming = cols.iter().find(|(a, _)| *a <= 2).expect("nothing on the left");
+        let outgoing = cols
+            .iter()
+            .find(|(_, b)| *b >= pane - 3)
+            .expect("nothing reaches the right");
+        assert!(
+            incoming.0 < outgoing.0,
+            "the two sides are not on different sides: {cols:?}"
+        );
+    }
+
+    /// A long message wraps inside its bubble rather than across the pane, and
+    /// nothing runs past the edge.
+    #[test]
+    fn a_long_message_wraps_inside_its_bubble() {
+        let mut app = sample();
+        let long = "the quick brown fox jumps over the lazy dog and keeps going \
+                    well past the width of any sensible bubble in this pane";
+        app.said = vec![said("bob", "8qbHbw2B", false, long, 3661)];
+        let out = render(&app, 100, 24);
+        for l in out.lines() {
+            assert!(
+                UnicodeWidthStr::width(l) <= 100,
+                "a line ran past the screen: {l:?}"
+            );
+        }
+        let cols = columns(&app, 100, 24);
+        let pane = 100 - 31;
+        // Wrapped to a bubble, not to the pane: nothing reaches the far edge.
+        assert!(
+            cols.iter().all(|(_, b)| *b < pane - 4),
+            "the text used the whole pane instead of a bubble: {cols:?}"
+        );
+    }
+
+    /// A word with no spaces in it — a URL — is cut rather than allowed to
+    /// push the conversation wide.
+    #[test]
+    fn one_enormous_word_is_cut_rather_than_overflowing() {
+        let mut app = sample();
+        app.said = vec![said("bob", "8qbHbw2B", false, &"x".repeat(400), 3661)];
+        let out = render(&app, 80, 24);
+        for l in out.lines() {
+            assert!(UnicodeWidthStr::width(l) <= 80, "overflowed: {l:?}");
+        }
+    }
+
+    /// One header per run, and it carries the key — SIP-21 applies however the
+    /// messages are arranged.
+    #[test]
+    fn a_run_is_headed_once_and_the_header_carries_the_key() {
+        let mut app = sample();
+        app.said = vec![
+            said("bob", "8qbHbw2B", false, "one", 3661),
+            said("bob", "8qbHbw2B", false, "two", 3671),
+            said("bob", "8qbHbw2B", false, "three", 3681),
+        ];
+        let out = render(&app, 100, 24);
+        assert_eq!(
+            out.matches("8qbHbw2B").count(),
+            2,
+            "expected one header in the transcript and one row in the list:\n{out}"
+        );
+
+        // A long enough silence starts a new run, because by then the reader
+        // has lost the thread of who is speaking.
+        app.said[2].at = 3681 + RUN_GAP + 1;
+        let out = render(&app, 100, 24);
+        assert_eq!(out.matches("8qbHbw2B").count(), 3, "{out}");
+    }
+
+    #[test]
+    fn a_day_separator_appears_between_days_and_not_within_one() {
+        let mut app = sample();
+        app.now = 200_000;
+        app.said = vec![
+            said("bob", "8qbHbw2B", false, "before midnight", 3661),
+            said("bob", "8qbHbw2B", false, "after midnight", 3661 + 86_400),
+        ];
+        let out = render(&app, 100, 24);
+        assert_eq!(
+            out.lines().filter(|l| l.contains("─── ")).count(),
+            2,
+            "expected a separator above each day:\n{out}"
+        );
+
+        app.said[1].at = 3661 + 60;
+        let out = render(&app, 100, 24);
+        assert_eq!(
+            out.lines().filter(|l| l.contains("─── ")).count(),
+            1,
+            "a separator appeared inside one day:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_identicon_is_stable_for_a_key_and_differs_between_keys() {
+        let a = identicon("8qbHbw2B");
+        assert_eq!(a.len(), ICON);
+        let styles = |v: &[Span]| v.iter().map(|s| (s.style.fg, s.style.bg)).collect::<Vec<_>>();
+        assert_eq!(styles(&a), styles(&identicon("8qbHbw2B")), "not stable");
+        assert_ne!(
+            styles(&a),
+            styles(&identicon("9hSR6S7W")),
+            "two keys drew the same face"
+        );
+        // Derived from the key, so a key that differs in one character does
+        // not draw the same thing.
+        assert_ne!(styles(&identicon("aaaaaaaa")), styles(&identicon("aaaaaaab")));
+    }
+
+    /// A conversation sits against the composer, not at the top of an empty
+    /// pane — the next message should appear near where somebody is typing.
+    #[test]
+    fn a_short_conversation_sits_at_the_bottom() {
+        let mut app = sample();
+        app.said = vec![said("bob", "8qbHbw2B", false, "hello", 3661)];
+        let out = render(&app, 100, 24);
+        let rows: Vec<&str> = out.lines().collect();
+        let at = rows
+            .iter()
+            .position(|l| l.contains("hello"))
+            .expect("the message is not on screen");
+        // Below the middle of the transcript, which runs from row 1 to row 19.
+        assert!(at > 10, "the conversation floated at the top:\n{out}");
+    }
+
+    /// Everything that trails a message shares its last line. A line each for
+    /// the time would halve how much of a conversation fits on screen.
+    #[test]
+    fn the_time_and_markers_ride_on_the_message() {
+        let mut app = sample();
+        let mut s = said("bob", "8qbHbw2B", false, "here it is", 3661);
+        s.has_file = true;
+        s.edited = true;
+        s.seq = 12;
+        app.said = vec![s];
+        let out = render(&app, 100, 24);
+        let line = out
+            .lines()
+            .find(|l| l.contains("here it is"))
+            .expect("the message is not on screen");
+        assert!(line.contains("/save 12"), "the file hint left the line: {line:?}");
+        assert!(line.contains("(edited)"), "the edit mark left the line: {line:?}");
+        assert!(
+            line.contains(clock(3661).trim()),
+            "the time left the line: {line:?}"
+        );
+        // And it all still fits.
+        for l in out.lines() {
+            assert!(UnicodeWidthStr::width(l) <= 100, "overflowed: {l:?}");
+        }
     }
 
     #[test]
