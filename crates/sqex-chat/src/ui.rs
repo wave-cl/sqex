@@ -42,9 +42,13 @@ pub mod palette {
     /// that near-white text sits on it cleanly.
     pub const SENT_BG: Color = Color::Rgb(0x3A, 0x6A, 0xD6);
     pub const SENT_FG: Color = Color::Rgb(0xF7, 0xF9, 0xFC);
-    /// A step *lighter* than the bubble, so a quotation reads as sitting on
-    /// top of it rather than as a hole cut through it.
-    pub const SENT_QUOTE_BG: Color = Color::Rgb(0x54, 0x82, 0xE8);
+    /// A step *darker* than the bubble, and darker for the sake of the text
+    /// on it. Lighter reads better as an inset — which is what it was — but
+    /// white on this blue only reaches 4.7:1 to begin with, so anything
+    /// lighter than the bubble takes light text worse than the bubble does,
+    /// and the quotation was sitting at 3.5:1. Down here it is 7.2:1, and
+    /// still a clear step away from the bubble at 1.5:1.
+    pub const SENT_QUOTE_BG: Color = Color::Rgb(0x2A, 0x4F, 0xA8);
     /// The time, the ticks and the markers, on blue. Dimmer than the words
     /// and still legible, which one grey for both sides could not manage.
     pub const SENT_TRAILER: Color = Color::Rgb(0xDC, 0xE6, 0xFA);
@@ -52,6 +56,11 @@ pub mod palette {
     /// Everybody else's.
     pub const RECV_BG: Color = Color::Rgb(0x30, 0x34, 0x3C);
     pub const RECV_FG: Color = Color::Rgb(0xE4, 0xE7, 0xED);
+    /// The received quotation goes the other way, and the asymmetry is the
+    /// point: a dark grey has room above it, and going darker instead would
+    /// leave only 1.2:1 between the quotation and the bubble it sits in.
+    /// Both sides read as a band inside the bubble; only the direction they
+    /// take to get there differs, because only one of them is constrained.
     pub const RECV_QUOTE_BG: Color = Color::Rgb(0x44, 0x4A, 0x54);
     pub const RECV_TRAILER: Color = Color::Rgb(0x9A, 0xA0, 0xAA);
 
@@ -2504,6 +2513,7 @@ mod tests {
         // What somebody is actually reading.
         for (name, fg, bg) in [
             ("sent", palette::SENT_FG, palette::SENT_BG),
+            ("sent quote", palette::SENT_FG, palette::SENT_QUOTE_BG),
             ("received", palette::RECV_FG, palette::RECV_BG),
             ("received quote", palette::RECV_FG, palette::RECV_QUOTE_BG),
             ("chip", palette::CHIP_FG, palette::CHIP_BG),
@@ -2521,12 +2531,6 @@ mod tests {
         // honest thing is to hold secondary text to the floor it belongs to
         // rather than to raise it until it stops being secondary.
         for (name, fg, bg) in [
-            // The quotation is a reference to another message rather than the
-            // message: already cut, already elided. It is a step *lighter*
-            // than the bubble, which is what makes it read as sitting on top —
-            // and a lighter blue takes light text worse than the bubble does,
-            // so this is the ceiling that choice comes with.
-            ("sent quote", palette::SENT_FG, palette::SENT_QUOTE_BG),
             ("sent trailer", palette::SENT_TRAILER, palette::SENT_BG),
             ("received trailer", palette::RECV_TRAILER, palette::RECV_BG),
             ("chip of ours", palette::CHIP_MINE, palette::CHIP_BG),
@@ -2540,6 +2544,20 @@ mod tests {
             contrast(palette::SENT_BG, palette::RECV_BG) >= 1.5,
             "the two sides are nearly the same colour"
         );
+        // A quotation has to stay visibly a band inside its bubble. Raising
+        // its text contrast by moving it towards the bubble's own colour
+        // would be trading one unreadable thing for another.
+        for (name, quote, bubble) in [
+            ("sent", palette::SENT_QUOTE_BG, palette::SENT_BG),
+            ("received", palette::RECV_QUOTE_BG, palette::RECV_BG),
+        ] {
+            let got = contrast(quote, bubble);
+            assert!(
+                got >= 1.2,
+                "the {name} quotation is at {got:.2}:1 against its bubble — it has \
+                 stopped being a quotation and become part of the message"
+            );
+        }
     }
 
     fn said(who: &str, key: &str, mine: bool, text: &str, at: u64) -> Said {
