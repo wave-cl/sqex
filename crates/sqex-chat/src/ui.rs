@@ -587,25 +587,26 @@ const KEY_HEAD: usize = 6;
 /// pane, which is where somebody looks for it.
 fn header(f: &mut Frame, app: &App, area: Rect) {
     let dim = Style::default().fg(palette::MUTED);
+    // A colour is not a word. Green, amber and red say *that* something has
+    // changed and never what, and a reader who has not learnt this particular
+    // client's three colours is being asked to guess — including at the one
+    // moment the answer matters, which is when it has just gone amber.
+    //
+    // So all three say which. Leaving green silent made the good state the
+    // only one you had to know the code for.
     let (colour, word) = match app.link {
-        Link::Up => (palette::LIVE, ""),
+        Link::Up => (palette::LIVE, "connected"),
         Link::Retrying => (palette::TRYING, "reconnecting…"),
         Link::Gone => (palette::GONE, "offline"),
     };
-    // A dot on its own can say *that* something is wrong and not *what*. Two
-    // of the three states are wrong in different ways — one is worth ignoring
-    // and one is not — so those two say which. Green stays silent, because a
-    // word that is on screen whenever nothing is happening is not read.
     let mut left = vec![
         Span::styled(" ●", Style::default().fg(colour)),
         Span::styled(
             format!(" {}", app.me.chars().take(KEY_HEAD).collect::<String>()),
             dim,
         ),
+        Span::styled(format!("  {word}"), Style::default().fg(colour)),
     ];
-    if !word.is_empty() {
-        left.push(Span::styled(format!("  {word}"), Style::default().fg(colour)));
-    }
     // The name of the thing goes in the corner, where a title bar puts it and
     // where the eye is not looking for anything else — with the version, so
     // that "which one am I running" never needs asking. It has been the first
@@ -2463,21 +2464,24 @@ mod tests {
         assert_eq!(light(&app), Some(palette::GONE));
     }
 
-    /// A dot can say that something is wrong. It cannot say which of two
-    /// wrongs, and those two want opposite things from a reader.
+    /// A colour says that something changed, never what. Every state says
+    /// which in words, including the good one — leaving that silent made it
+    /// the only state you had to know the colour code for.
     #[test]
-    fn a_link_that_is_down_says_what_kind_of_down() {
+    fn every_state_of_the_link_says_which_it_is() {
         let mut app = sample();
-        app.link = Link::Up;
-        let top = row_at(&app, 100, 24, 0);
-        assert!(!top.contains("reconnecting"), "{top:?}");
-        assert!(!top.contains("offline"), "{top:?}");
-
-        app.link = Link::Retrying;
-        assert!(row_at(&app, 100, 24, 0).contains("reconnecting"));
-
-        app.link = Link::Gone;
-        assert!(row_at(&app, 100, 24, 0).contains("offline"));
+        for (link, word, other) in [
+            (Link::Up, "connected", ["reconnecting", "offline"]),
+            (Link::Retrying, "reconnecting", ["connected", "offline"]),
+            (Link::Gone, "offline", ["connected", "reconnecting"]),
+        ] {
+            app.link = link;
+            let top = row_at(&app, 100, 24, 0);
+            assert!(top.contains(word), "{link:?} does not say {word:?}: {top:?}");
+            for wrong in other {
+                assert!(!top.contains(wrong), "{link:?} also says {wrong:?}: {top:?}");
+            }
+        }
     }
 
     #[test]
