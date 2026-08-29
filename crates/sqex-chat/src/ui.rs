@@ -271,7 +271,7 @@ pub struct App {
 /// would be a scrolling grid nobody wants. Any emoji can still be sent by a
 /// client that offers more — the wire carries the string, not an index into
 /// this.
-pub const REACTIONS: &[&str] = &["👍", "🎉", "💜", "😂", "🤔", "👀"];
+pub const REACTIONS: &[&str] = &["👍", "🎉", "🧡", "😂", "🤔", "👀"];
 
 impl App {
     pub fn selected_row(&self) -> Option<&Row> {
