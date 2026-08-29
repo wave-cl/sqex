@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -611,6 +614,10 @@ async fn interface(mut chat: Chat) -> Result<(), String> {
 
     let mut app = App {
         me: format!("{}", chat.me),
+        // Capture is on from the start, because it is what makes hovering
+        // work and hovering is the reason it is here at all. `/mouse off`
+        // hands it back.
+        mouse: true,
         ..Default::default()
     };
 
@@ -663,12 +670,17 @@ async fn event_loop(
     }
 
     let mut poll_at = tokio::time::Instant::now();
+    let mut hover = ui::Hover::default();
     loop {
         let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
         refresh(app, open, &chat.me, &names);
         app.link = chat.link();
+        // Where each message ended up, kept from the frame that drew it: a
+        // second copy of the layout could disagree with the first, and a
+        // pointer that names the message above the one under it is worse than
+        // no pointer at all.
         terminal
-            .draw(|f| ui::draw(f, app))
+            .draw(|f| hover = ui::draw(f, app))
             .map_err(|e| e.to_string())?;
         if app.should_quit {
             return Ok(());
@@ -676,10 +688,22 @@ async fn event_loop(
 
         // Keys first, so typing never waits on the network.
         if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
-            if let Event::Key(k) = event::read().map_err(|e| e.to_string())?
-                && k.kind == KeyEventKind::Press
-            {
-                handle_key(chat, open, app, k.code, k.modifiers).await;
+            match event::read().map_err(|e| e.to_string())? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    handle_key(chat, open, app, k.code, k.modifiers).await;
+                }
+                // Motion is reported a cell at a time, so a sweep across the
+                // pane is dozens of these. Only a change of *message* is worth
+                // a redraw; the rest are dropped here rather than costing a
+                // frame each and starving the poll below.
+                Event::Mouse(m) if m.kind == MouseEventKind::Moved => {
+                    let over = hover.at(m.column, m.row);
+                    if over == app.hovered {
+                        continue;
+                    }
+                    app.hovered = over;
+                }
+                _ => {}
             }
             continue;
         }
@@ -1254,6 +1278,37 @@ async fn handle_key(
                 app.helping = true;
                 return;
             }
+            // The terminal, not the exchange, so it is settled here rather
+            // than in `account_command`.
+            if let Command::Mouse(want) = cmd {
+                let on = want.unwrap_or(!app.mouse);
+                let note = match set_mouse(on) {
+                    Ok(()) => {
+                        app.mouse = on;
+                        if on {
+                            "the mouse is the client's — hover a message for its full \
+                             time. Selecting text now needs Shift (Option on macOS)"
+                                .to_string()
+                        } else {
+                            "the mouse is the terminal's again — selection and copy work \
+                             as usual, and hovering says nothing"
+                                .to_string()
+                        }
+                    }
+                    Err(e) => format!("could not change the mouse: {e}"),
+                };
+                // Nothing is under the pointer once it has stopped being
+                // watched, and a stale timestamp would sit in the status line
+                // for good.
+                if !app.mouse {
+                    app.hovered = None;
+                }
+                match selected_index(open, app) {
+                    Some(i) => open[i].note = Some((note, std::time::Instant::now())),
+                    None => app.trouble.message = Some(note),
+                }
+                return;
+            }
             if matches!(
                 cmd,
                 Command::Profile(_)
@@ -1307,6 +1362,7 @@ async fn handle_key(
                 | Command::Blocked
                 | Command::Whoami
                 | Command::Reconnect
+                | Command::Mouse(_)
                 | Command::Help => Ok(None),
                 Command::Name(name) => match chat.set_name(&channel, &name).await {
                     Ok(_) => Ok(Some(format!("renamed to {name}"))),
@@ -1638,6 +1694,8 @@ enum Command {
     /// `/reconnect` — try the exchange again now, whatever the backoff had
     /// planned. So that a red light has an answer that is not "restart it".
     Reconnect,
+    /// `/mouse [on|off]` — whether the client takes the mouse.
+    Mouse(Option<bool>),
     /// `/search <text>` — find it in this conversation.
     Search(String),
     /// `/op <key>` — make somebody an admin here, so they can rename it,
@@ -1756,6 +1814,12 @@ impl Command {
             "/help" | "/?" => Command::Help,
             "/whoami" => Command::Whoami,
             "/reconnect" => Command::Reconnect,
+            "/mouse" => match rest.trim() {
+                "" => Command::Mouse(None),
+                "on" => Command::Mouse(Some(true)),
+                "off" => Command::Mouse(Some(false)),
+                other => Command::Unknown(format!("/mouse takes on or off, not {other:?}")),
+            },
             "/search" if !rest.is_empty() => Command::Search(rest.to_string()),
             "/search" => Command::Unknown("/search needs something to look for".into()),
             "/op" if !first.is_empty() => Command::Op(first.to_string()),
@@ -2389,14 +2453,33 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
 fn start_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    crossterm::execute!(out, EnterAlternateScreen)?;
+    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     Terminal::new(CrosstermBackend::new(out))
 }
 
 fn stop_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()
+}
+
+/// Hand the mouse back to the terminal, or take it again.
+///
+/// Capture costs something real: with it on, the terminal's own selection stops
+/// working and copying a message means holding Shift — or Option, on macOS.
+/// That is a poor trade for somebody who never points at anything, so it can be
+/// given back. `/mouse` is the whole of the interface to it.
+fn set_mouse(on: bool) -> io::Result<()> {
+    let mut out = io::stdout();
+    if on {
+        crossterm::execute!(out, EnableMouseCapture)
+    } else {
+        crossterm::execute!(out, DisableMouseCapture)
+    }
 }
 
 fn now() -> u64 {

@@ -16,7 +16,7 @@
 //!   (SIP-16).
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
@@ -320,6 +320,19 @@ pub struct App {
     pub hits: Vec<Hit>,
     pub query: String,
     pub searching: bool,
+    /// Whether the client has taken the mouse from the terminal.
+    ///
+    /// Not drawn. Kept here because `/mouse` toggles it and something has to
+    /// remember which way it went.
+    pub mouse: bool,
+    /// The message the pointer is over, as an index into `said`.
+    ///
+    /// Detail on demand, and only detail: nothing a reader *needs* may live
+    /// here. A key shown on hover is a key most people never see, which is
+    /// the opposite of what SIP-21 asks for — a timestamp is the right sort
+    /// of thing, because the short one is already on the message and this is
+    /// only the rest of it.
+    pub hovered: Option<usize>,
     /// The first message not read when this conversation was opened, if there
     /// was one. A line goes above it.
     pub divider: Option<u64>,
@@ -508,7 +521,29 @@ pub fn author(name: &str, key: &str, mine: bool) -> String {
     format!("{} ({key})", truncate(name, room))
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+/// Which message each row of the screen belongs to.
+///
+/// Returned by [`draw`] rather than recomputed, because a second copy of the
+/// layout is a second copy that can drift from the first — and a pointer that
+/// reports the message above the one under it is worse than no pointer.
+#[derive(Default)]
+pub struct Hover {
+    /// The transcript's pane. A pointer anywhere else is over nothing.
+    pub pane: Rect,
+    /// Indexed by absolute screen row.
+    pub rows: Vec<Option<usize>>,
+}
+
+impl Hover {
+    pub fn at(&self, column: u16, row: u16) -> Option<usize> {
+        if !self.pane.contains(Position { x: column, y: row }) {
+            return None;
+        }
+        *self.rows.get(row as usize)?
+    }
+}
+
+pub fn draw(f: &mut Frame, app: &App) -> Hover {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -530,9 +565,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(outer[1]);
 
     conversations(f, app, panes[0]);
-    transcript(f, app, panes[1]);
+    let hover = transcript(f, app, panes[1], f.area().height);
     input(f, app, outer[2]);
     status(f, app, outer[3]);
+    hover
 }
 
 /// How much of this account's key the header carries.
@@ -1094,18 +1130,20 @@ const RUN_GAP: u64 = 5 * 60;
 /// quotation's own width, so a short quote cannot force a wide bubble.
 const QUOTE_FLOOR: usize = 30;
 
-fn transcript(f: &mut Frame, app: &App, area: Rect) {
+fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Hover {
+    // The views that are not the conversation have nothing to hover: no rows
+    // of theirs belong to a message.
     if app.helping {
         help(f, area);
-        return;
+        return Hover::default();
     }
     if app.searching {
         results(f, app, area);
-        return;
+        return Hover::default();
     }
     if !app.found.is_empty() {
         directory(f, app, area);
-        return;
+        return Hover::default();
     }
     // The header belongs to the conversation, so the views that are not the
     // conversation — the command list, a search, the directory — take the
@@ -1122,6 +1160,10 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
     let width = (inner * 3 / 5).clamp(16, inner.max(16));
 
     let mut lines: Vec<Line> = Vec::new();
+    // Which message each line belongs to, built in step with the lines
+    // themselves. Anything that is not a message — a separator, a blank, the
+    // note about lost history — owns nothing, and hovering it says nothing.
+    let mut owners: Vec<Option<usize>> = Vec::new();
     let dim = Style::default().fg(palette::MUTED);
     if app.trouble.lost > 0 {
         // In the transcript, above the messages that did survive, because that
@@ -1136,12 +1178,14 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
             ),
             dim,
         )));
+        owners.push(None);
     }
     if app.trouble.gap {
         lines.push(Line::from(Span::styled(
             "─── older messages are past the retention window and cannot be recovered ───",
             dim,
         )));
+        owners.push(None);
     }
 
     let mut day: Option<String> = None;
@@ -1157,6 +1201,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
                 ))
                 .alignment(Alignment::Center),
             );
+            owners.push(None);
             day = this_day;
         }
         // Where you had got to when you opened this. Above the first message
@@ -1170,35 +1215,56 @@ fn transcript(f: &mut Frame, app: &App, area: Rect) {
                 ))
                 .alignment(Alignment::Center),
             );
+            owners.push(None);
         } else if starts_run(i.checked_sub(1).and_then(|p| app.said.get(p)), s) && i > 0 {
             lines.push(Line::from(""));
+            owners.push(None);
         }
         let head = starts_run(i.checked_sub(1).and_then(|p| app.said.get(p)), s);
-        lines.extend(bubble(app, s, app.picked == Some(i), head, width));
+        let block = bubble(app, s, app.picked == Some(i), head, width);
+        // The whole bubble belongs to its message — the run header and the
+        // reactions included. Anywhere on it is a place somebody will point.
+        owners.extend(std::iter::repeat_n(Some(i), block.len()));
+        lines.extend(block);
     }
 
     if app.said.is_empty() && app.trouble.is_quiet() {
         lines.push(Line::from(Span::styled("nothing here yet", dim)));
+        owners.push(None);
     }
     if app.peer_typing {
         lines.push(Line::from(Span::styled("typing…", dim)));
+        owners.push(None);
     }
 
-    let height = area.height.saturating_sub(2) as usize;
-    let skip = lines.len().saturating_sub(height);
+    let room = area.height.saturating_sub(2) as usize;
+    let skip = lines.len().saturating_sub(room);
     // A short conversation sits at the bottom, against the input box, rather
     // than floating at the top of an empty pane — where the next message would
     // appear a long way from where somebody is typing.
-    for _ in lines.len()..height {
+    for _ in lines.len()..room {
         lines.insert(0, Line::from(""));
+        owners.insert(0, None);
     }
+    let shown = lines.split_off(skip.min(lines.len()));
+    // The same cut, on the same vector, so a row and its owner cannot come
+    // apart. Doing this arithmetic twice is how they would.
+    let owners = owners.split_off(skip.min(owners.len()));
     f.render_widget(
         // No `Wrap`: the text is already wrapped above, and a wrapped
         // paragraph ignores per-line alignment.
-        Paragraph::new(lines.split_off(skip.min(lines.len())))
-            .block(Block::default().borders(Borders::NONE)),
+        Paragraph::new(shown).block(Block::default().borders(Borders::NONE)),
         area,
     );
+
+    let mut rows = vec![None; height as usize];
+    for (n, owner) in owners.into_iter().enumerate() {
+        let y = area.y as usize + n;
+        if y < rows.len() {
+            rows[y] = owner;
+        }
+    }
+    Hover { pane: area, rows }
 }
 
 /// What a search found, newest first.
@@ -1310,6 +1376,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
         ("/block  /unblock  /blocked", "who may reach you"),
         ("/whoami", "your key in full — the header carries only the first six"),
+        ("/mouse [on|off]", "hover a message for its full time, or hand the mouse back"),
         ("/reconnect", "try the exchange again now, rather than waiting out the backoff"),
     ]),
 ];
@@ -1465,15 +1532,21 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
             ),
             Style::default().fg(palette::ATTENTION),
         )
-    } else if app.trouble.is_quiet() {
-        (
-            keys_line(area.width as usize),
-            Style::default().fg(palette::MUTED),
-        )
-    } else {
+    } else if !app.trouble.is_quiet() {
         (
             format!(" {}", app.trouble.line()),
             Style::default().fg(palette::ATTENTION),
+        )
+    } else if let Some(s) = app.hovered.and_then(|i| app.said.get(i)) {
+        // In the status line rather than floating by the pointer. A tooltip
+        // over a transcript covers the message it is describing, and this line
+        // is already where the client puts a detail somebody asked for. It
+        // gives way to trouble, which is not a detail.
+        (format!(" {}", stamp(s.at)), Style::default().fg(palette::MUTED))
+    } else {
+        (
+            keys_line(area.width as usize),
+            Style::default().fg(palette::MUTED),
         )
     };
     f.render_widget(Paragraph::new(text).style(style), area);
@@ -1497,6 +1570,23 @@ fn clock(at: u64) -> String {
         // at: a plausible wrong time is worse than none.
         None => "      ".to_string(),
     }
+}
+
+/// The whole of a moment, for when the four characters on the message are not
+/// enough — which day, which year, and the seconds.
+///
+/// The short clock stays on the message. This is the rest of it, and it is the
+/// right sort of thing to put behind a pointer: nobody has to find it to read
+/// the conversation.
+fn stamp(at: u64) -> String {
+    match local(at) {
+        Some(z) => stamp_of(&z),
+        None => String::new(),
+    }
+}
+
+fn stamp_of(z: &jiff::Zoned) -> String {
+    z.strftime("%A, %-d %B %Y at %H:%M:%S %Z").to_string()
 }
 
 /// The formatting alone, given a moment already placed in a zone.
@@ -1683,7 +1773,7 @@ mod tests {
 
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
+        t.draw(|f| { draw(f, app); }).unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -2284,7 +2374,7 @@ mod tests {
     /// twice; `TestBackend` settles it.
     fn columns(app: &App, w: u16, h: u16) -> Vec<(usize, usize)> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
+        t.draw(|f| { draw(f, app); }).unwrap();
         let buf = t.backend().buffer().clone();
         // For each row of the transcript pane, the first and last column
         // holding anything.
@@ -2314,7 +2404,7 @@ mod tests {
     /// difference has produced two wrong bug reports here already.
     fn transcript_text(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
+        t.draw(|f| { draw(f, app); }).unwrap();
         let buf = t.backend().buffer().clone();
         ((2 + HEAD)..buf.area.height.saturating_sub(4))
             .map(|y| {
@@ -2330,7 +2420,7 @@ mod tests {
     /// A row of cells, as symbols, so a width can be counted in columns.
     fn row_at(app: &App, w: u16, h: u16, y: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
+        t.draw(|f| { draw(f, app); }).unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().to_string())
@@ -2340,7 +2430,7 @@ mod tests {
     /// The colour of the first `●` on screen.
     fn light(app: &App) -> Option<Color> {
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
+        t.draw(|f| { draw(f, app); }).unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.width)
             .find(|x| buf[(*x, 0)].symbol() == "●")
@@ -2560,6 +2650,149 @@ mod tests {
         }
     }
 
+    /// The screen, and the map from its rows back to the messages on them.
+    fn drawn(app: &App, w: u16, h: u16) -> (Vec<String>, Hover) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hover = Hover::default();
+        t.draw(|f| hover = draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, hover)
+    }
+
+    /// The first row **of the transcript** holding `text`.
+    ///
+    /// From the pane down, not from the top of the screen: the conversation's
+    /// header names the same person the run header does, and a search over the
+    /// whole screen finds that one — which belongs to no message, and made
+    /// this look like a bug in the map.
+    fn row_of(rows: &[String], hover: &Hover, text: &str) -> u16 {
+        rows.iter()
+            .enumerate()
+            .skip(hover.pane.y as usize)
+            .find(|(_, r)| r.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} is not in the transcript"))
+            .0 as u16
+    }
+
+    /// The map has to come from the frame that drew it. A second copy of the
+    /// layout can disagree with the first, and a pointer that names the
+    /// message above the one under it is worse than no pointer.
+    #[test]
+    fn the_row_a_message_is_drawn_on_names_that_message() {
+        let app = sample();
+        let (rows, hover) = drawn(&app, 100, 24);
+        let x = hover.pane.x + 1;
+        for (want, text) in [(0usize, "are you there?"), (1, "i am")] {
+            let y = row_of(&rows, &hover, text);
+            assert_eq!(
+                hover.at(x, y),
+                Some(want),
+                "the row holding {text:?} points at the wrong message"
+            );
+        }
+    }
+
+    /// The run header and the reactions are part of the message, because that
+    /// is what somebody is pointing at when they point at them.
+    #[test]
+    fn the_whole_bubble_belongs_to_its_message() {
+        let mut app = sample();
+        app.said[0].reactions = vec![("🧡".into(), 1, false)];
+        let (rows, hover) = drawn(&app, 100, 24);
+        let x = hover.pane.x + 1;
+        for text in ["bob (8qbHbw2B)", "are you there?", "🧡"] {
+            let y = row_of(&rows, &hover, text);
+            assert_eq!(hover.at(x, y), Some(0), "{text:?} is not part of its message");
+        }
+    }
+
+    /// A short conversation is padded from the top and a long one is cut from
+    /// it, and the map has to survive both. This is the case that would drift:
+    /// the rows are moved by one arithmetic and the owners by another, and
+    /// nothing on screen would show that they had come apart.
+    #[test]
+    fn the_map_survives_a_transcript_that_has_scrolled() {
+        let mut app = sample();
+        app.said = (0..40)
+            .map(|n| {
+                said(
+                    "bob",
+                    "8qbHbw2B",
+                    n % 2 == 0,
+                    &format!("message number {n}"),
+                    3661 + n as u64 * RUN_GAP * 2,
+                )
+            })
+            .collect();
+        let (rows, hover) = drawn(&app, 100, 24);
+        let x = hover.pane.x + 1;
+        // The newest is on screen; the oldest has scrolled off.
+        let y = row_of(&rows, &hover, "message number 39");
+        assert_eq!(hover.at(x, y), Some(39), "the newest message is misattributed");
+        assert!(
+            !rows.iter().any(|r| r.contains("message number 0 ")),
+            "nothing scrolled, so this proves nothing"
+        );
+    }
+
+    /// Everything that is not a message is nothing to point at, and a
+    /// separator that claimed to be a message would put a time on the wrong
+    /// thing entirely.
+    #[test]
+    fn what_is_not_a_message_belongs_to_nobody() {
+        let mut app = sample();
+        app.said[1].at = app.said[0].at + 60 * 60 * 30;
+        let (rows, hover) = drawn(&app, 100, 24);
+        let x = hover.pane.x + 1;
+        let y = row_of(&rows, &hover, "───");
+        assert_eq!(hover.at(x, y), None, "a day separator claimed to be a message");
+
+        // And outside the pane: the conversation list, and the input box.
+        let anywhere = row_of(&rows, &hover, "i am");
+        assert_eq!(hover.at(0, anywhere), None, "the list is not the transcript");
+        assert_eq!(hover.at(x, 23), None, "the input box is not the transcript");
+    }
+
+    /// The four characters on the message are the time; this is the rest of
+    /// it. Behind a pointer because nobody has to find it to read.
+    #[test]
+    fn hovering_says_the_whole_moment() {
+        let mut app = sample();
+        app.hovered = Some(0);
+        let out = render(&app, 100, 24);
+        let want = stamp(app.said[0].at);
+        assert!(!want.is_empty());
+        assert!(out.contains(&want), "the full time is not on screen:\n{out}");
+        // And it stands down for the keys line when nothing is under it.
+        app.hovered = None;
+        assert!(!render(&app, 100, 24).contains(&want));
+    }
+
+    /// Trouble is not a detail somebody asked for, and it wins.
+    #[test]
+    fn a_fault_outranks_the_pointer() {
+        let mut app = sample();
+        app.hovered = Some(0);
+        app.trouble.no_key = Some(7);
+        let out = render(&app, 100, 24);
+        assert!(out.contains("no key for epoch 7"), "{out}");
+        assert!(!out.contains(&stamp(app.said[0].at)), "{out}");
+    }
+
+    #[test]
+    fn the_whole_moment_says_the_day_the_year_and_the_seconds() {
+        // A fixed offset, so this reads the same wherever it is run.
+        let said = stamp_of(&at(3661, 1));
+        assert_eq!(said, "Thursday, 1 January 1970 at 02:01:01 +01");
+    }
+
     fn said(who: &str, key: &str, mine: bool, text: &str, at: u64) -> Said {
         Said {
             who: who.into(),
@@ -2749,7 +2982,7 @@ mod tests {
             3661,
         )];
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
 
         // Every row holding part of the message has the same run of coloured
@@ -2782,7 +3015,7 @@ mod tests {
         let mut app = sample();
         app.said = vec![said("bob", "8qbHbw2B", false, "hello", 3661)];
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
         let painted = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
@@ -2802,7 +3035,7 @@ mod tests {
         s.redacted = true;
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
         let painted = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
@@ -3021,7 +3254,7 @@ mod tests {
     /// sentence that wrapped.
     fn flowed(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
+        t.draw(|f| { draw(f, app); }).unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -3045,7 +3278,7 @@ mod tests {
         app.query = "friday".into();
         app.hits = vec![hit("bob (8qbHbw2B)", "we ship on friday, not thursday", "friday", 3661)];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
         let marked: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -3066,7 +3299,7 @@ mod tests {
             s.reactions = vec![("👍".into(), 2, false)];
             app.said = vec![s];
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            t.draw(|f| draw(f, &app)).unwrap();
+            t.draw(|f| { draw(f, &app); }).unwrap();
             let buf = t.backend().buffer().clone();
             // The bubble's right edge, and the reaction chips' right edge.
             let right_of = |bg: Color| {
@@ -3102,7 +3335,7 @@ mod tests {
         s.reactions = vec![("👍".into(), 1, true)];
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
         let chip = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
@@ -3136,7 +3369,7 @@ mod tests {
         s.reactions = vec![("\u{2764}\u{fe0f}".into(), 1, false)];
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
         // No cell inside the chip run is left without a background.
         let run: Vec<(u16, u16)> = (0..buf.area.height)
@@ -3169,7 +3402,7 @@ mod tests {
         ));
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
+        t.draw(|f| { draw(f, &app); }).unwrap();
         let buf = t.backend().buffer().clone();
         let right_of = |bg: Color| {
             (0..buf.area.height)
@@ -3234,7 +3467,7 @@ mod tests {
             }
             app.said = vec![s];
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            t.draw(|f| draw(f, &app)).unwrap();
+            t.draw(|f| { draw(f, &app); }).unwrap();
             let buf = t.backend().buffer().clone();
             let bg = if mine { palette::SENT_BG } else { palette::RECV_BG };
 
@@ -3286,7 +3519,7 @@ mod tests {
             let mut app2 = sample();
             app2.said = vec![s];
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            t.draw(|f| draw(f, &app2)).unwrap();
+            t.draw(|f| { draw(f, &app2); }).unwrap();
             let buf = t.backend().buffer().clone();
             (0..buf.area.height)
                 .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
