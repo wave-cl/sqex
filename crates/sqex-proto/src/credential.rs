@@ -36,6 +36,15 @@ use sqnr_core::{Error, PubKey, Result};
 
 /// Domain separator for a delegation signature.
 pub const DELEGATION_CONTEXT: &[u8] = b"sqnr-delegate-v1";
+/// Domain separator for a revocation signature (SIP-32).
+///
+/// `sqnr-` rather than `sqex-`, for the same reason the delegation context is:
+/// an account key is an sqnr identity and may be held in hardware. A revocation
+/// belongs to the identity that signs it, not to the service that stores it.
+pub const REVOCATION_CONTEXT: &[u8] = b"sqnr-revoke-v1";
+
+/// Bytes of a revocation.
+pub const REVOCATION_LEN: usize = 32 + 32 + 8 + 64;
 
 /// The scope this stack's chat services check for.
 pub const SCOPE_CHAT: &str = "sqex-chat";
@@ -371,5 +380,180 @@ mod tests {
         let mut bytes = c.encode();
         bytes[64] = (MAX_SCOPE + 1) as u8;
         assert!(Credential::decode(&bytes).is_err());
+    }
+}
+
+/// An account withdrawing a device it credentialed (SIP-32).
+///
+/// The mirror of a [`Credential`], and deliberately the same shape: one
+/// identity speaking about another, meant to be repeated. A credential was a
+/// portable artifact anybody could check and its undoing was a request over an
+/// authenticated connection — so the mechanism SIP-22 advertises as the thing a
+/// portable credential structurally cannot do was itself the thing that could
+/// not travel.
+///
+/// # Signed by the account, and why not by a device
+///
+/// SIP-22 lets any registered device of an account revoke another, subject to
+/// seniority. A device could sign, and the result would not be checkable by
+/// anybody: seniority is evaluated against `added` times only the exchange
+/// holds. A signed statement whose authority cannot be evaluated is worse than
+/// an unsigned one, because it looks like evidence. So the portable form is the
+/// one whose authority is self-contained, and device-initiated revocation
+/// survives as an explicitly **local** act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Revocation {
+    pub account: PubKey,
+    pub device: PubKey,
+    /// The account's own clock. Advisory, and checked only for not being in the
+    /// future: what makes a revocation bite is that it exists, not when.
+    pub issued: u64,
+    pub signature: [u8; 64],
+}
+
+fn revocation_body(account: &PubKey, device: &PubKey, issued: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(72);
+    b.extend_from_slice(account.as_bytes());
+    b.extend_from_slice(device.as_bytes());
+    b.extend_from_slice(&issued.to_be_bytes());
+    b
+}
+
+fn revocation_input(body: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(REVOCATION_CONTEXT.len() + 32);
+    m.extend_from_slice(REVOCATION_CONTEXT);
+    m.extend_from_slice(&Sha256::digest(body));
+    m
+}
+
+impl Revocation {
+    /// Sign one. The account withdraws; the device is named and not consulted.
+    pub fn issue(account_seed: &[u8; 32], device: &PubKey, issued: u64) -> Revocation {
+        let signing = SigningKey::from_bytes(account_seed);
+        let account = PubKey::new(signing.verifying_key().to_bytes());
+        let body = revocation_body(&account, device, issued);
+        Revocation {
+            account,
+            device: *device,
+            issued,
+            signature: signing.sign(&revocation_input(&body)).to_bytes(),
+        }
+    }
+
+    /// Check it, stopping at the first failure.
+    ///
+    /// `now` allows a small skew forward: an account whose clock runs fast must
+    /// not produce a revocation nobody will accept. There is no expiry — a
+    /// withdrawal that lapsed would re-admit the key it withdrew.
+    pub fn verify(&self, expect_account: &PubKey, now: u64, skew: u64) -> std::result::Result<(), Invalid> {
+        if &self.account != expect_account {
+            return Err(Invalid::WrongAccount);
+        }
+        if self.issued > now.saturating_add(skew) {
+            return Err(Invalid::NotYetValid);
+        }
+        let vk = VerifyingKey::from_bytes(self.account.as_bytes())
+            .map_err(|_| Invalid::BadSignature)?;
+        let body = revocation_body(&self.account, &self.device, self.issued);
+        vk.verify(
+            &revocation_input(&body),
+            &Signature::from_bytes(&self.signature),
+        )
+        .map_err(|_| Invalid::BadSignature)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = revocation_body(&self.account, &self.device, self.issued);
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Revocation> {
+        if b.len() != REVOCATION_LEN {
+            return Err(Error::Malformed(format!(
+                "revocation is {} bytes, want {REVOCATION_LEN}",
+                b.len()
+            )));
+        }
+        Ok(Revocation {
+            account: PubKey::new(b[0..32].try_into().unwrap()),
+            device: PubKey::new(b[32..64].try_into().unwrap()),
+            issued: u64::from_be_bytes(b[64..72].try_into().unwrap()),
+            signature: b[72..136].try_into().unwrap(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+
+    fn key(b: u8) -> ([u8; 32], PubKey) {
+        let sk = SigningKey::from_bytes(&[b; 32]);
+        (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
+    }
+
+    #[test]
+    fn a_revocation_verifies_under_the_account_alone() {
+        let (seed, account) = key(1);
+        let (_, device) = key(2);
+        let r = Revocation::issue(&seed, &device, 1000);
+        assert_eq!(r.verify(&account, 1000, 60), Ok(()));
+        // The whole point: no exchange is consulted.
+        assert_eq!(Revocation::decode(&r.encode()).unwrap(), r);
+    }
+
+    /// Each field, one at a time. Varying two would let a construction that
+    /// omitted one of them still pass.
+    #[test]
+    fn every_field_is_covered() {
+        let (seed, account) = key(1);
+        let (_, device) = key(2);
+        let (_, other) = key(3);
+        let r = Revocation::issue(&seed, &device, 1000);
+
+        for (what, tampered) in [
+            ("device", Revocation { device: other, ..r }),
+            ("issued", Revocation { issued: 1001, ..r }),
+            ("account", Revocation { account: other, ..r }),
+        ] {
+            let expect = if what == "account" { &other } else { &account };
+            assert!(
+                tampered.verify(expect, 2000, 60).is_err(),
+                "a signature survived a changed {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_revocation_naming_another_account_is_not_evidence() {
+        let (seed, _) = key(1);
+        let (_, device) = key(2);
+        let (_, stranger) = key(3);
+        let r = Revocation::issue(&seed, &device, 1000);
+        assert_eq!(r.verify(&stranger, 2000, 60), Err(Invalid::WrongAccount));
+    }
+
+    /// A withdrawal that lapsed would re-admit the key it withdrew, so there is
+    /// no expiry — only a bound on claiming the future.
+    #[test]
+    fn a_revocation_does_not_expire_but_cannot_be_postdated() {
+        let (seed, account) = key(1);
+        let (_, device) = key(2);
+        let r = Revocation::issue(&seed, &device, 1000);
+        assert_eq!(r.verify(&account, u64::MAX / 2, 60), Ok(()), "it expired");
+        assert_eq!(
+            Revocation::issue(&seed, &device, 9_999).verify(&account, 1000, 60),
+            Err(Invalid::NotYetValid)
+        );
+    }
+
+    /// The two contexts must not be interchangeable, or a delegation could be
+    /// presented as its own withdrawal.
+    #[test]
+    fn the_contexts_are_separate() {
+        assert_ne!(DELEGATION_CONTEXT, REVOCATION_CONTEXT);
+        assert!(!REVOCATION_CONTEXT.starts_with(DELEGATION_CONTEXT));
+        assert!(!DELEGATION_CONTEXT.starts_with(REVOCATION_CONTEXT));
     }
 }

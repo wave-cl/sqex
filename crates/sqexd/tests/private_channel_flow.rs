@@ -16,7 +16,7 @@ use sqex_proto::channel::{
 use sqex_proto::channel::Posted;
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
-    open_envelope, seal_envelope,
+    open_envelope, seal_envelope, sign_envelope,
 };
 use sqex_proto::message::{Body, Part, Post as SipPost};
 use sqex_proto::prekey::{Pool, Prekey, Publish, Take, Taken};
@@ -27,7 +27,7 @@ use sqnr_core::PubKey;
 
 mod common;
 use common::{Chain, Signer, instance_for};
-use sqex_proto::channel::{Action, ByChannelSigned, EVENT_ADDED, EVENT_JOINED, EVENT_LEFT, EVENT_REMOVED, EVENT_ROTATED};
+use sqex_proto::channel::{Action, ByChannelSigned, EVENT_ADDED, EVENT_CREATED, EVENT_JOINED, EVENT_LEFT, EVENT_REMOVED, EVENT_ROTATED};
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
@@ -144,6 +144,21 @@ impl Peer {
     }
 }
 
+/// Sign an envelope as `s`'s device published it (SIP-32).
+///
+/// The exchange verifies this, so a test that seals without signing is one that
+/// publishes a key nobody put their name to.
+fn published(s: &Signer, channel: [u8; 32], epoch: u32, e: Envelope) -> Envelope {
+    sign_envelope(
+        &s.seed,
+        &s.exchange,
+        &instance_for(channel, 0),
+        &channel,
+        epoch,
+        e,
+    )
+}
+
 /// The signature for minting `epoch`, which is a rotation and therefore writes
 /// a system entry. Minting the *first* epoch is a rotation from 0 and needs one
 /// just the same: there is no unsigned way to key a channel.
@@ -228,7 +243,7 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap());
+        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     let (code, body) = alice
@@ -341,7 +356,7 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap());
+        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     alice
@@ -387,7 +402,7 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
             KeyPut {
                 channel,
                 epoch: 2,
-                envelopes: vec![seal_envelope(&alice.key, p.id, &p.public, 2, &[epoch2]).unwrap()],
+                envelopes: vec![published(&alice.signer, channel, 2, seal_envelope(&alice.key, p.id, &p.public, 2, &[epoch2]).unwrap())],
                 action: Some(rot),
             }
             .encode(),
@@ -441,7 +456,7 @@ async fn an_envelope_is_served_only_to_the_recipient_it_names() {
             KeyPut {
                 channel,
                 epoch: 1,
-                envelopes: vec![seal_envelope(&alice.key, p.id, &p.public, 1, &[epoch1]).unwrap()],
+                envelopes: vec![published(&alice.signer, channel, 1, seal_envelope(&alice.key, p.id, &p.public, 1, &[epoch1]).unwrap())],
                 action: Some(rot),
             }
             .encode(),
@@ -586,8 +601,11 @@ async fn an_envelope_cannot_be_published_twice_for_one_epoch() {
         .await
         .unwrap();
 
-    let seal_one = |p: &Prekey, k: ChannelKey, who: &PubKey| -> Envelope {
-        seal_envelope(who, p.id, &p.public, 1, &[k]).unwrap()
+    // A detached copy, so the closure does not hold a borrow of `alice` across
+    // the calls that need it mutably.
+    let signer = alice.signer;
+    let seal_one = move |p: &Prekey, k: ChannelKey, who: &PubKey| -> Envelope {
+        published(&signer, channel, 1, seal_envelope(who, p.id, &p.public, 1, &[k]).unwrap())
     };
     let p1 = alice.take_prekey_for(alice.key).await;
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
@@ -639,10 +657,20 @@ async fn a_public_channel_has_no_keys_to_distribute() {
     let channel = [6u8; 32];
     alice.publish_prekeys(2).await;
 
-    let mut req = private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![]);
-    req.visibility = Visibility::Public;
-    req.name = "open".into();
-    alice.client.post("/channel/create", req.encode()).await.unwrap();
+    // Built public rather than built private and flipped: SIP-32's `created`
+    // action commits to the visibility and the name, so mutating them after
+    // signing leaves a signature for a channel nobody asked for.
+    let req = alice.signer.create_chained(
+        &mut alice_chain,
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "open",
+        vec![],
+    );
+    let (code, body) = alice.client.post("/channel/create", req.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
     let p = alice.take_prekey_for(alice.key).await;
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
@@ -654,8 +682,13 @@ async fn a_public_channel_has_no_keys_to_distribute() {
                 channel,
                 epoch: 1,
                 envelopes: vec![
-                    seal_envelope(&alice.key, p.id, &p.public, 1, &[ChannelKey::generate()])
-                        .unwrap(),
+                    published(
+                        &alice.signer,
+                        channel,
+                        1,
+                        seal_envelope(&alice.key, p.id, &p.public, 1, &[ChannelKey::generate()])
+                            .unwrap(),
+                    ),
                 ],
                 action: Some(rot),
             }
@@ -744,7 +777,7 @@ async fn a_real_conversation_renders_end_to_end() {
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap());
+        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     alice
@@ -882,7 +915,7 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap());
+        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     alice
@@ -994,10 +1027,11 @@ async fn a_removal_leaves_a_record_of_who_did_it() {
         .filter_map(|e| System::decode(&e.body).ok().flatten())
         .collect();
 
-    assert_eq!(events.len(), 2, "added at creation, then removed");
-    assert_eq!(events[0].event, EVENT_ADDED);
-    assert_eq!(events[0].subject, bob.key);
-    assert_eq!(events[1].event, EVENT_REMOVED);
+    assert_eq!(events.len(), 3, "created, added at creation, then removed");
+    assert_eq!(events[0].event, EVENT_CREATED);
+    assert_eq!(events[1].event, EVENT_ADDED);
+    assert_eq!(events[1].subject, bob.key);
+    assert_eq!(events[2].event, EVENT_REMOVED);
     assert_eq!(events[1].subject, bob.key);
     assert_eq!(events[1].actor, alice.key, "and by whom");
 
@@ -1018,17 +1052,15 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
     let mut alice_chain = Chain::default();
     let bob = Peer::new(addr, pubkey, 132).await;
     let mut mallory = Peer::new(addr, pubkey, 133).await;
-    let _mallory_chain = Chain::default();
+    let mut mallory_chain = Chain::default();
 
     let dm = sqex_proto::channel::direct_message_id(&alice.key, &bob.key);
 
-    // Mallory gets there first, knowing nothing but two public keys.
-    let (code, _) = mallory
-        .client
-        .post("/channel/create", private(&alice.signer, &mut alice_chain, dm, instance_for(dm, 0), vec![]).encode())
-        .await
-        .unwrap();
-    assert_eq!(code, 200);
+    // Mallory gets there first, knowing nothing but two public keys — and
+    // signs its own create, because SIP-32's `created` names its actor.
+    let squat = private(&mallory.signer, &mut mallory_chain, dm, instance_for(dm, 0), vec![]);
+    let (code, body) = mallory.client.post("/channel/create", squat.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
     // Alice claims it by showing it is the derivation over herself and Bob,
     // which nobody but those two can do. The squatter's channel is discarded.

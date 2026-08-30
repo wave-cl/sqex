@@ -67,15 +67,20 @@ fn signer(server_pub: [u8; 32], b: u8) -> Signer {
 }
 
 /// A public channel `b` creates, with nothing in it.
-async fn a_room(c: &mut Client, s: &Signer, channel: [u8; 32]) {
-    let (code, body) = c
-        .post(
-            "/channel/create",
-            s.create(channel, instance_for(channel, 0), Visibility::Public, 3600, "room", vec![])
-                .encode(),
-        )
-        .await
-        .unwrap();
+///
+/// Takes the creator's chain, because SIP-32's `created` event spends a position
+/// on it — a caller that went on to post from a fresh chain would fork.
+async fn a_room(c: &mut Client, s: &Signer, chain: &mut Chain, channel: [u8; 32]) {
+    let req = s.create_chained(
+        chain,
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "room",
+        vec![],
+    );
+    let (code, body) = c.post("/channel/create", req.encode()).await.unwrap();
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 }
 
@@ -100,7 +105,8 @@ async fn an_entry_signed_by_one_device_and_claimed_by_another_is_refused() {
 
     let mut a = connect(addr, server_pub, alice_seed).await;
     let mut m = connect(addr, server_pub, mallory_seed).await;
-    a_room(&mut a, &signer(server_pub, 11), channel).await;
+    let mut chain = Chain::default();
+    a_room(&mut a, &signer(server_pub, 11), &mut chain, channel).await;
 
     // Mallory joins, so membership is not what refuses him.
     let joining = signer(server_pub, 12).action_outside(
@@ -169,29 +175,30 @@ async fn an_entry_signed_against_one_exchange_is_refused_by_another() {
     // The same channel identifier on both, which is the whole hazard.
     let mut a1 = connect(addr_a, pub_a, alice_seed).await;
     let mut a2 = connect(addr_b, pub_b, alice_seed).await;
-    for (c, key) in [(&mut a1, pub_a), (&mut a2, pub_b)] {
-        let (code, _) = c
-            .post(
-                "/channel/create",
-                signer(key, 21)
-                    .create(
-                        channel,
-                        instance_for(channel, 0),
-                        Visibility::Public,
-                        3600,
-                        "",
-                        vec![],
-                    )
-                    .encode(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(code, 200);
+    // A chain per exchange: the same device stands in a different place on each,
+    // because each `created` event was signed against its own exchange.
+    let mut chain_a = Chain::default();
+    let mut chain_b = Chain::default();
+    for (c, key, chain) in [
+        (&mut a1, pub_a, &mut chain_a),
+        (&mut a2, pub_b, &mut chain_b),
+    ] {
+        let req = signer(key, 21).create_chained(
+            chain,
+            channel,
+            instance_for(channel, 0),
+            Visibility::Public,
+            3600,
+            "",
+            vec![],
+        );
+        let (code, body) = c.post("/channel/create", req.encode()).await.unwrap();
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     }
 
     // Signed for exchange A, accepted there.
     let signed = signer(pub_a, 21).post_chained(
-        &mut Chain::default(),
+        &mut chain_a,
         channel,
         instance_for(channel, 0),
         0,
@@ -232,19 +239,23 @@ async fn an_entry_from_a_previous_incarnation_is_refused_by_the_next() {
     let mut b = connect(addr, server_pub, bob_seed).await;
 
     let first = instance_for(channel, 0);
-    let (code, _) = a
-        .post(
-            "/channel/create",
-            signer(server_pub, 31)
-                .create(channel, first, Visibility::Public, 3600, "", vec![])
-                .encode(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(code, 200);
+    // One chain across the create and the post that follows it: SIP-32's
+    // `created` spends a position, so a post from a fresh chain would fork.
+    let mut chain = Chain::default();
+    let req = signer(server_pub, 31).create_chained(
+        &mut chain,
+        channel,
+        first,
+        Visibility::Public,
+        3600,
+        "",
+        vec![],
+    );
+    let (code, body) = a.post("/channel/create", req.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
     let said = signer(server_pub, 31).post_chained(
-        &mut Chain::default(),
+        &mut chain,
         channel,
         first,
         0,
@@ -264,17 +275,20 @@ async fn an_entry_from_a_previous_incarnation_is_refused_by_the_next() {
         .unwrap();
     assert_eq!(code, 200);
 
+    // A new incarnation starts a new chain: destroying the channel took the
+    // exchange's record of where this device stood in it.
     let second = instance_for(channel, 1);
-    let (code, _) = a
-        .post(
-            "/channel/create",
-            signer(server_pub, 31)
-                .create(channel, second, Visibility::Public, 3600, "", vec![])
-                .encode(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(code, 200);
+    let rebuilt = signer(server_pub, 31).create_chained(
+        &mut Chain::default(),
+        channel,
+        second,
+        Visibility::Public,
+        3600,
+        "",
+        vec![],
+    );
+    let (code, body) = a.post("/channel/create", rebuilt.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
     // The old entry, verbatim, into the new incarnation.
     let (code, body) = a.post("/channel/post", said.encode()).await.unwrap();
@@ -301,9 +315,11 @@ async fn an_incarnation_cannot_be_used_twice_for_one_identifier() {
     let mut a = connect(addr, server_pub, alice_seed).await;
 
     let once = instance_for(channel, 0);
+    // A fresh chain per incarnation: a destroyed channel takes the exchange's
+    // record of where this device stood in it with it.
     let build = |i: [u8; 32]| {
         signer(server_pub, 41)
-            .create(channel, i, Visibility::Public, 3600, "", vec![])
+            .create_chained(&mut Chain::default(), channel, i, Visibility::Public, 3600, "", vec![])
             .encode()
     };
     assert_eq!(a.post("/channel/create", build(once)).await.unwrap().0, 200);
@@ -350,10 +366,9 @@ async fn a_chain_position_is_neither_reused_nor_skipped() {
     let (alice_seed, _) = identity(51);
     let channel = [5u8; 32];
     let mut a = connect(addr, server_pub, alice_seed).await;
-    a_room(&mut a, &signer(server_pub, 51), channel).await;
-
     let s = signer(server_pub, 51);
     let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
     let first = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 0, b"one".to_vec());
     assert_eq!(a.post("/channel/post", first.encode()).await.unwrap().0, 200);
 
@@ -400,10 +415,9 @@ async fn a_tombstone_keeps_a_signature_that_still_verifies() {
     let (alice_seed, _) = identity(61);
     let channel = [6u8; 32];
     let mut a = connect(addr, server_pub, alice_seed).await;
-    a_room(&mut a, &signer(server_pub, 61), channel).await;
-
     let s = signer(server_pub, 61);
     let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
     let said = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 0, b"regret".to_vec());
     let (_, body) = a.post("/channel/post", said.encode()).await.unwrap();
     let seq = sqex_proto::channel::Posted::decode(&body).unwrap().seq;
@@ -465,7 +479,8 @@ async fn an_unsigned_entry_is_refused() {
     let (alice_seed, _) = identity(71);
     let channel = [7u8; 32];
     let mut a = connect(addr, server_pub, alice_seed).await;
-    a_room(&mut a, &signer(server_pub, 71), channel).await;
+    let mut chain = Chain::default();
+    a_room(&mut a, &signer(server_pub, 71), &mut chain, channel).await;
 
     let bare = Post {
         channel,
@@ -497,7 +512,8 @@ async fn a_membership_event_needs_the_actors_signature() {
     let (_, bob) = identity(82);
     let channel = [8u8; 32];
     let mut a = connect(addr, server_pub, alice_seed).await;
-    a_room(&mut a, &signer(server_pub, 81), channel).await;
+    let mut chain = Chain::default();
+    a_room(&mut a, &signer(server_pub, 81), &mut chain, channel).await;
 
     // An invite carrying a signature made by somebody else's key.
     let impostor = Signer {
@@ -582,11 +598,10 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
 
     let d = Signer::new(desk_seed, desk_key, server_pub).for_account(account);
     let h = Signer::new(hand_seed, hand_key, server_pub).for_account(account);
-    a_room(&mut desk, &d, channel).await;
-
-    // Two chains, both starting at zero, neither treading on the other.
+    // The desktop's chain carries its `created` event into its later posts.
     let mut dc = Chain::default();
     let mut hc = Chain::default();
+    a_room(&mut desk, &d, &mut dc, channel).await;
     let one = d.post_chained(&mut dc, channel, instance_for(channel, 0), 0, 0, b"desk".to_vec());
     let two = h.post_chained(&mut hc, channel, instance_for(channel, 0), 0, 0, b"phone".to_vec());
     assert_eq!(desk.post("/channel/post", one.encode()).await.unwrap().0, 200);
@@ -607,7 +622,10 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
         assert_eq!(e.account, account, "the account is the person, not the client");
     }
     assert_ne!(mine[0].device, mine[1].device, "two clients, two devices");
-    assert_eq!(mine[0].chain_seq, 0);
+    // The desktop created the channel, so its `created` took position 0 and its
+    // message is at 1. The phone created nothing and starts at 0 — which is the
+    // point: the chains are per device and do not tread on each other.
+    assert_eq!(mine[0].chain_seq, 1);
     assert_eq!(mine[1].chain_seq, 0, "each device keeps its own chain");
 
     // And a device may not sign for the other's position.
@@ -615,4 +633,158 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
     let (code, _) = hand.post("/channel/post", crossed.encode()).await.unwrap();
     assert_eq!(code, 401, "one device's signature stood for another's entry");
     let _ = Invitee { account, role: Role::Member };
+}
+
+/// **SIP-32: a channel's constitution cannot be restated.**
+///
+/// Whether a channel is public or private, what it is called, and how long it
+/// keeps things all sat outside every signature until now — so a reader took
+/// them on the exchange's word, and a create could be signed as one thing and
+/// sent as another.
+#[tokio::test]
+async fn a_channels_constitution_cannot_be_restated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, _) = identity(101);
+    let channel = [0xa1; 32];
+    let mut a = connect(addr, server_pub, alice_seed).await;
+    let s = signer(server_pub, 101);
+
+    // Signed as private, sent as public.
+    let mut flipped = s.create_chained(
+        &mut Chain::default(),
+        channel,
+        instance_for(channel, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
+    flipped.visibility = Visibility::Public;
+    let (code, body) = a.post("/channel/create", flipped.encode()).await.unwrap();
+    assert_eq!(
+        code, 401,
+        "a channel was created as something other than what was signed: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Signed for one name, sent under another.
+    let mut renamed = s.create_chained(
+        &mut Chain::default(),
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "book club",
+        vec![],
+    );
+    // The same length, deliberately. A different one would be caught by the
+    // length prefix alone and would say nothing about whether the name's bytes
+    // are covered — which is exactly what a control caught this test not
+    // testing.
+    renamed.name = "team chat".into();
+    assert_eq!(renamed.name.len(), 9);
+    let (code, _) = a.post("/channel/create", renamed.encode()).await.unwrap();
+    assert_eq!(code, 401, "a public channel was named something it did not sign for");
+
+    // And the honest case still works, or this proves nothing.
+    let honest = s.create_chained(
+        &mut Chain::default(),
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "book club",
+        vec![],
+    );
+    let (code, body) = a.post("/channel/create", honest.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+}
+
+/// **SIP-32: a create with no invitees still signs its own origin.**
+///
+/// Until now such a create wrote no entry at all, so a channel could exist with
+/// nobody having signed for its existence.
+#[tokio::test]
+async fn a_channel_always_opens_with_a_signed_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(111);
+    let channel = [0xb1; 32];
+    let mut a = connect(addr, server_pub, alice_seed).await;
+
+    let mut chain = Chain::default();
+    a_room(&mut a, &signer(server_pub, 111), &mut chain, channel).await;
+
+    let (_, body) = a
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    let seen = Entries::decode(&body).unwrap();
+    assert_eq!(seen.entries.len(), 1, "an empty channel wrote no origin");
+
+    let opening = sqex_proto::channel::System::decode(&seen.entries[0].body)
+        .unwrap()
+        .expect("the opening event is one nobody knows");
+    assert_eq!(opening.event, sqex_proto::channel::EVENT_CREATED);
+    assert_eq!(opening.actor, alice);
+    assert_ne!(opening.sig, [0u8; 64], "nobody signed for the channel existing");
+}
+
+/// **SIP-32: renaming a public channel is recorded, and signed.**
+///
+/// It left no trace whatsoever before — a gap that needs no second exchange to
+/// matter, since a member could not tell that the room they were in had been
+/// called something else yesterday.
+#[tokio::test]
+async fn a_rename_is_recorded_and_signed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(121);
+    let channel = [0xc1; 32];
+    let mut a = connect(addr, server_pub, alice_seed).await;
+    let s = signer(server_pub, 121);
+
+    let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
+
+    let info = s.info(&mut a, channel).await;
+    let arg = sqex_proto::channel::constitution(
+        Visibility::Public,
+        info.retention_secs,
+        info.max_entries,
+        "renamed room",
+        "",
+    );
+    let me = s.account;
+    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_RENAMED, &me, &arg);
+    let (code, body) = a
+        .post(
+            "/channel/directory",
+            sqex_proto::channel::Directory {
+                channel,
+                name: "renamed room".into(),
+                topic: String::new(),
+                action,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+
+    let (_, body) = a
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    let seen = Entries::decode(&body).unwrap();
+    let events: Vec<_> = seen
+        .entries
+        .iter()
+        .filter_map(|e| sqex_proto::channel::System::decode(&e.body).ok().flatten())
+        .collect();
+    assert_eq!(events.len(), 2, "the rename left no record");
+    assert_eq!(events[1].event, sqex_proto::channel::EVENT_RENAMED);
+    assert_eq!(events[1].actor, alice);
+    assert_ne!(events[1].sig, [0u8; 64]);
 }

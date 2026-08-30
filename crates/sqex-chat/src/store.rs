@@ -130,6 +130,24 @@ CREATE TABLE IF NOT EXISTS chain (
     chain_seq INTEGER NOT NULL,
     head      BLOB    NOT NULL
 );
+-- SIP-32: which incarnation of a channel our state belongs to.
+--
+-- A direct message's identifier is derived from its two accounts, so it
+-- survives the channel being destroyed and rebuilt — and everything keyed on it
+-- then belongs to a conversation that no longer exists. SIP-16 infers this from
+-- a cursor above the exchange's last sequence number, which works and only once
+-- something has been fetched. The incarnation says so outright, and says it
+-- before the first thing we sign.
+CREATE TABLE IF NOT EXISTS incarnation (
+    channel  BLOB PRIMARY KEY,
+    instance BLOB NOT NULL,
+    -- Set when the incarnation changed under us and we cleared this channel,
+    -- and cleared when a poll has reported it. Durable, because a client that
+    -- reset and then stopped should still say so when it comes back: the reset
+    -- is the whole reason the conversation above the divider is not the one
+    -- below it.
+    announce INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -825,12 +843,71 @@ impl Store {
     ///
     /// `channel_meta` is deliberately left: the conversation is between the
     /// same two people and should stay where the reader left it.
+    /// Which incarnation this store's state for `channel` belongs to.
+    pub fn incarnation(&self, channel: &[u8; 32]) -> Result<Option<[u8; 32]>> {
+        let row: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT instance FROM incarnation WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read incarnation"))?;
+        Ok(row.and_then(|b| b.try_into().ok()))
+    }
+
+    pub fn set_incarnation(
+        &self,
+        channel: &[u8; 32],
+        instance: &[u8; 32],
+        announce: bool,
+    ) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO incarnation (channel, instance, announce) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (channel) DO UPDATE SET instance = ?2, announce = ?3",
+                params![&channel[..], &instance[..], i64::from(announce)],
+            )
+            .map_err(storage("set incarnation"))?;
+        Ok(())
+    }
+
+    /// Whether this channel was reset under us since anybody last asked, and
+    /// clear the note. Reported once, like the reset it describes.
+    pub fn take_announcement(&self, channel: &[u8; 32]) -> Result<bool> {
+        let pending: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT announce FROM incarnation WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read announcement"))?;
+        if pending == Some(1) {
+            self.db
+                .execute(
+                    "UPDATE incarnation SET announce = 0 WHERE channel = ?1",
+                    params![&channel[..]],
+                )
+                .map_err(storage("clear announcement"))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
         for sql in [
             "DELETE FROM message WHERE channel = ?1",
             "DELETE FROM seen WHERE channel = ?1",
             "DELETE FROM channel_key WHERE channel = ?1",
             "DELETE FROM cursor WHERE channel = ?1",
+            // SIP-31 chain state, for the same reason as the rest: a recreated
+            // channel is a different channel, and a position carried into it
+            // is one the exchange has no record of — every signature after it
+            // refused as a broken chain, for good.
+            "DELETE FROM chain WHERE channel = ?1",
         ] {
             self.db
                 .execute(sql, params![&channel[..]])

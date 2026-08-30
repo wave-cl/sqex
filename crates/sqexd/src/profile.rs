@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::profile::{
-    Blocks, Got, MAX_BLOCKED, MAX_UPDATES_PER_HOUR, Profile, FLAG_WITHHOLD,
+    Blocks, Got, MAX_BLOCKED, MAX_UPDATES_PER_HOUR, Record, FLAG_WITHHOLD,
 };
 use sqnr_core::PubKey;
 
@@ -32,6 +32,13 @@ use crate::state::now_unix;
 pub enum ProfileError {
     TooManyBlocked,
     RateLimited,
+    /// SIP-32: the record names an account other than the caller's.
+    NotYours,
+    /// SIP-32: the record's signature does not verify under the device it names.
+    BadSignature,
+    /// SIP-32: a serial at or below the one held — an old record put back over
+    /// a newer one, which is what the counter exists to make lose.
+    Stale,
     Storage,
 }
 
@@ -40,6 +47,9 @@ impl ProfileError {
         match self {
             ProfileError::TooManyBlocked => "too_many_blocked",
             ProfileError::RateLimited => "rate_limited",
+            ProfileError::NotYours => "not_yours",
+            ProfileError::BadSignature => "bad_signature",
+            ProfileError::Stale => "stale_serial",
             ProfileError::Storage => "storage",
         }
     }
@@ -47,6 +57,8 @@ impl ProfileError {
     pub fn status(&self) -> u16 {
         match self {
             ProfileError::TooManyBlocked | ProfileError::RateLimited => 507,
+            ProfileError::NotYours | ProfileError::BadSignature => 401,
+            ProfileError::Stale => 409,
             ProfileError::Storage => 500,
         }
     }
@@ -72,7 +84,13 @@ CREATE TABLE IF NOT EXISTS profile (
     -- to make an exchange serve a great deal of traffic on somebody else's
     -- behalf.
     hour    INTEGER NOT NULL,
-    in_hour INTEGER NOT NULL
+    in_hour INTEGER NOT NULL,
+    -- SIP-32. `serial` is the subject's own counter and the highest wins, which
+    -- is what makes an old record lose rather than merely look old. `record` is
+    -- the signed artifact, stored whole so what is served later is the thing
+    -- the subject signed rather than this exchange's copy of its fields.
+    serial  INTEGER NOT NULL DEFAULT 0,
+    record  BLOB    NOT NULL DEFAULT x''
 );
 CREATE TABLE IF NOT EXISTS block (
     account BLOB NOT NULL,
@@ -95,11 +113,40 @@ impl Profiles {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "FULL")?;
         db.execute_batch(SCHEMA)?;
+        // A deployed store has profile rows written before SIP-32, which
+        // `CREATE TABLE IF NOT EXISTS` will not alter. They keep their fields
+        // and report no record, which is the honest answer: what is held is an
+        // assertion this exchange accepted, not evidence anybody can check.
+        for (column, decl) in [
+            ("serial", "INTEGER NOT NULL DEFAULT 0"),
+            ("record", "BLOB NOT NULL DEFAULT x''"),
+        ] {
+            let existing: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('profile') WHERE name = ?1",
+                    [column],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if existing == 0 {
+                db.execute_batch(&format!("ALTER TABLE profile ADD COLUMN {column} {decl}"))?;
+            }
+        }
         Ok(Profiles { db: Mutex::new(db) })
     }
 
     /// Replace a profile whole.
-    pub fn put(&self, account: &PubKey, p: &Profile) -> Result<(), ProfileError> {
+    pub fn put(&self, account: &PubKey, record: &Record) -> Result<(), ProfileError> {
+        let p = &record.profile;
+        // SIP-32. The record is the subject's own statement, so it is verified
+        // here and stored whole — what the exchange serves later is the
+        // artifact rather than its copy of the fields.
+        if &record.account != account {
+            return Err(ProfileError::NotYours);
+        }
+        if !record.verify() {
+            return Err(ProfileError::BadSignature);
+        }
         let now = now_unix();
         let hour = now / 3600;
         let db = self.db.lock().unwrap();
@@ -111,6 +158,24 @@ impl Profiles {
             )
             .optional()
             .map_err(storage("read rate"))?;
+        // Ordering is by serial and rate limiting is by the clock; the two do
+        // not interact. A serial at or below the one held is a replay — an old
+        // record put back over a new one — and loses, which is the property
+        // that makes these replicate without trusting whoever carries them.
+        let held: Option<i64> = db
+            .query_row(
+                "SELECT serial FROM profile WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read serial"))?;
+        if let Some(h) = held
+            && record.serial <= h as u64
+        {
+            return Err(ProfileError::Stale);
+        }
+
         let in_hour = match used {
             Some((h, n)) if h as u64 == hour => {
                 if n as usize >= MAX_UPDATES_PER_HOUR {
@@ -122,11 +187,13 @@ impl Profiles {
         };
 
         db.execute(
-            "INSERT INTO profile (account, flags, name, title, avatar, updated, hour, in_hour)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO profile (account, flags, name, title, avatar, updated, hour, in_hour,
+                                  serial, record)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT (account) DO UPDATE SET
                  flags = ?2, name = ?3, title = ?4, avatar = ?5,
-                 updated = ?6, hour = ?7, in_hour = ?8",
+                 updated = ?6, hour = ?7, in_hour = ?8,
+                 serial = ?9, record = ?10",
             params![
                 account.as_bytes(),
                 p.flags as i64,
@@ -136,6 +203,8 @@ impl Profiles {
                 now as i64,
                 hour as i64,
                 in_hour,
+                record.serial as i64,
+                record.encode(),
             ],
         )
         .map_err(storage("write profile"))?;
@@ -162,15 +231,15 @@ impl Profiles {
             return Ok(Got::none(now));
         }
 
-        let row: Option<(i64, String, String, Vec<u8>, i64)> = db
+        let row: Option<(i64, i64, Vec<u8>)> = db
             .query_row(
-                "SELECT flags, name, title, avatar, updated FROM profile WHERE account = ?1",
+                "SELECT flags, updated, record FROM profile WHERE account = ?1",
                 params![subject.as_bytes()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(storage("read profile"))?;
-        let Some((flags, name, title, avatar, updated)) = row else {
+        let Some((flags, updated, stored)) = row else {
             return Ok(Got::none(now));
         };
 
@@ -184,11 +253,14 @@ impl Profiles {
             found: true,
             updated: updated as u64,
             now,
-            profile: Profile {
-                flags: flags as u8,
-                name,
-                title,
-                avatar,
+            // The artifact, served whole. Empty for a row written before
+            // SIP-32: reported as absent rather than reassembled from the
+            // columns, because a record this exchange manufactured would look
+            // exactly like one its subject signed and be worth nothing.
+            record: if stored.is_empty() {
+                None
+            } else {
+                Record::decode(&stored).ok()
             },
         })
     }

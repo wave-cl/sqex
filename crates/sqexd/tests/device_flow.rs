@@ -8,7 +8,7 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{Create, Entries, Fetch, Visibility};
-use sqex_proto::credential::{Credential, SCOPE_CHAT};
+use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
 use sqex_proto::device::{Devices, ListDevices, Register, Revoke};
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -90,6 +90,24 @@ fn public(signer: &Signer, channel: [u8; 32]) -> Create {
     signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, "shared", vec![])
 }
 
+/// Where a creator's chain stands after SIP-32's `created` event.
+///
+/// The create spends position 0, so anything the creator signs next follows on
+/// from it — starting again from zero would be a fork.
+fn created_head(signer: &Signer, channel: [u8; 32]) -> [u8; 32] {
+    let mut chain = Chain::default();
+    let _ = signer.create_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "shared",
+        vec![],
+    );
+    chain.head
+}
+
 #[tokio::test]
 async fn one_person_two_devices_share_a_membership() {
     let dir = tempfile::tempdir().unwrap();
@@ -120,12 +138,15 @@ async fn one_person_two_devices_share_a_membership() {
     let desk = Signer::new(desktop_seed, desktop, pubkey).for_account(account);
     let hand = Signer::new(phone_seed, phone, pubkey).for_account(account);
 
-    let (code, _) = d.post("/channel/create", public(&desk, channel).encode()).await.unwrap();
-    assert_eq!(code, 200);
+    let (code, body) = d.post("/channel/create", public(&desk, channel).encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
     // A chain each: the position is per device, so both start at zero and
     // neither treads on the other.
-    let mut desk_chain = Chain::default();
+    // The desktop created the channel, so SIP-32's `created` already took its
+    // position 0. The phone created nothing and starts at 0 — which is the
+    // point: the chains are per device.
+    let mut desk_chain = Chain { seq: 1, head: created_head(&desk, channel) };
     let mut hand_chain = Chain::default();
     let post = |signer: &Signer, chain: &mut Chain, body: &[u8], seq: u64| {
         signer
@@ -146,12 +167,19 @@ async fn one_person_two_devices_share_a_membership() {
         .await
         .unwrap();
     let seen = Entries::decode(&body).unwrap();
-    assert_eq!(seen.entries.len(), 2);
+    // Three: SIP-32's `created`, then a message from each client.
+    assert_eq!(seen.entries.len(), 3);
 
-    // Both entries are attributed to the person and distinguished by client.
-    assert!(seen.entries.iter().all(|e| e.account == account));
-    assert_eq!(seen.entries[0].device, desktop);
-    assert_eq!(seen.entries[1].device, phone);
+    // Both messages are attributed to the person and distinguished by client.
+    let said: Vec<_> = seen
+        .entries
+        .iter()
+        .filter(|e| e.kind == sqex_proto::channel::KIND_MEMBER)
+        .collect();
+    assert_eq!(said.len(), 2);
+    assert!(said.iter().all(|e| e.account == account));
+    assert_eq!(said[0].device, desktop);
+    assert_eq!(said[1].device, phone);
     // Both counted from zero and did not collide, which is the whole reason
     // the subkey is per device.
     assert!(seen.entries.iter().all(|e| e.msg_seq == 0));
@@ -175,7 +203,7 @@ async fn a_revoked_device_cannot_re_register_with_the_credential_it_still_holds(
 
     // The phone is lost. The desktop, registered first, may revoke it.
     let (code, _) = d
-        .post("/device/revoke", Revoke { device: phone }.encode())
+        .post("/device/revoke", Revoke { device: phone, revocation: None }.encode())
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -225,14 +253,14 @@ async fn a_junior_device_cannot_evict_its_senior() {
     assert_eq!(enrol(&mut a, &account_seed, &second, 3600).await, 200);
 
     let (code, _) = b
-        .post("/device/revoke", Revoke { device: first }.encode())
+        .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
         .await
         .unwrap();
     assert_eq!(code, 403, "the newer device may not evict the older");
 
     // It may always sign itself out.
     let (code, _) = b
-        .post("/device/revoke", Revoke { device: second }.encode())
+        .post("/device/revoke", Revoke { device: second, revocation: None }.encode())
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -328,8 +356,9 @@ async fn an_account_with_no_registered_devices_is_its_own_device() {
     let (code, _) = c
         .post(
             "/channel/post",
+            // Position 1: the create's `created` event took 0.
             solo.post_chained(
-                &mut Chain::default(),
+                &mut Chain { seq: 1, head: created_head(&solo, channel) },
                 channel,
                 instance_for(channel, 0),
                 0,
@@ -347,8 +376,15 @@ async fn an_account_with_no_registered_devices_is_its_own_device() {
         .await
         .unwrap();
     let seen = Entries::decode(&body).unwrap();
-    assert_eq!(seen.entries[0].account, alone);
-    assert_eq!(seen.entries[0].device, alone, "its own device");
+    // Entry 0 is SIP-32's `created`, which the exchange wrote and so carries
+    // zeroes; the message is the member entry after it.
+    let said = seen
+        .entries
+        .iter()
+        .find(|e| e.kind == sqex_proto::channel::KIND_MEMBER)
+        .expect("no member entry");
+    assert_eq!(said.account, alone);
+    assert_eq!(said.device, alone, "its own device");
 }
 
 #[tokio::test]
@@ -466,7 +502,7 @@ async fn the_account_may_revoke_a_device_it_never_registered_beside() {
     // The account has no device row of its own, and revokes anyway.
     let mut a = connect(addr, pubkey, account_seed).await;
     let (code, body) = a
-        .post("/device/revoke", Revoke { device: laptop }.encode())
+        .post("/device/revoke", Revoke { device: laptop, revocation: None }.encode())
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
@@ -494,15 +530,130 @@ async fn the_account_is_exempt_from_seniority_and_nobody_else_is() {
     let mut s = connect(addr, pubkey, stranger_seed).await;
     assert_eq!(enrol(&mut s, &stranger_seed, &stranger, 3600).await, 200);
     let (code, _) = s
-        .post("/device/revoke", Revoke { device: first }.encode())
+        .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
         .await
         .unwrap();
     assert_eq!(code, 403, "a stranger revoked another account's device");
 
     // The account may, junior though it is.
     let (code, body) = a
-        .post("/device/revoke", Revoke { device: first }.encode())
+        .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+}
+
+/// **SIP-32: the registry keeps the credential it verified.**
+///
+/// Until it did, SIP-31's second step — binding the device that signed an entry
+/// to the account the entry names — could not be performed by anybody at all.
+/// The exchange checked once at registration and answered afterwards with its
+/// own summary, so every signature rested on its memory of having checked.
+#[tokio::test]
+async fn a_listing_carries_the_credential_it_rests_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (account_seed, account) = keys(31);
+    let (laptop_seed, laptop) = keys(32);
+
+    // The device registers itself with the credential its account signed, which
+    // is the branch SIP-22 exists for: an account key may be in hardware and a
+    // hardware key cannot be a transport key at all.
+    let mut d = connect(addr, pubkey, laptop_seed).await;
+    assert_eq!(enrol(&mut d, &account_seed, &laptop, 3600).await, 200);
+
+    let listed = devices_of(&mut d, &account).await;
+    let row = listed
+        .devices
+        .iter()
+        .find(|x| x.device == laptop)
+        .expect("the laptop is not listed");
+
+    let cred = row
+        .credential
+        .as_ref()
+        .expect("the registry produced no credential, so nobody can check the binding");
+
+    // Verified here, against the account key alone — the exchange is not
+    // consulted and its mapping is not taken on trust. The clock is the real
+    // one: `enrol` issues against wall time, and a synthetic `now` would report
+    // a perfectly good credential as not yet valid.
+    assert_eq!(cred.delegate, laptop);
+    assert_eq!(cred.verify(&account, SCOPE_CHAT, now()), Ok(()));
+
+    // And it is not evidence about anybody else.
+    let (_, stranger) = keys(33);
+    assert!(cred.verify(&stranger, SCOPE_CHAT, now()).is_err());
+}
+
+/// **SIP-32: an attested revocation carries its own authority.**
+///
+/// The account's signed withdrawal needs no registration behind it and no
+/// seniority, because it is the same authority that signed the credential. A
+/// stranger's signature over the same fields is not evidence about this account.
+#[tokio::test]
+async fn an_attested_revocation_stands_on_the_account_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (account_seed, account) = keys(41);
+    let (laptop_seed, laptop) = keys(42);
+    let (stranger_seed, _) = keys(43);
+
+    let mut d = connect(addr, pubkey, laptop_seed).await;
+    assert_eq!(enrol(&mut d, &account_seed, &laptop, 3600).await, 200);
+
+    let now = 1_000_000u64;
+
+    // Signed by somebody else's account over the right device: refused.
+    let forged = Revoke {
+        device: laptop,
+        revocation: Some(Revocation::issue(&stranger_seed, &laptop, now)),
+    };
+    let (code, body) = d.post("/device/revoke", forged.encode()).await.unwrap();
+    assert_ne!(
+        code, 200,
+        "a stranger's signature withdrew somebody else's device: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(devices_of(&mut d, &account).await.devices.len(), 1);
+
+    // The account's own withdrawal.
+    let attested = Revocation::issue(&account_seed, &laptop, now);
+    let (code, body) = d
+        .post(
+            "/device/revoke",
+            Revoke { device: laptop, revocation: Some(attested) }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(devices_of(&mut d, &account).await.devices.is_empty());
+
+    // The artifact is repeatable: verified against the account key with no
+    // reference to the exchange that stored it.
+    assert_eq!(attested.verify(&account, now + 1, 60), Ok(()));
+}
+
+/// A revocation naming one device cannot retire another, however well signed.
+#[tokio::test]
+async fn a_revocation_is_evidence_about_the_device_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (account_seed, account) = keys(51);
+    let (laptop_seed, laptop) = keys(52);
+    let (_, phone) = keys(53);
+
+    let mut d = connect(addr, pubkey, laptop_seed).await;
+    assert_eq!(enrol(&mut d, &account_seed, &laptop, 3600).await, 200);
+    assert_eq!(enrol(&mut d, &account_seed, &phone, 3600).await, 200);
+
+    // Refused at the decoder: a request whose artifact speaks about a different
+    // device is malformed rather than merely unauthorised.
+    let crossed = Revoke {
+        device: laptop,
+        revocation: Some(Revocation::issue(&account_seed, &phone, 1_000_000)),
+    };
+    let (code, _) = d.post("/device/revoke", crossed.encode()).await.unwrap();
+    assert_ne!(code, 200, "a revocation retired a device it did not name");
+    assert_eq!(devices_of(&mut d, &account).await.devices.len(), 2);
 }

@@ -219,6 +219,41 @@ impl Signer {
         )
     }
 
+    /// The same, with a count cap. Separate because SIP-32's `created` commits
+    /// to `max_entries`, so a test that wants one has to say so before signing
+    /// rather than setting it on the request afterwards.
+    pub fn create_capped(
+        &self,
+        channel: [u8; 32],
+        instance: [u8; 32],
+        visibility: Visibility,
+        retention_secs: u32,
+        max_entries: u32,
+        name: &str,
+    ) -> Create {
+        let mut req =
+            self.create_chained(&mut Chain::default(), channel, instance, visibility, retention_secs, name, vec![]);
+        req.max_entries = max_entries;
+        let public = visibility == Visibility::Public;
+        let founding = sqex_proto::channel::constitution(
+            visibility,
+            retention_secs,
+            max_entries,
+            if public { name } else { "" },
+            "",
+        );
+        let me = self.account;
+        req.actions = vec![self.action_chained(
+            &mut Chain::default(),
+            channel,
+            instance,
+            sqex_proto::channel::EVENT_CREATED,
+            &me,
+            &founding,
+        )];
+        req
+    }
+
     /// The same, advancing a chain the caller keeps.
     ///
     /// A create consumes one chain position per invitee, so a peer that goes on
@@ -235,7 +270,29 @@ impl Signer {
         name: &str,
         invites: Vec<Invitee>,
     ) -> Create {
-        let mut actions = Vec::with_capacity(invites.len());
+        let mut actions = Vec::with_capacity(invites.len() + 1);
+        // SIP-32's `created` first, so it takes the creator's chain position 0
+        // and commits to the constitution the exchange will store — a private
+        // channel's name and topic are kept empty there, so signing what was
+        // asked for rather than what is kept would commit to something that
+        // never existed.
+        let public = visibility == Visibility::Public;
+        let founding = sqex_proto::channel::constitution(
+            visibility,
+            retention_secs,
+            0,
+            if public { name } else { "" },
+            "",
+        );
+        let me = self.account;
+        actions.push(self.action_chained(
+            chain,
+            channel,
+            instance,
+            sqex_proto::channel::EVENT_CREATED,
+            &me,
+            &founding,
+        ));
         for i in invites.iter() {
             actions.push(self.action_chained(
                 chain,

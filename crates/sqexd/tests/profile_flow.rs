@@ -13,14 +13,14 @@ use sqex_proto::channel::{
     direct_message_id,
 };
 use sqex_proto::profile::{
-    Block, Blocks, ByAccount, FLAG_WITHHOLD, Got, MAX_UPDATES_PER_HOUR, Profile, Put, TYPE_GET,
+    Block, Blocks, ByAccount, FLAG_WITHHOLD, Record, Got, MAX_UPDATES_PER_HOUR, Profile, Put, TYPE_GET,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
 mod common;
-use common::{Signer, instance_for};
+use common::{Chain, Signer, instance_for};
 use sqex_proto::channel::{ByChannelSigned, EVENT_ADDED, EVENT_JOINED};
 use sqex_proto::entry_sig::GENESIS;
 
@@ -59,6 +59,21 @@ async fn peer(addr: SocketAddr, pubkey: [u8; 32], b: u8) -> (Client, PubKey) {
     )
 }
 
+/// Where a creator's chain stands after SIP-32's `created` event.
+fn created_head(s: &Signer, channel: [u8; 32], visibility: Visibility, name: &str) -> [u8; 32] {
+    let mut chain = Chain::default();
+    let _ = s.create_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        visibility,
+        3600,
+        name,
+        vec![],
+    );
+    chain.head
+}
+
 /// What signs for identity `b` against this exchange (SIP-31).
 fn signer(pubkey: [u8; 32], b: u8) -> Signer {
     let sk = SigningKey::from_bytes(&[b; 32]);
@@ -74,8 +89,11 @@ fn profile(name: &str, title: &str, flags: u8) -> Profile {
     }
 }
 
-async fn put(c: &mut Client, p: Profile) -> u16 {
-    c.post("/profile/put", Put { profile: p }.encode())
+/// A signed profile record, at a serial that climbs each time so it never
+/// loses to what the exchange already holds.
+async fn put_as(c: &mut Client, seed: &[u8; 32], account: &PubKey, serial: u64, p: Profile) -> u16 {
+    let record = Record::sign(seed, account, serial, 1_000_000 + serial, p);
+    c.post("/profile/put", Put { record }.encode())
         .await
         .unwrap()
         .0
@@ -109,19 +127,19 @@ async fn a_profile_is_published_and_read() {
     let (mut b, _) = peer(addr, pubkey, 22).await;
 
     assert!(!get(&mut b, &alice).await.found, "nothing published yet");
-    assert_eq!(put(&mut a, profile("Colin Lyons", "Infrastructure", 0)).await, 200);
+    assert_eq!(put_as(&mut a, &[21; 32], &alice, 1, profile("Colin Lyons", "Infrastructure", 0)).await, 200);
 
     let got = get(&mut b, &alice).await;
     assert!(got.found);
-    assert_eq!(got.profile.name, "Colin Lyons");
-    assert_eq!(got.profile.title, "Infrastructure");
+    assert_eq!(got.profile().name, "Colin Lyons");
+    assert_eq!(got.profile().title, "Infrastructure");
     assert!(got.updated > 0);
 
     // Replacement is whole: there is no partial update to get wrong.
-    assert_eq!(put(&mut a, profile("C. Lyons", "", 0)).await, 200);
+    assert_eq!(put_as(&mut a, &[21; 32], &alice, 2, profile("C. Lyons", "", 0)).await, 200);
     let got = get(&mut b, &alice).await;
-    assert_eq!(got.profile.name, "C. Lyons");
-    assert!(got.profile.title.is_empty());
+    assert_eq!(got.profile().name, "C. Lyons");
+    assert!(got.profile().title.is_empty());
 }
 
 #[tokio::test]
@@ -133,7 +151,7 @@ async fn a_withheld_profile_looks_exactly_like_one_that_does_not_exist() {
     let (_, never) = peer(addr, pubkey, 33).await;
     let channel = [1u8; 32];
 
-    assert_eq!(put(&mut a, profile("Hidden", "", FLAG_WITHHOLD)).await, 200);
+    assert_eq!(put_as(&mut a, &[31; 32], &alice, 1, profile("Hidden", "", FLAG_WITHHOLD)).await, 200);
 
     // A stranger is told the same thing about a withheld profile as about one
     // that was never published. Answering "exists but hidden" would itself be
@@ -179,17 +197,24 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
 
     assert_eq!(block(&mut alice, &{ let (_, m) = peer(addr, pubkey, 42).await; m }, true).await, 200);
 
-    let mut req = public(&signer(pubkey, 42), channel);
-    req.visibility = Visibility::Private;
-    req.name = String::new();
-    mallory.post("/channel/create", req.encode()).await.unwrap();
+    // Built private rather than built public and flipped: SIP-32's `created`
+    // commits to the visibility and the name.
+    let req = signer(pubkey, 42).create(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
+    let (code, body) = mallory.post("/channel/create", req.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
 
     let mut invite = vec![TYPE_INVITE];
     invite.extend_from_slice(&channel);
     invite.extend_from_slice(alice_key.as_bytes());
     invite.push(Role::Member as u8);
-    // Mallory's first act in this channel, so position zero: the create had no
-    // invitees and spent nothing.
+    // Position 1: SIP-32's `created` took 0.
     signer(pubkey, 42)
         .action_outside(
             channel,
@@ -197,8 +222,8 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
             EVENT_ADDED,
             &alice_key,
             &[Role::Member as u8],
-            0,
-            GENESIS,
+            1,
+            created_head(&signer(pubkey, 42), channel, Visibility::Private, ""),
         )
         .write(&mut invite);
     let (code, _) = mallory.post("/channel/invite", invite).await.unwrap();
@@ -324,13 +349,13 @@ async fn a_blocked_account_is_told_nothing_about_the_blocker() {
     let (mut alice, alice_key) = peer(addr, pubkey, 61).await;
     let (mut mallory, mallory_key) = peer(addr, pubkey, 62).await;
 
-    assert_eq!(put(&mut alice, profile("Alice", "", 0)).await, 200);
+    assert_eq!(put_as(&mut alice, &[61; 32], &alice_key, 1, profile("Alice", "", 0)).await, 200);
     assert!(get(&mut mallory, &alice_key).await.found);
 
     assert_eq!(block(&mut alice, &mallory_key, true).await, 200);
     let got = get(&mut mallory, &alice_key).await;
     assert!(!got.found);
-    assert!(got.profile.avatar.is_empty());
+    assert!(got.profile().avatar.is_empty());
 
     // Everybody else still sees it.
     let (mut bob, _) = peer(addr, pubkey, 63).await;
@@ -368,12 +393,20 @@ async fn profile_updates_are_rate_limited() {
     // else's behalf.
     let dir = tempfile::tempdir().unwrap();
     let (addr, pubkey, _h) = server_in(dir.path()).await;
-    let (mut a, _) = peer(addr, pubkey, 81).await;
+    let (mut a, alice) = peer(addr, pubkey, 81).await;
 
+    // A climbing serial each time: the rate limit is what should refuse the
+    // last one, not a stale record losing to the one before it.
     for i in 0..MAX_UPDATES_PER_HOUR {
-        assert_eq!(put(&mut a, profile(&format!("n{i}"), "", 0)).await, 200, "at {i}");
+        let s = i as u64 + 1;
+        assert_eq!(
+            put_as(&mut a, &[81; 32], &alice, s, profile(&format!("n{i}"), "", 0)).await,
+            200,
+            "at {i}"
+        );
     }
-    assert_eq!(put(&mut a, profile("one too many", "", 0)).await, 507);
+    let over = MAX_UPDATES_PER_HOUR as u64 + 1;
+    assert_eq!(put_as(&mut a, &[81; 32], &alice, over, profile("one too many", "", 0)).await, 507);
 }
 
 #[tokio::test]
@@ -389,7 +422,7 @@ async fn the_profile_store_survives_a_restart() {
         let (_, mk) = peer(addr, pubkey, mallory_b).await;
         alice_key = ak;
         mallory_key = mk;
-        assert_eq!(put(&mut a, profile("Durable", "", 0)).await, 200);
+        assert_eq!(put_as(&mut a, &[alice_b; 32], &alice_key, 1, profile("Durable", "", 0)).await, 200);
         assert_eq!(block(&mut a, &mallory_key, true).await, 200);
     }
     first.abort();
@@ -397,7 +430,7 @@ async fn the_profile_store_survives_a_restart() {
 
     let (addr, pubkey, _second) = server_in(dir.path()).await;
     let (mut b, _) = peer(addr, pubkey, 93).await;
-    assert_eq!(get(&mut b, &alice_key).await.profile.name, "Durable");
+    assert_eq!(get(&mut b, &alice_key).await.profile().name, "Durable");
 
     // A block that evaporated on a restart would be worse than none.
     let (mut m, _) = peer(addr, pubkey, mallory_b).await;

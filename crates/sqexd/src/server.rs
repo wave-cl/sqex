@@ -843,7 +843,7 @@ async fn route(
         ("POST", "/profile/put") => match (account, ProfilePut::decode(body)) {
             (None, _) => no_identity("publishing a profile"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.profiles.put(&me, &req.profile) {
+            (Some(me), Ok(req)) => match server.profiles.put(&me, &req.record) {
                 Ok(()) => {
                     // SIP-21 scopes a profile to the people you are already in
                     // a room with, so that is exactly who may be told it
@@ -937,7 +937,10 @@ async fn route(
         ("POST", "/device/revoke") => match (device, DeviceRevoke::decode(body)) {
             (None, _) => no_identity("revoking a device"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.devices.revoke(&me, &req.device) {
+            (Some(me), Ok(req)) => match server
+                .devices
+                .revoke(&me, &req.device, req.revocation.as_ref())
+            {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => (
                     e.status(),
@@ -1211,10 +1214,10 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/directory") => match (account, ChannelDirectory::decode(body)) {
+        ("POST", "/channel/directory") => match (who, ChannelDirectory::decode(body)) {
             (None, _) => no_identity("naming a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.set_directory(&me, &req) {
+            (Some((me, dev)), Ok(req)) => match server.channels.set_directory(&me, &dev, &req) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
             },

@@ -80,6 +80,17 @@ pub const EVENT_PROMOTED: u8 = 0x05;
 pub const EVENT_DEMOTED: u8 = 0x06;
 pub const EVENT_ROTATED: u8 = 0x07;
 pub const EVENT_RETENTION: u8 = 0x08;
+/// SIP-32: `actor` created the channel under a stated constitution.
+///
+/// Written before any invitee's `added`, so a channel always opens with a
+/// signed event — including one created with no invitees, which until now left
+/// a channel whose origin nobody had signed for at all.
+pub const EVENT_CREATED: u8 = 0x09;
+/// SIP-32: `actor` changed a public channel's name or topic.
+///
+/// This left no record whatsoever before, so a public room could be renamed
+/// with nothing to show for it — a gap that needs no second exchange to matter.
+pub const EVENT_RENAMED: u8 = 0x0a;
 
 /// The body of an entry the exchange wrote itself.
 ///
@@ -128,7 +139,7 @@ impl System {
                 b.len()
             )));
         }
-        if b[0] == 0 || b[0] > EVENT_RETENTION {
+        if b[0] == 0 || b[0] > EVENT_RENAMED {
             return Ok(None);
         }
         Ok(Some(System {
@@ -141,6 +152,37 @@ impl System {
             sig: b[137..201].try_into().unwrap(),
         }))
     }
+}
+
+/// What a SIP-32 `created` or `renamed` action commits to.
+///
+/// A channel's *constitution*: whether it is public or private, what it is
+/// called, and how long it keeps things. All of it sat outside every signature
+/// until SIP-32, so a reader took it on the exchange's word.
+///
+/// A digest rather than the values, because an action's `arg` is a fixed small
+/// field and a name is not. It is a commitment and not a record: it proves the
+/// constitution to somebody who already holds the values and wants them
+/// checked, and reveals nothing to somebody who does not — which is why the
+/// values still travel in the clear for a public channel and stay absent for a
+/// private one.
+pub fn constitution(
+    visibility: Visibility,
+    retention_secs: u32,
+    max_entries: u32,
+    name: &str,
+    topic: &str,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update([visibility as u8]);
+    h.update(retention_secs.to_be_bytes());
+    h.update(max_entries.to_be_bytes());
+    h.update([name.len() as u8]);
+    h.update(name.as_bytes());
+    h.update((topic.len() as u16).to_be_bytes());
+    h.update(topic.as_bytes());
+    h.finalize().into()
 }
 
 /// Members one channel may hold.
@@ -298,8 +340,10 @@ pub struct Create {
     pub name: String,
     pub topic: String,
     pub invites: Vec<Invitee>,
-    /// One per invitee, in list order — a create writes one system entry per
-    /// invitee and none for the creator.
+    /// The `created` event first, then one per invitee's `added` in list order.
+    ///
+    /// A **return** to a direct message is the exception and carries exactly
+    /// one, for the `joined` the exchange writes instead.
     ///
     /// Each is signed over its own event rather than one signature covering the
     /// batch, so that a replica verifying a single membership fact does not
@@ -371,20 +415,29 @@ impl Create {
                 "create invites {count} accounts, limit is {MAX_MEMBERS}"
             )));
         }
-        // One action per invitee, in list order: a create writes an `added`
-        // for each and nothing for the creator, who is not joining anything
-        // that existed a moment ago. A direct message has exactly one invitee,
-        // so its single action covers the `added` on a fresh create and the
-        // `joined` on a return — which the client can tell apart, because a
-        // return is answered `created: 0` before it signs anything.
-        let acts = count;
-        if b.len() != o + count * 33 + acts * ACTION_LEN {
+        // Two shapes, and the decoder cannot tell which case this is — only the
+        // exchange knows whether the channel already exists.
+        //
+        // A **fresh** create writes `created` and one `added` per invitee, so
+        // it carries `count + 1`. A **return** to a direct message writes a
+        // single `joined` instead, so it carries exactly one; the client knows
+        // it is returning because its first create was answered `created: 0`
+        // with an incarnation it did not propose. The two coincide when there
+        // are no invitees, which is why this is a pair of alternatives rather
+        // than a range.
+        let fresh = count + 1;
+        let acts = if b.len() == o + count * 33 + fresh * ACTION_LEN {
+            fresh
+        } else if b.len() == o + count * 33 + ACTION_LEN {
+            1
+        } else {
             return Err(Error::Malformed(format!(
-                "create is {} bytes, want {}",
+                "create is {} bytes, want {} or {}",
                 b.len(),
-                o + count * 33 + acts * ACTION_LEN
+                o + count * 33 + fresh * ACTION_LEN,
+                o + count * 33 + ACTION_LEN
             )));
-        }
+        };
         let mut invites = Vec::with_capacity(count);
         for i in 0..count {
             let at = o + i * 33;
@@ -650,17 +703,21 @@ pub struct Directory {
     pub channel: [u8; 32],
     pub name: String,
     pub topic: String,
+    /// SIP-32: signs for the `renamed` event this will write.
+    pub action: Action,
 }
 
 impl Directory {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(36 + self.name.len() + self.topic.len());
+        let mut out =
+            Vec::with_capacity(36 + ACTION_LEN + self.name.len() + self.topic.len());
         out.push(TYPE_DIRECTORY);
         out.extend_from_slice(&self.channel);
         out.push(self.name.len() as u8);
         out.extend_from_slice(self.name.as_bytes());
         out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
         out.extend_from_slice(self.topic.as_bytes());
+        self.action.write(&mut out);
         out
     }
 
@@ -688,7 +745,7 @@ impl Directory {
         let topic_len =
             u16::from_be_bytes([b[after_name], b[after_name + 1]]) as usize;
         let start = after_name + 2;
-        if b.len() != start + topic_len {
+        if b.len() != start + topic_len + ACTION_LEN {
             return Err(Error::Malformed("directory topic runs past the end".into()));
         }
         let topic = String::from_utf8(b[start..start + topic_len].to_vec())
@@ -697,6 +754,7 @@ impl Directory {
             channel,
             name,
             topic,
+            action: Action::read(b, start + topic_len),
         })
     }
 }
@@ -1510,7 +1568,7 @@ mod tests {
                 account: key(2),
                 role: Role::Member,
             }],
-            actions: vec![act(0)],
+            actions: vec![act(0), act(1)],
         }
     }
 
@@ -1522,27 +1580,39 @@ mod tests {
 
     #[test]
     fn create_with_nothing_optional_round_trips() {
+        // One action even with nothing else: SIP-32's `created`, which is what
+        // stops a channel having an origin nobody signed for.
         let c = Create {
             name: String::new(),
             topic: String::new(),
             invites: vec![],
-            actions: vec![],
+            actions: vec![act(0)],
             ..create()
         };
         assert_eq!(Create::decode(&c.encode()).unwrap(), c);
     }
 
-    /// A create must carry exactly one action per system entry it will write.
-    /// Fewer would leave an event nobody signed for; more would leave a
-    /// signature with no event, and either is a request to refuse rather than
-    /// interpret.
+    /// A create must sign for every system entry it will write. Fewer would
+    /// leave an event nobody signed for; more would leave a signature with no
+    /// event, and either is a request to refuse rather than interpret.
+    ///
+    /// Two counts are legitimate and the decoder cannot tell which case this
+    /// is, so it accepts either and the exchange enforces the one that matches
+    /// the path it takes: `created` plus one `added` per invitee on a fresh
+    /// create, or a single `joined` on a return to a direct message.
     #[test]
     fn a_create_must_sign_for_every_event_it_will_write() {
-        let short = Create { actions: vec![], ..create() };
-        assert!(Create::decode(&short.encode()).is_err());
+        // `create()` has one invitee, so a fresh create signs twice.
+        assert_eq!(Create::decode(&create().encode()).unwrap().actions.len(), 2);
 
-        let long = Create { actions: vec![act(0), act(1)], ..create() };
-        assert!(Create::decode(&long.encode()).is_err());
+        let returning = Create { actions: vec![act(0)], ..create() };
+        assert_eq!(Create::decode(&returning.encode()).unwrap().actions.len(), 1);
+
+        let none = Create { actions: vec![], ..create() };
+        assert!(Create::decode(&none.encode()).is_err());
+
+        let too_many = Create { actions: vec![act(0), act(1), act(2)], ..create() };
+        assert!(Create::decode(&too_many.encode()).is_err());
     }
 
     #[test]

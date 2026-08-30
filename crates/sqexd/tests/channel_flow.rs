@@ -11,7 +11,7 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{
-    Action, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Cursor, EVENT_JOINED, EVENT_LEFT, EVENT_RETENTION, Entries,
+    Action, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Cursor, EVENT_CREATED, EVENT_JOINED, EVENT_LEFT, EVENT_RETENTION, Entries,
     Fetch, KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_RETENTION, MIN_RETENTION, Mark, Marks, Posted, Retain, Role, SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
     TYPE_LEAVE, TYPE_REDACT, Visibility,
 };
@@ -228,14 +228,16 @@ async fn two_members_hold_a_conversation_in_one_order() {
         bodies(&seen),
         vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec(), b"four".to_vec()]
     );
-    // Bob's join is entry 1, so the messages start at 2 — the exchange's own
-    // entries share the sequence space, which is what makes interleaving free.
+    // SIP-32's `created` is entry 1 and Bob's join is entry 2, so the messages
+    // start at 3 — the exchange's own entries share the sequence space, which
+    // is what makes interleaving free.
     assert_eq!(
         messages(&seen).iter().map(|e| e.seq).collect::<Vec<_>>(),
-        vec![2, 3, 4, 5]
+        vec![3, 4, 5, 6]
     );
-    assert_eq!(events(&seen).len(), 1);
-    assert_eq!(events(&seen)[0].event, EVENT_JOINED);
+    assert_eq!(events(&seen).len(), 2);
+    assert_eq!(events(&seen)[0].event, EVENT_CREATED);
+    assert_eq!(events(&seen)[1].event, EVENT_JOINED);
 
     let (_, body) = fetch(&mut a.client, channel, 0, 0).await;
     assert_eq!(bodies(&Entries::decode(&body).unwrap()), bodies(&seen));
@@ -329,7 +331,9 @@ async fn a_fetch_with_nothing_to_say_returns_empty_rather_than_hanging() {
     assert_eq!(create_public(&mut a, channel, "quiet").await, 200);
 
     let started = std::time::Instant::now();
-    let (code, body) = fetch(&mut a.client, channel, 0, 1).await;
+    // From the `created` event onwards, so a long poll on a channel with
+    // nothing said in it still has nothing to say.
+    let (code, body) = fetch(&mut a.client, channel, 1, 1).await;
     assert_eq!(code, 200);
     assert!(Entries::decode(&body).unwrap().entries.is_empty());
     assert!(started.elapsed() >= std::time::Duration::from_millis(900));
@@ -361,8 +365,9 @@ async fn the_log_survives_a_restart() {
 
     // And the sequence continues rather than starting again, because next_seq
     // is stored rather than derived from what survives.
+    // SIP-32's `created` is entry 1 and the pruned message was 2, so this is 3.
     let (_, body) = post(&mut a, channel, b"after").await;
-    assert_eq!(Posted::decode(&body).unwrap().seq, 2);
+    assert_eq!(Posted::decode(&body).unwrap().seq, 3);
 }
 
 #[tokio::test]
@@ -373,8 +378,17 @@ async fn retention_by_count_drops_the_oldest() {
     let channel = [6u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
 
-    let mut req = public(&a.signer, channel, "short memory");
-    req.max_entries = 3;
+    // Signed with the cap in place: SIP-32's `created` commits to
+    // `max_entries`, so setting it on the request afterwards would leave a
+    // signature for a channel nobody asked for.
+    let req = a.signer.create_capped(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        MAX_RETENTION,
+        3,
+        "short memory",
+    );
     assert_eq!(create(&mut a, &req).await, 200);
 
     for i in 0..6u8 {
@@ -386,8 +400,8 @@ async fn retention_by_count_drops_the_oldest() {
 
     // A client that was away longer than the window must be able to tell it
     // has a gap, which is what `first` is for.
-    assert_eq!(seen.first, 4);
-    assert_eq!(seen.last, 6);
+    assert_eq!(seen.first, 5);
+    assert_eq!(seen.last, 7);
 }
 
 #[tokio::test]
@@ -400,9 +414,14 @@ async fn a_public_channel_outlives_its_membership_and_a_private_one_does_not() {
     let open = [7u8; 32];
     let shut = [8u8; 32];
     assert_eq!(create_public(&mut a, open, "a place").await, 200);
-    let mut priv_req = public(&a.signer, shut, "");
-    priv_req.channel = shut;
-    priv_req.visibility = Visibility::Private;
+    let priv_req = a.signer.create(
+        shut,
+        instance_for(shut, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
     assert_eq!(create(&mut a, &priv_req).await, 200);
 
     assert_eq!(leave(&mut a, open).await, 200);
@@ -436,8 +455,14 @@ async fn the_directory_lists_public_channels_only() {
 
     assert_eq!(create_public(&mut a, [10u8; 32], "rust talk").await, 200);
     assert_eq!(create_public(&mut a, [11u8; 32], "garden talk").await, 200);
-    let mut hidden = public(&a.signer, [12u8; 32], "should not appear");
-    hidden.visibility = Visibility::Private;
+    let hidden = a.signer.create(
+        [12u8; 32],
+        instance_for([12u8; 32], 0),
+        Visibility::Private,
+        3600,
+        "should not appear",
+        vec![],
+    );
     assert_eq!(create(&mut a, &hidden).await, 200);
 
     let (code, body) = a.client
@@ -564,8 +589,8 @@ async fn delivery_is_observed_and_reading_is_asserted() {
     let (_, body) = fetch(&mut b.client, channel, 0, 0).await;
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(messages(&seen).len(), 3);
-    // Four entries in all: Bob's join, then three messages.
-    assert_eq!(seen.entries.len(), 4);
+    // Five in all: SIP-32's `created`, Bob's join, then three messages.
+    assert_eq!(seen.entries.len(), 5);
     let last = seen.last;
 
     let m = marks(&mut b.client, channel).await;
@@ -973,7 +998,7 @@ async fn narrowing_retention_drops_what_now_falls_outside_it() {
 
     // And a reader is told where the surviving history starts, or it would
     // present what is left as the whole conversation.
-    assert_eq!(seen.first, 5);
+    assert_eq!(seen.first, 6);
 
     // The change is recorded, so a member can see that somebody narrowed it
     // rather than finding messages missing with no explanation.

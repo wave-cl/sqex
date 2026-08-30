@@ -54,9 +54,14 @@ pub const ENTRY_CONTEXT: &[u8] = b"sqex-entry-v1";
 /// as an action signature or the reverse.
 pub const ACTION_CONTEXT: &[u8] = b"sqex-action-v1";
 
-/// Bytes an action's own parameters may occupy: a role byte, an epoch, or a
-/// retention pair. Nothing here needs more and a cap costs nothing.
-pub const MAX_ARG: usize = 8;
+/// Bytes an action's own parameters may occupy: a role byte, an epoch, a
+/// retention pair, or a SIP-32 constitution digest.
+///
+/// **Widened from 8 to 32 by SIP-32, and it costs nothing on any wire.** `arg`
+/// is never transmitted: both sides reconstruct it — the exchange from the
+/// request it received, the client from the request it sent — which is exactly
+/// what makes it a binding rather than a claim.
+pub const MAX_ARG: usize = 32;
 
 /// A device's first link in a channel. Not a hash of anything — there is
 /// nothing before it.

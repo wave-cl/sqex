@@ -206,7 +206,7 @@ async fn the_welcome_channel_does_not_make_everybody_acquainted() {
     assert!(
         !got.found,
         "sharing the lobby was enough to see a withheld profile: {:?}",
-        got.profile.name
+        got.profile().name
     );
 
     // Somewhere they actually chose to be together is different.
@@ -214,7 +214,7 @@ async fn the_welcome_channel_does_not_make_everybody_acquainted() {
     assert!(!room.is_empty() || true);
     let got = stranger.profile_of(&hidden.me).await.unwrap();
     assert!(
-        got.found && got.profile.name == "Hidden",
+        got.found && got.profile().name == "Hidden",
         "a channel they were actually invited to should count"
     );
 }

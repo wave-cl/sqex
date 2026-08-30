@@ -173,10 +173,11 @@ async fn a_file_survives_the_round_trip_and_the_exchange_never_sees_it() {
     let (mut bob, _) = client_for(addr, pubkey, 22).await;
     let channel = [1u8; 32];
 
-    alice
+    let (code, body) = alice
         .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
         .await
         .unwrap();
+    assert_eq!(code, 200, "create: {}", String::from_utf8_lossy(&body));
     let joining = signer(pubkey, 22).action_outside(
         channel,
         instance_for(channel, 0),
@@ -233,7 +234,7 @@ async fn a_commit_that_does_not_hash_to_its_name_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 31).await;
     let channel = [2u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
+        .post("/channel/create", public(&signer(pubkey, 31), channel, "pictures").encode())
         .await
         .unwrap();
 
@@ -257,7 +258,7 @@ async fn an_upload_missing_a_chunk_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 41).await;
     let channel = [3u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
+        .post("/channel/create", public(&signer(pubkey, 41), channel, "pictures").encode())
         .await
         .unwrap();
 
@@ -303,8 +304,19 @@ async fn a_stranger_cannot_fetch_a_blob_and_absence_looks_the_same() {
     let channel = [4u8; 32];
 
     // A private channel, so membership is the only way in.
-    let mut req = public(&signer(pubkey, 21), channel, "");
-    req.visibility = Visibility::Private;
+    //
+    // Built private rather than built public and flipped: SIP-32's `created`
+    // action commits to the visibility, so mutating it afterwards leaves a
+    // signature for a channel that was never asked for — which the exchange
+    // refuses, and which is the whole point of the commitment.
+    let req = signer(pubkey, 51).create(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
     alice.post("/channel/create", req.encode()).await.unwrap();
 
     let (_, sealed, id) = seal_file(b"not for you", 1024);
@@ -333,11 +345,11 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
     let first = [5u8; 32];
     let second = [6u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), first, "one").encode())
+        .post("/channel/create", public(&signer(pubkey, 61), first, "one").encode())
         .await
         .unwrap();
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), second, "two").encode())
+        .post("/channel/create", public(&signer(pubkey, 61), second, "two").encode())
         .await
         .unwrap();
 
@@ -390,7 +402,7 @@ async fn an_aborted_upload_leaves_nothing_behind() {
     let (mut alice, _) = client_for(addr, pubkey, 71).await;
     let channel = [7u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), channel, "x").encode())
+        .post("/channel/create", public(&signer(pubkey, 71), channel, "x").encode())
         .await
         .unwrap();
 
@@ -432,7 +444,7 @@ async fn a_chunk_outside_the_reservation_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 81).await;
     let channel = [8u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), channel, "x").encode())
+        .post("/channel/create", public(&signer(pubkey, 81), channel, "x").encode())
         .await
         .unwrap();
 
@@ -462,7 +474,7 @@ async fn an_attachment_reference_describes_what_was_uploaded() {
     let (mut alice, _) = client_for(addr, pubkey, 91).await;
     let channel = [9u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 21), channel, "x").encode())
+        .post("/channel/create", public(&signer(pubkey, 91), channel, "x").encode())
         .await
         .unwrap();
 

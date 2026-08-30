@@ -56,6 +56,36 @@ pub enum Verdict {
     /// without that device signing twice or somebody replaying, and it is the
     /// only one of these that is evidence.
     Fork,
+    /// The signature verifies and **nobody can say whose key it is** (SIP-32).
+    ///
+    /// SIP-31's second step binds the signing device to the account the entry
+    /// names, through a SIP-20 credential. Where no credential can be obtained
+    /// the first step still proves a key signed, and proves nothing about who.
+    /// Reported rather than quietly accepted, because a mapping somebody
+    /// asserts and evidence somebody can check are different things and this is
+    /// the only place a reader would find out which they hold.
+    Unattributed,
+}
+
+/// What a reader can say about a tombstone (SIP-32).
+///
+/// SIP-16's redaction removes the bytes and keeps the entry, and the removal is
+/// the exchange's own act — it is the only party that can take them. So the
+/// question a reader can actually answer is not *was this deleted* but *did
+/// anybody authorised ask for it*, which the paired SIP-19 `Redact` body
+/// answers, in the log, signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Deletion {
+    /// Not a tombstone.
+    #[default]
+    No,
+    /// A tombstone with a signed `Redact` from its author or an admin behind
+    /// it. Somebody asked, and was entitled to.
+    Asked,
+    /// A tombstone with nothing corroborating it. The exchange did this on its
+    /// own authority — which it can, and which a reader should be able to see
+    /// rather than have it pass as an ordinary deletion.
+    Unasked,
 }
 
 /// One entry as it reached us, with its body already opened if we could.
@@ -102,6 +132,9 @@ pub struct Message {
     /// higher number can replace it.
     edit_seq: Option<u64>,
     pub redacted: bool,
+    /// SIP-32: whether anybody authorised asked for this removal, or the
+    /// exchange simply made it. `No` unless `redacted`.
+    pub deletion: Deletion,
     /// Emoji to the accounts that reacted with it, each at most once.
     pub reactions: BTreeMap<String, Vec<PubKey>>,
 }
@@ -212,6 +245,10 @@ impl Timeline {
                         edited: None,
                         edit_seq: None,
                         redacted: true,
+                        // A tombstone arriving with nothing to explain it. If a
+                        // signed `Redact` follows in this run it is upgraded
+                        // below; if none ever does, the exchange did this.
+                        deletion: Deletion::Unasked,
                         reactions: BTreeMap::new(),
                     },
                 );
@@ -234,6 +271,7 @@ impl Timeline {
                         edited: None,
                         edit_seq: None,
                         redacted: false,
+                        deletion: Deletion::No,
                         reactions: BTreeMap::new(),
                     },
                 );
@@ -266,6 +304,10 @@ impl Timeline {
                     return;
                 }
                 m.redacted = true;
+                // Somebody entitled to asked, and said so in a signed entry.
+                // That is the strongest thing a reader can establish about a
+                // removal the exchange performed.
+                m.deletion = Deletion::Asked;
                 m.post = Post::default();
             }
             Body::Reaction { target, add, emoji } => {
@@ -674,5 +716,92 @@ mod tests {
 
         assert_eq!(t.unreadable(), &[3]);
         assert!(t.get(3).is_none(), "an unopenable entry became a message");
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+    use crate::channel::KIND_MEMBER;
+    use crate::message::Post as SipPost;
+
+    fn key(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    fn said(seq: u64, who: u8, text: &str) -> Received {
+        Received {
+            seq,
+            account: key(who),
+            posted: 100 + seq,
+            kind: KIND_MEMBER,
+            body: Some(Body::Post(SipPost::text(text))),
+            tombstone: false,
+            verdict: Verdict::Valid,
+        }
+    }
+
+    fn tombstone(seq: u64, who: u8) -> Received {
+        Received {
+            seq,
+            account: key(who),
+            posted: 100 + seq,
+            kind: KIND_MEMBER,
+            body: None,
+            tombstone: true,
+            verdict: Verdict::Valid,
+        }
+    }
+
+    fn asked(seq: u64, who: u8, target: u64) -> Received {
+        Received {
+            seq,
+            account: key(who),
+            posted: 100 + seq,
+            kind: KIND_MEMBER,
+            body: Some(Body::Redact { target }),
+            tombstone: false,
+            verdict: Verdict::Valid,
+        }
+    }
+
+    /// A removal the author asked for, in a signed entry the reader holds.
+    #[test]
+    fn a_removal_somebody_asked_for_is_told_apart_from_one_nobody_did() {
+        let t = Timeline::fold(&[said(1, 1, "regret"), asked(2, 1, 1)], &[]);
+        let m = t.get(1).unwrap();
+        assert!(m.redacted);
+        assert_eq!(m.deletion, Deletion::Asked);
+
+        // The same tombstone with nothing behind it. The exchange can do this,
+        // and a reader should be able to see that it did rather than have it
+        // pass as an ordinary deletion.
+        let t = Timeline::fold(&[tombstone(1, 1)], &[]);
+        let m = t.get(1).unwrap();
+        assert!(m.redacted);
+        assert_eq!(m.deletion, Deletion::Unasked);
+    }
+
+    /// An admin may ask; a stranger may not, and their asking changes nothing.
+    #[test]
+    fn only_an_authorised_request_corroborates_a_removal() {
+        let entries = [said(1, 1, "regret"), asked(2, 9, 1)];
+        let t = Timeline::fold(&entries, &[]);
+        let m = t.get(1).unwrap();
+        assert!(!m.redacted, "a stranger's redaction was honoured");
+        assert_eq!(m.deletion, Deletion::No);
+
+        // The same run, with that account an admin.
+        let t = Timeline::fold(&entries, &[key(9)]);
+        let m = t.get(1).unwrap();
+        assert!(m.redacted);
+        assert_eq!(m.deletion, Deletion::Asked);
+    }
+
+    /// A message nobody deleted says so.
+    #[test]
+    fn an_ordinary_message_reports_no_deletion() {
+        let t = Timeline::fold(&[said(1, 1, "still here")], &[]);
+        assert_eq!(t.get(1).unwrap().deletion, Deletion::No);
     }
 }

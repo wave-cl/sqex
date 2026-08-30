@@ -7,18 +7,20 @@
 
 use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
-    EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
+    EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
+    EVENT_REMOVED, EVENT_RENAMED,
     EVENT_RETENTION, EVENT_ROTATED,
-    Entries, Entry, Fetch, Invite, Invitee,
+    Entries, Entry, Fetch, Invite, Invitee, constitution,
     KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
     Marks, Membership, Mine, Mines, Post, Posted, Retain, Role, TYPE_CLOSE, TYPE_CURSORS,
     TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, Visibility, direct_message_id,
 };
 use sqex_proto::channel_key::{
+    Envelope, sign_envelope, verify_envelope,
     Absent, ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING, open_envelope,
     seal_envelope,
 };
-use sqex_proto::credential::{Credential, SCOPE_CHAT};
+use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
 use sqex_proto::entry_sig::{
     ActionTerms, EntryTerms, GENESIS, Place, link, sign_action, sign_entry, verify_entry,
     verify_entry_hashed,
@@ -30,6 +32,7 @@ use sqex_proto::device::{AdmissionRequest, Device, Devices, ListDevices, Registe
 use sqex_proto::blob::Attachment;
 use sqex_proto::profile::{
     self, Block, Blocks, ByAccount as ProfileByAccount, Got as GotProfile, Profile,
+    Record as ProfileRecord,
     Put as ProfilePut,
 };
 use sqex_proto::message::{Body, MAX_EMOJI, Part, Post as SipPost};
@@ -405,19 +408,19 @@ impl Chat {
         }
     }
 
-    /// Check an entry the way SIP-31 requires, as far as this client can.
+    /// Check an entry the way SIP-31 requires — **both steps**.
     ///
-    /// **Step one of two.** The signature proves *a key* signed; it says
-    /// nothing about whose key it is. Binding the device to the account is
-    /// SIP-20's credential, and this client takes that binding from SIP-22's
-    /// registry — which the exchange verified when the device was enrolled —
-    /// rather than re-checking a credential of its own. That is weaker, and it
-    /// is weaker in a specific way worth naming: it trusts this exchange to
-    /// have checked, which a replica carrying somebody else's log must not.
+    /// Step one is the signature under the device the entry names, which proves
+    /// a key signed and nothing about whose key it is. Step two is a SIP-20
+    /// credential binding that device to the account the entry names, which
+    /// this client now verifies for itself from `bound` rather than taking the
+    /// exchange's mapping on trust. Until SIP-32 the credential was verified at
+    /// registration and discarded, so step two could not be performed by
+    /// anybody at all.
     ///
     /// A system entry carries no signature of its own; its actor's is inside
     /// the body, and the exchange verified it before writing the row.
-    fn verdict_for(&self, channel: &[u8; 32], instance: [u8; 32], e: &Entry, chain: &mut HashMap<PubKey, (u64, [u8; 32])>) -> Verdict {
+    fn verdict_for(&self, channel: &[u8; 32], instance: [u8; 32], e: &Entry, chain: &mut HashMap<PubKey, (u64, [u8; 32])>, bound: &HashMap<PubKey, Option<PubKey>>) -> Verdict {
         if e.kind == KIND_SYSTEM {
             return Verdict::Valid;
         }
@@ -443,6 +446,20 @@ impl Chat {
         if !signed {
             return Verdict::Forged;
         }
+        // Step two. An account with no registered device *is* its own device
+        // (SIP-22), so a self-signed entry needs no credential — that is the
+        // ordinary single-client case and not an unattributed one.
+        if e.device != e.account {
+            match bound.get(&e.device) {
+                // A credential we verified, naming a different account. The
+                // entry claims somebody it does not belong to.
+                Some(Some(account)) if account != &e.account => return Verdict::Forged,
+                Some(Some(_)) => {}
+                // Registered, with no credential the exchange could produce.
+                // The signature stands and the attribution does not.
+                Some(None) | None => return Verdict::Unattributed,
+            }
+        }
         let input = terms.input_hashed(&e.body_hash);
         match chain.get(&e.device) {
             Some(&(seq, head)) if e.chain_seq == seq && e.prev == head => {
@@ -467,6 +484,34 @@ impl Chat {
         }
     }
 
+    /// Verified device-to-account bindings for a set of accounts (SIP-32).
+    ///
+    /// `Some(account)` is a SIP-20 credential **this client checked**, not a
+    /// mapping the exchange reported. `None` is a device the registry lists and
+    /// cannot produce a credential for — a registration made before SIP-32, or
+    /// an exchange withholding one — and it is carried rather than dropped so a
+    /// reader is told the difference between evidence and an assertion.
+    async fn bindings(&mut self, accounts: &[PubKey]) -> Result<HashMap<PubKey, Option<PubKey>>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut out = HashMap::new();
+        for account in accounts {
+            let body = self
+                .post("/device/list", ListDevices { account: *account }.encode())
+                .await?;
+            let listed = Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            for d in listed.devices {
+                let verified = d.credential.as_ref().is_some_and(|c| {
+                    c.delegate == d.device && c.verify(account, SCOPE_CHAT, now).is_ok()
+                });
+                out.insert(d.device, verified.then_some(*account));
+            }
+        }
+        Ok(out)
+    }
+
     /// Where a signature for `channel` must be made, given what `info` told us.
     fn place(&self, channel: &[u8; 32], info: &ChannelInfo) -> Place {
         Place {
@@ -485,6 +530,36 @@ impl Chat {
     /// same discipline `send_body` already applies to the SIP-17 counter, for a
     /// different reason and with the same shape.
     fn chain_at(&self, channel: &[u8; 32], info: &ChannelInfo) -> Result<(u64, [u8; 32])> {
+        // SIP-32. A direct message's identifier is derived from its two
+        // accounts, so it survives the channel being destroyed and rebuilt —
+        // and everything this store keeps under it then belongs to a
+        // conversation that no longer exists. Resuming a chain into a new
+        // incarnation means every signature after it is refused as a broken
+        // chain, permanently, which is SIP-16's "goes silent for good" in a
+        // place it had not been looked for.
+        //
+        // Checked here rather than on the next fetch because this runs before
+        // the first thing we sign, and the incarnation says outright what a
+        // cursor above the exchange's last sequence number only implies.
+        //
+        // **Only against an incarnation the exchange stated.** A create carries
+        // one this client *proposed*, which is new by construction — comparing
+        // against that would reset the channel on every `open_dm`, which is a
+        // routine call, and take the conversation with it. `actions_for_create`
+        // therefore reads the chain directly.
+        if info.instance != [0u8; 32] {
+            match self.store.incarnation(channel)? {
+                Some(known) if known == info.instance => {}
+                Some(_) => {
+                    self.store.reset_sequence_space(channel)?;
+                    // Noted for the next poll to report. The reset is the whole
+                    // reason the conversation above the divider is not the one
+                    // below it, and a reader should be told.
+                    self.store.set_incarnation(channel, &info.instance, true)?;
+                }
+                None => self.store.set_incarnation(channel, &info.instance, false)?,
+            }
+        }
         let (mine, head) = self.store.chain(channel)?;
         Ok(if mine >= info.my_chain_seq {
             (mine, head)
@@ -542,32 +617,64 @@ impl Chat {
         req: &Create,
         instance: [u8; 32],
     ) -> Result<(Vec<Action>, [u8; 32])> {
-        let info = ChannelInfo {
-            instance,
-            my_chain_seq: 0,
-            my_chain_head: GENESIS,
-            ..Self::empty_info()
-        };
-        let mut out = Vec::with_capacity(req.invites.len());
+        let mut out = Vec::with_capacity(req.invites.len() + 1);
         // A create is this device's first act in a channel that did not exist,
-        // so the chain starts here and each invitee takes the next position.
-        let (start, mut prev) = self.chain_at(&req.channel, &info)?;
-        for (n, i) in req.invites.iter().enumerate() {
+        // so the chain starts here: `created` takes the first position and each
+        // invitee the next.
+        //
+        // **From zero, always.** A create either makes a channel the exchange
+        // has no chain for — so nothing else could be right — or finds one we
+        // are already in, where it writes nothing and these signatures go
+        // unused. Reading the store instead would carry a position from a
+        // previous incarnation of a derived identifier into a channel that has
+        // never seen this device, and every signature after it would be refused
+        // as a broken chain.
+        let (start, mut prev) = (0u64, GENESIS);
+
+        // SIP-32. The digest covers the constitution as the exchange will store
+        // it — a private channel's name and topic are kept empty there, because
+        // a membership graph with a name on it says more than the graph, so
+        // signing what was asked for rather than what is kept would commit to
+        // something that never existed.
+        let public = req.visibility == Visibility::Public;
+        let founding = constitution(
+            req.visibility,
+            req.retention_secs,
+            req.max_entries,
+            if public { &req.name } else { "" },
+            if public { &req.topic } else { "" },
+        );
+        let sign = |event: u8, subject: PubKey, arg: &[u8], n: u64, prev_link: [u8; 32]|
+         -> Result<(Action, [u8; 32])> {
             let terms = ActionTerms {
-                place: self.place(&req.channel, &info),
+                place: Place {
+                    exchange: self.exchange,
+                    instance,
+                    channel: req.channel,
+                },
                 actor: self.me,
                 actor_device: self.device,
-                event: EVENT_ADDED,
-                subject: i.account,
-                arg: &[i.role as u8],
-                chain_seq: start + n as u64,
-                prev,
+                event,
+                subject,
+                arg,
+                chain_seq: n,
+                prev: prev_link,
             };
             let sig =
                 sign_action(&self.seed, &terms).map_err(|e| ChatError::Protocol(e.to_string()))?;
             let input = terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?;
-            prev = link(&input);
-            out.push(Action { chain_seq: start + n as u64, prev: terms.prev, sig });
+            Ok((Action { chain_seq: n, prev: prev_link, sig }, link(&input)))
+        };
+
+        let (opening, head) = sign(EVENT_CREATED, self.me, &founding, start, prev)?;
+        out.push(opening);
+        prev = head;
+
+        for (n, i) in req.invites.iter().enumerate() {
+            let at = start + 1 + n as u64;
+            let (action, head) = sign(EVENT_ADDED, i.account, &[i.role as u8], at, prev)?;
+            out.push(action);
+            prev = head;
         }
         Ok((out, prev))
     }
@@ -1113,13 +1220,24 @@ impl Chat {
         members: &[PubKey],
     ) -> Result<()> {
         let key = ChannelKey::generate();
+        // The incarnation this epoch belongs to: SIP-32 binds it into every
+        // publication signature, so an envelope cannot lift into another
+        // incarnation of a channel whose identifier is derived.
+        let instance = self.info(channel).await?.instance;
         let mut envelopes = Vec::new();
         let mut skipped = Vec::new();
         for who in members {
             match self.take_prekey_for(*who).await {
                 Ok(p) => envelopes.push(
-                    seal_envelope(who, p.id, &p.public, epoch, &[key])
-                        .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                    sign_envelope(
+                        &self.seed,
+                        &self.exchange,
+                        &instance,
+                        channel,
+                        epoch,
+                        seal_envelope(who, p.id, &p.public, epoch, &[key])
+                            .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                    ),
                 ),
                 Err(ChatError::NotReady(w)) if members.len() > 2 => skipped.push(w),
                 Err(e) => return Err(e),
@@ -1183,6 +1301,8 @@ impl Chat {
     /// against, so what is written here is the only copy that will exist
     /// tomorrow.
     pub async fn collect_keys(&mut self, channel: &[u8; 32]) -> Result<usize> {
+        // The incarnation these envelopes must have been published to.
+        let instance = self.info(channel).await?.instance;
         let since = self.store.highest_epoch(channel)?;
         let body = self
             .post(
@@ -1201,6 +1321,7 @@ impl Chat {
 
         let mut pool = self.store.pool(&self.seed)?;
         let mut opened = 0;
+        let mut unattested = 0usize;
         for env in &got.envelopes {
             if self.store.key(channel, env.from_epoch)?.is_some() {
                 continue;
@@ -1212,6 +1333,23 @@ impl Chat {
                 // other epochs in this batch may still be good.
                 Err(_) => continue,
             };
+            // SIP-32: who put this here. An envelope whose signature does not
+            // verify is one somebody other than its claimed publisher supplied,
+            // and a channel key is not a thing to accept from an unknown hand.
+            // Recorded rather than merely skipped, because a member being
+            // handed a key by nobody in particular is worth knowing about.
+            // `Got` omits the recipient — it only ever answers one — so the
+            // signature is checked against *us*, which is who the exchange
+            // served it to. Verifying the zeroes it arrived with would fail on
+            // every honest envelope.
+            let addressed = Envelope {
+                recipient: self.device,
+                ..env.clone()
+            };
+            if !verify_envelope(&self.exchange, &instance, channel, env.from_epoch, &addressed) {
+                unattested += 1;
+                continue;
+            }
             let keys = match open_envelope(&self.seed, &secret, env) {
                 Ok(k) => k,
                 Err(_) => continue,
@@ -1221,6 +1359,9 @@ impl Chat {
                 opened += 1;
             }
         }
+        // Counted rather than logged: this crate has no logger, and a caller
+        // that wants to say something has the number.
+        let _ = unattested;
         // Deleting is the mechanism, and it only counts once it is durable.
         self.store.save_pool(&pool)?;
         if opened > 0 {
@@ -1362,8 +1503,15 @@ impl Chat {
                 Err(ChatError::NotReady(_)) => continue,
                 Err(e) => return Err(e),
             };
-            let envelope = seal_envelope(&device.device, p.id, &p.public, info.epoch, &[key])
-                .map_err(|e| ChatError::Protocol(e.to_string()))?;
+            let envelope = sign_envelope(
+                &self.seed,
+                &self.exchange,
+                &info.instance,
+                channel,
+                info.epoch,
+                seal_envelope(&device.device, p.id, &p.public, info.epoch, &[key])
+                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
+            );
             let body = self
                 .post(
                     "/channel/key/put",
@@ -1432,15 +1580,53 @@ impl Chat {
         Absent::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
-    /// Withdraw a device.
+    /// Withdraw a device, **attested** — the account's signed withdrawal.
     ///
     /// What a portable credential structurally cannot do. Note what it does
     /// *not* undo: SIP-17 is explicit that a revoked device keeps every key it
     /// was ever given, so this bounds what happens next rather than reaching
     /// back. Rotating is what actually cuts them off from what follows.
+    ///
+    /// SIP-32 makes the withdrawal an artifact rather than a request, so it is
+    /// verifiable by anybody holding the account key and cannot be quietly
+    /// dropped by whoever repeats the registry. Only a client acting as the
+    /// account itself can produce one — which is the case somebody who has lost
+    /// a device is in, and the recovery SIP-22 names.
     pub async fn revoke_device(&mut self, device: &PubKey) -> Result<()> {
-        self.post("/device/revoke", Revoke { device: *device }.encode())
-            .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let revocation = Revocation::issue(&self.seed, device, now);
+        self.post(
+            "/device/revoke",
+            Revoke {
+                device: *device,
+                revocation: Some(revocation),
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Sign this client out, **locally**.
+    ///
+    /// A device holds no account key, so this produces no artifact anybody can
+    /// repeat: the exchange records it on its own authority, under SIP-22's
+    /// seniority rule. That is the right shape for signing out a client you
+    /// still hold, and the wrong one for a device you have lost — use
+    /// [`Chat::revoke_device`] with the account for that.
+    pub async fn sign_out_device(&mut self, device: &PubKey) -> Result<()> {
+        self.post(
+            "/device/revoke",
+            Revoke {
+                device: *device,
+                revocation: None,
+            }
+            .encode(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1716,16 +1902,31 @@ impl Chat {
         // name is deliberately never given to it, because a membership graph
         // with a name on it says considerably more than the graph.
         if info.visibility == Visibility::Public {
+            // SIP-32: this writes a `renamed` event now, so it signs for one.
+            // The digest covers the constitution as it will stand — the name and
+            // topic being set, over the retention already in force.
+            let arg = constitution(
+                Visibility::Public,
+                info.retention_secs,
+                info.max_entries,
+                &name,
+                &topic,
+            );
+            let me = self.me;
+            let (action, head) =
+                self.sign_action_at(channel, &info, EVENT_RENAMED, &me, &arg)?;
             self.post(
                 "/channel/directory",
                 sqex_proto::channel::Directory {
                     channel: *channel,
                     name,
                     topic,
+                    action,
                 }
                 .encode(),
             )
             .await?;
+            self.store.set_chain(channel, action.chain_seq, &head)?;
         }
         Ok(posted)
     }
@@ -1760,8 +1961,15 @@ impl Chat {
         for device in self.devices_of(&[*who]).await? {
             let p = self.take_prekey_for(device).await?;
             envelopes.push(
-                seal_envelope(&device, p.id, &p.public, info.epoch, &[key])
-                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                sign_envelope(
+                    &self.seed,
+                    &self.exchange,
+                    &info.instance,
+                    channel,
+                    info.epoch,
+                    seal_envelope(&device, p.id, &p.public, info.epoch, &[key])
+                        .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                ),
             );
         }
         let body = self
@@ -2125,8 +2333,24 @@ impl Chat {
             )));
         }
         let (name, title) = (profile.name.clone(), profile.title.clone());
+        // SIP-32: a signed record, ordered by a counter we keep. The serial
+        // must climb past whatever the exchange already holds, or the record
+        // loses to the one that is there — which is the property that makes an
+        // old profile unable to be put back over a new one.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let me = self.me;
+        let held = self
+            .profile_of(&me)
+            .await
+            .ok()
+            .and_then(|g| g.record.map(|r| r.serial))
+            .unwrap_or(0);
+        let record = ProfileRecord::sign(&self.seed, &me, held + 1, now, profile);
         let body = self
-            .post("/profile/put", ProfilePut { profile }.encode())
+            .post("/profile/put", ProfilePut { record }.encode())
             .await?;
         Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         // Written through to our own store, because nobody will tell us.
@@ -2251,10 +2475,12 @@ impl Chat {
             // A profile withheld from us and one never published answer the
             // same way, and both are stored as empty: we asked, and were told
             // nothing.
-            let (name, title) = if got.found {
-                (got.profile.name, got.profile.title)
-            } else {
-                (String::new(), String::new())
+            // SIP-32: shown only if the subject signed it. A record that does
+            // not verify is somebody else's assertion about this account, and a
+            // profile is exactly the field a reader would act on.
+            let (name, title) = match got.record.as_ref().filter(|r| r.verify()) {
+                Some(r) if got.found => (r.profile.name.clone(), r.profile.title.clone()),
+                _ => (String::new(), String::new()),
             };
             self.store.put_profile(account, &name, &title, now)?;
             asked += 1;
@@ -2521,7 +2747,12 @@ impl Chat {
         // all passed the retention window. That reports `last == 0` and needs
         // no reset — it heals itself as soon as an entry arrives above our
         // cursor, and resetting would throw away history for nothing.
-        let restarted = since > 0 && entries.last > 0 && entries.last < since;
+        // Either inference: a cursor above the exchange's newest entry, or an
+        // incarnation that changed under us before we got here. The second is
+        // the sharper signal and usually fires first, because it is checked
+        // before anything is signed rather than after something is fetched.
+        let restarted = (since > 0 && entries.last > 0 && entries.last < since)
+            || self.store.take_announcement(channel)?;
         if restarted {
             self.store.reset_sequence_space(channel)?;
             // The caller's fold goes too. Every message in it is filed under a
@@ -2574,6 +2805,10 @@ impl Chat {
         // backwards, because starting to read in the middle of a channel is
         // ordinary and is not a gap anybody caused.
         let mut seen_chains: HashMap<PubKey, (u64, [u8; 32])> = HashMap::new();
+        // Fetched once for the batch rather than per entry: SIP-31's second
+        // step needs a credential for every device that signed one, and the
+        // members are who could have.
+        let bound = self.bindings(&members_of(&info)).await.unwrap_or_default();
         let mut last = since;
         for e in &entries.entries {
             last = last.max(e.seq);
@@ -2617,7 +2852,7 @@ impl Chat {
             // SIP-31, before anything is stored or shown: an entry nobody
             // signed for is not a message, and folding it first would put it in
             // front of a reader while the check was still pending.
-            let verdict = self.verdict_for(channel, info.instance, e, &mut seen_chains);
+            let verdict = self.verdict_for(channel, info.instance, e, &mut seen_chains, &bound);
             if verdict == Verdict::Forged {
                 // Not stored, not folded, and not counted as read. `history`
                 // rebuilds from this store without the signatures — they are

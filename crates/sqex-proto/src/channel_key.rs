@@ -36,6 +36,13 @@ use crate::channel::{ACTION_LEN, Action};
 pub const KEY_CONTEXT: &[u8] = b"sqex-channel-key-v1";
 /// Domain separator for sealing an epoch key to a device.
 pub const ENVELOPE_CONTEXT: &[u8] = b"sqex-channel-envelope-v1";
+/// Domain separator for a SIP-32 publication signature.
+///
+/// Distinct from the sealing context above, and doing a different job: that one
+/// derives the key an envelope is sealed under, this one attests to who put it
+/// there. Before it a member received a channel key and could not tell who had
+/// handed it over — SIP-31 named this as its nearest residual gap.
+pub const ENVELOPE_PUB_CONTEXT: &[u8] = b"sqex-envelope-v1";
 
 pub const TYPE_PUT: u8 = 0x01;
 pub const TYPE_GET: u8 = 0x02;
@@ -44,7 +51,16 @@ pub const TYPE_MISSING: u8 = 0x03;
 /// Envelopes one `Put` may carry. Set by the 64 KiB request body: one envelope
 /// is 76 bytes of header plus 16 + 32 × range, so 256 at the current epoch come
 /// to 31 KiB, with margin.
-pub const MAX_ENVELOPES: usize = 256;
+/// Envelopes one `Put` may carry.
+///
+/// **Halved from 256 by SIP-32**, which added a publisher and a signature to
+/// each. SIP-17's arithmetic is 80 bytes of header plus `16 + 32 × range` of
+/// ciphertext — 128 bytes at the current epoch, and 256 of those came to 32 KiB
+/// inside a 64 KiB request. At 224 bytes, 256 of them would be 56 KiB, which
+/// leaves no margin against a body that also carries its own header. A fully
+/// populated channel already needed several calls and now needs twice as many,
+/// which is what the same-epoch `Put` exists to permit.
+pub const MAX_ENVELOPES: usize = 128;
 /// Epochs one envelope may grant. A single envelope at this range is 32 KiB,
 /// which is where the number comes from rather than any property of epochs.
 pub const MAX_RANGE: u32 = 1024;
@@ -52,7 +68,8 @@ pub const MAX_RANGE: u32 = 1024;
 pub const MAX_EPOCH: u32 = 65_536;
 
 /// Bytes of envelope header before the ciphertext, inside a `Put`.
-const ENVELOPE_HEADER: usize = 32 + 4 + 4 + 4 + 32 + 4;
+// recipient, publisher, signature, from_epoch, to_epoch, prekey_id, ephemeral, len
+const ENVELOPE_HEADER: usize = 32 + 32 + 64 + 4 + 4 + 4 + 32 + 4;
 
 /// A channel key: 32 bytes, uniformly random, one per epoch.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -188,6 +205,14 @@ impl Replay {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub recipient: PubKey,
+    /// SIP-32: the device that published this, and its signature over
+    /// everything below plus the place it was published to.
+    ///
+    /// Per envelope rather than per `Put`, because `Get` serves one recipient
+    /// the envelopes addressed to it and has to hand over something verifiable
+    /// on its own.
+    pub publisher: PubKey,
+    pub sig: [u8; 64],
     pub from_epoch: u32,
     pub to_epoch: u32,
     /// The SIP-23 prekey this was sealed against. **Zero is invalid**: there is
@@ -258,6 +283,11 @@ pub fn seal_envelope(
 
     Ok(Envelope {
         recipient: *recipient,
+        // Unsigned as sealed. `sign_envelope` fills these in, because the
+        // signature covers the place it is published to and sealing knows
+        // nothing about that.
+        publisher: PubKey::new([0; 32]),
+        sig: [0; 64],
         from_epoch,
         to_epoch: from_epoch + keys.len() as u32 - 1,
         prekey_id,
@@ -368,6 +398,8 @@ impl Put {
         out.extend_from_slice(&(self.envelopes.len() as u16).to_be_bytes());
         for e in &self.envelopes {
             out.extend_from_slice(e.recipient.as_bytes());
+            out.extend_from_slice(e.publisher.as_bytes());
+            out.extend_from_slice(&e.sig);
             out.extend_from_slice(&e.from_epoch.to_be_bytes());
             out.extend_from_slice(&e.to_epoch.to_be_bytes());
             out.extend_from_slice(&e.prekey_id.to_be_bytes());
@@ -455,6 +487,9 @@ fn read_envelope(b: &[u8], o: &mut usize, with_recipient: bool) -> Result<Envelo
     } else {
         (PubKey::new([0; 32]), at)
     };
+    let publisher = PubKey::new(b[at..at + 32].try_into().unwrap());
+    let sig: [u8; 64] = b[at + 32..at + 96].try_into().unwrap();
+    let at = at + 96;
     let from_epoch = u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
     let to_epoch = u32::from_be_bytes(b[at + 4..at + 8].try_into().unwrap());
     let prekey_id = u32::from_be_bytes(b[at + 8..at + 12].try_into().unwrap());
@@ -478,6 +513,8 @@ fn read_envelope(b: &[u8], o: &mut usize, with_recipient: bool) -> Result<Envelo
     *o = at + 48 + len;
     Ok(Envelope {
         recipient,
+        publisher,
+        sig,
         from_epoch,
         to_epoch,
         prekey_id,
@@ -562,6 +599,10 @@ impl Got {
         out.extend_from_slice(&self.now.to_be_bytes());
         out.extend_from_slice(&(self.envelopes.len() as u16).to_be_bytes());
         for e in &self.envelopes {
+            // The recipient is omitted — `Got` only ever answers one — but the
+            // publisher is not: naming who handed a key over is the whole point.
+            out.extend_from_slice(e.publisher.as_bytes());
+            out.extend_from_slice(&e.sig);
             out.extend_from_slice(&e.from_epoch.to_be_bytes());
             out.extend_from_slice(&e.to_epoch.to_be_bytes());
             out.extend_from_slice(&e.prekey_id.to_be_bytes());
@@ -663,6 +704,78 @@ impl Absent {
                 .collect(),
         })
     }
+}
+
+/// What a SIP-32 envelope-publication signature is made over.
+///
+/// The first three terms are SIP-31's and are there for its reasons: an
+/// envelope must not lift between exchanges, nor between incarnations of a
+/// channel whose identifier is derived and therefore stable.
+pub fn envelope_input(
+    exchange: &PubKey,
+    instance: &[u8; 32],
+    channel: &[u8; 32],
+    epoch: u32,
+    e: &Envelope,
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(exchange.as_bytes());
+    h.update(instance);
+    h.update(channel);
+    h.update(epoch.to_be_bytes());
+    h.update(e.recipient.as_bytes());
+    h.update(e.from_epoch.to_be_bytes());
+    h.update(e.to_epoch.to_be_bytes());
+    h.update(e.prekey_id.to_be_bytes());
+    h.update(e.ephemeral);
+    h.update(Sha256::digest(&e.ciphertext));
+
+    let mut out = Vec::with_capacity(ENVELOPE_PUB_CONTEXT.len() + 32);
+    out.extend_from_slice(ENVELOPE_PUB_CONTEXT);
+    out.extend_from_slice(&h.finalize());
+    out
+}
+
+/// Sign an envelope as the publishing device, filling in `publisher` and `sig`.
+pub fn sign_envelope(
+    device_seed: &[u8; 32],
+    exchange: &PubKey,
+    instance: &[u8; 32],
+    channel: &[u8; 32],
+    epoch: u32,
+    mut e: Envelope,
+) -> Envelope {
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing = SigningKey::from_bytes(device_seed);
+    e.publisher = PubKey::new(signing.verifying_key().to_bytes());
+    e.sig = signing
+        .sign(&envelope_input(exchange, instance, channel, epoch, &e))
+        .to_bytes();
+    e
+}
+
+/// Check who published an envelope.
+///
+/// As everywhere else in this stack, this proves a key signed. Binding that key
+/// to a person is a SIP-20 credential, and a caller that stops here knows only
+/// that *some* device put the envelope there.
+pub fn verify_envelope(
+    exchange: &PubKey,
+    instance: &[u8; 32],
+    channel: &[u8; 32],
+    epoch: u32,
+    e: &Envelope,
+) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(e.publisher.as_bytes()) else {
+        return false;
+    };
+    vk.verify(
+        &envelope_input(exchange, instance, channel, epoch, e),
+        &Signature::from_bytes(&e.sig),
+    )
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -825,6 +938,90 @@ mod tests {
         assert_eq!(Got::decode(&got.encode()).unwrap(), got);
     }
 
+    /// **SIP-32: a recipient can name who published its key**, and an envelope
+    /// re-signed by another device does not verify.
+    #[test]
+    fn an_envelope_names_who_published_it() {
+        let (seed, bob) = device(2);
+        let (other_seed, _) = device(3);
+        let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
+        let exchange = PubKey::new([9u8; 32]);
+        let instance = [4u8; 32];
+        let channel = [7u8; 32];
+
+        let sealed =
+            seal_envelope(&bob, prekey.id, &prekey.public, 1, &[ChannelKey::generate()]).unwrap();
+        let published = sign_envelope(&seed, &exchange, &instance, &channel, 1, sealed.clone());
+        assert!(verify_envelope(&exchange, &instance, &channel, 1, &published));
+        assert_ne!(published.publisher, PubKey::new([0; 32]));
+
+        // Somebody else's signature over the same envelope.
+        let forged = sign_envelope(&other_seed, &exchange, &instance, &channel, 1, sealed.clone());
+        assert_ne!(forged.publisher, published.publisher);
+        let claimed = Envelope { publisher: published.publisher, ..forged };
+        assert!(
+            !verify_envelope(&exchange, &instance, &channel, 1, &claimed),
+            "an envelope verified under a publisher that did not sign it"
+        );
+
+        // And it does not travel: not to another exchange, another
+        // incarnation, another channel, or another epoch.
+        for (what, ok) in [
+            ("exchange", verify_envelope(&PubKey::new([8; 32]), &instance, &channel, 1, &published)),
+            ("instance", verify_envelope(&exchange, &[5; 32], &channel, 1, &published)),
+            ("channel", verify_envelope(&exchange, &instance, &[8; 32], 1, &published)),
+            ("epoch", verify_envelope(&exchange, &instance, &channel, 2, &published)),
+        ] {
+            assert!(!ok, "an envelope verified under a changed {what}");
+        }
+    }
+
+    /// SIP-32 halved `MAX_ENVELOPES` to pay for the publisher and signature.
+    ///
+    /// The number that matters is **not** whether a full `Put` of single-epoch
+    /// envelopes fits — it does either way, at 56 KiB inside 64 — but whether
+    /// there is room for what SIP-17 promised: "the range to be wider than
+    /// one". A two-epoch envelope is 256 bytes, so 256 of them come to exactly
+    /// the request cap and 128 come to half of it. A test that only asked
+    /// whether the narrowest case fits would pass at the old cap and say
+    /// nothing, which is what a control caught it doing.
+    #[test]
+    fn a_full_put_leaves_room_for_a_wider_range() {
+        let (seed, bob) = device(2);
+        let exchange = PubKey::new([9u8; 32]);
+        let mut envelopes = Vec::with_capacity(MAX_ENVELOPES);
+        for i in 0..MAX_ENVELOPES {
+            let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, i as u32 + 1);
+            // Two epochs, which is the case SIP-17 says must have room.
+            let sealed = seal_envelope(
+                &bob,
+                prekey.id,
+                &prekey.public,
+                1,
+                &[ChannelKey::generate(), ChannelKey::generate()],
+            )
+            .unwrap();
+            envelopes.push(sign_envelope(&seed, &exchange, &[0; 32], &[0; 32], 1, sealed));
+        }
+        let put = Put { channel: [0; 32], epoch: 1, envelopes, action: None };
+        let bytes = put.encode();
+        // At the old cap of 256 this comes to 65,576 bytes — over the request
+        // limit outright, not merely tight. Half of it leaves the margin
+        // SIP-17's arithmetic assumed.
+        assert!(
+            bytes.len() < 34 * 1024,
+            "a full put of two-epoch envelopes is {} bytes, which leaves no margin \
+             inside the 64 KiB request cap",
+            bytes.len()
+        );
+        assert_eq!(Put::decode(&bytes).unwrap().envelopes.len(), MAX_ENVELOPES);
+
+        // One more is refused rather than truncated.
+        let mut over = Put::decode(&bytes).unwrap();
+        over.envelopes.push(over.envelopes[0].clone());
+        assert!(Put::decode(&over.encode()).is_err());
+    }
+
     #[test]
     fn an_envelope_whose_length_contradicts_its_range_is_refused() {
         let (seed, bob) = device(2);
@@ -873,3 +1070,4 @@ mod tests {
         assert_eq!(PutAck::decode(&p.encode()).unwrap(), p);
     }
 }
+

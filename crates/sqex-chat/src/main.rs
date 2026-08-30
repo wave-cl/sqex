@@ -31,7 +31,7 @@ const NOTE_LINGER: Duration = Duration::from_secs(8);
 
 use sqex_proto::events::Event as ChatEvent;
 use sqex_proto::message::Post as SipPost;
-use sqex_proto::timeline::Timeline;
+use sqex_proto::timeline::{Deletion, Timeline};
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::Signer;
 use sqex_proto::channel::{Role, Visibility};
@@ -1067,11 +1067,11 @@ async fn account_command(
                 match chat.profile_of(&me).await {
                     Ok(got) if got.found => Ok(Some(format!(
                         "you are {:?}{} — /profile <name> | <title> changes it",
-                        got.profile.name,
-                        if got.profile.title.is_empty() {
+                        got.profile().name,
+                        if got.profile().title.is_empty() {
                             String::new()
                         } else {
-                            format!(", {:?}", got.profile.title)
+                            format!(", {:?}", got.profile().title)
                         }
                     ))),
                     Ok(_) => Ok(Some(
@@ -2538,7 +2538,14 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 .last()
                 .map(|m| {
                     let said = if m.redacted {
-                        "message deleted".to_string()
+                        // SIP-32: a tombstone with a signed request behind it
+                        // is somebody deleting their message; one without is
+                        // the exchange having removed it on its own authority,
+                        // which it can do and which a reader should see.
+                        match m.deletion {
+                            Deletion::Unasked => "message removed by the exchange".to_string(),
+                            _ => "message deleted".to_string(),
+                        }
                     } else {
                         m.post
                             .body_text()

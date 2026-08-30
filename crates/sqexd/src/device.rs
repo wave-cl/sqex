@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use sqex_proto::credential::{Credential, Invalid, SCOPE_CHAT};
+use sqex_proto::credential::{Credential, Invalid, Revocation, SCOPE_CHAT};
 use sqex_proto::device::{Device, Devices, MAX_DEVICES, MAX_REGISTRATIONS_PER_HOUR};
 use sqnr_core::PubKey;
 
@@ -123,6 +123,14 @@ CREATE TABLE IF NOT EXISTS revoked (
 CREATE INDEX IF NOT EXISTS device_by_account ON device (account);
 "#;
 
+/// How far ahead of us an account's clock may be on a revocation.
+///
+/// A withdrawal that its author's fast clock made unacceptable would be a
+/// recovery that failed at the moment it was needed. There is deliberately no
+/// bound in the other direction: a revocation that lapsed would re-admit the
+/// key it withdrew.
+pub const REVOCATION_SKEW: u64 = 5 * 60;
+
 pub struct Registry {
     db: Mutex<Connection>,
 }
@@ -140,6 +148,14 @@ impl Registry {
         // already exists, so a column added after a release needs this. A
         // deployed exchange has a `revoked` table without `account`.
         add_column(&db, "revoked", "account", "BLOB")?;
+        // SIP-32. A deployed registry has rows whose credential was verified
+        // and discarded, so this is added rather than declared: those devices
+        // keep their mapping and report no credential until they re-register,
+        // which SIP-22 already calls renewal.
+        add_column(&db, "device", "credential", "BLOB NOT NULL DEFAULT x''")?;
+        // The account's own signed withdrawal, where there is one. A
+        // device-initiated revocation is legitimate and local, and stores none.
+        add_column(&db, "revoked", "revocation", "BLOB NOT NULL DEFAULT x''")?;
         Ok(Registry { db: Mutex::new(db) })
     }
 
@@ -246,15 +262,20 @@ impl Registry {
         // Idempotent for a device already mapped: re-registering refreshes the
         // credential, which is how a device renews before its expiry passes.
         tx.execute(
-            "INSERT INTO device (device, account, added, issued, not_after)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (device) DO UPDATE SET issued = ?4, not_after = ?5",
+            "INSERT INTO device (device, account, added, issued, not_after, credential)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (device) DO UPDATE SET issued = ?4, not_after = ?5,
+                                                credential = ?6",
             params![
                 credential.delegate.as_bytes(),
                 credential.account.as_bytes(),
                 now as i64,
                 credential.issued as i64,
                 credential.not_after as i64,
+                // SIP-32: kept, not just checked. Verifying it and throwing it
+                // away left SIP-31's second step — binding a device to the
+                // account an entry names — impossible for anybody to perform.
+                credential.encode(),
             ],
         )
         .map_err(storage("insert device"))?;
@@ -275,13 +296,31 @@ impl Registry {
     /// may not revoke one registered before it**. That seniority rule costs
     /// nothing and closes the obvious attack: somebody who steals a newly added
     /// laptop cannot use it to evict the phone that would revoke it.
-    pub fn revoke(&self, caller: &PubKey, device: &PubKey) -> Result<(), DeviceError> {
+    pub fn revoke(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        attested: Option<&Revocation>,
+    ) -> Result<(), DeviceError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin revoke"))?;
         expire(&tx, now)?;
 
         let target = row(&tx, device)?.ok_or(DeviceError::NoSuchDevice)?;
+
+        // SIP-32. An attested revocation carries its own authority: it is the
+        // account's signed withdrawal of a credential the account signed, and
+        // it needs no seniority and no registration behind it. Verified against
+        // the account the device actually belongs to — a revocation signed by
+        // somebody else's account is evidence about somebody else.
+        if let Some(r) = attested {
+            r.verify(&target.1, now, REVOCATION_SKEW)
+                .map_err(DeviceError::Invalid)?;
+            if r.device != *device {
+                return Err(DeviceError::NotAuthorised);
+            }
+        }
 
         // The account itself may revoke any of its devices, registered or not,
         // and is exempt from seniority. It signed every credential; a design in
@@ -293,7 +332,10 @@ impl Registry {
         // after linking another device would be the junior of the two, so
         // seniority alone would leave it unable to remove a device it
         // authorised.
-        if *caller != target.1 {
+        // An attested revocation has already proved its authority above, so
+        // the local path's rules — registration, and seniority — apply only
+        // when there is nothing signed to rest on.
+        if attested.is_none() && *caller != target.1 {
             let mine = row(&tx, caller)?.ok_or(DeviceError::NotAuthorised)?;
             if mine.1 != target.1 {
                 return Err(DeviceError::NotAuthorised);
@@ -307,9 +349,17 @@ impl Registry {
         tx.execute("DELETE FROM device WHERE device = ?1", params![device.as_bytes()])
             .map_err(storage("delete device"))?;
         tx.execute(
-            "INSERT INTO revoked (device, at, not_after, account) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (device) DO UPDATE SET at = ?2, not_after = ?3, account = ?4",
-            params![device.as_bytes(), now as i64, target.3 as i64, target.1.as_bytes()],
+            "INSERT INTO revoked (device, at, not_after, account, revocation)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (device) DO UPDATE SET at = ?2, not_after = ?3,
+                                                account = ?4, revocation = ?5",
+            params![
+                device.as_bytes(),
+                now as i64,
+                target.3 as i64,
+                target.1.as_bytes(),
+                attested.map(|r| r.encode()).unwrap_or_default(),
+            ],
         )
         .map_err(storage("record revocation"))?;
         tx.commit().map_err(storage("commit revoke"))?;
@@ -322,16 +372,25 @@ impl Registry {
         let db = self.db.lock().unwrap();
         let mut stmt = db
             .prepare(
-                "SELECT device, added, not_after FROM device
+                "SELECT device, added, not_after, credential FROM device
                  WHERE account = ?1 AND not_after >= ?2 ORDER BY added ASC, device ASC",
             )
             .map_err(storage("prepare list"))?;
         let devices = stmt
             .query_map(params![account.as_bytes(), now as i64], |r| {
+                let stored: Vec<u8> = r.get(3)?;
                 Ok(Device {
                     device: PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
                     added: r.get::<_, i64>(1)? as u64,
                     not_after: r.get::<_, i64>(2)? as u64,
+                    // Empty for a registration made before SIP-32. Reported as
+                    // absent rather than invented, so a verifier knows it is
+                    // holding a mapping and not evidence.
+                    credential: if stored.is_empty() {
+                        None
+                    } else {
+                        Credential::decode(&stored).ok()
+                    },
                 })
             })
             .map_err(storage("query list"))?

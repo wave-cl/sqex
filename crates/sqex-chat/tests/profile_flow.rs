@@ -85,10 +85,10 @@ async fn a_name_is_published_and_read_back_by_somebody_sharing_a_channel() {
 
     let got = bob.profile_of(&alice_key).await.unwrap();
     assert!(got.found);
-    assert_eq!(got.profile.name, "Alice");
+    assert_eq!(got.profile().name, "Alice");
     // Called `title` and not `role` on purpose: `role` is what the exchange
     // holds and vouches for, and this is what its subject says about itself.
-    assert_eq!(got.profile.title, "shipping");
+    assert_eq!(got.profile().title, "shipping");
 }
 
 #[tokio::test]
@@ -377,9 +377,9 @@ async fn a_published_name_can_be_taken_back() {
     alice.set_profile(named("", "")).await.unwrap();
     let got = bob.profile_of(&alice_key).await.unwrap();
     assert!(
-        got.profile.name.is_empty() && got.profile.title.is_empty(),
+        got.profile().name.is_empty() && got.profile().title.is_empty(),
         "the name could not be taken back: {:?}",
-        got.profile
+        got.profile()
     );
 
     // And a client that had cached it stops using it once it asks again.
