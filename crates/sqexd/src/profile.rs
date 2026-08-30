@@ -27,6 +27,7 @@ use sqex_proto::profile::{
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
+use sqex_proto::refusal::Code;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileError {
@@ -51,6 +52,20 @@ impl ProfileError {
             ProfileError::BadSignature => "bad_signature",
             ProfileError::Stale => "stale_serial",
             ProfileError::Storage => "storage",
+        }
+    }
+
+    /// The wire code for this refusal. Exhaustive on purpose: a new variant is
+    /// a compile error here until it is given one, which is what keeps the
+    /// registry from drifting away from the enum it describes.
+    pub fn code(&self) -> Code {
+        match self {
+            ProfileError::TooManyBlocked => Code::TooManyBlocked,
+            ProfileError::RateLimited => Code::RateLimited,
+            ProfileError::NotYours => Code::NotYours,
+            ProfileError::BadSignature => Code::BadSignature,
+            ProfileError::Stale => Code::StaleSerial,
+            ProfileError::Storage => Code::Storage,
         }
     }
 

@@ -33,6 +33,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use sqnr_core::{Error, PubKey, Result};
+use crate::refusal::Code;
 
 /// Domain separator for a delegation signature.
 pub const DELEGATION_CONTEXT: &[u8] = b"sqnr-delegate-v1";
@@ -119,6 +120,19 @@ impl Invalid {
             Invalid::NotYetValid => "not_yet_valid",
             Invalid::WrongScope => "wrong_scope",
             Invalid::BadSignature => "bad_signature",
+        }
+    }
+
+    /// The wire code for this reason. Exhaustive on purpose: a new variant is a
+    /// compile error here until it is given one, which is what keeps the
+    /// registry from drifting away from the enum.
+    pub fn code(&self) -> Code {
+        match self {
+            Invalid::WrongAccount => Code::WrongAccount,
+            Invalid::Expired => Code::Expired,
+            Invalid::NotYetValid => Code::NotYetValid,
+            Invalid::WrongScope => Code::WrongScope,
+            Invalid::BadSignature => Code::BadSignature,
         }
     }
 }

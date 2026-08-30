@@ -58,6 +58,7 @@ use sqnr_core::PubKey;
 use tokio::sync::Notify;
 
 use crate::state::now_unix;
+use sqex_proto::refusal::Code;
 
 /// Why an operation was refused. These are not malformed requests — the bytes
 /// were fine and the answer is no.
@@ -143,6 +144,39 @@ impl ChannelError {
             ChannelError::BadRetention => "bad_retention",
             ChannelError::LastAdmin => "last_admin",
             ChannelError::Storage => "storage",
+        }
+    }
+
+    /// The wire code for this refusal. Exhaustive on purpose: a new variant is
+    /// a compile error here until it is given one, which is what keeps the
+    /// registry from drifting away from the enum it describes.
+    pub fn code(&self) -> Code {
+        match self {
+            ChannelError::NoSuchChannel => Code::NoSuchChannel,
+            ChannelError::NotAMember => Code::NotAMember,
+            ChannelError::NotAnAdmin => Code::NotAnAdmin,
+            ChannelError::NotPublic => Code::NotPublic,
+            ChannelError::Full => Code::ChannelFull,
+            ChannelError::TooManyChannels => Code::TooManyChannels,
+            ChannelError::WrongEpoch => Code::WrongEpoch,
+            ChannelError::NotPrivate => Code::NotPrivate,
+            ChannelError::DirectMessage => Code::DirectMessage,
+            ChannelError::NoPrekey => Code::NoPrekey,
+            ChannelError::NoSuchUpload => Code::NoSuchUpload,
+            ChannelError::NoSuchBlob => Code::NoSuchBlob,
+            ChannelError::NoSuchEntry => Code::NoSuchEntry,
+            ChannelError::SystemEntry => Code::SystemEntry,
+            ChannelError::BadChunk => Code::BadChunk,
+            ChannelError::TooManyUploads => Code::TooManyUploads,
+            ChannelError::BlobQuota => Code::BlobQuota,
+            ChannelError::BlobChannels => Code::BlobChannelQuota,
+            ChannelError::InviteQuota => Code::InviteQuota,
+            ChannelError::BadRetention => Code::BadRetention,
+            ChannelError::LastAdmin => Code::LastAdmin,
+            ChannelError::BadSignature => Code::BadSignature,
+            ChannelError::BrokenChain => Code::BrokenChain,
+            ChannelError::UsedInstance => Code::UsedInstance,
+            ChannelError::Storage => Code::Storage,
         }
     }
 

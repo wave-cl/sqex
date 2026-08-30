@@ -34,6 +34,7 @@ use sqex_proto::device::{Device, Devices, MAX_DEVICES, MAX_REGISTRATIONS_PER_HOU
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
+use sqex_proto::refusal::Code;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceError {
@@ -66,6 +67,23 @@ impl DeviceError {
             DeviceError::TooManyDevices => "too_many_devices",
             DeviceError::RateLimited => "rate_limited",
             DeviceError::Storage => "storage",
+        }
+    }
+
+    /// The wire code for this refusal. Exhaustive on purpose: a new variant is
+    /// a compile error here until it is given one, which is what keeps the
+    /// registry from drifting away from the enum it describes.
+    pub fn code(&self) -> Code {
+        match self {
+            DeviceError::Invalid(i) => i.code(),
+            DeviceError::NotAuthorised => Code::NotAuthorised,
+            DeviceError::Claimed => Code::AlreadyClaimed,
+            DeviceError::Revoked => Code::Revoked,
+            DeviceError::Senior => Code::SeniorDevice,
+            DeviceError::NoSuchDevice => Code::NoSuchDevice,
+            DeviceError::TooManyDevices => Code::TooManyDevices,
+            DeviceError::RateLimited => Code::RateLimited,
+            DeviceError::Storage => Code::Storage,
         }
     }
 

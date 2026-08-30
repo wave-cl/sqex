@@ -54,8 +54,10 @@ pub struct Drained {
 /// connection light on amber over a working connection.
 #[derive(Debug)]
 pub enum Refusal {
-    /// The exchange answered, and said no.
-    Status(u16),
+    /// The exchange answered, and said no. The body is its stated reason —
+    /// a `sqex_proto::refusal::Refusal` from any exchange that speaks them,
+    /// and empty when none arrived.
+    Status(u16, Vec<u8>),
     /// The exchange did not answer.
     Transport(String),
 }
@@ -63,7 +65,10 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::Status(s) => write!(f, "the exchange refused an event stream ({s})"),
+            Refusal::Status(s, body) => match sqex_proto::refusal::Refusal::decode(body) {
+                Ok(r) => write!(f, "the exchange refused an event stream ({s}): {r}"),
+                Err(_) => write!(f, "the exchange refused an event stream ({s})"),
+            },
             Refusal::Transport(e) => write!(f, "{e}"),
         }
     }
@@ -88,13 +93,19 @@ impl Stream {
     /// window in between, silently.
     pub async fn open(client: &sqnr::Client) -> Result<Stream, Refusal> {
         let body = Subscribe { version: VERSION }.encode();
-        let stream = client
+        let mut stream = client
             .stream("POST", "/events", body)
             .await
             .map_err(Refusal::Transport)?;
         let status = stream.status();
         if status != 200 {
-            return Err(Refusal::Status(status));
+            // Take the exchange's stated reason rather than reporting a bare
+            // number: `too_many_streams` says how many are allowed, and
+            // `unsupported_version` says which version it speaks. An absent or
+            // unreadable body is not worth failing over — the status is still
+            // an answer — so it degrades to empty.
+            let said = stream.next().await.ok().flatten().unwrap_or_default();
+            return Err(Refusal::Status(status, said));
         }
         let (tx, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(pump(stream, tx));

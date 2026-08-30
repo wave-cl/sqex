@@ -104,7 +104,7 @@ async fn get(c: &mut Client, who: &PubKey) -> Got {
         .post("/profile/get", ByAccount { account: *who }.encode(TYPE_GET))
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     Got::decode(&body).unwrap()
 }
 
@@ -208,7 +208,7 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
         vec![],
     );
     let (code, body) = mallory.post("/channel/create", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     let mut invite = vec![TYPE_INVITE];
     invite.extend_from_slice(&channel);
@@ -331,12 +331,12 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
         GENESIS,
     )];
     let (code, body) = alice.post("/channel/create", back.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let (code, body) = alice
         .post("/channel/info", ByChannel { channel: dm }.encode(TYPE_INFO))
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     assert_eq!(ChannelInfo::decode(&body).unwrap().members.len(), 2);
 }
 

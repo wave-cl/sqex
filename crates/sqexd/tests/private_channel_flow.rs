@@ -124,7 +124,7 @@ impl Peer {
             )
             .await
             .unwrap();
-        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(code, 200, "{}", common::said(&body));
         let got = Got::decode(&body).unwrap();
         let mut out = Vec::new();
         for env in got.envelopes {
@@ -260,7 +260,7 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let ack = PutAck::decode(&body).unwrap();
     assert!(ack.accepted && ack.epoch == 1);
 
@@ -274,7 +274,7 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
         .post("/channel/post", req.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     // Bob collects the key and reads it.
     let keys = bob.collect_keys(channel).await;
@@ -409,7 +409,7 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     assert_eq!(PutAck::decode(&body).unwrap().epoch, 2);
 
     // Bob was never sealed epoch 2, and cannot collect it.
@@ -482,7 +482,7 @@ async fn an_envelope_is_served_only_to_the_recipient_it_names() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let absent = Absent::decode(&body).unwrap();
     assert_eq!(absent.epoch, 1);
     assert_eq!(absent.devices.len(), 1);
@@ -567,7 +567,7 @@ async fn a_direct_message_cannot_gain_a_third_party() {
         .action_chained(&mut probe, dm, instance_for(dm, 0), EVENT_ADDED, &carol.key, &[Role::Member as u8])
         .write(&mut b);
     let (code, body) = alice.client.post("/channel/invite", b).await.unwrap();
-    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 409, "{}", common::said(&body));
 
     // Nor may either party eject the other; leaving is the way out.
     let mut rm = vec![TYPE_REMOVE];
@@ -670,7 +670,7 @@ async fn a_public_channel_has_no_keys_to_distribute() {
         vec![],
     );
     let (code, body) = alice.client.post("/channel/create", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     let p = alice.take_prekey_for(alice.key).await;
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
@@ -859,7 +859,7 @@ async fn a_real_conversation_renders_end_to_end() {
         .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let entries = Entries::decode(&body).unwrap();
     assert_eq!(
         entries
@@ -1060,7 +1060,7 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
     // signs its own create, because SIP-32's `created` names its actor.
     let squat = private(&mallory.signer, &mut mallory_chain, dm, instance_for(dm, 0), vec![]);
     let (code, body) = mallory.client.post("/channel/create", squat.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     // Alice claims it by showing it is the derivation over herself and Bob,
     // which nobody but those two can do. The squatter's channel is discarded.
@@ -1077,7 +1077,7 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     let (code, body) = alice
         .client
@@ -1178,13 +1178,13 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
         .post("/channel/create", back.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let (code, body) = alice
         .client
         .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     assert_eq!(
         sqex_proto::channel::ChannelInfo::decode(&body).unwrap().members.len(),
         2

@@ -16,6 +16,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{
     ByChannel, Entries, Fetch, Invitee, Post, Role, TYPE_INFO, Visibility, direct_message_id,
 };
+use sqex_proto::refusal::{Code, Refusal};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -81,7 +82,7 @@ async fn a_room(c: &mut Client, s: &Signer, chain: &mut Chain, channel: [u8; 32]
         vec![],
     );
     let (code, body) = c.post("/channel/create", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 }
 
 /// **The forgery this SIP exists to stop.**
@@ -147,7 +148,7 @@ async fn an_entry_signed_by_one_device_and_claimed_by_another_is_refused() {
     assert_eq!(
         code, 401,
         "an entry claiming another account was stored: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
 }
 
@@ -193,7 +194,7 @@ async fn an_entry_signed_against_one_exchange_is_refused_by_another() {
             vec![],
         );
         let (code, body) = c.post("/channel/create", req.encode()).await.unwrap();
-        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(code, 200, "{}", common::said(&body));
     }
 
     // Signed for exchange A, accepted there.
@@ -216,7 +217,7 @@ async fn an_entry_signed_against_one_exchange_is_refused_by_another() {
     assert_eq!(
         code, 401,
         "an entry lifted between exchanges verified: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
 }
 
@@ -252,7 +253,7 @@ async fn an_entry_from_a_previous_incarnation_is_refused_by_the_next() {
         vec![],
     );
     let (code, body) = a.post("/channel/create", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     let said = signer(server_pub, 31).post_chained(
         &mut chain,
@@ -288,14 +289,14 @@ async fn an_entry_from_a_previous_incarnation_is_refused_by_the_next() {
         vec![],
     );
     let (code, body) = a.post("/channel/create", rebuilt.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     // The old entry, verbatim, into the new incarnation.
     let (code, body) = a.post("/channel/post", said.encode()).await.unwrap();
     assert_eq!(
         code, 401,
         "an entry from a previous incarnation was accepted: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
     let _ = &mut b;
 }
@@ -338,9 +339,9 @@ async fn an_incarnation_cannot_be_used_twice_for_one_identifier() {
     assert_eq!(
         code, 409,
         "an identifier reused an incarnation: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
-    assert!(String::from_utf8_lossy(&body).contains("used_instance"));
+    assert_eq!(Refusal::decode(&body).unwrap().code, Code::UsedInstance);
 
     // A fresh one is fine, which is what makes the refusal a rule and not a
     // ban on rebuilding a conversation.
@@ -382,8 +383,8 @@ async fn a_chain_position_is_neither_reused_nor_skipped() {
         b"again".to_vec(),
     );
     let (code, body) = a.post("/channel/post", repeat.encode()).await.unwrap();
-    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
-    assert!(String::from_utf8_lossy(&body).contains("broken_chain"));
+    assert_eq!(code, 409, "{}", common::said(&body));
+    assert_eq!(Refusal::decode(&body).unwrap().code, Code::BrokenChain);
 
     // A position skipped over.
     let ahead = s.post_chained(
@@ -395,7 +396,7 @@ async fn a_chain_position_is_neither_reused_nor_skipped() {
         b"ahead".to_vec(),
     );
     let (code, body) = a.post("/channel/post", ahead.encode()).await.unwrap();
-    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 409, "{}", common::said(&body));
 
     // And the next position, in order, still works.
     let second = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 3, b"two".to_vec());
@@ -496,7 +497,7 @@ async fn an_unsigned_entry_is_refused() {
     assert_eq!(
         code, 401,
         "an unsigned entry was stored: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
 }
 
@@ -542,7 +543,7 @@ async fn a_membership_event_needs_the_actors_signature() {
     assert_eq!(
         code, 401,
         "a membership change went in under a signature nobody made: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
 
     // Nobody was added.
@@ -665,7 +666,7 @@ async fn a_channels_constitution_cannot_be_restated() {
     assert_eq!(
         code, 401,
         "a channel was created as something other than what was signed: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
 
     // Signed for one name, sent under another.
@@ -698,7 +699,7 @@ async fn a_channels_constitution_cannot_be_restated() {
         vec![],
     );
     let (code, body) = a.post("/channel/create", honest.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 }
 
 /// **SIP-32: a create with no invitees still signs its own origin.**
@@ -771,7 +772,7 @@ async fn a_rename_is_recorded_and_signed() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     let (_, body) = a
         .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())

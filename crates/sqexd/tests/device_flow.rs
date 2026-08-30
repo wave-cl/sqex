@@ -10,6 +10,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{Create, Entries, Fetch, Visibility};
 use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
 use sqex_proto::device::{Devices, ListDevices, Register, Revoke};
+use sqex_proto::refusal::{Code, Refusal};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -82,7 +83,7 @@ async fn devices_of(c: &mut Client, account: &PubKey) -> Devices {
         .post("/device/list", ListDevices { account: *account }.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     Devices::decode(&body).unwrap()
 }
 
@@ -139,7 +140,7 @@ async fn one_person_two_devices_share_a_membership() {
     let hand = Signer::new(phone_seed, phone, pubkey).for_account(account);
 
     let (code, body) = d.post("/channel/create", public(&desk, channel).encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 
     // A chain each: the position is per device, so both start at zero and
     // neither treads on the other.
@@ -216,8 +217,8 @@ async fn a_revoked_device_cannot_re_register_with_the_credential_it_still_holds(
         .post("/device/register", Register { credential: stolen }.encode())
         .await
         .unwrap();
-    assert_eq!(code, 409, "{}", String::from_utf8_lossy(&body));
-    assert!(String::from_utf8_lossy(&body).contains("revoked"));
+    assert_eq!(code, 409, "{}", common::said(&body));
+    assert_eq!(Refusal::decode(&body).unwrap().code, Code::Revoked);
     assert_eq!(devices_of(&mut d, &account).await.devices.len(), 1);
 
     // A found phone comes back — but only with a credential the ACCOUNT signed
@@ -296,7 +297,7 @@ async fn a_credential_for_another_service_is_not_a_chat_device() {
         .await
         .unwrap();
     assert_eq!(code, 401);
-    assert!(String::from_utf8_lossy(&body).contains("wrong_scope"));
+    assert_eq!(Refusal::decode(&body).unwrap().code, Code::WrongScope);
 }
 
 #[tokio::test]
@@ -505,7 +506,7 @@ async fn the_account_may_revoke_a_device_it_never_registered_beside() {
         .post("/device/revoke", Revoke { device: laptop, revocation: None }.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     assert!(devices_of(&mut a, &account).await.devices.is_empty());
 }
 
@@ -540,7 +541,7 @@ async fn the_account_is_exempt_from_seniority_and_nobody_else_is() {
         .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
 }
 
 /// **SIP-32: the registry keeps the credential it verified.**
@@ -613,7 +614,7 @@ async fn an_attested_revocation_stands_on_the_account_alone() {
     assert_ne!(
         code, 200,
         "a stranger's signature withdrew somebody else's device: {}",
-        String::from_utf8_lossy(&body)
+        common::said(&body)
     );
     assert_eq!(devices_of(&mut d, &account).await.devices.len(), 1);
 
@@ -626,7 +627,7 @@ async fn an_attested_revocation_stands_on_the_account_alone() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     assert!(devices_of(&mut d, &account).await.devices.is_empty());
 
     // The artifact is repeatable: verified against the account key with no

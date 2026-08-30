@@ -21,6 +21,7 @@ use sqex_proto::channel_key::{
     seal_envelope,
 };
 use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
+use sqex_proto::refusal::{Code as RefusalCode, Refusal};
 use sqex_proto::entry_sig::{
     ActionTerms, EntryTerms, GENESIS, Place, link, sign_action, sign_entry, verify_entry,
     verify_entry_hashed,
@@ -172,8 +173,11 @@ pub enum Link {
 pub enum ChatError {
     Store(StoreError),
     Transport(String),
-    /// The exchange refused, with the status and whatever it said.
-    Refused(u16, String),
+    /// The exchange refused, and said why in a way this client can act on.
+    Refused(u16, Refusal),
+    /// The exchange refused and the body was not a refusal we could read —
+    /// an exchange older than this client, which answered JSON or a bare line.
+    Unreadable(u16, String),
     Protocol(String),
     /// We are a member with no key for the current epoch. SIP-17 asks that this
     /// be said plainly rather than shown as an empty conversation.
@@ -192,12 +196,53 @@ pub enum ChatError {
     NotReady(PubKey),
 }
 
+/// Turn a refused response into the error a caller can act on.
+///
+/// The decision is made on `Refusal::code` — a value — and never on the text of
+/// the body. It used to be made with `said.contains("not_an_admin")`, which was
+/// correct only while no code was a substring of another and no free-text
+/// detail ever contained one. A detail is now a separate field that this
+/// function does not read.
+fn classify(path: &str, code: u16, body: &[u8]) -> ChatError {
+    match Refusal::decode(body) {
+        Ok(r) => match r.code {
+            // The router's own 404 for a path it does not have, as against a
+            // chat route's 404 for a channel or blob that is not there. The two
+            // mean entirely different things to whoever reads the message: one
+            // is "your exchange is too old", the other is "that thing is gone".
+            RefusalCode::NotFound => ChatError::NoChatHere(path.to_string()),
+            // Matters because the client no longer decides locally whether it
+            // may rotate: SIP-17 lets a member rekey after revoking one of its
+            // own devices, and only the exchange holds the facts to judge it.
+            RefusalCode::NotAnAdmin => ChatError::NotAnAdmin,
+            _ => ChatError::Refused(code, r),
+        },
+        // An exchange older than this client, where refusals were JSON and a
+        // request that would not decode got a bare line. Matched by text, which
+        // is what this change removed from the path above — kept only so an old
+        // exchange still yields something a caller can act on. A JSON body does
+        // not decode as a refusal by accident: its length prefix would have to
+        // agree with its own size, and even then an unrecognised code lands in
+        // `Unknown`, which matches no branch here.
+        Err(_) => {
+            let said = String::from_utf8_lossy(body).into_owned();
+            if code == 404 && said.trim() == "not found" {
+                return ChatError::NoChatHere(path.to_string());
+            }
+            ChatError::Unreadable(code, said)
+        }
+    }
+}
+
 impl std::fmt::Display for ChatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChatError::Store(e) => write!(f, "{e}"),
             ChatError::Transport(e) => write!(f, "{e}"),
-            ChatError::Refused(code, body) => write!(f, "the exchange refused ({code}): {body}"),
+            ChatError::Refused(code, r) => write!(f, "the exchange refused ({code}): {r}"),
+            ChatError::Unreadable(code, body) => {
+                write!(f, "the exchange refused ({code}) and said: {body}")
+            }
             ChatError::Protocol(e) => write!(f, "{e}"),
             ChatError::NoKey(epoch) => write!(
                 f,
@@ -843,10 +888,7 @@ impl Chat {
             // must not be put into backoff. There is nothing to retry quickly
             // either: a client holding too many streams will still hold too
             // many a second later.
-            Err(crate::events::Refusal::Status(code)) => Err(ChatError::Refused(
-                code,
-                "the exchange would not open an event stream".into(),
-            )),
+            Err(crate::events::Refusal::Status(code, said)) => Err(classify("/events", code, &said)),
             Err(crate::events::Refusal::Transport(e)) => {
                 self.down();
                 Err(ChatError::Transport(e))
@@ -933,24 +975,7 @@ impl Chat {
             }
         };
         if code != 200 {
-            let said = String::from_utf8_lossy(&body).into_owned();
-            // The router's own 404 for a path it does not have, as against a
-            // chat route's 404 for a channel or blob that does not exist —
-            // those answer JSON. Told apart here because the two mean entirely
-            // different things to whoever is reading the message: one is "your
-            // exchange is too old", the other is "that thing is not there".
-            if code == 404 && said.trim() == "not found" {
-                return Err(ChatError::NoChatHere(path.to_string()));
-            }
-            // A refusal the caller can act on, rather than a status code it has
-            // to parse. This one matters now that the client no longer decides
-            // locally whether it may rotate: SIP-17 lets a member rekey after
-            // revoking one of its own devices, and only the exchange holds the
-            // facts to judge it.
-            if code == 403 && said.contains("not_an_admin") {
-                return Err(ChatError::NotAnAdmin);
-            }
-            return Err(ChatError::Refused(code, said));
+            return Err(classify(path, code, &body));
         }
         Ok(body)
     }
@@ -3019,5 +3044,80 @@ impl Chat {
             .await?;
         Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The case that could not be written before this change.
+    ///
+    /// `classify` used to decide with `said.contains("not_an_admin")` against
+    /// the whole body, and the body carried a free-text detail. A refusal about
+    /// something else whose detail merely *mentions* the words would have been
+    /// reported as `NotAnAdmin`, and the client would have taken an admin's
+    /// branch on a storage failure. The detail is a separate field now, and
+    /// nothing reads it to decide anything.
+    #[test]
+    fn a_detail_that_mentions_a_code_does_not_choose_the_branch() {
+        let body = Refusal::detailed(
+            RefusalCode::Storage,
+            "while checking not_an_admin and direct_message rules",
+        )
+        .encode();
+
+        // The old substring test, shown failing on these very bytes.
+        let said = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            said.contains("not_an_admin"),
+            "the detail must really contain the word, or this proves nothing"
+        );
+
+        match classify("/channel/grant", 403, &body) {
+            ChatError::Refused(403, r) => assert_eq!(r.code, RefusalCode::Storage),
+            other => panic!("detail decided the branch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_real_refusal_still_chooses_its_branch() {
+        let admin = Refusal::new(RefusalCode::NotAnAdmin).encode();
+        assert!(matches!(
+            classify("/channel/grant", 403, &admin),
+            ChatError::NotAnAdmin
+        ));
+
+        let gone = Refusal::new(RefusalCode::NotFound).encode();
+        match classify("/channel/fetch", 404, &gone) {
+            ChatError::NoChatHere(p) => assert_eq!(p, "/channel/fetch"),
+            other => panic!("wanted NoChatHere, got {other:?}"),
+        }
+    }
+
+    /// A chat route's own 404 — "that channel is not there" — must not be read
+    /// as "this exchange has no chat", which is what `NoChatHere` claims.
+    #[test]
+    fn a_missing_channel_is_not_a_missing_exchange() {
+        let body = Refusal::new(RefusalCode::NoSuchChannel).encode();
+        match classify("/channel/fetch", 404, &body) {
+            ChatError::Refused(404, r) => assert_eq!(r.code, RefusalCode::NoSuchChannel),
+            other => panic!("a missing channel read as {other:?}"),
+        }
+    }
+
+    /// An exchange older than this client answers JSON, or a bare line for a
+    /// request that would not decode. Neither is a refusal we can read, and
+    /// saying so beats guessing.
+    #[test]
+    fn an_older_exchange_still_gets_an_answer() {
+        match classify("/channel/fetch", 404, b"not found") {
+            ChatError::NoChatHere(p) => assert_eq!(p, "/channel/fetch"),
+            other => panic!("legacy 404 read as {other:?}"),
+        }
+        match classify("/channel/put", 403, br#"{"error":"not_an_admin"}"#) {
+            ChatError::Unreadable(403, said) => assert!(said.contains("not_an_admin")),
+            other => panic!("legacy JSON read as {other:?}"),
+        }
     }
 }

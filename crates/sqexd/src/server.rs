@@ -9,6 +9,7 @@ use std::time::Instant;
 use bytes::Buf;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
+use sqex_proto::refusal::{Code, Refusal};
 use sqnr_core::key::PubKey;
 use sqnr_core::{Error, Result, SignedTransaction};
 use sqex_proto::Op;
@@ -577,7 +578,8 @@ async fn handle_stream(
         while chunk.remaining() > 0 {
             let n = chunk.chunk().len();
             if body.len() + n > cap {
-                return respond(&mut stream, 413, "text/plain", b"body too large".to_vec()).await;
+                let (status, ct, out) = refuse(413, Code::BodyTooLarge, None);
+                return respond(&mut stream, status, ct, out).await;
             }
             body.extend_from_slice(chunk.chunk());
             chunk.advance(n);
@@ -628,51 +630,33 @@ async fn serve_events(
     match sqex_proto::events::Subscribe::decode(body) {
         Ok(sub) if sub.version == sqex_proto::events::VERSION => {}
         Ok(sub) => {
-            return respond(
-                stream,
+            let (status, ct, out) = refuse(
                 400,
-                "application/json",
-                json!({
-                    "error": "unsupported_version",
-                    "detail": format!(
-                        "this exchange speaks event version {}, not {}",
-                        sqex_proto::events::VERSION, sub.version
-                    ),
-                })
-                .to_string()
-                .into_bytes(),
-            )
-            .await;
+                Code::UnsupportedVersion,
+                Some(&format!(
+                    "this exchange speaks event version {}, not {}",
+                    sqex_proto::events::VERSION,
+                    sub.version
+                )),
+            );
+            return respond(stream, status, ct, out).await;
         }
         Err(e) => {
-            return respond(
-                stream,
-                400,
-                "application/json",
-                json!({ "error": "malformed", "detail": e.to_string() })
-                    .to_string()
-                    .into_bytes(),
-            )
-            .await;
+            let (status, ct, out) = refuse(400, Code::Malformed, Some(&e.to_string()));
+            return respond(stream, status, ct, out).await;
         }
     }
 
     let Some(mut feed) = server.events.subscribe(me) else {
-        return respond(
-            stream,
+        let (status, ct, out) = refuse(
             429,
-            "application/json",
-            json!({
-                "error": "too_many_streams",
-                "detail": format!(
-                    "an identity may hold {} event streams at once",
-                    crate::events::MAX_PER_IDENTITY
-                ),
-            })
-            .to_string()
-            .into_bytes(),
-        )
-        .await;
+            Code::TooManyStreams,
+            Some(&format!(
+                "an identity may hold {} event streams at once",
+                crate::events::MAX_PER_IDENTITY
+            )),
+        );
+        return respond(stream, status, ct, out).await;
     };
 
     // No content-length, and no `finish`: `respond` sets one and ends the
@@ -759,6 +743,14 @@ async fn route(
             let nonce = server.challenges.issue();
             (200, "application/octet-stream", nonce.to_vec())
         }
+        // **This route answers JSON, and must keep doing so.** Every other
+        // refusal is a `sqex_proto::refusal::Refusal`; this one is read by
+        // `sqnr::flow::sign_and_submit`, an external crate pinned by tag, which
+        // does `serde_json::from_slice(&body).unwrap_or(Null)` and then reads
+        // `error` and `detail` out of it. A binary body would not fail there —
+        // it would degrade silently to a refusal with no reason, which is worse
+        // than the substring matching this change exists to remove. Converting
+        // it means releasing sqnr first.
         ("POST", "/admin/command") => match server.execute(body).await {
             Ok(json_body) => (200, "application/json", json_body),
             Err(e) => {
@@ -777,16 +769,9 @@ async fn route(
         // identity may beat, registered or not, which is the whole point.
         // Reading is open to anyone holding the server key.
         ("POST", "/beacon/beat") => match Beat::decode(body) {
-            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(beat) => match peer.identity {
-                None => (
-                    403,
-                    "application/json",
-                    json!({ "error": "no_identity",
-                            "detail": "beating requires an advertised Ed25519 identity (SIP-3)" })
-                    .to_string()
-                    .into_bytes(),
-                ),
+                None => no_identity("beating"),
                 Some(id) => {
                     let now = server
                         .beacons
@@ -797,7 +782,7 @@ async fn route(
             },
         },
         ("POST", "/beacon/read") => match Read::decode(body) {
-            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(read) => {
                 let reply = server.beacons.read(&read.key, peer.identity.as_ref());
                 (200, "application/octet-stream", reply.encode())
@@ -816,7 +801,7 @@ async fn route(
         // stored and never what is answered.
         ("POST", "/admission/request") => match (device, AdmissionRequest::decode(body)) {
             (None, _) => no_identity("requesting admission"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 let siblings = server
                     .devices
@@ -842,7 +827,7 @@ async fn route(
         // alongside a name wherever the distinction could matter.
         ("POST", "/profile/put") => match (account, ProfilePut::decode(body)) {
             (None, _) => no_identity("publishing a profile"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.profiles.put(&me, &req.record) {
                 Ok(()) => {
                     // SIP-21 scopes a profile to the people you are already in
@@ -862,16 +847,12 @@ async fn route(
                     server.events.publish(&to, EventKind::Profile { account: me });
                     (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
                 }
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
         ("POST", "/profile/get") => match (account, ByAccount::decode(body, PR_GET)) {
             (None, _) => no_identity("reading a profile"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 // The welcome channel does not count towards knowing
                 // somebody: everybody is in it, so counting it would leave a
@@ -881,24 +862,16 @@ async fn route(
                 };
                 match server.profiles.get(&me, &req.account, &shares) {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
-                    Err(e) => (
-                        e.status(),
-                        "application/json",
-                        json!({ "error": e.as_str() }).to_string().into_bytes(),
-                    ),
+                    Err(e) => refuse(e.status(), e.code(), None),
                 }
             }
         },
         ("POST", "/block/set") => match (account, ProfileBlock::decode(body)) {
             (None, _) => no_identity("blocking"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.profiles.set_block(&me, &req.account, req.add) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
         // Returned only to its owner: a list of who somebody wants to avoid is
@@ -908,11 +881,7 @@ async fn route(
             None => no_identity("listing blocks"),
             Some(me) => match server.profiles.blocks(&me) {
                 Ok(list) => (200, "application/octet-stream", list.encode()),
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
 
@@ -921,32 +890,24 @@ async fn route(
         // entitle that key to anything.
         ("POST", "/device/register") => match (device, DeviceRegister::decode(body)) {
             (None, _) => no_identity("registering a device"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             // The caller is the delegate itself, or an already-registered
             // device of the same account. The account is never required to
             // connect, because a hardware-held one cannot.
             (Some(me), Ok(req)) => match server.devices.register(&me, &req.credential) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
         ("POST", "/device/revoke") => match (device, DeviceRevoke::decode(body)) {
             (None, _) => no_identity("revoking a device"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server
                 .devices
                 .revoke(&me, &req.device, req.revocation.as_ref())
             {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
         // Answerable to anybody: the mapping is public by construction, since
@@ -954,14 +915,10 @@ async fn route(
         // one. Pretending otherwise would protect something already published
         // while making a member list impossible to render.
         ("POST", "/device/list") => match ListDevices::decode(body) {
-            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(req) => match server.devices.list(&req.account) {
                 Ok(list) => (200, "application/octet-stream", list.encode()),
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
 
@@ -983,7 +940,7 @@ async fn route(
         ),
         ("POST", "/blob/begin") => match (account, BlobBegin::decode(body)) {
             (None, _) => no_identity("beginning an upload"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.begin_upload(&me, &req) {
                 Ok(upload) => (
                     200,
@@ -995,7 +952,7 @@ async fn route(
         },
         ("POST", "/blob/put") => match (account, BlobPut::decode(body)) {
             (None, _) => no_identity("uploading a chunk"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.put_chunk(&me, &req) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
@@ -1003,7 +960,7 @@ async fn route(
         },
         ("POST", "/blob/commit") => match (account, BlobCommit::decode(body)) {
             (None, _) => no_identity("committing an upload"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 match server.channels.commit_upload(&me, req.upload, &req.blob) {
                     Ok(stored) => (
@@ -1017,7 +974,7 @@ async fn route(
         },
         ("POST", "/blob/abort") => match (account, ByUpload::decode(body, BL_ABORT)) {
             (None, _) => no_identity("aborting an upload"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.abort_upload(&me, req.upload) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
@@ -1025,7 +982,7 @@ async fn route(
         },
         ("POST", "/blob/head") => match (account, ByBlob::decode(body, BL_HEAD)) {
             (None, _) => no_identity("reading a blob"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.head_blob(&me, &req.blob) {
                 Ok(h) => (200, "application/octet-stream", h.encode()),
                 Err(e) => refused(e),
@@ -1033,7 +990,7 @@ async fn route(
         },
         ("POST", "/blob/get") => match (account, GetChunk::decode(body)) {
             (None, _) => no_identity("fetching a chunk"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.get_chunk(&me, &req.blob, req.index) {
                 Ok(c) => (200, "application/octet-stream", c.encode()),
                 Err(e) => refused(e),
@@ -1042,7 +999,7 @@ async fn route(
         ("POST", "/blob/attach") => {
             match (account, ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH)) {
                 (None, _) => no_identity("attaching a blob"),
-                (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
                 (Some(me), Ok(req)) => match server.channels.attach_blob(&me, &req) {
                     Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                     Err(e) => refused(e),
@@ -1051,7 +1008,7 @@ async fn route(
         }
         ("POST", "/blob/detach") => match (account, ByChannelBlob::decode(body, BL_DETACH)) {
             (None, _) => no_identity("detaching a blob"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 match server.channels.detach_blob(&me, &req.channel, &req.blob) {
                     Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
@@ -1067,18 +1024,14 @@ async fn route(
         // the property by accident.
         ("POST", "/prekey/publish") => match (device, PrekeyPublish::decode(body)) {
             (None, _) => no_identity("publishing prekeys"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.prekeys.publish(&me, &req.prekeys) {
                 Ok(accepted) => {
                     let mut out = accepted.to_be_bytes().to_vec();
                     out.extend_from_slice(&now_unix().to_be_bytes());
                     (200, "application/octet-stream", out)
                 }
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
         // Unauthenticated by necessity: anybody who may seal to a device has
@@ -1086,7 +1039,7 @@ async fn route(
         // service anyone can cause, which the fallback turns into a loss of
         // forward secrecy rather than a failure to rotate.
         ("POST", "/prekey/take") => match PrekeyTake::decode(body) {
-            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(req) => (
                 200,
                 "application/octet-stream",
@@ -1111,11 +1064,7 @@ async fn route(
             None => no_identity("clearing prekeys"),
             Some(me) => match server.prekeys.clear(&me) {
                 Ok(cleared) => (200, "application/octet-stream", cleared.encode()),
-                Err(e) => (
-                    e.status(),
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(e.status(), e.code(), None),
             },
         },
 
@@ -1125,7 +1074,7 @@ async fn route(
         // already parked in a long poll.
         ("POST", "/channel/create") => match (who, ChannelCreate::decode(body)) {
             (None, _) => no_identity("creating a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
                 match server.channels.create(&me, &dev, &req, &blocked) {
@@ -1148,7 +1097,7 @@ async fn route(
         },
         ("POST", "/channel/join") => match (who, ByChannelSigned::decode(body, CH_JOIN)) {
             (None, _) => no_identity("joining a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server
                 .channels
                 .join(&me, &dev, &req.channel, &req.action)
@@ -1164,7 +1113,7 @@ async fn route(
         },
         ("POST", "/channel/leave") => match (who, ByChannelSigned::decode(body, CH_LEAVE)) {
             (None, _) => no_identity("leaving a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server
                 .channels
                 .leave(&me, &dev, &req.channel, &req.action)
@@ -1180,7 +1129,7 @@ async fn route(
         },
         ("POST", "/channel/post") => match (account, ChannelPost::decode(body)) {
             (None, _) => no_identity("posting to a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.post(
                 &me,
                 // The device is what SIP-17 derives the sealing subkey from and
@@ -1200,7 +1149,7 @@ async fn route(
         },
         ("POST", "/channel/info") => match (account, ByChannel::decode(body, CH_INFO)) {
             (None, _) => no_identity("reading a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.info(&me, &device.unwrap_or(me), &req.channel) {
                 Ok(info) => (200, "application/octet-stream", info.encode()),
                 Err(e) => refused(e),
@@ -1208,7 +1157,7 @@ async fn route(
         },
         ("POST", "/channel/retain") => match (who, ChannelRetain::decode(body)) {
             (None, _) => no_identity("setting retention"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server.channels.retain(&me, &dev, &req) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
@@ -1216,7 +1165,7 @@ async fn route(
         },
         ("POST", "/channel/directory") => match (who, ChannelDirectory::decode(body)) {
             (None, _) => no_identity("naming a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server.channels.set_directory(&me, &dev, &req) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
@@ -1224,7 +1173,7 @@ async fn route(
         },
         ("POST", "/channel/close") => match (account, ByChannel::decode(body, CH_CLOSE)) {
             (None, _) => no_identity("closing a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.close(&me, &req.channel) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
@@ -1237,14 +1186,14 @@ async fn route(
         // every other operation takes its 32-byte identifier as input.
         ("POST", "/channel/mine") => match (account, ChannelMine::decode(body)) {
             (None, _) => no_identity("listing your channels"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.mine(&me, req.offset) {
                 Ok(mine) => (200, "application/octet-stream", mine.encode()),
                 Err(e) => refused(e),
             },
         },
         ("POST", "/channel/list") => match ChannelList::decode(body) {
-            Err(e) => (400, "text/plain", e.to_string().into_bytes()),
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(req) => match server.channels.list(&req.query, req.offset) {
                 Ok(listing) => (200, "application/octet-stream", listing.encode()),
                 Err(e) => refused(e),
@@ -1252,7 +1201,7 @@ async fn route(
         },
         ("POST", "/channel/invite") => match (who, ChannelInvite::decode(body)) {
             (None, _) => no_identity("inviting to a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
                 let (channel, guest) = (req.channel, Invitee { account: req.account, role: req.role });
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
@@ -1272,7 +1221,7 @@ async fn route(
         },
         ("POST", "/channel/remove") => match (who, ChannelByAccount::decode(body, CH_REMOVE)) {
             (None, _) => no_identity("removing from a channel"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server
                 .channels
                 .remove(&me, &dev, &req.channel, &req.account, &req.action)
@@ -1293,7 +1242,7 @@ async fn route(
         // each only to the recipient it names, and holds no key that opens one.
         ("POST", "/channel/key/put") => match (who, KeyPut::decode(body)) {
             (None, _) => no_identity("publishing channel keys"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
                 // A device is resolved to its account here rather than inside
                 // the channel store, which keeps that store free of any
@@ -1315,7 +1264,7 @@ async fn route(
         },
         ("POST", "/channel/key/get") => match (account, device, KeyGet::decode(body)) {
             (None, _, _) | (_, None, _) => no_identity("collecting channel keys"),
-            (_, _, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, _, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Some(mine), Ok(req)) => {
                 match server.channels.get_keys(&me, &mine, &req.channel, req.since_epoch) {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
@@ -1325,7 +1274,7 @@ async fn route(
         },
         ("POST", "/channel/key/missing") => match (account, ByChannel::decode(body, CH_MISSING)) {
             (None, _) => no_identity("listing stranded devices"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 let has = |d: &PubKey| server.prekeys.has_any(d);
                 // An account with none registered is its own device (SIP-22).
@@ -1354,7 +1303,7 @@ async fn route(
 
         ("POST", "/channel/cursor") => match (account, ChannelCursor::decode(body)) {
             (None, _) => no_identity("setting a read mark"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 match server
                     .channels
@@ -1370,7 +1319,7 @@ async fn route(
         },
         ("POST", "/channel/cursors") => match (account, ByChannel::decode(body, CH_CURSORS)) {
             (None, _) => no_identity("reading marks"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.cursors(&me, &req.channel) {
                 Ok(marks) => (200, "application/octet-stream", marks.encode()),
                 Err(e) => refused(e),
@@ -1378,7 +1327,7 @@ async fn route(
         },
         ("POST", "/channel/redact") => match (account, ByTarget::decode(body, CH_REDACT)) {
             (None, _) => no_identity("redacting an entry"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.redact(&me, &req.channel, req.target) {
                 Ok(()) => {
                     // No sequence number to name: a redaction changes an entry
@@ -1394,7 +1343,7 @@ async fn route(
         // dropped every one of these would still conform.
         ("POST", "/channel/signal") => match (account, SignalOut::decode(body)) {
             (None, _) => no_identity("signalling"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 match server.channels.signal(&me, &req.channel, req.kind, &req.body) {
                     Ok(()) => {
@@ -1410,7 +1359,7 @@ async fn route(
 
         ("POST", "/channel/fetch") => match (account, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match fetch_waiting(server, &me, &req).await {
                 Ok(entries) => (200, "application/octet-stream", entries.encode()),
                 Err(e) => refused(e),
@@ -1419,19 +1368,15 @@ async fn route(
 
         ("POST", "/room/join") => match (peer.identity, RoomJoin::decode(body)) {
             (None, _) => no_identity("joining a room"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(join)) => match server.rooms.join(join.handle, me, join.proof) {
                 Ok(roster) => (200, "application/octet-stream", roster.encode()),
-                Err(e) => (
-                    507,
-                    "application/json",
-                    json!({ "error": e.as_str() }).to_string().into_bytes(),
-                ),
+                Err(e) => refuse(507, e.code(), None),
             },
         },
         ("POST", "/room/leave") => match (peer.identity, RoomLeave::decode(body)) {
             (None, _) => no_identity("leaving a room"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(leave)) => {
                 let was_there = server.rooms.leave(&leave.handle, &me);
                 (
@@ -1447,7 +1392,7 @@ async fn route(
         // mailbox belongs to whoever can connect as its key. Nothing is signed.
         ("POST", "/mailbox/send") => match (peer.identity, MailSend::decode(body)) {
             (None, _) => no_identity("sending"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(from), Ok(msg)) => {
                 match server.mailbox.send(from, msg.recipient, msg.sealed) {
                     Ok((id, now)) => (
@@ -1455,11 +1400,7 @@ async fn route(
                         "application/octet-stream",
                         SendAck { id, now }.encode(),
                     ),
-                    Err(e) => (
-                        507,
-                        "application/json",
-                        json!({ "error": e.as_str() }).to_string().into_bytes(),
-                    ),
+                    Err(e) => refuse(507, e.code(), None),
                 }
             }
         },
@@ -1473,7 +1414,7 @@ async fn route(
         },
         ("POST", "/mailbox/fetch") => match (peer.identity, ById::decode(body, TYPE_FETCH)) {
             (None, _) => no_identity("fetching"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 let out = match server.mailbox.fetch(&me, req.id) {
                     Some((sender, received, sealed)) => Fetched {
@@ -1489,7 +1430,7 @@ async fn route(
         },
         ("POST", "/mailbox/delete") => match (peer.identity, ById::decode(body, TYPE_DELETE)) {
             (None, _) => no_identity("deleting"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 let deleted = server.mailbox.delete(&me, req.id);
                 (200, "application/octet-stream", vec![u8::from(deleted)])
@@ -1497,7 +1438,7 @@ async fn route(
         },
         ("POST", "/mailbox/status") => match (peer.identity, ById::decode(body, TYPE_STATUS)) {
             (None, _) => no_identity("asking"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => (
                 200,
                 "application/octet-stream",
@@ -1511,7 +1452,7 @@ async fn route(
         // static private key from each peer, which it does not hold.
         ("POST", "/session/open") => match (peer.identity, Open::decode(body)) {
             (None, _) => no_identity("opening a session"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(open)) => (
                 200,
                 "application/octet-stream",
@@ -1520,21 +1461,17 @@ async fn route(
         },
         ("POST", "/session/send") => match (peer.identity, SendFrame::decode(body)) {
             (None, _) => no_identity("sending"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(f)) => {
                 match server.sessions.send(&me, f.session_id, f.seq, f.ciphertext) {
                     Ok(()) => (200, "application/octet-stream", vec![1u8]),
-                    Err(e) => (
-                        409,
-                        "application/json",
-                        json!({ "error": e.as_str() }).to_string().into_bytes(),
-                    ),
+                    Err(e) => refuse(409, e.code(), None),
                 }
             }
         },
         ("POST", "/session/recv") => match (peer.identity, BySession::decode(body, TYPE_RECV)) {
             (None, _) => no_identity("receiving"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(r)) => (
                 200,
                 "application/octet-stream",
@@ -1543,7 +1480,7 @@ async fn route(
         },
         ("POST", "/session/close") => match (peer.identity, BySession::decode(body, TYPE_CLOSE)) {
             (None, _) => no_identity("closing"),
-            (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(r)) => (
                 200,
                 "application/octet-stream",
@@ -1560,16 +1497,12 @@ async fn route(
                     json!({ "pong": true }).to_string().into_bytes(),
                 )
             } else {
-                (
-                    403,
-                    "application/json",
-                    json!({ "error": "not_whitelisted" })
-                        .to_string()
-                        .into_bytes(),
-                )
+                refuse(403, Code::NotWhitelisted, None)
             }
         }
-        _ => (404, "text/plain", b"not found".to_vec()),
+        // A route this exchange does not have. `sqex-chat` used to recognise
+        // this by matching the literal "not found" on a 404; it is a code now.
+        _ => refuse(404, Code::NotFound, None),
     }
 }
 
@@ -1774,11 +1707,7 @@ impl Server {
 /// no. Distinguishable from a malformed request, as SIP-16 requires, and never
 /// silent.
 fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
-    (
-        e.status(),
-        "application/json",
-        json!({ "error": e.as_str() }).to_string().into_bytes(),
-    )
+    refuse(e.status(), e.code(), None)
 }
 
 /// A fetch that answers at once when there is something, and otherwise holds
@@ -1816,15 +1745,12 @@ async fn fetch_waiting(
 
 
 fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
-    (
+    refuse(
         403,
-        "application/json",
-        json!({
-            "error": "no_identity",
-            "detail": format!("{action} requires an advertised Ed25519 identity (SIP-3)"),
-        })
-        .to_string()
-        .into_bytes(),
+        Code::NoIdentity,
+        Some(&format!(
+            "{action} requires an advertised Ed25519 identity (SIP-3)"
+        )),
     )
 }
 
@@ -1837,6 +1763,20 @@ fn error_status(e: &Error) -> (u16, &'static str) {
         Error::NotAdmin => (403, "not_admin"),
         Error::Key(_) => (400, "bad_key"),
     }
+}
+
+/// A refusal, as a value the caller can match on.
+///
+/// Replaces two older shapes — `{"error": …}` as JSON and a bare `text/plain`
+/// line for a request that would not decode. Both made a caller search a
+/// document for a word; see `sqex_proto::refusal` for why that could not be
+/// made safe.
+fn refuse(status: u16, code: Code, detail: Option<&str>) -> (u16, &'static str, Vec<u8>) {
+    let r = match detail {
+        Some(d) => Refusal::detailed(code, d),
+        None => Refusal::new(code),
+    };
+    (status, "application/octet-stream", r.encode())
 }
 
 async fn respond(

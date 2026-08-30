@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
+use sqex_proto::refusal::Refusal;
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
 use sqex_proto::session::{
@@ -216,7 +217,7 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
         if code != 200 {
             return Err(format!(
                 "open failed ({code}): {}",
-                String::from_utf8_lossy(&body)
+                said(&body)
             ));
         }
         let ack = OpenAck::decode(&body).map_err(|e| e.to_string())?;
@@ -329,7 +330,7 @@ async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), Strin
                     if code != 200 {
                         return Err(format!(
                             "send failed ({code}): {}",
-                            String::from_utf8_lossy(&body)
+                            said(&body)
                         ));
                     }
                     out_seq += 1;
@@ -417,7 +418,7 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
             if code != 200 {
                 return Err(format!(
                     "send refused ({code}): {}",
-                    String::from_utf8_lossy(&body)
+                    said(&body)
                 ));
             }
             let ack = SendAck::decode(&body).map_err(|e| e.to_string())?;
@@ -521,7 +522,7 @@ async fn list_mail(client: &mut Client) -> Result<Listing, String> {
     if code != 200 {
         return Err(format!(
             "list failed ({code}): {}",
-            String::from_utf8_lossy(&body)
+            said(&body)
         ));
     }
     Listing::decode(&body).map_err(|e| e.to_string())
@@ -583,7 +584,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             if code != 200 {
                 return Err(format!(
                     "beat refused ({code}): {}",
-                    String::from_utf8_lossy(&body)
+                    said(&body)
                 ));
             }
             let ack = BeatAck::decode(&body).map_err(|e| e.to_string())?;
@@ -614,7 +615,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             if code != 200 {
                 return Err(format!(
                     "read failed ({code}): {}",
-                    String::from_utf8_lossy(&body)
+                    said(&body)
                 ));
             }
             let r = Reply::decode(&body).map_err(|e| e.to_string())?;
@@ -793,6 +794,18 @@ async fn submit(cli: &Cli, cfg: &Config, ops: Vec<Operation>) -> Result<serde_js
     };
     let touch = || eprintln!("👆  Touch your YubiKey to sign…");
     flow::sign_and_submit(&mut client, &backend, server, ops, &review, &touch).await
+}
+
+/// What the exchange said about a refusal, for an operator to read.
+///
+/// Refusals on sqex-proto routes are a `Refusal`; `/admin/command` still
+/// answers JSON, and an exchange older than sqex 0.21 answered JSON everywhere.
+/// Anything that is not a refusal is shown as it came rather than guessed at.
+fn said(body: &[u8]) -> String {
+    match Refusal::decode(body) {
+        Ok(r) => r.to_string(),
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    }
 }
 
 // ---- output helpers ----------------------------------------------------------

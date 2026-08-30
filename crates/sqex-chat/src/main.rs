@@ -36,6 +36,7 @@ use sqnr::{Client, config::Config, identity};
 use sqnr_core::Signer;
 use sqex_proto::channel::{Role, Visibility};
 use sqex_proto::credential::Credential;
+use sqex_proto::refusal::Code as RefusalCode;
 use sqnr_core::PubKey;
 
 mod ui;
@@ -1751,8 +1752,8 @@ async fn handle_key(
                                 // message, where both parties are admins from
                                 // the start; say that rather than pass on a
                                 // bare refusal.
-                                Err(ChatError::Refused(_, body))
-                                    if body.contains("direct_message") =>
+                                Err(ChatError::Refused(_, r))
+                                    if r.code == RefusalCode::DirectMessage =>
                                 {
                                     Err(ChatError::Protocol(
                                         "a direct message has no roles to give — both of \

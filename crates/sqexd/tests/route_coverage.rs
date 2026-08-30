@@ -123,7 +123,7 @@ fn served() -> Vec<(String, String)> {
         .find("match (method, path) {")
         .expect("the dispatch match moved or was renamed");
     let end = src[start..]
-        .find("_ => (404,")
+        .find("_ => refuse(404,")
         .expect("the dispatch match lost its wildcard arm")
         + start;
     let body = &src[start..end];

@@ -10,6 +10,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::session::{
     BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
 };
+use sqex_proto::refusal::{Code, Refusal};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -258,7 +259,11 @@ async fn a_third_identity_cannot_join_or_read_a_session() {
         .await
         .unwrap();
     assert_eq!(code, 409, "Eve cannot inject frames");
-    assert!(String::from_utf8_lossy(&body).contains("no_session"));
+    assert_eq!(
+        Refusal::decode(&body).unwrap().code,
+        Code::NoSession,
+        "a send with no session should say so"
+    );
 
     let got = recv(&mut eve, id).await;
     assert!(!got.open, "reported exactly as no session");

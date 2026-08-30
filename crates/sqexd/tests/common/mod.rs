@@ -444,6 +444,17 @@ fn blank() -> ChannelInfo {
 
 /// A distinct incarnation per test channel. Any 32 bytes will do as long as one
 /// identifier never reuses them; the exchange refuses a repeat.
+/// What the exchange said, for a failure message.
+///
+/// Refusals are binary now, so a bare `from_utf8_lossy` prints mojibake exactly
+/// when a test fails and somebody needs to read why.
+pub fn said(body: &[u8]) -> String {
+    match sqex_proto::refusal::Refusal::decode(body) {
+        Ok(r) => r.to_string(),
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    }
+}
+
 pub fn instance_for(channel: [u8; 32], n: u8) -> [u8; 32] {
     let mut i = channel;
     i[0] ^= 0x5a;

@@ -25,6 +25,7 @@ use sqex_proto::session::{
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
+use sqex_proto::refusal::Code;
 
 /// Why a frame was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,16 @@ impl SendError {
         match self {
             SendError::NoSession => "no_session",
             SendError::Backpressure => "backpressure",
+        }
+    }
+
+    /// The wire code for this refusal. Exhaustive on purpose: a new variant is
+    /// a compile error here until it is given one, which is what keeps the
+    /// registry from drifting away from the enum it describes.
+    pub fn code(&self) -> Code {
+        match self {
+            SendError::NoSession => Code::NoSession,
+            SendError::Backpressure => Code::Backpressure,
         }
     }
 }

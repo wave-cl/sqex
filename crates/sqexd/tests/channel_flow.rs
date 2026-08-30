@@ -15,6 +15,7 @@ use sqex_proto::channel::{
     Fetch, KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_RETENTION, MIN_RETENTION, Mark, Marks, Posted, Retain, Role, SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
     TYPE_LEAVE, TYPE_REDACT, Visibility,
 };
+use sqex_proto::refusal::{Code, Refusal};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -222,7 +223,7 @@ async fn two_members_hold_a_conversation_in_one_order() {
 
     // The order is the exchange's, and it is the same order for everybody.
     let (code, body) = fetch(&mut b.client, channel, 0, 0).await;
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(
         bodies(&seen),
@@ -359,7 +360,7 @@ async fn the_log_survives_a_restart() {
     let (addr, pubkey, _second) = server_in(dir.path()).await;
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let (code, body) = fetch(&mut a.client, channel, 0, 0).await;
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(bodies(&seen), vec![b"before the restart".to_vec()]);
 
@@ -430,7 +431,7 @@ async fn a_public_channel_outlives_its_membership_and_a_private_one_does_not() {
     // The public room is still there and its admin, who is no longer a member,
     // can still see it and close it.
     let (code, body) = info(&mut a.client, open).await;
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     assert!(ChannelInfo::decode(&body).unwrap().members.is_empty());
 
     // The private one went with its last member.
@@ -560,7 +561,7 @@ async fn marks(client: &mut Client, channel: [u8; 32]) -> Marks {
         .post("/channel/cursors", ByChannel { channel }.encode(TYPE_CURSORS))
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     Marks::decode(&body).unwrap()
 }
 
@@ -868,7 +869,11 @@ async fn mine_answers_about_the_caller_and_nobody_else() {
     let mut anon = Client::connect(addr, &server_pub).await.unwrap();
     let (code, body) = anon.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     assert_eq!(code, 403, "an unidentified caller was answered");
-    assert!(String::from_utf8_lossy(&body).contains("no_identity"));
+    assert_eq!(
+        Refusal::decode(&body).unwrap().code,
+        Code::NoIdentity,
+        "an unidentified caller should be told why"
+    );
 }
 
 #[tokio::test]

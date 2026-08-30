@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
+use sqex_proto::refusal::{Code, Refusal};
 use sqex_proto::room::{Join, Leave, MAX_MEMBERS, RoomId, Roster};
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -51,7 +52,7 @@ async fn join(client: &mut Client, room: &RoomId, me: PubKey) -> Roster {
         .post("/room/join", Join::new(room, &me).encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", Refusal::decode(&body).map(|r| r.to_string()).unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned()));
     Roster::decode(&body).unwrap()
 }
 
@@ -171,8 +172,11 @@ async fn a_room_holds_only_so_many_and_refuses_the_rest() {
         .post("/room/join", Join::new(&room, &late_id).encode())
         .await
         .unwrap();
-    assert_eq!(code, 507, "{}", String::from_utf8_lossy(&body));
-    assert!(String::from_utf8_lossy(&body).contains("full"));
+    let r = Refusal::decode(&body).expect("a refused join says why");
+    assert_eq!(code, 507, "{r}");
+    // Was `contains("full")`, which would have been satisfied by `pool_full`,
+    // `channel_full` or `recipient_full` just as readily.
+    assert_eq!(r.code, Code::RoomFull);
 
     // Nobody was evicted to make space, and the room still works.
     let (first, first_id) = &mut clients[0];

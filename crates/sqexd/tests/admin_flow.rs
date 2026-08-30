@@ -258,13 +258,25 @@ async fn full_admin_flow() {
     );
 
     // A non-admin signer is rejected.
-    assert_eq!(
-        client
-            .admin(Op::WhitelistDisable, &server_pub, &outsider)
-            .await
-            .0,
-        403,
-        "outsider is not an admin"
+    let (outsider_status, outsider_body) = client
+        .admin(Op::WhitelistDisable, &server_pub, &outsider)
+        .await;
+    assert_eq!(outsider_status, 403, "outsider is not an admin");
+
+    // **This route still answers JSON, and this assertion is why.** Every other
+    // refusal on this exchange is a binary `Refusal` now. `/admin/command` is
+    // read by `sqnr::flow::sign_and_submit`, an external crate pinned by tag,
+    // which parses the body with `from_slice(..).unwrap_or(Null)` and then
+    // takes `error` and `detail` out of it. Converting this route would not
+    // fail there — it would quietly become a refusal with no reason. Asserting
+    // on the parsed fields rather than the raw bytes so that a change of
+    // wording stays free and a change of *format* does not.
+    let refusal: serde_json::Value = serde_json::from_slice(&outsider_body)
+        .expect("/admin/command must answer JSON — see sqnr::flow::sign_and_submit");
+    assert_eq!(refusal["error"].as_str(), Some("not_admin"));
+    assert!(
+        refusal["detail"].is_string(),
+        "sqnr reads `detail` as a string"
     );
 
     // Replay: reuse a consumed nonce.

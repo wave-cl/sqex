@@ -330,7 +330,19 @@ async fn one_connection_carries_several_streams_and_then_refuses() {
     }
 
     match sqex_chat::events::Stream::open(&client).await {
-        Err(sqex_chat::events::Refusal::Status(429)) => {}
+        Err(sqex_chat::events::Refusal::Status(429, said)) => {
+            // The reason survives the layer, which is the point of carrying the
+            // body: a bare 429 does not tell the operator how many streams they
+            // are allowed, and the exchange has just said so.
+            let r = sqex_proto::refusal::Refusal::decode(&said)
+                .expect("a refused stream carries a refusal");
+            assert_eq!(r.code, sqex_proto::refusal::Code::TooManyStreams);
+            let detail = r.detail.expect("the cap is worth stating");
+            assert!(
+                detail.contains(&sqexd::events::MAX_PER_IDENTITY.to_string()),
+                "the detail should name the cap, said {detail:?}"
+            );
+        }
         Err(other) => panic!("expected 429 past the cap, got {other:?}"),
         Ok(_) => panic!("the exchange kept a stream past its own cap"),
     }

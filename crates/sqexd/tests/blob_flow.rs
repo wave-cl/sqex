@@ -124,7 +124,7 @@ async fn upload(
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     let up = Begun::decode(&body).unwrap().upload;
 
     for (i, s) in sealed.iter().enumerate() {
@@ -146,7 +146,7 @@ async fn upload(
         .post("/blob/commit", Commit { upload: up, blob: id }.encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "{}", common::said(&body));
     Committed::decode(&body).unwrap().stored
 }
 
@@ -177,7 +177,7 @@ async fn a_file_survives_the_round_trip_and_the_exchange_never_sees_it() {
         .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "create: {}", String::from_utf8_lossy(&body));
+    assert_eq!(code, 200, "create: {}", common::said(&body));
     let joining = signer(pubkey, 22).action_outside(
         channel,
         instance_for(channel, 0),
@@ -572,7 +572,7 @@ async fn the_last_member_leaving_takes_the_blobs_with_them() {
             )
             .await
             .unwrap();
-        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(code, 200, "{}", common::said(&body));
     }
 
     assert_eq!(

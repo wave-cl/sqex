@@ -22,6 +22,7 @@ use sqex_proto::room::{MAX_MEMBERS, Member, Roster, TTL_SECS};
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
+use sqex_proto::refusal::Code;
 
 /// Why a join was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,15 @@ impl JoinError {
     pub fn as_str(&self) -> &'static str {
         match self {
             JoinError::Full => "room is full",
+        }
+    }
+
+    /// The wire code for this refusal. Exhaustive on purpose: a new variant is
+    /// a compile error here until it is given one, which is what keeps the
+    /// registry from drifting away from the enum it describes.
+    pub fn code(&self) -> Code {
+        match self {
+            JoinError::Full => Code::RoomFull,
         }
     }
 }
