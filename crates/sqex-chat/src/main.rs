@@ -35,6 +35,7 @@ use sqex_proto::timeline::{Deletion, Timeline};
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::Signer;
 use sqex_proto::channel::{Role, Visibility};
+use sqex_proto::credential::Credential;
 use sqnr_core::PubKey;
 
 mod ui;
@@ -261,6 +262,19 @@ async fn run(cli: Cli) -> Result<(), String> {
     interface(chat).await
 }
 
+/// Whether a credential was written for this client.
+///
+/// Compared against the client's **device** key and never the account it acts
+/// for. A credential's `delegate` is a device; a client that has already been
+/// linked acts for an account that is somebody else's key. Comparing against
+/// the account passes exactly once — on a fresh client, where `me` falls back
+/// to `device` — and then refuses the renewal SIP-22 expects a device to make
+/// before its credential expires, with a message naming the wrong key as the
+/// reason.
+fn credential_is_for(credential: &Credential, device: &PubKey) -> bool {
+    &credential.delegate == device
+}
+
 /// The device operations that talk to the exchange.
 async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> {
     match cmd {
@@ -311,13 +325,14 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
             let raw = bs58::decode(credential.trim())
                 .into_vec()
                 .map_err(|e| format!("that is not base58: {e}"))?;
-            let credential = sqex_proto::credential::Credential::decode(&raw)
+            let credential = Credential::decode(&raw)
                 .map_err(|e| format!("bad credential: {e}"))?;
-            if credential.delegate != chat.me {
+            if !credential_is_for(&credential, &chat.device()) {
                 return Err(format!(
                     "that credential names {}, not this client ({}) — \
                      a credential is bound to the device it was written for",
-                    credential.delegate, chat.me
+                    credential.delegate,
+                    chat.device()
                 ));
             }
             chat.register_self(&credential)
@@ -2945,6 +2960,31 @@ mod tests {
     use super::*;
     use sqex_proto::message::{Body, Post as SipPost};
     use sqex_proto::timeline::{Received, Verdict};
+
+    /// A credential is addressed to a device, so a client that has been linked
+    /// — where the account is somebody else's key — must still recognise one
+    /// written for it. This is the case the check got wrong: it compared
+    /// against the account, which equals the device only on a client that has
+    /// never been linked, so the first claim passed and every renewal after it
+    /// was refused with a message naming the wrong key.
+    #[test]
+    fn a_credential_is_recognised_by_device_and_not_by_account() {
+        let account = PubKey::new([1; 32]);
+        let device = PubKey::new([2; 32]);
+        let cred = |delegate: PubKey| Credential {
+            account,
+            delegate,
+            scope: "chat".to_string(),
+            issued: 0,
+            not_after: 0,
+            signature: [0; 64],
+        };
+
+        assert!(credential_is_for(&cred(device), &device));
+        // Written for the account key rather than this client: not ours, even
+        // though it is our account that signed it.
+        assert!(!credential_is_for(&cred(account), &device));
+    }
 
     fn conv(peer: u8, label: &str) -> Open {
         Open {
