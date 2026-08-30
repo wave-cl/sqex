@@ -36,6 +36,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha512};
 use sqex_proto::channel_key::{ChannelKey, Replay};
+use sqex_proto::entry_sig::GENESIS;
 use sqex_proto::prekey::{KIND_FALLBACK, KIND_ONE_TIME, Pool, PoolState};
 use sqnr_core::PubKey;
 
@@ -116,6 +117,18 @@ CREATE TABLE IF NOT EXISTS cursor (
     since    INTEGER NOT NULL DEFAULT 0,
     msg_seq  INTEGER NOT NULL DEFAULT 0,
     epoch    INTEGER NOT NULL DEFAULT 0
+);
+-- SIP-31 chain state: where this device stands in each channel.
+--
+-- Ours to keep, and the reason we keep it rather than asking is in SIP-31: a
+-- client that took the exchange's reported position on trust could be told a
+-- lower one, sign a second entry at a position it had already used, and produce
+-- a fork that reads as its own misconduct. We resume from the greater of this
+-- and what we are told.
+CREATE TABLE IF NOT EXISTS chain (
+    channel   BLOB PRIMARY KEY,
+    chain_seq INTEGER NOT NULL,
+    head      BLOB    NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -879,6 +892,46 @@ impl Store {
                 params![&channel[..], since as i64],
             )
             .map_err(storage("set since"))?;
+        Ok(())
+    }
+
+    /// Where we last signed in this channel: the **next** position to use, and
+    /// the link to put in it. `(0, GENESIS)` when we have signed nothing here.
+    pub fn chain(&self, channel: &[u8; 32]) -> Result<(u64, [u8; 32])> {
+        let row: Option<(i64, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT chain_seq, head FROM chain WHERE channel = ?1",
+                params![&channel[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage("read chain"))?;
+        Ok(match row {
+            None => (0, GENESIS),
+            Some((seq, head)) => (
+                seq as u64 + 1,
+                head.try_into().unwrap_or(GENESIS),
+            ),
+        })
+    }
+
+    /// Record a chain step the exchange **accepted**.
+    ///
+    /// Called after the request succeeds, not before it — unlike `set_msg_seq`,
+    /// which is recorded first because a burnt nonce costs nothing and a reused
+    /// one costs two plaintexts. A position is only spent once something is in
+    /// the log at it, so a refused request leaves the chain where it was.
+    pub fn set_chain(&self, channel: &[u8; 32], chain_seq: u64, head: &[u8; 32]) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO chain (channel, chain_seq, head) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (channel) DO UPDATE SET
+                     chain_seq = MAX(chain_seq, ?2),
+                     head      = CASE WHEN ?2 >= chain_seq THEN ?3 ELSE head END",
+                params![&channel[..], chain_seq as i64, &head[..]],
+            )
+            .map_err(storage("set chain"))?;
         Ok(())
     }
 

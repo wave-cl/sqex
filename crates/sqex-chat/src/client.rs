@@ -6,8 +6,11 @@
 //! because the exchange is either unable or is the party being constrained.
 
 use sqex_proto::channel::{
-    Ack, ByAccount, ByChannel, ByTarget, ChannelInfo, Create, Entries, Fetch, Invite, Invitee,
-    KIND_MEMBER, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
+    Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
+    EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
+    EVENT_RETENTION, EVENT_ROTATED,
+    Entries, Entry, Fetch, Invite, Invitee,
+    KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
     Marks, Membership, Mine, Mines, Post, Posted, Retain, Role, TYPE_CLOSE, TYPE_CURSORS,
     TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, Visibility, direct_message_id,
 };
@@ -16,6 +19,13 @@ use sqex_proto::channel_key::{
     seal_envelope,
 };
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
+use sqex_proto::entry_sig::{
+    ActionTerms, EntryTerms, GENESIS, Place, link, sign_action, sign_entry, verify_entry,
+    verify_entry_hashed,
+};
+use sqex_proto::timeline::Verdict;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use sqex_proto::device::{AdmissionRequest, Device, Devices, ListDevices, Register, Revoke};
 use sqex_proto::blob::Attachment;
 use sqex_proto::profile::{
@@ -333,6 +343,13 @@ pub struct Chat {
     /// all per device, which is the distinction SIP-17 and SIP-22 exist to
     /// draw — two clients under one identity must not share a subkey.
     device: PubKey,
+    /// The exchange we are talking to, bound into every SIP-31 signature.
+    ///
+    /// Required rather than defaulted: a direct message's identifier derives
+    /// from its two accounts, so the same conversation has identical channel
+    /// bytes everywhere, and a signature that did not name the exchange would
+    /// verify in another one's copy of it.
+    exchange: PubKey,
     store: Store,
 }
 
@@ -341,11 +358,18 @@ impl Chat {
     /// prekeys for, and counts messages with. The **account** it acts for is
     /// usually the same key, and is not once the client has been linked to
     /// one, which is what `device claim` records.
-    pub fn new(client: Client, seed: [u8; 32], device: PubKey, store: Store) -> Chat {
+    pub fn new(
+        client: Client,
+        seed: [u8; 32],
+        device: PubKey,
+        exchange: PubKey,
+        store: Store,
+    ) -> Chat {
         let me = store.account().ok().flatten().unwrap_or(device);
         Chat {
             client,
             seed,
+            exchange,
             endpoint: None,
             link: Link::Up,
             attempts: 0,
@@ -356,6 +380,223 @@ impl Chat {
             device,
             store,
         }
+    }
+
+    /// A `ChannelInfo` carrying nothing but what a caller fills in.
+    ///
+    /// Used where a signature is needed before there is a channel to ask about
+    /// — creating one, where the creator proposes the incarnation itself.
+    fn empty_info() -> ChannelInfo {
+        ChannelInfo {
+            visibility: Visibility::Private,
+            epoch: 0,
+            instance: [0u8; 32],
+            retention_secs: 0,
+            max_entries: 0,
+            first: 0,
+            last: 0,
+            my_msg_seq: 0,
+            my_chain_seq: 0,
+            my_chain_head: GENESIS,
+            now: 0,
+            members: Vec::new(),
+            name: String::new(),
+            topic: String::new(),
+        }
+    }
+
+    /// Check an entry the way SIP-31 requires, as far as this client can.
+    ///
+    /// **Step one of two.** The signature proves *a key* signed; it says
+    /// nothing about whose key it is. Binding the device to the account is
+    /// SIP-20's credential, and this client takes that binding from SIP-22's
+    /// registry — which the exchange verified when the device was enrolled —
+    /// rather than re-checking a credential of its own. That is weaker, and it
+    /// is weaker in a specific way worth naming: it trusts this exchange to
+    /// have checked, which a replica carrying somebody else's log must not.
+    ///
+    /// A system entry carries no signature of its own; its actor's is inside
+    /// the body, and the exchange verified it before writing the row.
+    fn verdict_for(&self, channel: &[u8; 32], instance: [u8; 32], e: &Entry, chain: &mut HashMap<PubKey, (u64, [u8; 32])>) -> Verdict {
+        if e.kind == KIND_SYSTEM {
+            return Verdict::Valid;
+        }
+        let terms = EntryTerms {
+            place: Place { exchange: self.exchange, instance, channel: *channel },
+            account: e.account,
+            device: e.device,
+            epoch: e.epoch,
+            msg_seq: e.msg_seq,
+            expires_after: e.expires_after,
+            chain_seq: e.chain_seq,
+            prev: e.prev,
+            body: &e.body,
+        };
+        // A tombstone's body is gone, so the hash it committed to is the only
+        // thing left to check against — which is exactly why the commitment is
+        // to the hash and not the bytes.
+        let signed = if e.body.is_empty() && e.body_hash != Sha256::digest(&[] as &[u8]).as_slice() {
+            verify_entry_hashed(&terms, &e.body_hash, &e.sig)
+        } else {
+            verify_entry(&terms, &e.sig)
+        };
+        if !signed {
+            return Verdict::Forged;
+        }
+        let input = terms.input_hashed(&e.body_hash);
+        match chain.get(&e.device) {
+            Some(&(seq, head)) if e.chain_seq == seq && e.prev == head => {
+                chain.insert(e.device, (e.chain_seq + 1, link(&input)));
+                Verdict::Valid
+            }
+            Some(&(seq, _)) if e.chain_seq == seq => {
+                chain.insert(e.device, (e.chain_seq + 1, link(&input)));
+                Verdict::Fork
+            }
+            Some(_) => {
+                chain.insert(e.device, (e.chain_seq + 1, link(&input)));
+                Verdict::Gap
+            }
+            // The first entry we have seen from this device in this range. We
+            // may simply have started reading in the middle, which is ordinary,
+            // so continuity is claimed from here rather than backwards.
+            None => {
+                chain.insert(e.device, (e.chain_seq + 1, link(&input)));
+                Verdict::Valid
+            }
+        }
+    }
+
+    /// Where a signature for `channel` must be made, given what `info` told us.
+    fn place(&self, channel: &[u8; 32], info: &ChannelInfo) -> Place {
+        Place {
+            exchange: self.exchange,
+            instance: info.instance,
+            channel: *channel,
+        }
+    }
+
+    /// The next SIP-31 chain position and link for this channel.
+    ///
+    /// **The greater of what we remember and what we are told**, never the
+    /// exchange's report alone. An exchange that under-reported would otherwise
+    /// have us sign a second time at a position already used, and the resulting
+    /// fork would read as this client's misconduct rather than as its own. The
+    /// same discipline `send_body` already applies to the SIP-17 counter, for a
+    /// different reason and with the same shape.
+    fn chain_at(&self, channel: &[u8; 32], info: &ChannelInfo) -> Result<(u64, [u8; 32])> {
+        let (mine, head) = self.store.chain(channel)?;
+        Ok(if mine >= info.my_chain_seq {
+            (mine, head)
+        } else {
+            (info.my_chain_seq, info.my_chain_head)
+        })
+    }
+
+    /// Create a channel, signing for every membership event it will write.
+    ///
+    /// The creator proposes the incarnation, because SIP-31 binds it into every
+    /// signature and the exchange has minted nothing at the moment we sign. Two
+    /// answers come back with `created: 0` and mean different things: we are
+    /// already a member, which is the idempotent case and needs nothing; or we
+    /// are returning to a direct message we had left, where the incarnation
+    /// that stands is not the one we proposed. Only in the second do we sign
+    /// again — this time for a `joined` rather than an `added`, which is the
+    /// event that actually gets written, and which we could not have known to
+    /// sign for before asking.
+    async fn create_signed(&mut self, mut req: Create) -> Result<Created> {
+        let instance = {
+            use rand_core::RngCore;
+            let mut b = [0u8; 32];
+            rand_core::OsRng.fill_bytes(&mut b);
+            b
+        };
+        req.instance = instance;
+        let (actions, _head) = self.actions_for_create(&req, instance)?;
+        req.actions = actions;
+
+        let out = self.post("/channel/create", req.encode()).await?;
+        let ack = Created::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        if ack.created || ack.instance == instance || ack.instance == [0u8; 32] {
+            return Ok(ack);
+        }
+
+        // Returning. Sign a `joined` against the incarnation that stands.
+        let info = ChannelInfo {
+            instance: ack.instance,
+            my_chain_seq: 0,
+            my_chain_head: GENESIS,
+            ..Self::empty_info()
+        };
+        let (action, _head) = self.sign_action_at(&req.channel, &info, EVENT_JOINED, &self.me, &[])?;
+        req.instance = ack.instance;
+        req.actions = vec![action];
+        let out = self.post("/channel/create", req.encode()).await?;
+        Created::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// One `added` per invitee, in list order, against the proposed instance,
+    /// with the chain head they leave behind.
+    fn actions_for_create(
+        &self,
+        req: &Create,
+        instance: [u8; 32],
+    ) -> Result<(Vec<Action>, [u8; 32])> {
+        let info = ChannelInfo {
+            instance,
+            my_chain_seq: 0,
+            my_chain_head: GENESIS,
+            ..Self::empty_info()
+        };
+        let mut out = Vec::with_capacity(req.invites.len());
+        // A create is this device's first act in a channel that did not exist,
+        // so the chain starts here and each invitee takes the next position.
+        let (start, mut prev) = self.chain_at(&req.channel, &info)?;
+        for (n, i) in req.invites.iter().enumerate() {
+            let terms = ActionTerms {
+                place: self.place(&req.channel, &info),
+                actor: self.me,
+                actor_device: self.device,
+                event: EVENT_ADDED,
+                subject: i.account,
+                arg: &[i.role as u8],
+                chain_seq: start + n as u64,
+                prev,
+            };
+            let sig =
+                sign_action(&self.seed, &terms).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            let input = terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?;
+            prev = link(&input);
+            out.push(Action { chain_seq: start + n as u64, prev: terms.prev, sig });
+        }
+        Ok((out, prev))
+    }
+
+    /// Sign a membership action, and hand back the step to record if the
+    /// exchange accepts it.
+    fn sign_action_at(
+        &self,
+        channel: &[u8; 32],
+        info: &ChannelInfo,
+        event: u8,
+        subject: &PubKey,
+        arg: &[u8],
+    ) -> Result<(Action, [u8; 32])> {
+        let (chain_seq, prev) = self.chain_at(channel, info)?;
+        let terms = ActionTerms {
+            place: self.place(channel, info),
+            actor: self.me,
+            actor_device: self.device,
+            event,
+            subject: *subject,
+            arg,
+            chain_seq,
+            prev,
+        };
+        let sig = sign_action(&self.seed, &terms)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let input = terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?;
+        Ok((Action { chain_seq, prev, sig }, link(&input)))
     }
 
     /// Where to dial when the connection is lost.
@@ -761,10 +1002,12 @@ impl Chat {
     /// changing anything, so this is also the ordinary way to reopen one.
     pub async fn open_dm(&mut self, them: &PubKey) -> Result<[u8; 32]> {
         let channel = self.dm_with(them);
-        self.post(
-            "/channel/create",
-            Create {
+        self.create_signed(Create {
                 channel,
+                // Both are filled in by `create_signed`, which proposes the
+                // incarnation and signs one action per invitee against it.
+                instance: [0u8; 32],
+                actions: Vec::new(),
                 visibility: Visibility::Private,
                 retention_secs: RETENTION_SECS,
                 max_entries: 0,
@@ -777,10 +1020,8 @@ impl Chat {
                     account: *them,
                     role: Role::Admin,
                 }],
-            }
-            .encode(),
-        )
-        .await?;
+            })
+            .await?;
 
         self.collect_keys(&channel).await?;
         Ok(channel)
@@ -889,6 +1130,23 @@ impl Chat {
                 skipped.first().copied().unwrap_or(self.me),
             ));
         }
+        // A put that advances the epoch writes a `rotated` system entry, so it
+        // signs for it. A same-epoch put writes none and carries no action —
+        // which is why who published which envelope stays a transport
+        // observation, and SIP-31 names that as its nearest residual gap.
+        let info = self.info(channel).await?;
+        let rotating = epoch > info.epoch;
+        let signed = if rotating {
+            Some(self.sign_action_at(
+                channel,
+                &info,
+                EVENT_ROTATED,
+                &self.me,
+                &epoch.to_be_bytes(),
+            )?)
+        } else {
+            None
+        };
         let body = self
             .post(
                 "/channel/key/put",
@@ -896,12 +1154,16 @@ impl Chat {
                     channel: *channel,
                     epoch,
                     envelopes,
+                    action: signed.as_ref().map(|(a, _)| *a),
                 }
                 .encode(),
             )
             .await?;
         let ack = PutAck::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         if ack.accepted {
+            if let Some((a, head)) = signed {
+                self.store.set_chain(channel, a.chain_seq, &head)?;
+            }
             self.store.put_key(channel, epoch, &key)?;
         } else {
             // Somebody else minted the same epoch first. One `Put` wins and the
@@ -993,6 +1255,11 @@ impl Chat {
                     account,
                     posted,
                     kind,
+                    // What this client verified when the entry arrived. The
+                    // store keeps no signatures, so nothing can be re-checked
+                    // here — which is only honest because `poll` refuses to
+                    // write an entry that failed.
+                    verdict: Verdict::Valid,
                     tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
                     body: plain.and_then(|p| Body::decode(&p).ok().flatten()),
                 },
@@ -1104,6 +1371,9 @@ impl Chat {
                         channel: *channel,
                         epoch: info.epoch,
                         envelopes: vec![envelope],
+                        // The current epoch: this adds an envelope and rotates
+                        // nothing, so there is no system entry to sign for.
+                        action: None,
                     }
                     .encode(),
                 )
@@ -1190,10 +1460,12 @@ impl Chat {
             use rand_core::RngCore;
             rand_core::OsRng.fill_bytes(&mut channel);
         }
-        self.post(
-            "/channel/create",
-            Create {
+        self.create_signed(Create {
                 channel,
+                // Both are filled in by `create_signed`, which proposes the
+                // incarnation and signs one action per invitee against it.
+                instance: [0u8; 32],
+                actions: Vec::new(),
                 visibility: Visibility::Private,
                 retention_secs: RETENTION_SECS,
                 max_entries: 0,
@@ -1206,10 +1478,8 @@ impl Chat {
                         role: Role::Member,
                     })
                     .collect(),
-            }
-            .encode(),
-        )
-        .await?;
+            })
+            .await?;
         self.ensure_epoch(&channel).await?;
         if !name.is_empty() {
             self.set_name(&channel, name).await?;
@@ -1229,20 +1499,20 @@ impl Chat {
             use rand_core::RngCore;
             rand_core::OsRng.fill_bytes(&mut channel);
         }
-        self.post(
-            "/channel/create",
-            Create {
+        self.create_signed(Create {
                 channel,
+                // Both are filled in by `create_signed`, which proposes the
+                // incarnation and signs one action per invitee against it.
+                instance: [0u8; 32],
+                actions: Vec::new(),
                 visibility: Visibility::Public,
                 retention_secs: RETENTION_SECS,
                 max_entries: 0,
                 name: name.chars().take(MAX_NAME).collect(),
                 topic: topic.chars().take(MAX_TOPIC).collect(),
                 invites: Vec::new(),
-            }
-            .encode(),
-        )
-        .await?;
+            })
+            .await?;
         Ok(channel)
     }
 
@@ -1263,12 +1533,37 @@ impl Chat {
 
     /// Join a public channel. A private one refuses, which is what stops its
     /// identifier being a way in.
-    pub async fn join(&mut self, channel: &[u8; 32]) -> Result<()> {
+    ///
+    /// `instance` comes from the directory record this channel was found in.
+    /// It has to: SIP-31 binds it into the signature, and `Info` — the other
+    /// place it appears — requires the membership this call is asking for.
+    pub async fn join(&mut self, channel: &[u8; 32], instance: [u8; 32]) -> Result<()> {
+        // Our own chain state, not the exchange's: we cannot ask, and we are
+        // the only party that could be harmed by a lower answer.
+        let (chain_seq, prev) = self.store.chain(channel)?;
+        let terms = ActionTerms {
+            place: Place { exchange: self.exchange, instance, channel: *channel },
+            actor: self.me,
+            actor_device: self.device,
+            event: EVENT_JOINED,
+            subject: self.me,
+            arg: &[],
+            chain_seq,
+            prev,
+        };
+        let sig = sign_action(&self.seed, &terms)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let head = link(&terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?);
         self.post(
             "/channel/join",
-            ByChannel { channel: *channel }.encode(TYPE_JOIN),
+            ByChannelSigned {
+                channel: *channel,
+                action: Action { chain_seq, prev, sig },
+            }
+            .encode(TYPE_JOIN),
         )
         .await?;
+        self.store.set_chain(channel, chain_seq, &head)?;
         Ok(())
     }
 
@@ -1290,16 +1585,24 @@ impl Chat {
     /// only, and refused in a direct message, where both parties are admins
     /// from the start and there is nobody to promote.
     pub async fn grant(&mut self, channel: &[u8; 32], who: &PubKey, role: Role) -> Result<()> {
+        let info = self.info(channel).await?;
+        // The role is in the signature: without it a signed promotion could be
+        // replayed as a demotion, which is the same request with one byte
+        // changed.
+        let event = if role == Role::Admin { EVENT_PROMOTED } else { EVENT_DEMOTED };
+        let (action, head) = self.sign_action_at(channel, &info, event, who, &[role as u8])?;
         self.post(
             "/channel/invite",
             Invite {
                 channel: *channel,
                 account: *who,
                 role,
+                action,
             }
             .encode(),
         )
         .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
         Ok(())
     }
 
@@ -1434,17 +1737,21 @@ impl Chat {
     /// it. Rotating instead would deny it, which is a different decision and
     /// not one to make silently on somebody's behalf.
     pub async fn invite(&mut self, channel: &[u8; 32], who: &PubKey) -> Result<()> {
+        let info = self.info(channel).await?;
+        let (action, head) =
+            self.sign_action_at(channel, &info, EVENT_ADDED, who, &[Role::Member as u8])?;
         self.post(
             "/channel/invite",
             Invite {
                 channel: *channel,
                 account: *who,
                 role: Role::Member,
+                action,
             }
             .encode(),
         )
         .await?;
-        let info = self.info(channel).await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
         let key = self
             .store
             .key(channel, info.epoch)?
@@ -1464,6 +1771,9 @@ impl Chat {
                     channel: *channel,
                     epoch: info.epoch,
                     envelopes,
+                    // Handing the current key to a new member. No rotation, so
+                    // no system entry and nothing to sign for.
+                    action: None,
                 }
                 .encode(),
             )
@@ -1513,16 +1823,21 @@ impl Chat {
         channel: &[u8; 32],
         who: &PubKey,
     ) -> Result<()> {
+        let info = self.info(channel).await?;
+        let (action, head) =
+            self.sign_action_at(channel, &info, EVENT_ADDED, who, &[Role::Member as u8])?;
         self.post(
             "/channel/invite",
             Invite {
                 channel: *channel,
                 account: *who,
                 role: Role::Member,
+                action,
             }
             .encode(),
         )
         .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
         Ok(())
     }
 
@@ -1534,15 +1849,19 @@ impl Chat {
     /// read everything posted after they left from the exchange's own copy —
     /// or from anyone who forwards it.
     pub async fn remove(&mut self, channel: &[u8; 32], who: &PubKey) -> Result<()> {
+        let info = self.info(channel).await?;
+        let (action, head) = self.sign_action_at(channel, &info, EVENT_REMOVED, who, &[])?;
         self.post(
             "/channel/remove",
             ByAccount {
                 channel: *channel,
                 account: *who,
+                action,
             }
             .encode(TYPE_REMOVE),
         )
         .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
         let info = self.info(channel).await?;
         let to = self.devices_of(&members_of(&info)).await?;
         self.mint_epoch(channel, info.epoch + 1, &to).await?;
@@ -1551,11 +1870,19 @@ impl Chat {
 
     /// Leave a channel.
     pub async fn leave(&mut self, channel: &[u8; 32]) -> Result<()> {
+        let info = self.info(channel).await?;
+        let me = self.me;
+        let (action, head) = self.sign_action_at(channel, &info, EVENT_LEFT, &me, &[])?;
         self.post(
             "/channel/leave",
-            ByChannel { channel: *channel }.encode(TYPE_LEAVE),
+            ByChannelSigned {
+                channel: *channel,
+                action,
+            }
+            .encode(TYPE_LEAVE),
         )
         .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
         Ok(())
     }
 
@@ -1708,6 +2035,15 @@ impl Chat {
                 "retention is {MIN_RETENTION} to {MAX_RETENTION} seconds"
             )));
         }
+        let info = self.info(channel).await?;
+        // The pair travels in the signature. A bare "somebody changed
+        // retention" would let a signed request be replayed with different
+        // numbers, which is the whole of what this request decides.
+        let mut arg = Vec::with_capacity(8);
+        arg.extend_from_slice(&retention_secs.to_be_bytes());
+        arg.extend_from_slice(&max_entries.to_be_bytes());
+        let (action, head) =
+            self.sign_action_at(channel, &info, EVENT_RETENTION, &self.me, &arg)?;
         let body = self
             .post(
                 "/channel/retain",
@@ -1715,11 +2051,13 @@ impl Chat {
                     channel: *channel,
                     retention_secs,
                     max_entries,
+                    action,
                 }
                 .encode(),
             )
             .await?;
         Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
         Ok(())
     }
 
@@ -2051,6 +2389,25 @@ impl Chat {
         // while reusing one costs the confidentiality of two messages.
         self.store.set_msg_seq(channel, epoch, msg_seq)?;
 
+        // SIP-31. Signed over the body **as posted** — ciphertext here, plain
+        // in a public channel — so that anybody can check who wrote it without
+        // holding a key. The chain position is the greater of what we remember
+        // and what the exchange reports, never its report alone.
+        let (chain_seq, prev) = self.chain_at(channel, &info)?;
+        let terms = EntryTerms {
+            place: self.place(channel, &info),
+            account: self.me,
+            device: self.device,
+            epoch,
+            msg_seq,
+            expires_after: 0,
+            chain_seq,
+            prev,
+            body: &sealed,
+        };
+        let sig = sign_entry(&self.seed, &terms);
+        let head = link(&terms.input());
+
         let out = self
             .post(
                 "/channel/post",
@@ -2059,11 +2416,18 @@ impl Chat {
                     epoch,
                     msg_seq,
                     expires_after: 0,
+                    chain_seq,
+                    prev,
+                    sig,
                     body: sealed,
                 }
                 .encode(),
             )
             .await?;
+        // Only now. A chain position is spent when something is in the log at
+        // it, so a refused post leaves the chain where it was — the opposite of
+        // the counter above, and for the opposite reason.
+        self.store.set_chain(channel, chain_seq, &head)?;
         let posted = Posted::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))?;
 
         // Keep what we just said, rather than waiting for the exchange to hand
@@ -2205,6 +2569,11 @@ impl Chat {
             .collect();
 
         let mut replay = self.store.replay_for(channel)?;
+        // SIP-31 chain state per device, over this run of entries. Continuity
+        // is claimed from the first entry seen from each device rather than
+        // backwards, because starting to read in the middle of a channel is
+        // ordinary and is not a gap anybody caused.
+        let mut seen_chains: HashMap<PubKey, (u64, [u8; 32])> = HashMap::new();
         let mut last = since;
         for e in &entries.entries {
             last = last.max(e.seq);
@@ -2245,6 +2614,30 @@ impl Chat {
             // a sealed tombstone has nothing to unseal, so opening it fails
             // exactly as a missing key does.
             let tombstone = e.body.is_empty();
+            // SIP-31, before anything is stored or shown: an entry nobody
+            // signed for is not a message, and folding it first would put it in
+            // front of a reader while the check was still pending.
+            let verdict = self.verdict_for(channel, info.instance, e, &mut seen_chains);
+            if verdict == Verdict::Forged {
+                // Not stored, not folded, and not counted as read. `history`
+                // rebuilds from this store without the signatures — they are
+                // not kept — so anything written here is taken on trust later,
+                // and the only way that stays honest is to write nothing that
+                // failed to verify now.
+                timeline.apply(
+                    &Received {
+                        seq: e.seq,
+                        account: e.account,
+                        posted: e.posted,
+                        kind: e.kind,
+                        tombstone,
+                        body: None,
+                        verdict,
+                    },
+                    &admins,
+                );
+                continue;
+            }
             self.store.put_message(
                 channel,
                 Kept {
@@ -2280,6 +2673,7 @@ impl Chat {
                     kind: e.kind,
                     tombstone,
                     body,
+                    verdict,
                 },
                 &admins,
             );

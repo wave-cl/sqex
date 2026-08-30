@@ -70,7 +70,7 @@ async fn chat_at(addr: SocketAddr, server_pub: [u8; 32], b: u8, store_path: &Pat
     let (seed, me) = identity(b);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(store_path)).unwrap();
-    let mut chat = Chat::new(client, seed, me, store);
+    let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.top_up_prekeys().await.unwrap();
     chat
 }
@@ -441,7 +441,7 @@ async fn linked_device(
     let (seed, device) = identity(b);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(store)).unwrap();
-    let mut second = Chat::new(client, seed, device, store);
+    let mut second = Chat::new(client, seed, device, PubKey::new(server_pub), store);
     second.top_up_prekeys().await.unwrap();
     second
 }

@@ -30,6 +30,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use sha2::{Digest, Sha512};
 use sqnr_core::{Error, PubKey, Result};
 
+use crate::channel::{ACTION_LEN, Action};
+
 /// Domain separator for a sender's subkey.
 pub const KEY_CONTEXT: &[u8] = b"sqex-channel-key-v1";
 /// Domain separator for sealing an epoch key to a device.
@@ -346,12 +348,20 @@ pub struct Put {
     pub channel: [u8; 32],
     pub epoch: u32,
     pub envelopes: Vec<Envelope>,
+    /// SIP-31 signature for the rotation this put performs, present exactly
+    /// when `epoch` advances the channel's current one.
+    ///
+    /// A same-epoch put adds envelopes and writes no system entry, so it has
+    /// nothing to sign for. Who published which envelope therefore remains a
+    /// transport observation — SIP-31 names that as its nearest residual gap
+    /// rather than closing it here.
+    pub action: Option<Action>,
 }
 
 impl Put {
     pub fn encode(&self) -> Vec<u8> {
         let total: usize = self.envelopes.iter().map(|e| e.wire_len()).sum();
-        let mut out = Vec::with_capacity(39 + total);
+        let mut out = Vec::with_capacity(40 + ACTION_LEN + total);
         out.push(TYPE_PUT);
         out.extend_from_slice(&self.channel);
         out.extend_from_slice(&self.epoch.to_be_bytes());
@@ -364,6 +374,13 @@ impl Put {
             out.extend_from_slice(&e.ephemeral);
             out.extend_from_slice(&(e.ciphertext.len() as u32).to_be_bytes());
             out.extend_from_slice(&e.ciphertext);
+        }
+        match &self.action {
+            Some(a) => {
+                out.push(1);
+                a.write(&mut out);
+            }
+            None => out.push(0),
         }
         out
     }
@@ -390,6 +407,28 @@ impl Put {
             let e = read_envelope(b, &mut o, true)?;
             envelopes.push(e);
         }
+        if o >= b.len() {
+            return Err(Error::Malformed("put carries no rotation flag".into()));
+        }
+        let action = match b[o] {
+            0 => {
+                o += 1;
+                None
+            }
+            1 => {
+                if b.len() < o + 1 + ACTION_LEN {
+                    return Err(Error::Malformed("put claims a rotation and is short".into()));
+                }
+                let a = Action::read(b, o + 1);
+                o += 1 + ACTION_LEN;
+                Some(a)
+            }
+            other => {
+                return Err(Error::Malformed(format!(
+                    "put rotation flag is {other}, want 0 or 1"
+                )));
+            }
+        };
         if o != b.len() {
             return Err(Error::Malformed(format!(
                 "put has {} trailing bytes",
@@ -400,6 +439,7 @@ impl Put {
             channel: b[1..33].try_into().unwrap(),
             epoch: u32::from_be_bytes(b[33..37].try_into().unwrap()),
             envelopes,
+            action,
         })
     }
 }
@@ -766,8 +806,13 @@ mod tests {
             channel: [4u8; 32],
             epoch: 1,
             envelopes: vec![env.clone()],
+            action: Some(Action { chain_seq: 3, prev: [1; 32], sig: [2; 64] }),
         };
         assert_eq!(Put::decode(&put.encode()).unwrap(), put);
+
+        // A same-epoch put writes no system entry and signs for nothing.
+        let unsigned = Put { action: None, ..put.clone() };
+        assert_eq!(Put::decode(&unsigned.encode()).unwrap(), unsigned);
 
         // Got omits the recipient, since it only ever answers one.
         let got = Got {
@@ -792,6 +837,7 @@ mod tests {
             channel: [4u8; 32],
             epoch: 1,
             envelopes: vec![env],
+            action: None,
         };
         assert!(Put::decode(&put.encode()).is_err());
     }

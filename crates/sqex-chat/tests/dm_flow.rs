@@ -69,7 +69,7 @@ async fn chat_at(
     let (seed, me) = identity(b);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(store_path)).unwrap();
-    let mut chat = Chat::new(client, seed, me, store);
+    let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.top_up_prekeys().await.unwrap();
     chat
 }
@@ -957,7 +957,7 @@ async fn a_stranger_finds_a_public_channel_and_joins_it() {
     assert_eq!(listing.total, 1);
     assert_eq!(listing.channels[0].channel, channel);
     assert_eq!(listing.channels[0].name, "rustaceans");
-    stranger.join(&channel).await.unwrap();
+    join_public(&mut stranger, channel).await.unwrap();
 
     let mut t = Timeline::new();
     let got = stranger.poll(&channel, &mut t, 0).await.unwrap();
@@ -1024,7 +1024,7 @@ async fn a_private_channel_refuses_a_join() {
     // Not in the directory under any query.
     assert!(stranger.find("", 0).await.unwrap().channels.is_empty());
     // And knowing the identifier does not help.
-    assert!(stranger.join(&channel).await.is_err());
+    assert!(join_public(&mut stranger, channel).await.is_err());
     let mut t = Timeline::new();
     assert!(stranger.poll(&channel, &mut t, 0).await.is_err());
 }
@@ -1040,7 +1040,7 @@ async fn a_public_channel_a_person_joined_comes_back_from_mine() {
     let mut joiner = chat_at(addr, server_pub, 9, &joiner_store).await;
 
     let channel = alice.create_public("the pub", "open to all").await.unwrap();
-    joiner.join(&channel).await.unwrap();
+    join_public(&mut joiner, channel).await.unwrap();
 
     let mine = joiner.mine().await.unwrap();
     assert_eq!(mine.len(), 1);
@@ -1089,7 +1089,7 @@ async fn link_device(
     // Rebuilt so it picks the account up, as a real client would on next start.
     let client = Client::connect_as(addr, &server_pub, &identity(b).0).await.unwrap();
     let store = Store::open(&identity(b).0, Some(store)).unwrap();
-    let mut second = Chat::new(client, identity(b).0, identity(b).1, store);
+    let mut second = Chat::new(client, identity(b).0, identity(b).1, PubKey::new(server_pub), store);
     second.top_up_prekeys().await.unwrap();
     second
 }
@@ -1766,6 +1766,7 @@ async fn words_deleted_before_we_learned_to_forget_them_are_cleared_on_reload() 
         Client::connect_as(addr, &server_pub, &seed).await.unwrap(),
         seed,
         me,
+        PubKey::new(server_pub),
         Store::open(&seed, Some(&path)).unwrap(),
     );
     let folded = chat.history(&channel, &[them]).unwrap();
@@ -1781,4 +1782,24 @@ async fn words_deleted_before_we_learned_to_forget_them_are_cleared_on_reload() 
         Some(Vec::new()),
         "the words of an already-deleted message survived the reload"
     );
+}
+
+/// Join a public channel the way the client does: find it in the directory,
+/// and sign against the incarnation that row carries.
+///
+/// A joiner cannot ask `Info` for it — that needs the membership the join is
+/// acquiring — so the directory is where it comes from. A channel that is not
+/// listed yields a zero incarnation, which is what makes the refusal tests
+/// still test a refusal rather than a lookup failure.
+async fn join_public(chat: &mut Chat, channel: [u8; 32]) -> Result<(), sqex_chat::ChatError> {
+    let instance = match chat.find("", 0).await {
+        Ok(listing) => listing
+            .channels
+            .iter()
+            .find(|c| c.channel == channel)
+            .map(|c| c.instance)
+            .unwrap_or([0u8; 32]),
+        Err(_) => [0u8; 32],
+    };
+    chat.join(&channel, instance).await
 }

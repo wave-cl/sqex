@@ -11,14 +11,17 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{
-    ByChannel, ByTarget, ChannelInfo, Create, Cursor, EVENT_JOINED, EVENT_RETENTION, Entries,
-    Fetch, KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_RETENTION, MIN_RETENTION, Mark, Marks,
-    Post, Posted, Retain, Role, SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
+    Action, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Cursor, EVENT_JOINED, EVENT_LEFT, EVENT_RETENTION, Entries,
+    Fetch, KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_RETENTION, MIN_RETENTION, Mark, Marks, Posted, Retain, Role, SignalOut, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_INFO, TYPE_JOIN,
     TYPE_LEAVE, TYPE_REDACT, Visibility,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
+
+mod common;
+use common::{Signer, instance_for};
+use sqex_proto::entry_sig::GENESIS;
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
@@ -58,50 +61,102 @@ fn identity(b: u8) -> ([u8; 32], PubKey) {
     (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
 }
 
-async fn as_identity(addr: SocketAddr, server_pub: [u8; 32], seed: [u8; 32]) -> Client {
-    Client::connect_as(addr, &server_pub, &seed).await.unwrap()
+/// A connection and what signs on it.
+///
+/// They travel together because every write to a channel is now signed, and a
+/// test holding them apart would have to thread a seed through every call.
+/// `client` is public so the many helpers that only read still take a `Client`.
+struct Peer {
+    client: Client,
+    signer: Signer,
 }
 
-fn public(channel: [u8; 32], name: &str) -> Create {
-    Create {
-        channel,
-        visibility: Visibility::Public,
-        retention_secs: 3600,
-        max_entries: 0,
-        name: name.into(),
-        topic: String::new(),
-        invites: vec![],
+async fn as_identity(addr: SocketAddr, server_pub: [u8; 32], seed: [u8; 32]) -> Peer {
+    let key = PubKey::new(SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+    Peer {
+        client: Client::connect_as(addr, &server_pub, &seed).await.unwrap(),
+        signer: Signer::new(seed, key, server_pub),
     }
 }
 
-async fn create(client: &mut Client, req: &Create) -> u16 {
-    let (code, _) = client.post("/channel/create", req.encode()).await.unwrap();
+fn public(signer: &Signer, channel: [u8; 32], name: &str) -> Create {
+    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, name, vec![])
+}
+
+/// Create a public channel, signed by the peer that is creating it.
+///
+/// A separate helper because the request has to be built from the signer
+/// before the connection is borrowed to send it.
+async fn create_public(peer: &mut Peer, channel: [u8; 32], name: &str) -> u16 {
+    let req = public(&peer.signer, channel, name);
+    create(peer, &req).await
+}
+
+/// The signature for a retention change. The pair is what it authorises, so
+/// the pair is what it covers: a bare "somebody changed retention" would let a
+/// signed request be replayed with different numbers.
+async fn retention_action(
+    peer: &mut Peer,
+    channel: [u8; 32],
+    retention_secs: u32,
+    max_entries: u32,
+) -> Action {
+    let mut arg = Vec::with_capacity(8);
+    arg.extend_from_slice(&retention_secs.to_be_bytes());
+    arg.extend_from_slice(&max_entries.to_be_bytes());
+    let account = peer.signer.account;
+    peer.signer
+        .action(&mut peer.client, channel, EVENT_RETENTION, &account, &arg)
+        .await
+}
+
+async fn create(peer: &mut Peer, req: &Create) -> u16 {
+    let (code, _) = peer.client.post("/channel/create", req.encode()).await.unwrap();
     code
 }
 
-async fn join(client: &mut Client, channel: [u8; 32]) -> u16 {
-    let (code, _) = client
-        .post("/channel/join", ByChannel { channel }.encode(TYPE_JOIN))
+async fn join(peer: &mut Peer, channel: [u8; 32]) -> u16 {
+    // Signed against the incarnation this test chose when it created the
+    // channel. A joiner cannot ask `Info` for it — that needs the membership
+    // the join is acquiring — so in the real client it comes from the
+    // directory row the channel was found in.
+    let action = peer.signer.action_outside(
+        channel,
+        instance_for(channel, 0),
+        EVENT_JOINED,
+        &peer.signer.account,
+        &[],
+        0,
+        GENESIS,
+    );
+    let (code, _) = peer
+        .client
+        .post("/channel/join", ByChannelSigned { channel, action }.encode(TYPE_JOIN))
         .await
         .unwrap();
     code
 }
 
-async fn post(client: &mut Client, channel: [u8; 32], text: &[u8]) -> (u16, Vec<u8>) {
-    client
+async fn leave(peer: &mut Peer, channel: [u8; 32]) -> u16 {
+    let account = peer.signer.account;
+    let action = peer
+        .signer
+        .action(&mut peer.client, channel, EVENT_LEFT, &account, &[])
+        .await;
+    let (code, _) = peer
+        .client
         .post(
-            "/channel/post",
-            Post {
-                channel,
-                epoch: 0,
-                msg_seq: 0,
-                expires_after: 0,
-                body: text.to_vec(),
-            }
-            .encode(),
+            "/channel/leave",
+            ByChannelSigned { channel, action }.encode(TYPE_LEAVE),
         )
         .await
-        .unwrap()
+        .unwrap();
+    code
+}
+
+async fn post(peer: &mut Peer, channel: [u8; 32], text: &[u8]) -> (u16, Vec<u8>) {
+    let req = peer.signer.post(&mut peer.client, channel, 0, 0, text.to_vec()).await;
+    peer.client.post("/channel/post", req.encode()).await.unwrap()
 }
 
 async fn fetch(client: &mut Client, channel: [u8; 32], since: u64, wait: u16) -> (u16, Vec<u8>) {
@@ -157,7 +212,7 @@ async fn two_members_hold_a_conversation_in_one_order() {
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "planning")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "planning").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
 
     for text in [&b"one"[..], b"two", b"three"] {
@@ -166,7 +221,7 @@ async fn two_members_hold_a_conversation_in_one_order() {
     assert_eq!(post(&mut b, channel, b"four").await.0, 200);
 
     // The order is the exchange's, and it is the same order for everybody.
-    let (code, body) = fetch(&mut b, channel, 0, 0).await;
+    let (code, body) = fetch(&mut b.client, channel, 0, 0).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(
@@ -182,11 +237,11 @@ async fn two_members_hold_a_conversation_in_one_order() {
     assert_eq!(events(&seen).len(), 1);
     assert_eq!(events(&seen)[0].event, EVENT_JOINED);
 
-    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let (_, body) = fetch(&mut a.client, channel, 0, 0).await;
     assert_eq!(bodies(&Entries::decode(&body).unwrap()), bodies(&seen));
 
     // The creator is an admin and the joiner is not.
-    let (_, body) = info(&mut a, channel).await;
+    let (_, body) = info(&mut a.client, channel).await;
     let seen = ChannelInfo::decode(&body).unwrap();
     assert_eq!(seen.members.len(), 2);
     let mine = seen.members.iter().find(|m| m.account == alice).unwrap();
@@ -206,16 +261,24 @@ async fn a_stranger_cannot_read_a_channel_it_has_not_joined() {
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut m = as_identity(addr, pubkey, mallory_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "members only")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "members only").await, 200);
     assert_eq!(post(&mut a, channel, b"secret enough").await.0, 200);
 
-    assert_eq!(fetch(&mut m, channel, 0, 0).await.0, 403);
-    assert_eq!(post(&mut m, channel, b"hello").await.0, 403);
-    assert_eq!(info(&mut m, channel).await.0, 403);
+    assert_eq!(fetch(&mut m.client, channel, 0, 0).await.0, 403);
+    // Built without asking `Info`, which a stranger is refused anyway — the
+    // refusal under test is the post's, not the lookup's.
+    let stranger = m
+        .signer
+        .post_outside(channel, instance_for(channel, 0), 0, 0, b"hello".to_vec());
+    assert_eq!(
+        m.client.post("/channel/post", stranger.encode()).await.unwrap().0,
+        403
+    );
+    assert_eq!(info(&mut m.client, channel).await.0, 403);
 
     // Joining is what changes it, and a public channel lets anyone.
     assert_eq!(join(&mut m, channel).await, 200);
-    let (code, body) = fetch(&mut m, channel, 0, 0).await;
+    let (code, body) = fetch(&mut m.client, channel, 0, 0).await;
     assert_eq!(code, 200);
     assert_eq!(bodies(&Entries::decode(&body).unwrap()), vec![b"secret enough".to_vec()]);
 }
@@ -230,17 +293,17 @@ async fn a_parked_fetch_is_answered_by_a_post() {
 
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
-    assert_eq!(create(&mut a, &public(channel, "waiting")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "waiting").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
 
     // Bob's join is itself an entry, so catch up first: a fetch only parks
     // when there is genuinely nothing waiting.
-    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let (_, body) = fetch(&mut b.client, channel, 0, 0).await;
     let caught_up = Entries::decode(&body).unwrap().last;
 
     let waiter = tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let (code, body) = fetch(&mut b, channel, caught_up, 20).await;
+        let (code, body) = fetch(&mut b.client, channel, caught_up, 20).await;
         (code, body, started.elapsed())
     });
 
@@ -263,10 +326,10 @@ async fn a_fetch_with_nothing_to_say_returns_empty_rather_than_hanging() {
     let (alice_seed, _) = identity(51);
     let channel = [4u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
-    assert_eq!(create(&mut a, &public(channel, "quiet")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "quiet").await, 200);
 
     let started = std::time::Instant::now();
-    let (code, body) = fetch(&mut a, channel, 0, 1).await;
+    let (code, body) = fetch(&mut a.client, channel, 0, 1).await;
     assert_eq!(code, 200);
     assert!(Entries::decode(&body).unwrap().entries.is_empty());
     assert!(started.elapsed() >= std::time::Duration::from_millis(900));
@@ -283,7 +346,7 @@ async fn the_log_survives_a_restart() {
     let (addr, pubkey, first) = server_in(dir.path()).await;
     {
         let mut a = as_identity(addr, pubkey, alice_seed).await;
-        assert_eq!(create(&mut a, &public(channel, "durable")).await, 200);
+        assert_eq!(create_public(&mut a, channel, "durable").await, 200);
         assert_eq!(post(&mut a, channel, b"before the restart").await.0, 200);
     }
     first.abort();
@@ -291,7 +354,7 @@ async fn the_log_survives_a_restart() {
 
     let (addr, pubkey, _second) = server_in(dir.path()).await;
     let mut a = as_identity(addr, pubkey, alice_seed).await;
-    let (code, body) = fetch(&mut a, channel, 0, 0).await;
+    let (code, body) = fetch(&mut a.client, channel, 0, 0).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(bodies(&seen), vec![b"before the restart".to_vec()]);
@@ -310,14 +373,14 @@ async fn retention_by_count_drops_the_oldest() {
     let channel = [6u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
 
-    let mut req = public(channel, "short memory");
+    let mut req = public(&a.signer, channel, "short memory");
     req.max_entries = 3;
     assert_eq!(create(&mut a, &req).await, 200);
 
     for i in 0..6u8 {
         assert_eq!(post(&mut a, channel, &[b'a' + i]).await.0, 200);
     }
-    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let (_, body) = fetch(&mut a.client, channel, 0, 0).await;
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(bodies(&seen), vec![vec![b'd'], vec![b'e'], vec![b'f']]);
 
@@ -336,31 +399,32 @@ async fn a_public_channel_outlives_its_membership_and_a_private_one_does_not() {
 
     let open = [7u8; 32];
     let shut = [8u8; 32];
-    assert_eq!(create(&mut a, &public(open, "a place")).await, 200);
-    let mut priv_req = public(shut, "");
+    assert_eq!(create_public(&mut a, open, "a place").await, 200);
+    let mut priv_req = public(&a.signer, shut, "");
     priv_req.channel = shut;
     priv_req.visibility = Visibility::Private;
     assert_eq!(create(&mut a, &priv_req).await, 200);
 
-    let leave = |c: [u8; 32]| ByChannel { channel: c }.encode(TYPE_LEAVE);
-    assert_eq!(a.post("/channel/leave", leave(open)).await.unwrap().0, 200);
-    assert_eq!(a.post("/channel/leave", leave(shut)).await.unwrap().0, 200);
+    assert_eq!(leave(&mut a, open).await, 200);
+    assert_eq!(leave(&mut a, shut).await, 200);
 
     // The public room is still there and its admin, who is no longer a member,
     // can still see it and close it.
-    let (code, body) = info(&mut a, open).await;
+    let (code, body) = info(&mut a.client, open).await;
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     assert!(ChannelInfo::decode(&body).unwrap().members.is_empty());
 
     // The private one went with its last member.
-    assert_eq!(info(&mut a, shut).await.0, 404);
+    assert_eq!(info(&mut a.client, shut).await.0, 404);
 
     let (code, _) = a
+
+        .client
         .post("/channel/close", ByChannel { channel: open }.encode(TYPE_CLOSE))
         .await
         .unwrap();
     assert_eq!(code, 200);
-    assert_eq!(info(&mut a, open).await.0, 404);
+    assert_eq!(info(&mut a.client, open).await.0, 404);
 }
 
 #[tokio::test]
@@ -370,13 +434,13 @@ async fn the_directory_lists_public_channels_only() {
     let (alice_seed, _) = identity(91);
     let mut a = as_identity(addr, pubkey, alice_seed).await;
 
-    assert_eq!(create(&mut a, &public([10u8; 32], "rust talk")).await, 200);
-    assert_eq!(create(&mut a, &public([11u8; 32], "garden talk")).await, 200);
-    let mut hidden = public([12u8; 32], "should not appear");
+    assert_eq!(create_public(&mut a, [10u8; 32], "rust talk").await, 200);
+    assert_eq!(create_public(&mut a, [11u8; 32], "garden talk").await, 200);
+    let mut hidden = public(&a.signer, [12u8; 32], "should not appear");
     hidden.visibility = Visibility::Private;
     assert_eq!(create(&mut a, &hidden).await, 200);
 
-    let (code, body) = a
+    let (code, body) = a.client
         .post(
             "/channel/list",
             List {
@@ -396,7 +460,7 @@ async fn the_directory_lists_public_channels_only() {
 
     // A private channel's name is not stored at the exchange at all, so it
     // cannot leak through a query that happens to match it.
-    let (_, body) = a
+    let (_, body) = a.client
         .post(
             "/channel/list",
             List {
@@ -417,7 +481,7 @@ async fn retention_outside_the_permitted_range_is_refused() {
     let (alice_seed, _) = identity(101);
     let mut a = as_identity(addr, pubkey, alice_seed).await;
 
-    let mut too_short = public([13u8; 32], "blink");
+    let mut too_short = public(&a.signer, [13u8; 32], "blink");
     too_short.retention_secs = MIN_RETENTION - 1;
     assert_eq!(create(&mut a, &too_short).await, 409);
 }
@@ -429,13 +493,25 @@ async fn an_anonymous_connection_has_no_membership() {
     let (alice_seed, _) = identity(111);
     let channel = [14u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
-    assert_eq!(create(&mut a, &public(channel, "named callers only")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "named callers only").await, 200);
 
     // Client::connect does not advertise an identity (SIP-3 is opt-in), and
     // every channel route refuses a connection carrying none.
     let mut anon = Client::connect(addr, &pubkey).await.unwrap();
     assert_eq!(fetch(&mut anon, channel, 0, 0).await.0, 403);
-    assert_eq!(join(&mut anon, channel).await, 403);
+    // Built by hand rather than through `join`, which would first ask
+    // `/channel/info` to sign against — and be refused there instead, which is
+    // the right answer for the wrong reason. The signature is never reached:
+    // no identity is refused before anything is verified.
+    let unsigned = ByChannelSigned {
+        channel,
+        action: Action { chain_seq: 0, prev: [0; 32], sig: [0; 64] },
+    };
+    let (code, _) = anon
+        .post("/channel/join", unsigned.encode(TYPE_JOIN))
+        .await
+        .unwrap();
+    assert_eq!(code, 403);
 }
 
 async fn cursor(client: &mut Client, channel: [u8; 32], read: u64, receipts: bool) -> u16 {
@@ -477,7 +553,7 @@ async fn delivery_is_observed_and_reading_is_asserted() {
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "receipts")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "receipts").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
     for t in [&b"one"[..], b"two", b"three"] {
         assert_eq!(post(&mut a, channel, t).await.0, 200);
@@ -485,31 +561,31 @@ async fn delivery_is_observed_and_reading_is_asserted() {
 
     // Bob collects everything. He never says so — asking for what comes after 0
     // and being handed three entries is the exchange watching him do it.
-    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let (_, body) = fetch(&mut b.client, channel, 0, 0).await;
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(messages(&seen).len(), 3);
     // Four entries in all: Bob's join, then three messages.
     assert_eq!(seen.entries.len(), 4);
     let last = seen.last;
 
-    let m = marks(&mut b, channel).await;
+    let m = marks(&mut b.client, channel).await;
     assert_eq!(mark_of(&m, &bob).delivered, last);
     assert_eq!(mark_of(&m, &bob).read, 0, "collected is not read");
 
-    assert_eq!(cursor(&mut b, channel, 2, true).await, 200);
-    let m = marks(&mut a, channel).await;
+    assert_eq!(cursor(&mut b.client, channel, 2, true).await, 200);
+    let m = marks(&mut a.client, channel).await;
     assert_eq!(mark_of(&m, &bob).read, 2);
     let delivered = mark_of(&m, &bob).delivered;
 
     // A mark cannot run ahead of what was delivered: a client may not claim to
     // have read further than it collected.
-    assert_eq!(cursor(&mut b, channel, 99, true).await, 200);
-    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, delivered);
+    assert_eq!(cursor(&mut b.client, channel, 99, true).await, 200);
+    assert_eq!(mark_of(&marks(&mut a.client, channel).await, &bob).read, delivered);
 
     // Nor backwards.
-    assert_eq!(cursor(&mut b, channel, 1, true).await, 200);
-    assert_eq!(mark_of(&marks(&mut a, channel).await, &bob).read, delivered);
-    assert_eq!(mark_of(&marks(&mut a, channel).await, &alice).delivered, 0);
+    assert_eq!(cursor(&mut b.client, channel, 1, true).await, 200);
+    assert_eq!(mark_of(&marks(&mut a.client, channel).await, &bob).read, delivered);
+    assert_eq!(mark_of(&marks(&mut a.client, channel).await, &alice).delivered, 0);
 }
 
 #[tokio::test]
@@ -525,24 +601,24 @@ async fn opting_out_of_receipts_withholds_others_reading_but_not_their_delivery(
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "quiet reader")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "quiet reader").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
     assert_eq!(post(&mut a, channel, b"hello").await.0, 200);
 
-    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let (_, body) = fetch(&mut a.client, channel, 0, 0).await;
     let last = Entries::decode(&body).unwrap().last;
-    assert_eq!(cursor(&mut a, channel, last, true).await, 200);
+    assert_eq!(cursor(&mut a.client, channel, last, true).await, 200);
 
     // Bob reads, and opts out.
-    fetch(&mut b, channel, 0, 0).await;
-    assert_eq!(cursor(&mut b, channel, last, false).await, 200);
+    fetch(&mut b.client, channel, 0, 0).await;
+    assert_eq!(cursor(&mut b.client, channel, last, false).await, 200);
 
-    let seen = marks(&mut b, channel).await;
+    let seen = marks(&mut b.client, channel).await;
     assert_eq!(mark_of(&seen, &alice).read, 0, "he gave nothing, he sees nothing");
     assert!(mark_of(&seen, &alice).delivered > 0, "delivery is never withheld");
 
     // Alice still gave hers, so she still sees his.
-    assert!(mark_of(&marks(&mut a, channel).await, &alice).read > 0);
+    assert!(mark_of(&marks(&mut a.client, channel).await, &alice).read > 0);
 }
 
 #[tokio::test]
@@ -555,7 +631,7 @@ async fn a_redaction_leaves_a_tombstone_and_a_stranger_cannot_make_one() {
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "regrets")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "regrets").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
     let (_, body) = post(&mut b, channel, b"said too much").await;
     let bobs = Posted::decode(&body).unwrap().seq;
@@ -566,20 +642,20 @@ async fn a_redaction_leaves_a_tombstone_and_a_stranger_cannot_make_one() {
     let (mallory_seed, _) = identity(143);
     let mut m = as_identity(addr, pubkey, mallory_seed).await;
     assert_eq!(join(&mut m, channel).await, 200);
-    let (code, _) = m.post("/channel/redact", redact(channel, bobs)).await.unwrap();
+    let (code, _) = m.client.post("/channel/redact", redact(channel, bobs)).await.unwrap();
     assert_eq!(code, 403);
 
     // Nor may an admin reach the exchange's own record of who did what: an
     // audit trail its subject can erase is not one.
-    let (code, _) = a.post("/channel/redact", redact(channel, 1)).await.unwrap();
+    let (code, _) = a.client.post("/channel/redact", redact(channel, 1)).await.unwrap();
     assert_eq!(code, 409, "a system entry is never redactable");
 
     // Its author may.
-    let (code, _) = b.post("/channel/redact", redact(channel, bobs)).await.unwrap();
+    let (code, _) = b.client.post("/channel/redact", redact(channel, bobs)).await.unwrap();
     assert_eq!(code, 200);
 
     // The entry survives as a gap, which is the record.
-    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let (_, body) = fetch(&mut a.client, channel, 0, 0).await;
     let seen = Entries::decode(&body).unwrap();
     let mine: Vec<_> = messages(&seen).into_iter().filter(|e| e.seq == bobs).collect();
     assert_eq!(mine.len(), 1, "the entry is still there");
@@ -588,10 +664,10 @@ async fn a_redaction_leaves_a_tombstone_and_a_stranger_cannot_make_one() {
     // An admin may redact somebody else's, which is the moderation path.
     let (_, body) = post(&mut b, channel, b"again").await;
     let again = Posted::decode(&body).unwrap().seq;
-    let (code, _) = a.post("/channel/redact", redact(channel, again)).await.unwrap();
+    let (code, _) = a.client.post("/channel/redact", redact(channel, again)).await.unwrap();
     assert_eq!(code, 200);
 
-    let (code, _) = a.post("/channel/redact", redact(channel, 99)).await.unwrap();
+    let (code, _) = a.client.post("/channel/redact", redact(channel, 99)).await.unwrap();
     assert_eq!(code, 404, "nothing to redact");
 }
 
@@ -605,10 +681,10 @@ async fn a_signal_reaches_the_others_once_and_is_never_stored() {
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "typing")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "typing").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
 
-    let (code, _) = a
+    let (code, _) = a.client
         .post(
             "/channel/signal",
             SignalOut {
@@ -622,7 +698,7 @@ async fn a_signal_reaches_the_others_once_and_is_never_stored() {
         .unwrap();
     assert_eq!(code, 200);
 
-    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let (_, body) = fetch(&mut b.client, channel, 0, 0).await;
     let seen = Entries::decode(&body).unwrap();
     assert_eq!(seen.signals.len(), 1);
     assert_eq!(seen.signals[0].account, alice);
@@ -630,11 +706,11 @@ async fn a_signal_reaches_the_others_once_and_is_never_stored() {
     assert!(messages(&seen).is_empty(), "a signal is not an entry");
 
     // Delivered at most once, and it left nothing behind.
-    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let (_, body) = fetch(&mut b.client, channel, 0, 0).await;
     assert!(Entries::decode(&body).unwrap().signals.is_empty());
 
     // The sender does not receive their own.
-    let (_, body) = fetch(&mut a, channel, 0, 0).await;
+    let (_, body) = fetch(&mut a.client, channel, 0, 0).await;
     assert!(Entries::decode(&body).unwrap().signals.is_empty());
 }
 
@@ -649,19 +725,19 @@ async fn a_parked_fetch_is_answered_by_a_signal_too() {
     let channel = [24u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
-    assert_eq!(create(&mut a, &public(channel, "waiting")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "waiting").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
 
-    let (_, body) = fetch(&mut b, channel, 0, 0).await;
+    let (_, body) = fetch(&mut b.client, channel, 0, 0).await;
     let caught_up = Entries::decode(&body).unwrap().last;
 
     let waiter = tokio::spawn(async move {
         let started = std::time::Instant::now();
-        let (code, body) = fetch(&mut b, channel, caught_up, 20).await;
+        let (code, body) = fetch(&mut b.client, channel, caught_up, 20).await;
         (code, body, started.elapsed())
     });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    a.post(
+    a.client.post(
         "/channel/signal",
         SignalOut {
             channel,
@@ -697,21 +773,21 @@ async fn an_invitee_can_discover_the_private_channel_they_were_added_to() {
     let mut b = as_identity(addr, server_pub, bob_seed).await;
 
     let channel = [0x33; 32];
-    let (code, _) = a
+    let req = a.signer.create(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![sqex_proto::channel::Invitee {
+            account: bob,
+            role: Role::Member,
+        }],
+    );
+    let (code, _) = a.client
         .post(
             "/channel/create",
-            Create {
-                channel,
-                visibility: Visibility::Private,
-                retention_secs: 3600,
-                max_entries: 0,
-                name: String::new(),
-                topic: String::new(),
-                invites: vec![sqex_proto::channel::Invitee {
-                    account: bob,
-                    role: Role::Member,
-                }],
-            }
+            req
             .encode(),
         )
         .await
@@ -720,6 +796,7 @@ async fn an_invitee_can_discover_the_private_channel_they_were_added_to() {
 
     // Bob was never told the identifier, and the directory will not say.
     let (code, body) = b
+        .client
         .post("/channel/list", sqex_proto::channel::List { offset: 0, query: String::new() }.encode())
         .await
         .unwrap();
@@ -730,7 +807,7 @@ async fn an_invitee_can_discover_the_private_channel_they_were_added_to() {
     );
 
     // He asks what he is in, and finds it.
-    let (code, body) = b.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let (code, body) = b.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     assert_eq!(code, 200);
     let mine = Mines::decode(&body).unwrap();
     assert_eq!(mine.total, 1);
@@ -739,7 +816,7 @@ async fn an_invitee_can_discover_the_private_channel_they_were_added_to() {
     assert_eq!(mine.channels[0].visibility, Visibility::Private);
     assert_eq!(mine.channels[0].role, Role::Member);
     // Alice created it, so she is its admin and sees the same channel.
-    let (_, body) = a.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let (_, body) = a.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     assert_eq!(Mines::decode(&body).unwrap().channels[0].role, Role::Admin);
 }
 
@@ -754,11 +831,11 @@ async fn mine_answers_about_the_caller_and_nobody_else() {
     let mut a = as_identity(addr, server_pub, alice_seed).await;
     let mut s = as_identity(addr, server_pub, stranger_seed).await;
 
-    create(&mut a, &public([0x41; 32], "alice's room")).await;
+    create_public(&mut a, [0x41; 32], "alice's room").await;
 
     // The request names no account, so there is no way to ask about one. A
     // stranger asking gets their own empty list, not hers.
-    let (code, body) = s.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let (code, body) = s.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     assert_eq!(code, 200);
     assert!(Mines::decode(&body).unwrap().channels.is_empty());
 
@@ -782,15 +859,16 @@ async fn mine_pages_and_reports_the_window_and_the_read_mark() {
         let mut id = [0u8; 32];
         id[0] = n as u8;
         id[1] = (n >> 8) as u8;
-        create(&mut a, &public(id, &format!("room {n}"))).await;
+        create_public(&mut a, id, &format!("room {n}")).await;
     }
 
-    let (_, body) = a.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let (_, body) = a.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     let first = Mines::decode(&body).unwrap();
     assert_eq!(first.total as usize, MAX_MINE + 5, "total counts them all");
     assert_eq!(first.channels.len(), MAX_MINE, "one reply is bounded");
 
     let (_, body) = a
+        .client
         .post("/channel/mine", Mine { offset: MAX_MINE as u32 }.encode())
         .await
         .unwrap();
@@ -805,11 +883,12 @@ async fn mine_pages_and_reports_the_window_and_the_read_mark() {
     post(&mut a, id, b"hello").await;
     post(&mut a, id, b"again").await;
     let (_, body) = a
+        .client
         .post("/channel/cursor", Cursor { channel: id, read: 1, receipts: true }.encode())
         .await
         .unwrap();
     let _ = body;
-    let (_, body) = a.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let (_, body) = a.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     let mine = Mines::decode(&body).unwrap();
     let row = mine.channels.iter().find(|m| m.channel == id).unwrap();
     assert_eq!(row.read, 1, "the read mark did not travel");
@@ -819,7 +898,7 @@ async fn mine_pages_and_reports_the_window_and_the_read_mark() {
 
 #[tokio::test]
 async fn leaving_removes_a_channel_from_mine() {
-    use sqex_proto::channel::{Mine, Mines, TYPE_LEAVE};
+    use sqex_proto::channel::{Mine, Mines};
 
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
@@ -829,16 +908,14 @@ async fn leaving_removes_a_channel_from_mine() {
     let mut b = as_identity(addr, server_pub, bob_seed).await;
 
     let channel = [0x55; 32];
-    create(&mut a, &public(channel, "a room")).await;
+    create_public(&mut a, channel, "a room").await;
     join(&mut b, channel).await;
 
-    let (_, body) = b.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    let (_, body) = b.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     assert_eq!(Mines::decode(&body).unwrap().channels.len(), 1);
 
-    b.post("/channel/leave", ByChannel { channel }.encode(TYPE_LEAVE))
-        .await
-        .unwrap();
-    let (_, body) = b.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
+    leave(&mut b, channel).await;
+    let (_, body) = b.client.post("/channel/mine", Mine { offset: 0 }.encode()).await.unwrap();
     assert!(
         Mines::decode(&body).unwrap().channels.is_empty(),
         "a channel somebody left is still listed as theirs"
@@ -856,19 +933,21 @@ async fn narrowing_retention_drops_what_now_falls_outside_it() {
     let channel = [21u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "a long memory")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "a long memory").await, 200);
     for i in 0..6u8 {
         assert_eq!(post(&mut a, channel, &[b'a' + i]).await.0, 200);
     }
-    assert_eq!(bodies(&Entries::decode(&fetch(&mut a, channel, 0, 0).await.1).unwrap()).len(), 6);
+    assert_eq!(bodies(&Entries::decode(&fetch(&mut a.client, channel, 0, 0).await.1).unwrap()).len(), 6);
 
-    let (code, _) = a
+    let action = retention_action(&mut a, channel, MIN_RETENTION, 3).await;
+    let (code, _) = a.client
         .post(
             "/channel/retain",
             Retain {
                 channel,
                 retention_secs: MIN_RETENTION,
                 max_entries: 3,
+                action,
             }
             .encode(),
         )
@@ -882,7 +961,7 @@ async fn narrowing_retention_drops_what_now_falls_outside_it() {
     // Two messages out of a limit of three, because the record of the change
     // itself is an entry and occupies one of the places. Worth knowing: asking
     // for a limit of two here keeps one message.
-    let seen = Entries::decode(&fetch(&mut a, channel, 0, 0).await.1).unwrap();
+    let seen = Entries::decode(&fetch(&mut a.client, channel, 0, 0).await.1).unwrap();
     assert_eq!(bodies(&seen), vec![vec![b'e'], vec![b'f']]);
 
     // And a reader is told where the surviving history starts, or it would
@@ -902,7 +981,7 @@ async fn narrowing_retention_drops_what_now_falls_outside_it() {
         "narrowing the window left no record of who did it"
     );
 
-    let info = ChannelInfo::decode(&info(&mut a, channel).await.1).unwrap();
+    let info = ChannelInfo::decode(&info(&mut a.client, channel).await.1).unwrap();
     assert_eq!(info.retention_secs, MIN_RETENTION);
     assert_eq!(info.max_entries, 3);
 }
@@ -917,7 +996,7 @@ async fn only_an_admin_may_change_retention() {
     let mut a = as_identity(addr, pubkey, alice_seed).await;
     let mut b = as_identity(addr, pubkey, bob_seed).await;
 
-    assert_eq!(create(&mut a, &public(channel, "not yours")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "not yours").await, 200);
     assert_eq!(join(&mut b, channel).await, 200);
     assert_eq!(post(&mut a, channel, b"keep me").await.0, 200);
 
@@ -925,14 +1004,15 @@ async fn only_an_admin_may_change_retention() {
         channel,
         retention_secs: MIN_RETENTION,
         max_entries: 1,
+        action: retention_action(&mut a, channel, MIN_RETENTION, 1).await,
     }
     .encode();
-    let (code, _) = b.post("/channel/retain", narrow.clone()).await.unwrap();
+    let (code, _) = b.client.post("/channel/retain", narrow.clone()).await.unwrap();
     assert_ne!(code, 200, "a member who is not an admin narrowed the window");
 
     // A member being able to do this would be a member being able to delete
     // everybody's history, so the refusal is the whole point.
-    let seen = Entries::decode(&fetch(&mut b, channel, 0, 0).await.1).unwrap();
+    let seen = Entries::decode(&fetch(&mut b.client, channel, 0, 0).await.1).unwrap();
     assert_eq!(bodies(&seen), vec![b"keep me".to_vec()]);
 }
 
@@ -943,18 +1023,20 @@ async fn retention_outside_the_permitted_range_is_refused_by_retain_too() {
     let (alice_seed, _) = identity(104);
     let channel = [23u8; 32];
     let mut a = as_identity(addr, pubkey, alice_seed).await;
-    assert_eq!(create(&mut a, &public(channel, "bounded")).await, 200);
+    assert_eq!(create_public(&mut a, channel, "bounded").await, 200);
 
     // Create enforces the range. Retain is a second door into the same field
     // and has to enforce it as well, or the bound is only a default.
     for secs in [0, MIN_RETENTION - 1, MAX_RETENTION + 1] {
-        let (code, _) = a
+        let action = retention_action(&mut a, channel, secs, 0).await;
+        let (code, _) = a.client
             .post(
                 "/channel/retain",
                 Retain {
                     channel,
                     retention_secs: secs,
                     max_entries: 0,
+                    action,
                 }
                 .encode(),
             )
@@ -963,6 +1045,6 @@ async fn retention_outside_the_permitted_range_is_refused_by_retain_too() {
         assert_ne!(code, 200, "retention of {secs} was accepted");
     }
 
-    let info = ChannelInfo::decode(&info(&mut a, channel).await.1).unwrap();
+    let info = ChannelInfo::decode(&info(&mut a.client, channel).await.1).unwrap();
     assert_eq!(info.retention_secs, 3600, "a refused change took effect");
 }

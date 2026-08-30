@@ -58,7 +58,7 @@ async fn chat_at(addr: SocketAddr, server_pub: [u8; 32], b: u8, store: &Path) ->
     let (seed, me) = identity(b);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(store)).unwrap();
-    let mut chat = Chat::new(client, seed, me, store);
+    let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.top_up_prekeys().await.unwrap();
     chat
 }
@@ -76,7 +76,7 @@ async fn joining_a_public_channel_leaves_the_joiner_able_to_read_it() {
     // Somebody else finds it in the directory and joins, which is the whole
     // of what a public channel offers.
     let mut joiner = chat_at(addr, server_pub, 41, &dir.path().join("b.db")).await;
-    joiner.join(&channel).await.unwrap();
+    join_public(&mut joiner, channel).await.unwrap();
 
     let info = joiner.info(&channel).await.unwrap();
     println!("epoch in force: {} | members: {}", info.epoch, info.members.len());
@@ -261,4 +261,20 @@ async fn the_directory_route_refuses_a_private_channel() {
     // Whatever the exchange holds for it, it is not the name.
     let info = admin.info(&channel).await.unwrap();
     assert_eq!(info.name, "", "the exchange learned a private channel's name");
+}
+
+/// Join a public channel the way the client does: find it in the directory,
+/// and sign against the incarnation that row carries.
+///
+/// A joiner cannot ask `Info` for it — that needs the membership the join is
+/// acquiring — so the directory is where it comes from.
+async fn join_public(chat: &mut Chat, channel: [u8; 32]) -> Result<(), sqex_chat::ChatError> {
+    let listing = chat.find("", 0).await?;
+    let instance = listing
+        .channels
+        .iter()
+        .find(|c| c.channel == channel)
+        .map(|c| c.instance)
+        .unwrap_or([0u8; 32]);
+    chat.join(&channel, instance).await
 }

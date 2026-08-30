@@ -19,6 +19,11 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
+mod common;
+use common::{Signer, instance_for};
+use sqex_proto::channel::{ByChannelSigned, EVENT_ADDED, EVENT_JOINED};
+use sqex_proto::entry_sig::GENESIS;
+
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
@@ -54,6 +59,12 @@ async fn peer(addr: SocketAddr, pubkey: [u8; 32], b: u8) -> (Client, PubKey) {
     )
 }
 
+/// What signs for identity `b` against this exchange (SIP-31).
+fn signer(pubkey: [u8; 32], b: u8) -> Signer {
+    let sk = SigningKey::from_bytes(&[b; 32]);
+    Signer::new(sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()), pubkey)
+}
+
 fn profile(name: &str, title: &str, flags: u8) -> Profile {
     Profile {
         flags,
@@ -86,16 +97,8 @@ async fn block(c: &mut Client, who: &PubKey, add: bool) -> u16 {
         .0
 }
 
-fn public(channel: [u8; 32]) -> Create {
-    Create {
-        channel,
-        visibility: Visibility::Public,
-        retention_secs: 3600,
-        max_entries: 0,
-        name: "shared".into(),
-        topic: String::new(),
-        invites: vec![],
-    }
+fn public(signer: &Signer, channel: [u8; 32]) -> Create {
+    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, "shared", vec![])
 }
 
 #[tokio::test]
@@ -126,7 +129,7 @@ async fn a_withheld_profile_looks_exactly_like_one_that_does_not_exist() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, pubkey, _h) = server_in(dir.path()).await;
     let (mut a, alice) = peer(addr, pubkey, 31).await;
-    let (mut b, _) = peer(addr, pubkey, 32).await;
+    let (mut b, bob) = peer(addr, pubkey, 32).await;
     let (_, never) = peer(addr, pubkey, 33).await;
     let channel = [1u8; 32];
 
@@ -142,10 +145,24 @@ async fn a_withheld_profile_looks_exactly_like_one_that_does_not_exist() {
 
     // Sharing a channel is the visibility rule, and it is a relationship the
     // exchange already knows.
-    a.post("/channel/create", public(channel).encode()).await.unwrap();
-    b.post("/channel/join", ByChannel { channel }.encode(sqex_proto::channel::TYPE_JOIN))
+    a.post("/channel/create", public(&signer(pubkey, 31), channel).encode())
         .await
         .unwrap();
+    let joining = signer(pubkey, 32).action_outside(
+        channel,
+        instance_for(channel, 0),
+        EVENT_JOINED,
+        &bob,
+        &[],
+        0,
+        GENESIS,
+    );
+    b.post(
+        "/channel/join",
+        ByChannelSigned { channel, action: joining }.encode(sqex_proto::channel::TYPE_JOIN),
+    )
+    .await
+    .unwrap();
     assert!(get(&mut b, &alice).await.found, "now they share a room");
 
     // And she always sees her own, whatever the flag says.
@@ -162,7 +179,7 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
 
     assert_eq!(block(&mut alice, &{ let (_, m) = peer(addr, pubkey, 42).await; m }, true).await, 200);
 
-    let mut req = public(channel);
+    let mut req = public(&signer(pubkey, 42), channel);
     req.visibility = Visibility::Private;
     req.name = String::new();
     mallory.post("/channel/create", req.encode()).await.unwrap();
@@ -171,6 +188,19 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
     invite.extend_from_slice(&channel);
     invite.extend_from_slice(alice_key.as_bytes());
     invite.push(Role::Member as u8);
+    // Mallory's first act in this channel, so position zero: the create had no
+    // invitees and spent nothing.
+    signer(pubkey, 42)
+        .action_outside(
+            channel,
+            instance_for(channel, 0),
+            EVENT_ADDED,
+            &alice_key,
+            &[Role::Member as u8],
+            0,
+            GENESIS,
+        )
+        .write(&mut invite);
     let (code, _) = mallory.post("/channel/invite", invite).await.unwrap();
     assert_eq!(code, 200, "the request succeeds, as it must");
 
@@ -206,16 +236,16 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
     let (code, _) = mallory
         .post(
             "/channel/create",
-            Create {
-                channel: dm,
-                visibility: Visibility::Private,
-                retention_secs: 3600,
-                max_entries: 0,
-                name: String::new(),
-                topic: String::new(),
-                invites: vec![Invitee { account: alice_key, role: Role::Admin }],
-            }
-            .encode(),
+            signer(pubkey, 52)
+                .create(
+                    dm,
+                    instance_for(dm, 0),
+                    Visibility::Private,
+                    3600,
+                    "",
+                    vec![Invitee { account: alice_key, role: Role::Admin }],
+                )
+                .encode(),
         )
         .await
         .unwrap();
@@ -231,27 +261,57 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
     // Unblocking and creating again lets Alice take her half of the
     // identifier, which is hers by arithmetic.
     assert_eq!(block(&mut alice, &mallory_key, false).await, 200);
-    let (code, _) = alice
+    // A fresh incarnation: Mallory's is retired, and the exchange refuses a
+    // repeat so the entries signed under it can never be replayed into the
+    // channel Alice is taking over.
+    let (code, body) = alice
         .post(
             "/channel/create",
-            Create {
-                channel: dm,
-                visibility: Visibility::Private,
-                retention_secs: 3600,
-                max_entries: 0,
-                name: String::new(),
-                topic: String::new(),
-                invites: vec![Invitee { account: mallory_key, role: Role::Admin }],
-            }
-            .encode(),
+            signer(pubkey, 51)
+                .create(
+                    dm,
+                    instance_for(dm, 1),
+                    Visibility::Private,
+                    3600,
+                    "",
+                    vec![Invitee { account: mallory_key, role: Role::Admin }],
+                )
+                .encode(),
         )
         .await
         .unwrap();
     assert_eq!(code, 200);
-    let (_, body) = alice
+    // She is *returning*, not taking the identifier over: Mallory's create put
+    // her in the channel and the block only kept her from being told. So the
+    // first create is answered `created: 0` with the incarnation that stands
+    // and changes nothing, and the second names it and signs the `joined` the
+    // exchange will actually write. One extra round trip, only here.
+    let standing = sqex_proto::channel::Created::decode(&body).unwrap().instance;
+    let me = signer(pubkey, 51);
+    let mut back = me.create(
+        dm,
+        standing,
+        Visibility::Private,
+        3600,
+        "",
+        vec![Invitee { account: mallory_key, role: Role::Admin }],
+    );
+    back.actions = vec![me.action_outside(
+        dm,
+        standing,
+        EVENT_JOINED,
+        &alice_key,
+        &[],
+        0,
+        GENESIS,
+    )];
+    let (code, body) = alice.post("/channel/create", back.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
+    let (code, body) = alice
         .post("/channel/info", ByChannel { channel: dm }.encode(TYPE_INFO))
         .await
         .unwrap();
+    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     assert_eq!(ChannelInfo::decode(&body).unwrap().members.len(), 2);
 }
 

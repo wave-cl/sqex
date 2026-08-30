@@ -32,8 +32,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use sqex_proto::channel::{
-    ABANDON_SECS, Invitee, ChannelInfo, Create, Directory, Entries, Entry, KIND_MEMBER,
+    ABANDON_SECS, Action, Invitee, ChannelInfo, Create, Directory, Entries, Entry, KIND_MEMBER,
     KIND_SYSTEM, Listing,
     EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
     EVENT_RETENTION, EVENT_ROTATED, MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled,
@@ -51,6 +52,7 @@ use sqex_proto::blob_store::{
 use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
 };
+use sqex_proto::entry_sig::{ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry};
 use sqnr_core::PubKey;
 use tokio::sync::Notify;
 
@@ -96,6 +98,19 @@ pub enum ChannelError {
     BadRetention,
     /// Removing the last admin while other members remain.
     LastAdmin,
+    /// SIP-31: the signature does not verify, or is absent.
+    ///
+    /// Checked here even though every receiver must check it too. SIP-19 places
+    /// its authority rules with receivers *because the exchange cannot check
+    /// them*; this one it can, since the signature and the device are both in
+    /// the clear — so refusing here means no entry is ever stored that every
+    /// receiver would reject.
+    BadSignature,
+    /// SIP-31: the chain position or link does not follow the one held.
+    BrokenChain,
+    /// SIP-31: a create reusing an instance this channel identifier has already
+    /// used, which would re-admit the entries signed under it.
+    UsedInstance,
     Storage,
 }
 
@@ -116,6 +131,9 @@ impl ChannelError {
             ChannelError::NoSuchBlob => "no_such_blob",
             ChannelError::NoSuchEntry => "no_such_entry",
             ChannelError::SystemEntry => "system_entry",
+            ChannelError::BadSignature => "bad_signature",
+            ChannelError::BrokenChain => "broken_chain",
+            ChannelError::UsedInstance => "used_instance",
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
@@ -149,7 +167,12 @@ impl ChannelError {
             | ChannelError::DirectMessage
             | ChannelError::NoPrekey
             | ChannelError::BadChunk
-            | ChannelError::SystemEntry => 409,
+            | ChannelError::SystemEntry
+            | ChannelError::BrokenChain
+            | ChannelError::UsedInstance => 409,
+            // A forged or absent signature is a refusal to authenticate what
+            // was sent, not a conflict with stored state.
+            ChannelError::BadSignature => 401,
             ChannelError::Storage => 500,
         }
     }
@@ -191,6 +214,15 @@ fn storage<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> ChannelError +
 
 pub struct Channels {
     db: Mutex<Connection>,
+    /// This exchange's own SIP-9 identity, bound into every SIP-31 signature.
+    ///
+    /// A direct message's identifier derives from its two accounts, so the same
+    /// conversation has identical channel bytes on every exchange in existence.
+    /// Without this in the signing input an entry lifts from one exchange into
+    /// another's copy of it and verifies there. Required at construction rather
+    /// than defaulted, because a default would be a fixed place that every
+    /// deployment shared.
+    exchange: PubKey,
     /// Stored entry bytes one channel may hold before the oldest are pruned.
     ///
     /// SIP-16 calls its numbers recommended values, and this one is the only
@@ -228,7 +260,25 @@ CREATE TABLE IF NOT EXISTS channel (
     -- When the current epoch was minted. SIP-17 lets a member who is not an
     -- admin advance the epoch when it revoked one of its own devices *since*
     -- this moment, so the exchange has to hold the moment.
-    epoch_at       INTEGER NOT NULL DEFAULT 0
+    epoch_at       INTEGER NOT NULL DEFAULT 0,
+    -- SIP-31: which incarnation of this identifier this is. A direct message's
+    -- id derives from its two accounts, so a destroyed one is recreated under
+    -- the same 32 bytes with its numbering restarted; without this marker in
+    -- every signature, the previous incarnation's entries verify against this
+    -- one. Proposed by the creator, because it has to be signed over before the
+    -- exchange has minted anything.
+    instance       BLOB    NOT NULL
+);
+-- Instances this channel identifier has already used, so that a recreation
+-- cannot reuse one and re-admit the entries signed under it.
+--
+-- Only direct messages can ever recreate an identifier — a random one that is
+-- destroyed is simply gone — so this grows with how often two people have
+-- destroyed and rebuilt their conversation, which is a small number.
+CREATE TABLE IF NOT EXISTS retired_instance (
+    channel  BLOB NOT NULL,
+    instance BLOB NOT NULL,
+    PRIMARY KEY (channel, instance)
 );
 -- Accounts this exchange has already shown the front door to.
 --
@@ -266,8 +316,29 @@ CREATE TABLE IF NOT EXISTS entry (
     expires_after INTEGER NOT NULL,
     epoch         INTEGER NOT NULL,
     msg_seq       INTEGER NOT NULL,
+    -- SIP-31. `chain_seq` is a chain position and deliberately not `msg_seq`,
+    -- which is an AEAD nonce and is 0 in a public channel where a chain still
+    -- has to run. `body_hash` is what the signature commits to in place of the
+    -- body, so a redaction can take the bytes and leave a signature that still
+    -- verifies.
+    chain_seq     INTEGER NOT NULL,
+    prev          BLOB    NOT NULL,
+    body_hash     BLOB    NOT NULL,
+    sig           BLOB    NOT NULL,
     body          BLOB    NOT NULL,
     PRIMARY KEY (channel, seq)
+);
+-- SIP-31 chain head per device per channel.
+--
+-- Kept independently of the entries for the reason `high_water` is: pruning
+-- removes entries, so the highest surviving position understates what was used,
+-- and a device resuming from an understated mark forks its own chain.
+CREATE TABLE IF NOT EXISTS chain (
+    channel   BLOB    NOT NULL,
+    device    BLOB    NOT NULL,
+    chain_seq INTEGER NOT NULL,
+    head      BLOB    NOT NULL,
+    PRIMARY KEY (channel, device)
 );
 CREATE TABLE IF NOT EXISTS high_water (
     channel BLOB    NOT NULL,
@@ -347,7 +418,7 @@ CREATE INDEX IF NOT EXISTS entry_by_age ON entry (posted);
 impl Channels {
     /// Open the log. `None` gives an in-memory database, which is what a
     /// memory-only deployment and every test get.
-    pub fn open(path: Option<&Path>) -> rusqlite::Result<Channels> {
+    pub fn open(path: Option<&Path>, exchange: PubKey) -> rusqlite::Result<Channels> {
         let db = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -361,11 +432,35 @@ impl Channels {
         // A deployed exchange has a `channel` table without `epoch_at`, and
         // `CREATE TABLE IF NOT EXISTS` will not add it.
         add_column(&db, "channel", "epoch_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // SIP-31's columns are deliberately *not* added this way, and carry no
+        // defaults. A database predating them is wiped rather than migrated,
+        // because a default would make an unsigned entry representable — and
+        // the whole guarantee is that one is not.
         Ok(Channels {
             db: Mutex::new(db),
+            exchange,
             max_channel_bytes: MAX_CHANNEL_BYTES,
             waiters: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Where a signature for `channel` must have been made: this exchange, that
+    /// channel, and the incarnation currently standing under that identifier.
+    fn place(&self, db: &Connection, channel: &[u8; 32]) -> Result<Place, ChannelError> {
+        let instance: Vec<u8> = db
+            .query_row(
+                "SELECT instance FROM channel WHERE id = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read instance"))?
+            .ok_or(ChannelError::NoSuchChannel)?;
+        Ok(Place {
+            exchange: self.exchange,
+            instance: instance.try_into().map_err(|_| ChannelError::Storage)?,
+            channel: *channel,
         })
     }
 
@@ -442,9 +537,10 @@ impl Channels {
     pub fn create(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         req: &Create,
         blocked: &dyn Fn(&PubKey, &PubKey) -> bool,
-    ) -> Result<(bool, u32), ChannelError> {
+    ) -> Result<(bool, u32, [u8; 32]), ChannelError> {
         if req.retention_secs < MIN_RETENTION || req.retention_secs > MAX_RETENTION {
             return Err(ChannelError::BadRetention);
         }
@@ -452,19 +548,23 @@ impl Channels {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin create"))?;
 
-        let existing: Option<u32> = tx
+        let existing: Option<(u32, [u8; 32])> = tx
             .query_row(
-                "SELECT epoch FROM channel WHERE id = ?1",
+                "SELECT epoch, instance FROM channel WHERE id = ?1",
                 params![&req.channel[..]],
-                |r| r.get::<_, i64>(0),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )
             .optional()
             .map_err(storage("read channel"))?
-            .map(|e| e as u32);
+            .map(|(e, i)| {
+                let i: [u8; 32] = i.try_into().map_err(|_| ChannelError::Storage)?;
+                Ok::<_, ChannelError>((e as u32, i))
+            })
+            .transpose()?;
 
-        if let Some(epoch) = existing {
+        if let Some((epoch, instance)) = existing {
             if role_of(&tx, &req.channel, caller).is_some() {
-                return Ok((false, epoch));
+                return Ok((false, epoch, instance));
             }
             // A direct message is the one case where a create may touch a
             // channel the caller is not in, and it has to be: the identifier is
@@ -472,9 +572,21 @@ impl Channels {
             // alone, one request would let a stranger sit in the channel
             // forever and deny two people the ability to ever talk.
             match dm_claim(&tx, &req.channel, caller, &req.invites)? {
-                DmClaim::None => return Ok((false, 0)),
+                // Reporting the real epoch or instance here would disclose how
+                // often a channel the caller cannot see has rotated, and
+                // therefore roughly how often somebody was removed from it.
+                DmClaim::None => return Ok((false, 0, [0u8; 32])),
                 // Returning after leaving: re-add them and keep the history.
                 DmClaim::Returning => {
+                    // The signature must name the incarnation that stands, and
+                    // a returning party cannot know it — they are not a member,
+                    // so nothing has told them. Hand it over and change
+                    // nothing; the client signs against it and creates again.
+                    // One extra round trip, only when returning to a direct
+                    // message you had left.
+                    if req.instance != instance {
+                        return Ok((false, epoch, instance));
+                    }
                     tx.execute(
                         "INSERT INTO member (channel, account, role, joined, present)
                          VALUES (?1, ?2, ?3, ?4, 1)
@@ -487,9 +599,18 @@ impl Channels {
                         ],
                     )
                     .map_err(storage("rejoin direct message"))?;
-                    write_system(&tx, &req.channel, EVENT_JOINED, caller, caller, now)?;
+                    let place = Place {
+                        exchange: self.exchange,
+                        instance,
+                        channel: req.channel,
+                    };
+                    let action = req.actions.first().ok_or(ChannelError::BadSignature)?;
+                    write_system(
+                        &tx, &place, &req.channel, EVENT_JOINED, caller, caller, device, &[],
+                        action, now,
+                    )?;
                     tx.commit().map_err(storage("commit rejoin"))?;
-                    return Ok((false, epoch));
+                    return Ok((false, epoch, instance));
                 }
                 // Somebody with no claim to this identifier is occupying it.
                 // Discarding is safe because the claim is provable and
@@ -521,10 +642,32 @@ impl Channels {
             }
         }
 
+        // An instance this identifier has used before would re-admit every
+        // entry signed under it, which is the whole reason the marker exists.
+        // Only a direct message can reach here twice — a random identifier that
+        // is destroyed is simply gone — so this set stays small.
+        let reused: bool = tx
+            .query_row(
+                "SELECT 1 FROM retired_instance WHERE channel = ?1 AND instance = ?2",
+                params![&req.channel[..], &req.instance[..]],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(storage("read retired instances"))?
+            .unwrap_or(false);
+        if reused {
+            return Err(ChannelError::UsedInstance);
+        }
+        tx.execute(
+            "INSERT INTO retired_instance (channel, instance) VALUES (?1, ?2)",
+            params![&req.channel[..], &req.instance[..]],
+        )
+        .map_err(storage("retire instance"))?;
+
         tx.execute(
             "INSERT INTO channel (id, visibility, retention_secs, max_entries, name, topic,
-                                  epoch, next_seq, creator, created, empty_since)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1, ?7, ?8, NULL)",
+                                  epoch, next_seq, creator, created, empty_since, instance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 1, ?7, ?8, NULL, ?9)",
             params![
                 &req.channel[..],
                 req.visibility as u8 as i64,
@@ -537,6 +680,7 @@ impl Channels {
                 if req.visibility == Visibility::Public { &req.topic } else { "" },
                 caller.as_bytes(),
                 now as i64,
+                &req.instance[..],
             ],
         )
         .map_err(storage("insert channel"))?;
@@ -553,13 +697,20 @@ impl Channels {
         )
         .map_err(storage("insert creator"))?;
 
-        for i in &req.invites {
+        let place = Place {
+            exchange: self.exchange,
+            instance: req.instance,
+            channel: req.channel,
+        };
+        for (n, i) in req.invites.iter().enumerate() {
             // A direct message created by somebody the other party has blocked
             // succeeds and simply does not add them, leaving a channel the
-            // caller is alone in and may post into indefinitely.
+            // caller is alone in and may post into indefinitely. The action at
+            // this position simply goes unused.
             if blocked(&i.account, caller) {
                 continue;
             }
+            let action = req.actions.get(n).ok_or(ChannelError::BadSignature)?;
             tx.execute(
                 "INSERT OR IGNORE INTO member (channel, account, role, joined)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -571,10 +722,13 @@ impl Channels {
                 ],
             )
             .map_err(storage("insert invitee"))?;
-            write_system(&tx, &req.channel, EVENT_ADDED, &i.account, caller, now)?;
+            write_system(
+                &tx, &place, &req.channel, EVENT_ADDED, &i.account, caller, device,
+                &[i.role as u8], action, now,
+            )?;
         }
         tx.commit().map_err(storage("commit create"))?;
-        Ok((true, 0))
+        Ok((true, 0, req.instance))
     }
 
     /// Join a public channel. A private one MUST refuse, which is what stops an
@@ -626,8 +780,8 @@ impl Channels {
         tx.execute(
             "INSERT INTO channel
                 (id, visibility, retention_secs, max_entries, name, topic,
-                 epoch, next_seq, creator, created, epoch_at)
-             VALUES (?1, ?2, ?3, 0, ?4, '', 0, 1, ?5, ?6, 0)",
+                 epoch, next_seq, creator, created, epoch_at, instance)
+             VALUES (?1, ?2, ?3, 0, ?4, '', 0, 1, ?5, ?6, 0, ?7)",
             params![
                 &channel[..],
                 Visibility::Public as i64,
@@ -637,6 +791,11 @@ impl Channels {
                 name,
                 founder.map(|f| f.as_bytes().to_vec()).unwrap_or_default(),
                 now as i64,
+                // The identifier is already random and this channel is never
+                // recreated under it, so the incarnation can be the identifier
+                // itself — it only has to be unique per incarnation, and there
+                // is exactly one.
+                &channel[..],
             ],
         )
         .map_err(storage("create the welcome channel"))?;
@@ -677,14 +836,52 @@ impl Channels {
             )
             .map_err(storage("record welcomed"))?;
         }
-        // Outside the lock above, because `join` takes it itself. Recorded
-        // first: a join that fails must not leave this account to be welcomed
-        // again on its next request, which would retry for ever.
-        self.join(account, channel)?;
+        // Outside the lock above. Recorded first: a join that fails must not
+        // leave this account to be welcomed again on its next request, which
+        // would retry for ever.
+        //
+        // **The one membership change with no actor to sign it.** Every other
+        // is caused by somebody who signs for it under SIP-31; this one is the
+        // exchange putting a newcomer into its own front room, and the account
+        // is not a party to it — it has issued no request and may not even have
+        // a device registered yet. So the member row goes in without a system
+        // entry, rather than the exchange writing an event nobody authorised or
+        // signing one as though the account had. The cost is that a replica
+        // sees membership of the welcome channel it cannot derive from the log,
+        // and that is stated in SIP-31 rather than hidden here.
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin welcome"))?;
+        if visibility_of(&tx, channel)? != Visibility::Public {
+            return Err(ChannelError::NotPublic);
+        }
+        let (members, _) = counts(&tx, channel)?;
+        if members as usize >= MAX_MEMBERS {
+            return Err(ChannelError::Full);
+        }
+        tx.execute(
+            "INSERT INTO member (channel, account, role, joined, present)
+             VALUES (?1, ?2, 0, ?3, 1)
+             ON CONFLICT (channel, account) DO UPDATE SET present = 1",
+            params![&channel[..], account.as_bytes(), now_unix() as i64],
+        )
+        .map_err(storage("insert welcomed member"))?;
+        tx.execute(
+            "UPDATE channel SET empty_since = NULL WHERE id = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("clear empty_since"))?;
+        tx.commit().map_err(storage("commit welcome"))?;
+        self.wake(channel);
         Ok(true)
     }
 
-    pub fn join(&self, caller: &PubKey, channel: &[u8; 32]) -> Result<(), ChannelError> {
+    pub fn join(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        channel: &[u8; 32],
+        action: &Action,
+    ) -> Result<(), ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin join"))?;
@@ -706,7 +903,10 @@ impl Channels {
         )
         .map_err(storage("insert member"))?;
         if !already {
-            write_system(&tx, channel, EVENT_JOINED, caller, caller, now)?;
+            let place = self.place(&tx, channel)?;
+            write_system(
+                &tx, &place, channel, EVENT_JOINED, caller, caller, device, &[], action, now,
+            )?;
         }
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
@@ -721,7 +921,13 @@ impl Channels {
     /// Leave. A private channel or direct message with no members left is
     /// destroyed; a public one persists, because it is a place rather than a
     /// conversation and is listed so somebody finds it later.
-    pub fn leave(&self, caller: &PubKey, channel: &[u8; 32]) -> Result<(), ChannelError> {
+    pub fn leave(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        channel: &[u8; 32],
+        action: &Action,
+    ) -> Result<(), ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin leave"))?;
@@ -760,7 +966,10 @@ impl Channels {
             .map_err(storage("delete member"))?;
         }
 
-        write_system(&tx, channel, EVENT_LEFT, caller, caller, now)?;
+        let place = self.place(&tx, channel)?;
+        write_system(
+            &tx, &place, channel, EVENT_LEFT, caller, caller, device, &[], action, now,
+        )?;
         if members == 1 {
             if visibility == Visibility::Public {
                 tx.execute(
@@ -805,11 +1014,42 @@ impl Channels {
                 return Err(ChannelError::BadRetention);
             }
 
+            // SIP-31. Verified here even though every receiver must verify it
+            // too: SIP-19 leaves its authority rules to receivers *because the
+            // exchange cannot check them*, and this one it can — the signature
+            // and the device are both in the clear. Refusing here means no
+            // entry is stored that every receiver would reject.
+            let place = self.place(&tx, &req.channel)?;
+            let terms = EntryTerms {
+                place,
+                account: *account,
+                device: *device,
+                epoch: req.epoch,
+                msg_seq: req.msg_seq,
+                expires_after: req.expires_after,
+                chain_seq: req.chain_seq,
+                prev: req.prev,
+                body: &req.body,
+            };
+            if !verify_entry(&terms, &req.sig) {
+                return Err(ChannelError::BadSignature);
+            }
+            advance_chain(
+                &tx,
+                &req.channel,
+                device,
+                req.chain_seq,
+                &req.prev,
+                &terms.input(),
+            )?;
+            let body_hash = Sha256::digest(&req.body);
+
             seq = next;
             tx.execute(
                 "INSERT INTO entry (channel, seq, kind, account, device, posted,
-                                    expires_after, epoch, msg_seq, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                    expires_after, epoch, msg_seq,
+                                    chain_seq, prev, body_hash, sig, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     &req.channel[..],
                     seq as i64,
@@ -820,6 +1060,10 @@ impl Channels {
                     req.expires_after as i64,
                     req.epoch as i64,
                     req.msg_seq as i64,
+                    req.chain_seq as i64,
+                    &req.prev[..],
+                    &body_hash[..],
+                    &req.sig[..],
                     &req.body,
                 ],
             )
@@ -880,7 +1124,8 @@ impl Channels {
         let (first, last) = window(&db, channel);
         let mut stmt = db
             .prepare(
-                "SELECT seq, kind, account, device, posted, expires_after, epoch, msg_seq, body
+                "SELECT seq, kind, account, device, posted, expires_after, epoch, msg_seq,
+                        chain_seq, prev, body_hash, sig, body
                  FROM entry WHERE channel = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
             )
             .map_err(storage("prepare fetch"))?;
@@ -897,7 +1142,11 @@ impl Channels {
                         expires_after: r.get::<_, i64>(5)? as u32,
                         epoch: r.get::<_, i64>(6)? as u32,
                         msg_seq: r.get::<_, i64>(7)? as u64,
-                        body: r.get(8)?,
+                        chain_seq: r.get::<_, i64>(8)? as u64,
+                        prev: r.get::<_, Vec<u8>>(9)?.try_into().unwrap_or(GENESIS),
+                        body_hash: r.get::<_, Vec<u8>>(10)?.try_into().unwrap_or([0; 32]),
+                        sig: r.get::<_, Vec<u8>>(11)?.try_into().unwrap_or([0; 64]),
+                        body: r.get(12)?,
                     })
                 },
             )
@@ -1214,9 +1463,18 @@ impl Channels {
             )
             .map_err(storage("read name"))?;
 
+        // The chain the calling device stands at, so a client that lost its own
+        // record resumes exactly. It must take the greater of this and what it
+        // remembers — see SIP-31: an exchange that under-reported would induce
+        // the device to sign twice at one position, and the fork would read as
+        // the device's misconduct rather than the exchange's.
+        let (next_chain, head) = chain_head(&db, channel, device)?;
+        let place = self.place(&db, channel)?;
+
         Ok(ChannelInfo {
             visibility,
             epoch,
+            instance: place.instance,
             retention_secs: retention,
             max_entries: db
                 .query_row(
@@ -1228,6 +1486,8 @@ impl Channels {
             first,
             last,
             my_msg_seq,
+            my_chain_seq: next_chain,
+            my_chain_head: head,
             now: now_unix(),
             members,
             name,
@@ -1274,7 +1534,12 @@ impl Channels {
         Ok(())
     }
 
-    pub fn retain(&self, caller: &PubKey, req: &Retain) -> Result<(), ChannelError> {
+    pub fn retain(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        req: &Retain,
+    ) -> Result<(), ChannelError> {
         if req.retention_secs < MIN_RETENTION || req.retention_secs > MAX_RETENTION {
             return Err(ChannelError::BadRetention);
         }
@@ -1294,7 +1559,17 @@ impl Channels {
             ],
         )
         .map_err(storage("update retention"))?;
-        write_system(&tx, &req.channel, EVENT_RETENTION, caller, caller, now)?;
+        let place = self.place(&tx, &req.channel)?;
+        // The retention pair is what the caller is authorising, so it is what
+        // the signature covers; a bare "somebody changed retention" would let a
+        // signed request be replayed with different numbers.
+        let mut arg = Vec::with_capacity(8);
+        arg.extend_from_slice(&req.retention_secs.to_be_bytes());
+        arg.extend_from_slice(&req.max_entries.to_be_bytes());
+        write_system(
+            &tx, &place, &req.channel, EVENT_RETENTION, caller, caller, device, &arg,
+            &req.action, now,
+        )?;
         prune(&tx, &req.channel, now, self.max_channel_bytes)?;
         tx.commit().map_err(storage("commit retain"))?;
         self.wake(&req.channel);
@@ -1337,7 +1612,8 @@ impl Channels {
             .prepare(
                 "SELECT c.id, c.name, c.topic,
                         (SELECT COUNT(*) FROM member m WHERE m.channel = c.id AND m.present = 1),
-                        (SELECT COALESCE(MAX(seq), 0) FROM entry e WHERE e.channel = c.id)
+                        (SELECT COALESCE(MAX(seq), 0) FROM entry e WHERE e.channel = c.id),
+                        c.instance
                  FROM channel c
                  WHERE c.visibility = 1 AND (c.name LIKE ?1 ESCAPE '\\'
                                              OR c.topic LIKE ?1 ESCAPE '\\')
@@ -1348,6 +1624,9 @@ impl Channels {
             .query_map(params![&like, MAX_DIRECTORY as i64, offset as i64], |r| {
                 Ok(Public {
                     channel: r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    // A joiner signs against this and cannot ask `Info`, which
+                    // needs the membership they are trying to get.
+                    instance: r.get::<_, Vec<u8>>(5)?.try_into().unwrap_or([0; 32]),
                     name: r.get(1)?,
                     topic: r.get(2)?,
                     members: r.get::<_, i64>(3)? as u16,
@@ -1460,12 +1739,15 @@ impl Channels {
     /// Add an account to a channel. Admins only, and never on a direct
     /// message, where the membership can only ever be the two identities the
     /// channel is named after.
+    #[allow(clippy::too_many_arguments)]
     pub fn invite(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         account: &PubKey,
         role: Role,
+        action: &Action,
         blocked: &dyn Fn(&PubKey, &PubKey) -> bool,
     ) -> Result<(), ChannelError> {
         let now = now_unix();
@@ -1519,7 +1801,12 @@ impl Channels {
             Some(_) if role == Role::Admin => EVENT_PROMOTED,
             Some(_) => EVENT_DEMOTED,
         };
-        write_system(&tx, channel, event, account, caller, now)?;
+        let place = self.place(&tx, channel)?;
+        // The role travels in the signature, or a signed promotion could be
+        // replayed as a demotion.
+        write_system(
+            &tx, &place, channel, event, account, caller, device, &[role as u8], action, now,
+        )?;
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
             params![&channel[..]],
@@ -1536,8 +1823,10 @@ impl Channels {
     pub fn remove(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         account: &PubKey,
+        action: &Action,
     ) -> Result<(), ChannelError> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin remove"))?;
@@ -1570,7 +1859,11 @@ impl Channels {
         .map_err(storage("delete envelopes"))?;
         // The record of who did this is the whole reason system entries exist,
         // and is why an admin cannot redact one.
-        write_system(&tx, channel, EVENT_REMOVED, account, caller, now_unix())?;
+        let place = self.place(&tx, channel)?;
+        write_system(
+            &tx, &place, channel, EVENT_REMOVED, account, caller, device, &[], action,
+            now_unix(),
+        )?;
         tx.commit().map_err(storage("commit remove"))?;
         self.wake(channel);
         Ok(())
@@ -1591,6 +1884,7 @@ impl Channels {
     pub fn put_keys(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         req: &KeyPut,
         account_of: &dyn Fn(&PubKey) -> PubKey,
         revoked_since: &dyn Fn(&PubKey, u64) -> bool,
@@ -1711,7 +2005,12 @@ impl Channels {
                 params![&req.channel[..], req.epoch as i64, now as i64],
             )
             .map_err(storage("advance epoch"))?;
-            write_system(&tx, &req.channel, EVENT_ROTATED, caller, caller, now)?;
+            let place = self.place(&tx, &req.channel)?;
+            let action = req.action.as_ref().ok_or(ChannelError::BadSignature)?;
+            write_system(
+                &tx, &place, &req.channel, EVENT_ROTATED, caller, caller, device,
+                &req.epoch.to_be_bytes(), action, now,
+            )?;
         }
         tx.commit().map_err(storage("commit put"))?;
         Ok(PutAck {
@@ -2321,14 +2620,100 @@ impl Channels {
 /// messages and events already interleaved, in the order they happened, with
 /// nothing to merge. `account`, `device`, `msg_seq` and `expires_after` are all
 /// zero: the exchange wrote it and no member did.
+/// The chain position and head this device stands at in this channel.
+///
+/// Kept independently of the entries, so pruning cannot understate it — a
+/// device resuming from an understated mark would fork its own chain.
+fn chain_head(db: &Connection, channel: &[u8; 32], device: &PubKey) -> Result<(u64, [u8; 32]), ChannelError> {
+    let row: Option<(i64, Vec<u8>)> = db
+        .query_row(
+            "SELECT chain_seq, head FROM chain WHERE channel = ?1 AND device = ?2",
+            params![&channel[..], device.as_bytes()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(storage("read chain"))?;
+    match row {
+        None => Ok((0, GENESIS)),
+        Some((seq, head)) => Ok((
+            seq as u64 + 1,
+            head.try_into().map_err(|_| ChannelError::Storage)?,
+        )),
+    }
+}
+
+/// Check a chain step and record it.
+///
+/// The position offered must be exactly the one expected and the link must be
+/// the head held. Anything else is a fork or a gap, and neither may be written.
+fn advance_chain(
+    db: &Connection,
+    channel: &[u8; 32],
+    device: &PubKey,
+    chain_seq: u64,
+    prev: &[u8; 32],
+    input: &[u8],
+) -> Result<(), ChannelError> {
+    let (expect_seq, expect_prev) = chain_head(db, channel, device)?;
+    if chain_seq != expect_seq || prev != &expect_prev {
+        return Err(ChannelError::BrokenChain);
+    }
+    db.execute(
+        "INSERT INTO chain (channel, device, chain_seq, head) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (channel, device) DO UPDATE SET chain_seq = ?3, head = ?4",
+        params![&channel[..], device.as_bytes(), chain_seq as i64, &link(input)[..]],
+    )
+    .map_err(storage("advance chain"))?;
+    Ok(())
+}
+
+/// Verify a signed membership action, then take its chain step.
+///
+/// Returns the terms' signing input so the caller can store the link, and
+/// refuses before anything is written — a system entry nobody authorised must
+/// not reach the log even briefly.
+#[allow(clippy::too_many_arguments)]
+fn check_action(
+    db: &Connection,
+    place: &Place,
+    actor: &PubKey,
+    actor_device: &PubKey,
+    event: u8,
+    subject: &PubKey,
+    arg: &[u8],
+    action: &Action,
+) -> Result<(), ChannelError> {
+    let terms = ActionTerms {
+        place: *place,
+        actor: *actor,
+        actor_device: *actor_device,
+        event,
+        subject: *subject,
+        arg,
+        chain_seq: action.chain_seq,
+        prev: action.prev,
+    };
+    if !verify_action(&terms, &action.sig) {
+        return Err(ChannelError::BadSignature);
+    }
+    let input = terms.input().map_err(|_| ChannelError::BadSignature)?;
+    advance_chain(db, &place.channel, actor_device, action.chain_seq, &action.prev, &input)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_system(
     db: &Connection,
+    place: &Place,
     channel: &[u8; 32],
     event: u8,
     subject: &PubKey,
     actor: &PubKey,
+    actor_device: &PubKey,
+    arg: &[u8],
+    action: &Action,
     now: u64,
 ) -> Result<(), ChannelError> {
+    check_action(db, place, actor, actor_device, event, subject, arg, action)?;
     let seq: u64 = db
         .query_row(
             "SELECT next_seq FROM channel WHERE id = ?1",
@@ -2343,18 +2728,28 @@ fn write_system(
         event,
         subject: *subject,
         actor: *actor,
+        actor_device: *actor_device,
+        chain_seq: action.chain_seq,
+        prev: action.prev,
+        sig: action.sig,
     }
     .encode();
+    // The entry's own `sig` stays zero: the exchange wrote this row and did not
+    // sign it. The actor's signature is inside the body, which is where a
+    // verifier looks for a system entry — a different key in a different role.
     db.execute(
         "INSERT INTO entry (channel, seq, kind, account, device, posted,
-                            expires_after, epoch, msg_seq, body)
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, ?6)",
+                            expires_after, epoch, msg_seq,
+                            chain_seq, prev, body_hash, sig, body)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, 0, ?6, ?6, ?7, ?8)",
         params![
             &channel[..],
             seq as i64,
             KIND_SYSTEM as i64,
             &[0u8; 32][..],
             now as i64,
+            &GENESIS[..],
+            &[0u8; 64][..],
             &body,
         ],
     )
@@ -2643,6 +3038,12 @@ impl Channels {
             return Err(ChannelError::NotAnAdmin);
         }
         db.execute(
+            // `sig`, `prev`, `chain_seq` and `body_hash` all survive. The
+            // signature commits to the hash rather than to the bytes, so a
+            // tombstone still verifies with its body gone and the device's
+            // chain runs through it unbroken — which is the whole reason the
+            // commitment is arranged that way. Clearing the signature here
+            // would make every deleted message read as a forgery.
             "UPDATE entry SET body = x'' WHERE channel = ?1 AND seq = ?2",
             params![&channel[..], target as i64],
         )
@@ -2715,22 +3116,132 @@ impl Channels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use sqex_proto::channel::MAX_ENTRY_BODY;
+    use sqex_proto::entry_sig::{sign_action, sign_entry};
+
+    /// A key that can actually sign. It used to be `PubKey::new([b; 32])`, and
+    /// could not be: SIP-31 needs a real keypair behind every identity in a
+    /// test, or nothing here can produce a signature the exchange will take.
+    /// The seed behind `key(1)`, which every test uses as its first identity.
+    const ALICE: u8 = 1;
+    /// The identity the quota test invites *to*.
+    const VICTIM: u8 = 2;
 
     fn key(b: u8) -> PubKey {
-        PubKey::new([b; 32])
+        PubKey::new(SigningKey::from_bytes(&[b; 32]).verifying_key().to_bytes())
     }
 
-    fn public_channel(retention_secs: u32) -> Create {
+    /// The exchange every test in this module runs against.
+    fn exchange() -> PubKey {
+        key(200)
+    }
+
+    fn open() -> Channels {
+        Channels::open(None, exchange()).unwrap()
+    }
+
+    fn place_of(c: &Channels, channel: &[u8; 32]) -> Place {
+        let db = c.db.lock().unwrap();
+        c.place(&db, channel).unwrap()
+    }
+
+    /// A post signed as `b`'s device, taking the chain step the exchange is
+    /// expecting. Tests that want a *bad* signature build one by hand.
+    fn post_as(c: &Channels, b: u8, channel: &[u8; 32], epoch: u32, msg_seq: u64, body: Vec<u8>) -> Post {
+        let who = key(b);
+        let (place, chain_seq, prev) = {
+            let db = c.db.lock().unwrap();
+            let place = c.place(&db, channel).unwrap();
+            let (n, p) = chain_head(&db, channel, &who).unwrap();
+            (place, n, p)
+        };
+        let terms = EntryTerms {
+            place,
+            account: who,
+            device: who,
+            epoch,
+            msg_seq,
+            expires_after: 0,
+            chain_seq,
+            prev,
+            body: &body,
+        };
+        Post {
+            channel: *channel,
+            epoch,
+            msg_seq,
+            expires_after: 0,
+            chain_seq,
+            prev,
+            sig: sign_entry(&[b; 32], &terms),
+            body,
+        }
+    }
+
+    /// An action signed as `b`'s device, at the chain position expected next.
+    fn action_as(c: &Channels, b: u8, place: &Place, event: u8, subject: &PubKey, arg: &[u8]) -> Action {
+        let who = key(b);
+        let (chain_seq, prev) = {
+            let db = c.db.lock().unwrap();
+            chain_head(&db, &place.channel, &who).unwrap()
+        };
+        let terms = ActionTerms {
+            place: *place,
+            actor: who,
+            actor_device: who,
+            event,
+            subject: *subject,
+            arg,
+            chain_seq,
+            prev,
+        };
+        Action { chain_seq, prev, sig: sign_action(&[b; 32], &terms).unwrap() }
+    }
+
+    /// An action for a channel that does not exist yet, signed against the
+    /// instance the create proposes.
+    fn create_action(b: u8, channel: &[u8; 32], instance: [u8; 32], n: u64, prev: [u8; 32], subject: &PubKey, role: Role) -> (Action, [u8; 32]) {
+        let who = key(b);
+        let terms = ActionTerms {
+            place: Place { exchange: key(200), instance, channel: *channel },
+            actor: who,
+            actor_device: who,
+            event: EVENT_ADDED,
+            subject: *subject,
+            arg: &[role as u8],
+            chain_seq: n,
+            prev,
+        };
+        let sig = sign_action(&[b; 32], &terms).unwrap();
+        let head = link(&terms.input().unwrap());
+        (Action { chain_seq: n, prev, sig }, head)
+    }
+
+    /// A create by `b`, with its invitees' `added` events signed.
+    fn create_by(b: u8, channel: [u8; 32], instance: [u8; 32], visibility: Visibility, retention_secs: u32, invites: Vec<Invitee>) -> Create {
+        let mut actions = Vec::new();
+        let mut prev = GENESIS;
+        for (n, i) in invites.iter().enumerate() {
+            let (a, head) = create_action(b, &channel, instance, n as u64, prev, &i.account, i.role);
+            prev = head;
+            actions.push(a);
+        }
         Create {
-            channel: [7; 32],
-            visibility: Visibility::Public,
+            channel,
+            instance,
+            visibility,
             retention_secs,
             max_entries: 0,
             name: String::new(),
             topic: String::new(),
-            invites: Vec::new(),
+            invites,
+            actions,
         }
+    }
+
+    fn public_channel(retention_secs: u32) -> Create {
+        create_by(1, [7; 32], [77; 32], Visibility::Public, retention_secs, Vec::new())
     }
 
     fn stored_bytes(c: &Channels) -> u64 {
@@ -2748,22 +3259,16 @@ mod tests {
         // Ten entries at 32 KiB and room for four. The entry count alone would
         // not bound this: 50 000 of them is 1.6 GiB.
         let cap = 4 * (MAX_ENTRY_BODY + ENTRY_HEADER) as u64;
-        let c = Channels::open(None).unwrap().with_max_channel_bytes(cap);
+        let c = open().with_max_channel_bytes(cap);
         let alice = key(1);
-        c.create(&alice, &public_channel(MAX_RETENTION), &|_, _| false)
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
             .unwrap();
 
         for i in 0..10u8 {
             c.post(
                 &alice,
                 &alice,
-                &Post {
-                    channel: [7; 32],
-                    epoch: 0,
-                    msg_seq: i as u64,
-                    expires_after: 0,
-                    body: vec![i; MAX_ENTRY_BODY],
-                },
+                &post_as(&c, ALICE, &[7; 32], 0, i as u64, vec![i; MAX_ENTRY_BODY]),
             )
             .unwrap();
         }
@@ -2780,21 +3285,15 @@ mod tests {
 
     #[test]
     fn the_byte_cap_does_not_bite_a_small_channel() {
-        let c = Channels::open(None).unwrap();
+        let c = open();
         let alice = key(1);
-        c.create(&alice, &public_channel(MAX_RETENTION), &|_, _| false)
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
             .unwrap();
         for i in 0..20u8 {
             c.post(
                 &alice,
                 &alice,
-                &Post {
-                    channel: [7; 32],
-                    epoch: 0,
-                    msg_seq: i as u64,
-                    expires_after: 0,
-                    body: b"a short message".to_vec(),
-                },
+                &post_as(&c, ALICE, &[7; 32], 0, i as u64, b"a short message".to_vec()),
             )
             .unwrap();
         }
@@ -2803,20 +3302,12 @@ mod tests {
     }
 
     fn channel_n(n: u8, visibility: Visibility) -> Create {
-        Create {
-            channel: [n; 32],
-            visibility,
-            retention_secs: MAX_RETENTION,
-            max_entries: 0,
-            name: String::new(),
-            topic: String::new(),
-            invites: Vec::new(),
-        }
+        create_by(ALICE, [n; 32], [n ^ 0x5a; 32], visibility, MAX_RETENTION, Vec::new())
     }
 
     #[test]
     fn a_stranger_cannot_add_someone_to_unbounded_channels() {
-        let c = Channels::open(None).unwrap();
+        let c = open();
         let spammer = key(1);
         let victim = key(2);
 
@@ -2825,15 +3316,15 @@ mod tests {
         for n in 0..MAX_UNSPOKEN {
             let mut req = channel_n(n as u8, Visibility::Public);
             req.channel[31] = (n >> 8) as u8;
-            c.create(&spammer, &req, &|_, _| false).unwrap();
-            c.invite(&spammer, &req.channel, &victim, Role::Member, &|_, _| false)
+            c.create(&spammer, &spammer, &req, &|_, _| false).unwrap();
+            c.invite(&spammer, &spammer, &req.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
                 .unwrap();
         }
 
         let one_more = channel_n(200, Visibility::Public);
-        c.create(&spammer, &one_more, &|_, _| false).unwrap();
+        c.create(&spammer, &spammer, &one_more, &|_, _| false).unwrap();
         assert!(matches!(
-            c.invite(&spammer, &one_more.channel, &victim, Role::Member, &|_, _| false),
+            c.invite(&spammer, &spammer, &one_more.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &one_more.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false),
             Err(ChannelError::InviteQuota)
         ));
         // Refused distinguishably, and not silently: 507, not a malformed
@@ -2848,27 +3339,27 @@ mod tests {
             role: Role::Member,
         }];
         assert!(matches!(
-            c.create(&spammer, &with_invite, &|_, _| false),
+            c.create(&spammer, &spammer, &with_invite, &|_, _| false),
             Err(ChannelError::InviteQuota)
         ));
     }
 
     #[test]
     fn speaking_in_one_channel_frees_the_budget_and_so_does_leaving() {
-        let c = Channels::open(None).unwrap();
+        let c = open();
         let spammer = key(1);
         let victim = key(2);
         for n in 0..MAX_UNSPOKEN {
             let mut req = channel_n(n as u8, Visibility::Public);
             req.channel[31] = (n >> 8) as u8;
-            c.create(&spammer, &req, &|_, _| false).unwrap();
-            c.invite(&spammer, &req.channel, &victim, Role::Member, &|_, _| false)
+            c.create(&spammer, &spammer, &req, &|_, _| false).unwrap();
+            c.invite(&spammer, &spammer, &req.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
                 .unwrap();
         }
         let next = channel_n(200, Visibility::Public);
-        c.create(&spammer, &next, &|_, _| false).unwrap();
+        c.create(&spammer, &spammer, &next, &|_, _| false).unwrap();
         assert!(c
-            .invite(&spammer, &next.channel, &victim, Role::Member, &|_, _| false)
+            .invite(&spammer, &spammer, &next.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &next.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
             .is_err());
 
         // Post in one of them.
@@ -2877,52 +3368,58 @@ mod tests {
         c.post(
             &victim,
             &victim,
-            &Post {
-                channel: spoken,
-                epoch: 0,
-                msg_seq: 0,
-                expires_after: 0,
-                body: b"hello".to_vec(),
-            },
+            &post_as(&c, VICTIM, &spoken, 0, 0, b"hello".to_vec()),
         )
         .unwrap();
-        c.invite(&spammer, &next.channel, &victim, Role::Member, &|_, _| false)
+        c.invite(&spammer, &spammer, &next.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &next.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
             .expect("speaking in one frees the budget");
 
         // And leaving frees it too.
         let another = channel_n(202, Visibility::Public);
-        c.create(&spammer, &another, &|_, _| false).unwrap();
+        c.create(&spammer, &spammer, &another, &|_, _| false).unwrap();
         assert!(c
-            .invite(&spammer, &another.channel, &victim, Role::Member, &|_, _| false)
+            .invite(&spammer, &spammer, &another.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &another.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
             .is_err());
         let mut quiet = [1u8; 32];
         quiet[31] = 0;
-        c.leave(&victim, &quiet).unwrap();
-        c.invite(&spammer, &another.channel, &victim, Role::Member, &|_, _| false)
+        c.leave(&victim, &victim, &quiet, &action_as(&c, VICTIM, &place_of(&c, &quiet), EVENT_LEFT, &victim, &[])).unwrap();
+        c.invite(&spammer, &spammer, &another.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &another.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
             .expect("leaving frees the budget");
     }
 
     #[test]
     fn changing_an_existing_members_role_is_not_an_invitation() {
-        let c = Channels::open(None).unwrap();
+        let c = open();
         let admin = key(1);
         let member = key(2);
         let home = channel_n(9, Visibility::Private);
-        c.create(&admin, &home, &|_, _| false).unwrap();
-        c.invite(&admin, &home.channel, &member, Role::Member, &|_, _| false)
+        c.create(&admin, &admin, &home, &|_, _| false).unwrap();
+        c.invite(&admin, &admin, &home.channel, &member, Role::Member, &action_as(&c, ALICE, &place_of(&c, &home.channel), EVENT_ADDED, &member, &[Role::Member as u8]), &|_, _| false)
             .unwrap();
         // Fill the rest of the budget elsewhere.
         for n in 0..(MAX_UNSPOKEN - 1) {
             let mut req = channel_n(n as u8, Visibility::Public);
             req.channel[31] = (n >> 8) as u8;
             req.channel[30] = 0xaa;
-            c.create(&admin, &req, &|_, _| false).unwrap();
-            c.invite(&admin, &req.channel, &member, Role::Member, &|_, _| false)
+            c.create(&admin, &admin, &req, &|_, _| false).unwrap();
+            c.invite(&admin, &admin, &req.channel, &member, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &member, &[Role::Member as u8]), &|_, _| false)
                 .unwrap();
         }
         // Promoting them where they already are must not be refused.
-        c.invite(&admin, &home.channel, &member, Role::Admin, &|_, _| false)
-            .expect("a promotion is not an invitation");
+        // Signed as a *promotion*, because that is the event the exchange will
+        // write — inviting somebody already present changes their role. A
+        // signature naming `added` is refused here, which is the event binding
+        // doing its job rather than a quirk of the test.
+        c.invite(
+            &admin,
+            &admin,
+            &home.channel,
+            &member,
+            Role::Admin,
+            &action_as(&c, ALICE, &place_of(&c, &home.channel), EVENT_PROMOTED, &member, &[Role::Admin as u8]),
+            &|_, _| false,
+        )
+        .expect("a promotion is not an invitation");
     }
 
     fn channel_id(n: usize) -> [u8; 32] {
@@ -2935,14 +3432,14 @@ mod tests {
 
     #[test]
     fn a_blob_cannot_be_forwarded_into_unbounded_channels() {
-        let c = Channels::open(None).unwrap();
+        let c = open();
         let alice = key(1);
         let blob = [0xcc; 32];
 
         for n in 0..=MAX_BLOB_CHANNELS {
             let mut req = channel_n(0, Visibility::Public);
             req.channel = channel_id(n);
-            c.create(&alice, &req, &|_, _| false).unwrap();
+            c.create(&alice, &alice, &req, &|_, _| false).unwrap();
         }
         // A blob already in the first channel, which is what makes alice able
         // to fetch it and therefore able to forward it.

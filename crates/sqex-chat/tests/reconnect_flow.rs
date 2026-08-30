@@ -106,7 +106,7 @@ async fn the_client_comes_back_after_the_exchange_goes_away() {
     let (seed, me) = identity(70);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(&dir.path().join("chat.db"))).unwrap();
-    let mut chat = Chat::new(client, seed, me, store);
+    let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.dials(addr, server_pub);
 
     chat.top_up_prekeys().await.unwrap();
@@ -174,7 +174,7 @@ async fn a_chat_that_cannot_redial_keeps_trying() {
     let (seed, me) = identity(71);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(&dir.path().join("chat.db"))).unwrap();
-    let mut chat = Chat::new(client, seed, me, store);
+    let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     // Deliberately no `dials`.
 
     chat.top_up_prekeys().await.unwrap();

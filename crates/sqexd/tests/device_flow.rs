@@ -7,12 +7,15 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_proto::channel::{Create, Entries, Fetch, Post, Visibility};
+use sqex_proto::channel::{Create, Entries, Fetch, Visibility};
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
 use sqex_proto::device::{Devices, ListDevices, Register, Revoke};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
+
+mod common;
+use common::{Chain, Signer, instance_for};
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
@@ -83,16 +86,8 @@ async fn devices_of(c: &mut Client, account: &PubKey) -> Devices {
     Devices::decode(&body).unwrap()
 }
 
-fn public(channel: [u8; 32]) -> Create {
-    Create {
-        channel,
-        visibility: Visibility::Public,
-        retention_secs: 3600,
-        max_entries: 0,
-        name: "shared".into(),
-        topic: String::new(),
-        invites: vec![],
-    }
+fn public(signer: &Signer, channel: [u8; 32]) -> Create {
+    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, "shared", vec![])
 }
 
 #[tokio::test]
@@ -117,21 +112,34 @@ async fn one_person_two_devices_share_a_membership() {
 
     // The desktop joins; the phone is in the channel without doing anything,
     // because membership is the account's.
-    let (code, _) = d.post("/channel/create", public(channel).encode()).await.unwrap();
+    // Two devices of one account, and the SIP-31 signature is the device's
+    // while the entry's account is the account's. This is the case where the
+    // two keys actually differ — SIP-22 makes an account with no registered
+    // device its own device, and every device-versus-account rule is untestable
+    // until somebody links a second client.
+    let desk = Signer::new(desktop_seed, desktop, pubkey).for_account(account);
+    let hand = Signer::new(phone_seed, phone, pubkey).for_account(account);
+
+    let (code, _) = d.post("/channel/create", public(&desk, channel).encode()).await.unwrap();
     assert_eq!(code, 200);
 
-    let post = |body: &[u8], seq: u64| {
-        Post {
-            channel,
-            epoch: 0,
-            msg_seq: seq,
-            expires_after: 0,
-            body: body.to_vec(),
-        }
-        .encode()
+    // A chain each: the position is per device, so both start at zero and
+    // neither treads on the other.
+    let mut desk_chain = Chain::default();
+    let mut hand_chain = Chain::default();
+    let post = |signer: &Signer, chain: &mut Chain, body: &[u8], seq: u64| {
+        signer
+            .post_chained(chain, channel, instance_for(channel, 0), 0, seq, body.to_vec())
+            .encode()
     };
-    assert_eq!(d.post("/channel/post", post(b"from the desktop", 0)).await.unwrap().0, 200);
-    assert_eq!(p.post("/channel/post", post(b"from the phone", 0)).await.unwrap().0, 200);
+    assert_eq!(
+        d.post("/channel/post", post(&desk, &mut desk_chain, b"from the desktop", 0)).await.unwrap().0,
+        200
+    );
+    assert_eq!(
+        p.post("/channel/post", post(&hand, &mut hand_chain, b"from the phone", 0)).await.unwrap().0,
+        200
+    );
 
     let (_, body) = p
         .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
@@ -315,12 +323,20 @@ async fn an_account_with_no_registered_devices_is_its_own_device() {
     let mut c = connect(addr, pubkey, alone_seed).await;
 
     assert!(devices_of(&mut c, &alone).await.devices.is_empty());
-    assert_eq!(c.post("/channel/create", public(channel).encode()).await.unwrap().0, 200);
+    let solo = Signer::new(alone_seed, alone, pubkey);
+    assert_eq!(c.post("/channel/create", public(&solo, channel).encode()).await.unwrap().0, 200);
     let (code, _) = c
         .post(
             "/channel/post",
-            Post { channel, epoch: 0, msg_seq: 0, expires_after: 0, body: b"hello".to_vec() }
-                .encode(),
+            solo.post_chained(
+                &mut Chain::default(),
+                channel,
+                instance_for(channel, 0),
+                0,
+                0,
+                b"hello".to_vec(),
+            )
+            .encode(),
         )
         .await
         .unwrap();

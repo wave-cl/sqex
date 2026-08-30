@@ -268,6 +268,10 @@ impl Trouble {
 /// One row of a directory search.
 pub struct Found {
     pub channel: [u8; 32],
+    /// SIP-31: the incarnation to sign a join against. Carried from the
+    /// directory because `Info` — the other place it appears — needs the
+    /// membership a join is trying to acquire.
+    pub instance: [u8; 32],
     pub name: String,
     pub topic: String,
     pub members: u16,

@@ -30,7 +30,7 @@ use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::channel::{
-    Ack as ChannelAck, ByChannel, ByTarget, Cursor as ChannelCursor, Invitee,
+    Ack as ChannelAck, ByChannel, ByChannelSigned, ByTarget, Cursor as ChannelCursor, Invitee,
     SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
     ByAccount as ChannelByAccount, Invite as ChannelInvite, List as ChannelList, Mine as ChannelMine,
     Directory as ChannelDirectory, Post as ChannelPost, TYPE_REMOVE as CH_REMOVE,
@@ -316,7 +316,12 @@ pub async fn bind(
         // deployment gets a memory-only log and nothing has to be configured
         // twice. This is the one service that cannot honestly be memory-only
         // in production, and an operator choosing that is choosing it.
-        channels: Channels::open(channel_db.as_deref())
+        // The exchange's own key goes in, because SIP-31 binds every signature
+        // to the place it was made and this is that place. Without it a signed
+        // entry lifts into another exchange's copy of the same direct message
+        // — whose identifier is byte-identical, being derived from the two
+        // accounts — and verifies there.
+        channels: Channels::open(channel_db.as_deref(), public_key)
             .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
         // Durable, and it was not always. The argument for keeping prekeys in
         // memory was that a key surviving a restart the device did not is a key
@@ -721,6 +726,12 @@ async fn route(
     // devices is its own device, which is the ordinary single-client case.
     let device = peer.identity;
     let account = device.map(|d| server.devices.account_for(&d));
+    // The pair, for the SIP-31 routes: membership is an account's, the
+    // signature is always a device's, and every signed route needs both.
+    let who = match (account, device) {
+        (Some(a), Some(d)) => Some((a, d)),
+        _ => None,
+    };
 
     // The front door, held open once per account.
     //
@@ -1109,13 +1120,13 @@ async fn route(
         // membership or an admin role, and it is checked at the moment of the
         // call — a removed member's next fetch is refused, including one
         // already parked in a long poll.
-        ("POST", "/channel/create") => match (account, ChannelCreate::decode(body)) {
+        ("POST", "/channel/create") => match (who, ChannelCreate::decode(body)) {
             (None, _) => no_identity("creating a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => {
+            (Some((me, dev)), Ok(req)) => {
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
-                match server.channels.create(&me, &req, &blocked) {
-                    Ok((created, epoch)) => {
+                match server.channels.create(&me, &dev, &req, &blocked) {
+                    Ok((created, epoch, instance)) => {
                         // Everybody invited learns of a channel that did not
                         // exist when they last looked, which is the whole of
                         // how a conversation somebody else started arrives.
@@ -1125,17 +1136,20 @@ async fn route(
                         (
                             200,
                             "application/octet-stream",
-                            Created { created, epoch, now: now_unix() }.encode(),
+                            Created { created, epoch, instance, now: now_unix() }.encode(),
                         )
                     }
                     Err(e) => refused(e),
                 }
             }
         },
-        ("POST", "/channel/join") => match (account, ByChannel::decode(body, CH_JOIN)) {
+        ("POST", "/channel/join") => match (who, ByChannelSigned::decode(body, CH_JOIN)) {
             (None, _) => no_identity("joining a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.join(&me, &req.channel) {
+            (Some((me, dev)), Ok(req)) => match server
+                .channels
+                .join(&me, &dev, &req.channel, &req.action)
+            {
                 Ok(()) => {
                     server.tell(&req.channel, EventKind::Membership {
                         channel: req.channel, account: me, what: MEMBER_JOINED,
@@ -1145,10 +1159,13 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/leave") => match (account, ByChannel::decode(body, CH_LEAVE)) {
+        ("POST", "/channel/leave") => match (who, ByChannelSigned::decode(body, CH_LEAVE)) {
             (None, _) => no_identity("leaving a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.leave(&me, &req.channel) {
+            (Some((me, dev)), Ok(req)) => match server
+                .channels
+                .leave(&me, &dev, &req.channel, &req.action)
+            {
                 Ok(()) => {
                     server.tell_including(&req.channel, &me, EventKind::Membership {
                         channel: req.channel, account: me, what: MEMBER_LEFT,
@@ -1186,10 +1203,10 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/retain") => match (account, ChannelRetain::decode(body)) {
+        ("POST", "/channel/retain") => match (who, ChannelRetain::decode(body)) {
             (None, _) => no_identity("setting retention"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.retain(&me, &req) {
+            (Some((me, dev)), Ok(req)) => match server.channels.retain(&me, &dev, &req) {
                 Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
                 Err(e) => refused(e),
             },
@@ -1230,19 +1247,19 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        ("POST", "/channel/invite") => match (account, ChannelInvite::decode(body)) {
+        ("POST", "/channel/invite") => match (who, ChannelInvite::decode(body)) {
             (None, _) => no_identity("inviting to a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => {
-                let (channel, who) = (req.channel, Invitee { account: req.account, role: req.role });
+            (Some((me, dev)), Ok(req)) => {
+                let (channel, guest) = (req.channel, Invitee { account: req.account, role: req.role });
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
                 match server
                     .channels
-                    .invite(&me, &channel, &who.account, who.role, &blocked)
+                    .invite(&me, &dev, &channel, &guest.account, guest.role, &req.action, &blocked)
                 {
                     Ok(()) => {
                         server.tell(&channel, EventKind::Membership {
-                            channel, account: who.account, what: MEMBER_JOINED,
+                            channel, account: guest.account, what: MEMBER_JOINED,
                         });
                         (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
                     }
@@ -1250,10 +1267,13 @@ async fn route(
                 }
             }
         },
-        ("POST", "/channel/remove") => match (account, ChannelByAccount::decode(body, CH_REMOVE)) {
+        ("POST", "/channel/remove") => match (who, ChannelByAccount::decode(body, CH_REMOVE)) {
             (None, _) => no_identity("removing from a channel"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => match server.channels.remove(&me, &req.channel, &req.account) {
+            (Some((me, dev)), Ok(req)) => match server
+                .channels
+                .remove(&me, &dev, &req.channel, &req.account, &req.action)
+            {
                 Ok(()) => {
                     // The removed account is told too. It is the one party to
                     // this that cannot find out by asking again.
@@ -1268,10 +1288,10 @@ async fn route(
 
         // SIP-17 channel keys. The exchange stores envelopes opaquely, serves
         // each only to the recipient it names, and holds no key that opens one.
-        ("POST", "/channel/key/put") => match (account, KeyPut::decode(body)) {
+        ("POST", "/channel/key/put") => match (who, KeyPut::decode(body)) {
             (None, _) => no_identity("publishing channel keys"),
             (_, Err(e)) => (400, "text/plain", e.to_string().into_bytes()),
-            (Some(me), Ok(req)) => {
+            (Some((me, dev)), Ok(req)) => {
                 // A device is resolved to its account here rather than inside
                 // the channel store, which keeps that store free of any
                 // knowledge of the registry.
@@ -1283,7 +1303,7 @@ async fn route(
                 let revoked_since = |a: &PubKey, since: u64| server.devices.revoked_since(a, since);
                 match server
                     .channels
-                    .put_keys(&me, &req, &account_of, &revoked_since)
+                    .put_keys(&me, &dev, &req, &account_of, &revoked_since)
                 {
                     Ok(ack) => (200, "application/octet-stream", ack.encode()),
                     Err(e) => refused(e),

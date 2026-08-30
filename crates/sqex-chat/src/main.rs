@@ -207,7 +207,10 @@ async fn run(cli: Cli) -> Result<(), String> {
     let client = Client::connect_as(addr, server.as_bytes(), &seed)
         .await
         .map_err(|e| format!("could not reach {addr}: {e}"))?;
-    let mut chat = Chat::new(client, seed, me, store);
+    // The exchange we are talking to is bound into every SIP-31 signature, so
+    // an entry signed here cannot be lifted into another exchange's copy of the
+    // same conversation — which for a direct message is byte-identical.
+    let mut chat = Chat::new(client, seed, me, server, store);
     // Where to dial when this connection is lost — which, until now, was
     // nowhere: the client connected once here and a dropped connection meant
     // every request afterwards failed for as long as it stayed open.
@@ -1505,6 +1508,7 @@ async fn handle_key(
                                 .into_iter()
                                 .map(|c| Found {
                                     channel: c.channel,
+                                    instance: c.instance,
                                     name: c.name,
                                     topic: c.topic,
                                     members: c.members,
@@ -1525,8 +1529,12 @@ async fn handle_key(
                             Some("no such number — /find first".into());
                         return;
                     };
+                    // The incarnation comes from the directory row we found it
+                    // in — a joiner has to sign against it and cannot ask
+                    // `Info`, which wants the membership this is acquiring.
                     let (channel, name) = (found.channel, found.name.clone());
-                    let note = match chat.join(&channel).await {
+                    let instance = found.instance;
+                    let note = match chat.join(&channel, instance).await {
                         Ok(()) => format!("joined #{name}"),
                         Err(e) => e.to_string(),
                     };
@@ -2929,7 +2937,7 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<([u8; 32], PubKey), String> 
 mod tests {
     use super::*;
     use sqex_proto::message::{Body, Post as SipPost};
-    use sqex_proto::timeline::Received;
+    use sqex_proto::timeline::{Received, Verdict};
 
     fn conv(peer: u8, label: &str) -> Open {
         Open {
@@ -2963,6 +2971,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 body: Some(Body::Post(SipPost::text(text))),
+                verdict: Verdict::Valid,
             },
             &[],
         );
@@ -3031,6 +3040,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 body: Some(Body::Post(SipPost::text("hello"))),
+                verdict: Verdict::Valid,
             }],
             &[],
         );
@@ -3248,6 +3258,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 body: Some(Body::Post(SipPost::text("did you see this?"))),
+                verdict: Verdict::Valid,
             }],
             &[me],
         );
@@ -3321,6 +3332,7 @@ mod tests {
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
                     body: Some(Body::Post(SipPost::text("theirs"))),
+                    verdict: Verdict::Valid,
                 },
                 Received {
                     seq: 2,
@@ -3329,6 +3341,7 @@ mod tests {
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
                     body: Some(Body::Post(SipPost::text("mine"))),
+                    verdict: Verdict::Valid,
                 },
             ],
             &[me, bob],
@@ -3358,6 +3371,7 @@ mod tests {
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
             body: Some(Body::Post(SipPost::text("hello"))),
+            verdict: Verdict::Valid,
         };
         let mut c = conv(2, "bob");
         c.timeline = Timeline::fold(&[entry(1), entry(2), entry(3)], &[me]);
@@ -3400,6 +3414,7 @@ mod tests {
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
             body: Some(Body::Post(SipPost::text("hello"))),
+            verdict: Verdict::Valid,
         };
 
         // Only our own is newer than the mark: nothing to come back to.

@@ -35,6 +35,29 @@ use crate::channel::KIND_SYSTEM;
 use crate::blob::Attachment;
 use crate::message::{Body, EDIT_WINDOW, Post};
 
+/// What SIP-31 verification concluded about an entry.
+///
+/// Three states, not two. Collapsing `Broken` into `Valid` hides the omission
+/// the chain exists to make visible; collapsing it into `Forged` accuses an
+/// origin of rewriting when it may only have pruned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verdict {
+    /// Signed by the device the entry names, and following that device's chain.
+    #[default]
+    Valid,
+    /// The signature is absent, or does not verify under the entry's device.
+    /// Not a message: a reader MUST NOT show it as one.
+    Forged,
+    /// A gap in a device's chain. Ordinary — pruning, retention, and joining a
+    /// channel without its history all produce one — so it is reported and the
+    /// message is still shown.
+    Gap,
+    /// Two entries by one device at one chain position. This cannot happen
+    /// without that device signing twice or somebody replaying, and it is the
+    /// only one of these that is evidence.
+    Fork,
+}
+
 /// One entry as it reached us, with its body already opened if we could.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Received {
@@ -58,6 +81,10 @@ pub struct Received {
     /// The distinction is safe to make on length: a sealed body always carries
     /// its tag, so nothing openable is ever zero bytes.
     pub tombstone: bool,
+    /// What SIP-31 verification concluded. `Valid` for an entry the exchange
+    /// wrote itself, which carries an actor's signature inside its body rather
+    /// than one of its own.
+    pub verdict: Verdict,
 }
 
 /// A message as it should be shown.
@@ -93,6 +120,8 @@ pub struct Timeline {
     messages: BTreeMap<u64, Message>,
     /// Bodies we could not read at all, by sequence number.
     unreadable: Vec<u64>,
+    forged: Vec<u64>,
+    broken: Vec<(u64, Verdict)>,
     pub name: String,
     pub topic: String,
     /// The channel's picture, as an attachment reference. Kept rather than
@@ -126,6 +155,20 @@ impl Timeline {
         &self.unreadable
     }
 
+    /// Entries whose signature did not verify. Never folded into the messages,
+    /// because the whole point is that nobody vouched for them.
+    pub fn forged(&self) -> &[u64] {
+        &self.forged
+    }
+
+    /// Entries where a device's chain did not follow. Shown, and marked: a gap
+    /// is ordinary and only a fork is evidence, so a client that presented
+    /// either as tampering would cry wolf on every channel with a retention
+    /// window.
+    pub fn broken(&self) -> &[(u64, Verdict)] {
+        &self.broken
+    }
+
     /// Fold a run of entries. `admins` is the channel's admin list from SIP-16
     /// `Info`, which is the only place authority is a fact.
     pub fn fold(entries: &[Received], admins: &[PubKey]) -> Timeline {
@@ -137,6 +180,16 @@ impl Timeline {
     }
 
     pub fn apply(&mut self, e: &Received, admins: &[PubKey]) {
+        // Nobody vouched for this, so it is not a message and must not be shown
+        // as one. Recorded rather than dropped: a reader should be told that
+        // something arrived claiming to be from somebody and was not.
+        if e.verdict == Verdict::Forged {
+            self.forged.push(e.seq);
+            return;
+        }
+        if e.verdict != Verdict::Valid {
+            self.broken.push((e.seq, e.verdict));
+        }
         // An entry the exchange wrote is not a message and never carried a
         // SIP-19 body. It is a membership or rotation event, rendered from
         // SIP-16's own `System` layout, and counting it as something we failed
@@ -271,6 +324,7 @@ mod tests {
             kind: 0x01,
             tombstone: true,
             body: None,
+            verdict: Verdict::Valid,
         }
     }
 
@@ -282,6 +336,7 @@ mod tests {
             kind: 0x01,
             tombstone: false,
             body: Some(Body::Post(Post::text(text))),
+            verdict: Verdict::Valid,
         }
     }
 
@@ -293,6 +348,7 @@ mod tests {
             kind: 0x01,
             tombstone: false,
             body: Some(b),
+            verdict: Verdict::Valid,
         }
     }
 
@@ -548,6 +604,7 @@ mod tests {
                     kind: KIND_SYSTEM,
                     tombstone: false,
                     body: None,
+                    verdict: Verdict::Valid,
                 },
             ],
             &[],
@@ -571,6 +628,7 @@ mod tests {
                     kind: 0x01,
                     tombstone: false,
                     body: None,
+                    verdict: Verdict::Valid,
                 },
             ],
             &[],

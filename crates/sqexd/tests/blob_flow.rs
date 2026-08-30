@@ -21,6 +21,11 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
+mod common;
+use common::{Signer, instance_for};
+use sqex_proto::channel::{ByChannelSigned, EVENT_JOINED};
+use sqex_proto::entry_sig::GENESIS;
+
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
@@ -47,6 +52,12 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
     (addr, server_pub, handle)
 }
 
+/// What signs for identity `b` against this exchange (SIP-31).
+fn signer(pubkey: [u8; 32], b: u8) -> Signer {
+    let sk = SigningKey::from_bytes(&[b; 32]);
+    Signer::new(sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()), pubkey)
+}
+
 async fn client_for(addr: SocketAddr, pubkey: [u8; 32], b: u8) -> (Client, PubKey) {
     let sk = SigningKey::from_bytes(&[b; 32]);
     let seed = sk.to_bytes();
@@ -56,16 +67,8 @@ async fn client_for(addr: SocketAddr, pubkey: [u8; 32], b: u8) -> (Client, PubKe
     )
 }
 
-fn public(channel: [u8; 32], name: &str) -> Create {
-    Create {
-        channel,
-        visibility: Visibility::Public,
-        retention_secs: 3600,
-        max_entries: 0,
-        name: name.into(),
-        topic: String::new(),
-        invites: vec![],
-    }
+fn public(signer: &Signer, channel: [u8; 32], name: &str) -> Create {
+    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, name, vec![])
 }
 
 /// Seal a file the way a client must: one key, one nonce per chunk, and the
@@ -171,10 +174,22 @@ async fn a_file_survives_the_round_trip_and_the_exchange_never_sees_it() {
     let channel = [1u8; 32];
 
     alice
-        .post("/channel/create", public(channel, "pictures").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
         .await
         .unwrap();
-    bob.post("/channel/join", ByChannel { channel }.encode(TYPE_JOIN))
+    let joining = signer(pubkey, 22).action_outside(
+        channel,
+        instance_for(channel, 0),
+        EVENT_JOINED,
+        &signer(pubkey, 22).account,
+        &[],
+        0,
+        GENESIS,
+    );
+    bob.post(
+        "/channel/join",
+        ByChannelSigned { channel, action: joining }.encode(TYPE_JOIN),
+    )
         .await
         .unwrap();
 
@@ -218,7 +233,7 @@ async fn a_commit_that_does_not_hash_to_its_name_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 31).await;
     let channel = [2u8; 32];
     alice
-        .post("/channel/create", public(channel, "pictures").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
         .await
         .unwrap();
 
@@ -242,7 +257,7 @@ async fn an_upload_missing_a_chunk_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 41).await;
     let channel = [3u8; 32];
     alice
-        .post("/channel/create", public(channel, "pictures").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
         .await
         .unwrap();
 
@@ -288,7 +303,7 @@ async fn a_stranger_cannot_fetch_a_blob_and_absence_looks_the_same() {
     let channel = [4u8; 32];
 
     // A private channel, so membership is the only way in.
-    let mut req = public(channel, "");
+    let mut req = public(&signer(pubkey, 21), channel, "");
     req.visibility = Visibility::Private;
     alice.post("/channel/create", req.encode()).await.unwrap();
 
@@ -318,11 +333,11 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
     let first = [5u8; 32];
     let second = [6u8; 32];
     alice
-        .post("/channel/create", public(first, "one").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), first, "one").encode())
         .await
         .unwrap();
     alice
-        .post("/channel/create", public(second, "two").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), second, "two").encode())
         .await
         .unwrap();
 
@@ -375,7 +390,7 @@ async fn an_aborted_upload_leaves_nothing_behind() {
     let (mut alice, _) = client_for(addr, pubkey, 71).await;
     let channel = [7u8; 32];
     alice
-        .post("/channel/create", public(channel, "x").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), channel, "x").encode())
         .await
         .unwrap();
 
@@ -417,7 +432,7 @@ async fn a_chunk_outside_the_reservation_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 81).await;
     let channel = [8u8; 32];
     alice
-        .post("/channel/create", public(channel, "x").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), channel, "x").encode())
         .await
         .unwrap();
 
@@ -447,7 +462,7 @@ async fn an_attachment_reference_describes_what_was_uploaded() {
     let (mut alice, _) = client_for(addr, pubkey, 91).await;
     let channel = [9u8; 32];
     alice
-        .post("/channel/create", public(channel, "x").encode())
+        .post("/channel/create", public(&signer(pubkey, 21), channel, "x").encode())
         .await
         .unwrap();
 
@@ -485,7 +500,7 @@ async fn the_last_member_leaving_takes_the_blobs_with_them() {
     // member walking out of a private channel orphaned its files for good.
     // The collection lives inside `destroy` now, because a rule every caller
     // must remember is a rule one of them will not.
-    use sqex_proto::channel::{ByChannel, Invitee, Role, TYPE_LEAVE};
+    use sqex_proto::channel::{EVENT_LEFT, Invitee, Role, TYPE_LEAVE};
 
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
@@ -496,19 +511,19 @@ async fn the_last_member_leaving_takes_the_blobs_with_them() {
     let (code, _) = alice
         .post(
             "/channel/create",
-            Create {
-                channel,
-                visibility: Visibility::Private,
-                retention_secs: 3600,
-                max_entries: 0,
-                name: String::new(),
-                topic: String::new(),
-                invites: vec![Invitee {
-                    account: bob_key,
-                    role: Role::Member,
-                }],
-            }
-            .encode(),
+            signer(server_pub, 1)
+                .create(
+                    channel,
+                    instance_for(channel, 0),
+                    Visibility::Private,
+                    3600,
+                    "",
+                    vec![Invitee {
+                        account: bob_key,
+                        role: Role::Member,
+                    }],
+                )
+                .encode(),
         )
         .await
         .unwrap();
@@ -531,12 +546,21 @@ async fn the_last_member_leaving_takes_the_blobs_with_them() {
     assert_eq!(held("uploaded").0, 1);
 
     // Both leave. The channel is destroyed with the last of them.
-    for c in [&mut bob, &mut alice] {
-        let (code, _) = c
-            .post("/channel/leave", ByChannel { channel }.encode(TYPE_LEAVE))
+    for (c, b) in [(&mut bob, 2u8), (&mut alice, 1u8)] {
+        let who = signer(server_pub, b);
+        // Asked rather than assumed: Alice's create already spent a position
+        // for Bob's `added`, so she is not where Bob is, and both are still
+        // members here so `Info` will answer.
+        let account = who.account;
+        let action = who.action(c, channel, EVENT_LEFT, &account, &[]).await;
+        let (code, body) = c
+            .post(
+                "/channel/leave",
+                ByChannelSigned { channel, action }.encode(TYPE_LEAVE),
+            )
             .await
             .unwrap();
-        assert_eq!(code, 200);
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
     }
 
     assert_eq!(
@@ -563,7 +587,7 @@ async fn a_blob_attached_twice_survives_one_channel_ending() {
     let second = [0x82; 32];
     for c in [first, second] {
         let (code, _) = alice
-            .post("/channel/create", public(c, "room").encode())
+            .post("/channel/create", public(&signer(server_pub, 1), c, "room").encode())
             .await
             .unwrap();
         assert_eq!(code, 200);
