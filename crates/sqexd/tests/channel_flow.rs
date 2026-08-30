@@ -882,6 +882,13 @@ async fn mine_pages_and_reports_the_window_and_the_read_mark() {
     id[0] = 0;
     post(&mut a, id, b"hello").await;
     post(&mut a, id, b"again").await;
+    // Fetch before marking read, which is what a client actually does and what
+    // the mark means. `delivered` is what the exchange handed over, and it has
+    // handed Alice nothing — supplying an entry is not collecting one — so a
+    // read mark set before any fetch is clamped to zero. This test used to pass
+    // without the fetch only because `delivered` folded in the caller's own
+    // `since`, which let a request name its own delivery receipt.
+    fetch(&mut a.client, id, 0, 0).await;
     let (_, body) = a
         .client
         .post("/channel/cursor", Cursor { channel: id, read: 1, receipts: true }.encode())

@@ -1166,16 +1166,24 @@ impl Channels {
         }
         // `delivered` is observed rather than asserted, and what is observed is
         // what was *handed over* — not `since`, which is only what the caller
-        // already had. Recording it costs one integer and discloses nothing the
-        // exchange did not just watch itself do.
-        let delivered = entries.last().map(|e| e.seq).unwrap_or(since).max(since);
-        db.execute(
-            "INSERT INTO cursor (channel, account, delivered) VALUES (?1, ?2, ?3)
-             ON CONFLICT (channel, account)
-             DO UPDATE SET delivered = MAX(delivered, excluded.delivered)",
-            params![&channel[..], caller.as_bytes(), delivered as i64],
-        )
-        .map_err(storage("record delivery"))?;
+        // says it already had. Recording it costs one integer and discloses
+        // nothing the exchange did not just watch itself do.
+        //
+        // This once folded `since` in, which handed the caller its own delivery
+        // receipt: a fetch naming a large `since` set the mark to it, the mark
+        // is monotonic so it never came back down, and `read` is clamped to
+        // `delivered` — so a client could then claim to have read entries that
+        // do not exist. Nothing is recorded when nothing was returned; the
+        // previous fetch that actually handed entries over already moved it.
+        if let Some(delivered) = entries.last().map(|e| e.seq) {
+            db.execute(
+                "INSERT INTO cursor (channel, account, delivered) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (channel, account)
+                 DO UPDATE SET delivered = MAX(delivered, excluded.delivered)",
+                params![&channel[..], caller.as_bytes(), delivered as i64],
+            )
+            .map_err(storage("record delivery"))?;
+        }
 
         Ok(Entries {
             now: now_unix(),
@@ -2930,12 +2938,22 @@ impl Channels {
         if role_of(&db, channel, caller).is_none() {
             return Err(ChannelError::NotAMember);
         }
+        // The same rule on the way in. A row that does not exist yet belongs to
+        // an account that has never fetched, so nothing has been delivered to
+        // it and nothing can have been read — inserting the caller's claim into
+        // `delivered` would let a read mark create the delivery it is clamped
+        // against.
+        //
+        // The update clause names `?3` rather than `excluded.read` on purpose:
+        // `excluded` is the row this statement *tried* to insert, which now
+        // carries a deliberate zero, so reading the claim from there would pin
+        // every read mark at nothing.
         db.execute(
             "INSERT INTO cursor (channel, account, delivered, read, receipts)
-             VALUES (?1, ?2, ?3, ?3, ?4)
+             VALUES (?1, ?2, 0, 0, ?4)
              ON CONFLICT (channel, account) DO UPDATE SET
-                 read = MIN(MAX(read, excluded.read), delivered),
-                 receipts = excluded.receipts",
+                 read = MIN(MAX(read, ?3), delivered),
+                 receipts = ?4",
             params![
                 &channel[..],
                 caller.as_bytes(),
@@ -3252,6 +3270,58 @@ mod tests {
             |r| r.get::<_, i64>(0),
         )
         .unwrap() as u64
+    }
+
+    /// SIP-16: "`delivered` is observed, not asserted. The exchange already
+    /// learns each member's high-water mark from the `since` on every `Fetch`."
+    ///
+    /// But `since` is what the *caller* says it already has, not what the
+    /// exchange handed over — and folding it into `delivered` lets a client
+    /// name its own delivery receipt. The mark is monotonic, so an inflated one
+    /// never comes back down, and `read` is then permitted up to it: a client
+    /// can claim to have read messages that do not exist.
+    #[test]
+    fn delivered_is_observed_and_a_caller_cannot_assert_it() {
+        let c = open();
+        let alice = key(ALICE);
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
+            .unwrap();
+
+        // Nothing has ever been posted here, so nothing can have been
+        // delivered to anybody.
+        c.fetch(&alice, &[7; 32], 9_999).unwrap();
+
+        let marks = c.cursors(&alice, &[7; 32]).unwrap();
+        let mine = marks
+            .marks
+            .iter()
+            .find(|m| m.account == alice)
+            .expect("no mark for the caller");
+        assert_eq!(
+            mine.delivered, 0,
+            "a caller's `since` became its own delivery receipt"
+        );
+    }
+
+    /// The same rule on the other door. A read mark from an account that has
+    /// never fetched must not create the delivery it is clamped against.
+    #[test]
+    fn a_read_mark_cannot_create_the_delivery_it_is_clamped_against() {
+        let c = open();
+        let alice = key(ALICE);
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
+            .unwrap();
+
+        c.set_cursor(&alice, &[7; 32], 500, true).unwrap();
+
+        let marks = c.cursors(&alice, &[7; 32]).unwrap();
+        let mine = marks
+            .marks
+            .iter()
+            .find(|m| m.account == alice)
+            .expect("no mark for the caller");
+        assert_eq!(mine.delivered, 0, "a read mark asserted a delivery");
+        assert_eq!(mine.read, 0, "read ran past what was delivered");
     }
 
     #[test]
