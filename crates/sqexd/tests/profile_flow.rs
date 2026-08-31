@@ -386,6 +386,53 @@ async fn a_block_list_is_returned_only_to_its_owner() {
     assert!(Blocks::decode(&body).unwrap().accounts.is_empty());
 }
 
+/// **SIP-32: the highest serial wins, and a record at or below the one held is
+/// refused.**
+///
+/// Untested until now, and untestable by accident: the `put_as` helper climbs
+/// the serial every time it is called — it says so in its own doc comment —
+/// so every existing test drives the accepting path and nothing ever drove the
+/// refusal. That is the shape this repository has been caught by before: where
+/// a rule distinguishes two cases, the tests need one of each.
+///
+/// A counter rather than a clock is the whole mechanism here, and what it buys
+/// is that a stale record *loses* rather than merely looking old. An exchange
+/// that accepted a replayed record would let anyone who kept a copy of an old
+/// profile put it back.
+#[tokio::test]
+async fn a_profile_at_or_below_the_serial_held_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (mut a, alice) = peer(addr, pubkey, 91).await;
+
+    assert_eq!(
+        put_as(&mut a, &[91; 32], &alice, 5, profile("current", "", 0)).await,
+        200,
+        "the honest put must land, or the rest of this proves nothing"
+    );
+
+    // The same serial again: a replay of what is already held.
+    assert_eq!(
+        put_as(&mut a, &[91; 32], &alice, 5, profile("replayed", "", 0)).await,
+        409,
+        "a record at the serial held must be refused"
+    );
+    // And one below it.
+    assert_eq!(
+        put_as(&mut a, &[91; 32], &alice, 4, profile("older still", "", 0)).await,
+        409,
+        "a record below the serial held must be refused"
+    );
+
+    // What is served is still the record that won.
+    let got = get(&mut a, &alice).await;
+    assert!(got.found);
+    assert_eq!(
+        got.profile().name, "current",
+        "a refused record must not have overwritten the one held"
+    );
+}
+
 #[tokio::test]
 async fn profile_updates_are_rate_limited() {
     // A profile is served to everyone who shares a channel with its subject,

@@ -176,6 +176,69 @@ async fn a_rename_reaches_everybody_who_shares_a_channel() {
     assert!(got.is_some(), "a rename did not reach somebody sharing a channel");
 }
 
+/// **SIP-30: a profile event MUST NOT cross a block, in either direction.**
+///
+/// Untested until now, and untestable by accident: no test in this file ever
+/// set a block, so the filter at `/profile/put` was never asked to exclude
+/// anybody. Every existing profile-event test drives the delivering path.
+///
+/// It matters because the event is a liveness signal, not just a hint. Somebody
+/// who has blocked Alice, or whom Alice has blocked, would otherwise learn each
+/// time Alice edits her profile — that she is connected, and roughly when —
+/// while `/profile/get` was carefully arranged to tell them nothing at all.
+/// SIP-21's invisible refusal would leak through the notification beside it.
+#[tokio::test]
+async fn a_profile_event_does_not_cross_a_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _srv, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("b.db")).await;
+    let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("c.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let (_, carol_key) = identity(3);
+
+    // Both share a channel with Alice, so both are in the reach a profile has.
+    alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    alice.open_dm(&carol_key).await.unwrap();
+    carol.open_dm(&alice_key).await.unwrap();
+    assert!(bob.subscribe().await.unwrap());
+    assert!(carol.subscribe().await.unwrap());
+
+    // Bob blocks Alice. Carol does not, and is the control: without her a
+    // silent exchange would pass this test by telling nobody anything.
+    bob.set_block(&alice_key, true).await.unwrap();
+
+    alice
+        .set_profile(sqex_proto::profile::Profile {
+            flags: 0,
+            name: "Alice Byrne".into(),
+            title: String::new(),
+            avatar: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let reached = wait_for(
+        &mut carol,
+        |e| matches!(e, ChatEvent::Profile { account } if *account == alice_key),
+        SOON,
+    )
+    .await;
+    assert!(
+        reached.is_some(),
+        "the control failed: the event reached nobody, so excluding Bob proves nothing"
+    );
+
+    let his = collect_for(&mut bob, Duration::from_millis(300)).await;
+    assert!(
+        !his.iter()
+            .any(|e| matches!(e, ChatEvent::Profile { account } if *account == alice_key)),
+        "a profile event crossed a block, telling a blocker when the blocked account is active: {his:?}"
+    );
+}
+
 /// The one that matters most. An event stream must not become a way to learn
 /// about rooms you are not in.
 #[tokio::test]
