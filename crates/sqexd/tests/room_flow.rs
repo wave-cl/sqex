@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::refusal::{Code, Refusal};
-use sqex_proto::room::{Join, Leave, MAX_MEMBERS, RoomId, Roster};
+use sqex_proto::room::{Join, Leave, Left, MAX_MEMBERS, RoomId, Roster};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -206,7 +206,10 @@ async fn leaving_is_immediate_and_the_others_see_it() {
         .await
         .unwrap();
     assert_eq!(code, 200);
-    assert!(String::from_utf8_lossy(&body).contains("true"));
+    assert!(
+        Left::decode(&body).unwrap().was_there,
+        "b was in the room and should be reported as having left it"
+    );
 
     assert!(join(&mut a, &room, a_id).await.members.is_empty(), "b is gone");
 
@@ -216,7 +219,10 @@ async fn leaving_is_immediate_and_the_others_see_it() {
         .await
         .unwrap();
     assert_eq!(code, 200);
-    assert!(String::from_utf8_lossy(&body).contains("false"));
+    assert!(
+        !Left::decode(&body).unwrap().was_there,
+        "leaving a room you are not in is nothing, and says so"
+    );
 }
 
 #[tokio::test]

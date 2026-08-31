@@ -9,6 +9,7 @@ use std::time::Instant;
 use bytes::Buf;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
+use sqex_proto::exchange::Pong;
 use sqex_proto::refusal::{Code, Refusal};
 use sqnr_core::key::PubKey;
 use sqnr_core::{Error, Result, SignedTransaction};
@@ -54,7 +55,7 @@ use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
     Block as ProfileBlock, ByAccount, Put as ProfilePut, TYPE_GET as PR_GET,
 };
-use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave};
+use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave, Left};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
 
 /// The server's own version, reported in status. The protocol lives in
@@ -1379,11 +1380,7 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(leave)) => {
                 let was_there = server.rooms.leave(&leave.handle, &me);
-                (
-                    200,
-                    "application/json",
-                    json!({ "left": was_there }).to_string().into_bytes(),
-                )
+                (200, "application/octet-stream", Left { was_there }.encode())
             }
         },
 
@@ -1491,11 +1488,7 @@ async fn route(
         // A protected exchange endpoint, to demonstrate whitelist enforcement.
         ("GET", "/exchange/ping") => {
             if server.state.lock().unwrap().peer_allowed(peer.key) {
-                (
-                    200,
-                    "application/json",
-                    json!({ "pong": true }).to_string().into_bytes(),
-                )
+                (200, "application/octet-stream", Pong { now: now_unix() }.encode())
             } else {
                 refuse(403, Code::NotWhitelisted, None)
             }

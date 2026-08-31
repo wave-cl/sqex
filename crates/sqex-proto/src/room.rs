@@ -43,6 +43,8 @@ pub const HEARTBEAT_SECS: u64 = 2;
 
 pub const TYPE_JOIN: u8 = 0x01;
 pub const TYPE_LEAVE: u8 = 0x02;
+/// The answer to a leave.
+pub const TYPE_LEFT: u8 = 0x03;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -198,6 +200,36 @@ impl Leave {
         Ok(Leave {
             handle: b[1..33].try_into().unwrap(),
         })
+    }
+}
+
+/// What a leave did.
+///
+/// `was_there` distinguishes a member who left from a caller who was not in the
+/// room to begin with. Neither is an error — leaving a room you are not in is
+/// nothing — so the difference lives in the answer rather than in a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Left {
+    pub was_there: bool,
+}
+
+impl Left {
+    pub fn encode(&self) -> Vec<u8> {
+        vec![TYPE_LEFT, self.was_there as u8]
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Left> {
+        if b.len() != 2 {
+            return Err(Error::Malformed(format!("left is {} bytes, want 2", b.len())));
+        }
+        if b[0] != TYPE_LEFT {
+            return Err(Error::Malformed(format!("not a left (type {:#x})", b[0])));
+        }
+        match b[1] {
+            0 => Ok(Left { was_there: false }),
+            1 => Ok(Left { was_there: true }),
+            other => Err(Error::Malformed(format!("was_there is {other}, want 0 or 1"))),
+        }
     }
 }
 
