@@ -31,7 +31,7 @@ const NOTE_LINGER: Duration = Duration::from_secs(8);
 
 use sqex_proto::events::Event as ChatEvent;
 use sqex_proto::message::Post as SipPost;
-use sqex_proto::timeline::{Deletion, Timeline};
+use sqex_proto::timeline::{Deletion, Timeline, Verdict};
 use sqnr::{Client, config::Config, identity};
 use sqnr_core::Signer;
 use sqex_proto::channel::{Role, Visibility};
@@ -1037,6 +1037,23 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             conv.trouble.lost = got.lost;
             conv.trouble.gap = got.gap;
             conv.trouble.restarted = got.restarted;
+            // SIP-31 reports three states and not two, and until now only
+            // `Forged` was acted on — the others were classified, folded into
+            // the timeline, and never read by anything. A fork in particular
+            // MUST be surfaced: it is the one verdict here that is evidence.
+            conv.trouble.forked = conv
+                .timeline
+                .broken()
+                .iter()
+                .filter(|(_, v)| *v == Verdict::Fork)
+                .map(|(seq, _)| *seq)
+                .collect();
+            conv.trouble.unattributed = conv
+                .timeline
+                .broken()
+                .iter()
+                .filter(|(_, v)| *v == Verdict::Unattributed)
+                .count();
             conv.trouble.message = None;
             conv.typing = got.typing;
             let after = conv.timeline.messages().count();
@@ -2760,6 +2777,8 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         no_key: conv.trouble.no_key,
         gap: conv.trouble.gap,
         restarted: conv.trouble.restarted,
+        forked: conv.trouble.forked.clone(),
+        unattributed: conv.trouble.unattributed,
         message: note.or_else(|| conv.trouble.message.clone()).or_else(|| {
             conv.waiting.then(|| match conv.peer {
                 Some(_) => format!(
