@@ -186,12 +186,21 @@ async fn a_chat_that_cannot_redial_keeps_trying() {
     chat.keep_alive().await;
     assert!(began.elapsed() < Duration::from_millis(50));
 
+    // Assert that the request was actually made, not that it took a while.
+    //
+    // This used to require the call to last more than a millisecond, using
+    // elapsed time as a proxy for "it went to the wire". A successful round
+    // trip through a loopback relay takes about 0.7ms, so the proxy failed
+    // roughly a third of the time — and more often as the transport got
+    // faster, which is the wrong direction for a test to move. A short-circuit
+    // is what this guards against, and a short-circuit returns an error
+    // without leaving the process, so succeeding is the property.
     gate.store(true, Ordering::Relaxed);
-    let began = Instant::now();
-    let _ = chat.mine().await;
+    let outcome = chat.mine().await;
     assert!(
-        began.elapsed() > Duration::from_millis(1),
-        "it refused without trying, and it has no way back"
+        outcome.is_ok(),
+        "it refused without trying, and it has no way back: {:?}",
+        outcome.err()
     );
     server.abort();
 }

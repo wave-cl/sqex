@@ -4660,7 +4660,7 @@ dependencies = [
  "sqexd",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.19.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4708,7 +4708,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "sqnr-core",
- "squic",
+ "squic 0.19.0",
  "x25519-dalek",
 ]
 
@@ -4730,7 +4730,7 @@ dependencies = [
  "sqexd",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.19.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4763,7 +4763,7 @@ dependencies = [
  "sqex-proto",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.19.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4797,7 +4797,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqnr-core",
- "squic",
+ "squic 0.18.0",
  "tokio",
  "toml",
  "zeroize",
@@ -4819,6 +4819,31 @@ dependencies = [
 name = "squic"
 version = "0.18.0"
 source = "git+https://github.com/wave-cl/squic-rust?tag=v0.18.0#7256348ba5f12bacd91b8d1e458ef51c3eb15570"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "quinn",
+ "quinn-proto",
+ "rand 0.9.5",
+ "rand_core 0.6.4",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "socket2 0.5.10",
+ "thiserror 2.0.20",
+ "tokio",
+ "x25519-dalek",
+ "x509-cert",
+]
+
+[[package]]
+name = "squic"
+version = "0.19.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.19.0#c7a1e23085a65a6c886b88c2267d5575f7043e52"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
