@@ -126,7 +126,15 @@ const DIAL_SLICE: Duration = Duration::from_millis(50);
 
 /// A dial in progress: a handshake held across ticks so the interface stays
 /// live while it happens.
-type Dialing = Pin<Box<dyn Future<Output = std::result::Result<Client, String>>>>;
+///
+/// `Send` is required, and it did not used to be. The reconnect is advanced a
+/// slice at a time rather than spawned, which needs no bound at all — see the
+/// note in [`crate::events`]. But the bound is not the same thing as the task:
+/// without it a `Chat` cannot cross a thread, so the whole client can only be
+/// driven by whoever built it, and a program that also wants to draw a window
+/// or carry a call has nowhere to put it. Permitting a task costs nothing; the
+/// reconnect still does not use one.
+type Dialing = Pin<Box<dyn Future<Output = std::result::Result<Client, String>> + Send>>;
 
 /// A wait with up to a fifth taken off it or added to it.
 ///
