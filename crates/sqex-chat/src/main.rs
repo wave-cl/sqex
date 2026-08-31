@@ -215,7 +215,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         _ => {}
     }
 
-    let (client, addr, server) = connect(&cli, &cfg, &seed).await?;
+    let (client, addr, server, pinned_notice) = connect(&cli, &cfg, &seed).await?;
     // The exchange we are talking to is bound into every SIP-31 signature, so
     // an entry signed here cannot be lifted into another exchange's copy of the
     // same conversation — which for a direct message is byte-identical.
@@ -267,7 +267,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     // Held for the length of the session: dropping the guard, or the process
     // ending however it ends, hands it on.
     let _lock = store::lock(&path).map_err(|e| e.to_string())?;
-    interface(chat).await
+    interface(chat, pinned_notice).await
 }
 
 /// Whether a credential was written for this client.
@@ -664,7 +664,7 @@ fn hex8(channel: &[u8; 32]) -> String {
     channel[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn interface(mut chat: Chat) -> Result<(), String> {
+async fn interface(mut chat: Chat, pinned_notice: Option<String>) -> Result<(), String> {
     // Before anything is drawn: somebody may have written to us while this
     // client had never heard of them.
     if let Err(e) = discover(&mut chat).await {
@@ -676,6 +676,20 @@ async fn interface(mut chat: Chat) -> Result<(), String> {
         me: format!("{}", chat.me),
         ..Default::default()
     };
+
+    // A trust decision was made on this user's behalf during startup, so it is
+    // said where they will actually read it rather than into the scrollback the
+    // interface is about to paint over.
+    // On every conversation, not just the first: which one the interface opens
+    // on is its decision, and a notice the user never sees because they happened
+    // to land elsewhere is no notice at all. It expires in NOTE_LINGER either
+    // way, so this shows once and leaves nothing behind.
+    if let Some(notice) = pinned_notice {
+        let at = std::time::Instant::now();
+        for conv in open.iter_mut() {
+            conv.note = Some((notice.clone(), at));
+        }
+    }
 
     let mut terminal = start_terminal().map_err(|e| e.to_string())?;
     let result = event_loop(&mut terminal, &mut chat, &mut open, &mut app).await;
@@ -2913,7 +2927,7 @@ async fn connect(
     cli: &Cli,
     cfg: &Config,
     seed: &[u8; 32],
-) -> Result<(Client, std::net::SocketAddr, PubKey), String> {
+) -> Result<(Client, std::net::SocketAddr, PubKey, Option<String>), String> {
     let target = sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())?;
 
     let addr = match target {
@@ -2922,7 +2936,7 @@ async fn connect(
             let client = Client::connect_as(socket, key.as_bytes(), seed)
                 .await
                 .map_err(|e| format!("could not reach {socket}: {e}"))?;
-            return Ok((client, socket, key));
+            return Ok((client, socket, key, None));
         }
         sqex_discovery::Target::Discover(d) => d,
     };
@@ -2938,13 +2952,16 @@ async fn connect(
     let (server, candidates, newly_pinned) = sqex_discovery::candidates(domain)
         .await
         .map_err(|e| e.to_string())?;
-    if newly_pinned {
-        eprintln!(
-            "{domain}: discovered {server} over DNSSEC and pinned it.\n\
-             It will not change without telling you. Forget it with \
-             `sqex discover --forget {domain}`."
-        );
-    }
+    // Not printed here. This runs before the interface takes the terminal, so
+    // an `eprintln!` lands underneath the status line ratatui is about to draw
+    // over it — the first thing a new user sees, and it looks broken. It is
+    // carried out and shown as a note once there is somewhere to put it.
+    let pinned_notice = newly_pinned.then(|| {
+        format!(
+            "discovered {server} for {domain} over DNSSEC and pinned it — it will not \
+             change without telling you. Forget it with `sqex discover --forget {domain}`."
+        )
+    });
 
     let mut last = String::new();
     for c in &candidates {
@@ -2969,7 +2986,7 @@ async fn connect(
                     // time, so it is said once and not treated as fatal.
                     eprintln!("note: could not remember where {domain} answered: {e}");
                 }
-                return Ok((client, c.addr, server));
+                return Ok((client, c.addr, server, pinned_notice));
             }
             Err(e) => {
                 // Quiet per candidate: a stale cached address is ordinary and
