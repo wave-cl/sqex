@@ -33,8 +33,8 @@ You also need a signing identity for admin commands — install
 **flag > environment > `~/.sqnr/config`**:
 
 ```
-sqex --server host:5400 --server-key <b58> status   # flags
-SQEX_SERVER=host:5400 SQEX_SERVER_KEY=<b58> sqex status   # environment
+sqex --server host:443 --server-key <b58> status   # flags
+SQEX_SERVER=host:443 SQEX_SERVER_KEY=<b58> sqex status   # environment
 # or set server / server_key in ~/.sqnr/config and just: sqex status
 ```
 

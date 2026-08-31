@@ -68,6 +68,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Find the exchange a domain publishes (SIP-33), and inspect what is
+    /// pinned. Talks to DNS only — no exchange is contacted.
+    Discover {
+        /// The domain to look up. Omit to list what is already pinned.
+        domain: Option<String>,
+        /// Forget the key pinned for a domain, so the next connection is
+        /// treated as a first contact.
+        #[arg(long, value_name = "DOMAIN")]
+        forget: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -182,7 +192,86 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
+        Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
     }
+}
+
+// ---- discovery (SIP-33) -----------------------------------------------------
+
+/// Look a domain up, or show and edit what is pinned.
+///
+/// **Read-only on the pin store unless `--forget` is given.** A diagnostic that
+/// pinned a key as a side effect would make a trust decision every time somebody
+/// ran it to see what was there; connecting is what pins.
+async fn discover(domain: Option<&str>, forget: Option<&str>) -> Result<(), String> {
+    let path = sqex_discovery::known::path();
+
+    if let Some(d) = forget {
+        let mut store = sqex_discovery::Known::load(&path)?;
+        if store.remove(d) {
+            store.save(&path)?;
+            println!("forgot {d}. The next connection to it is a first contact again.");
+        } else {
+            println!("nothing was pinned for {d}");
+        }
+        return Ok(());
+    }
+
+    let store = sqex_discovery::Known::load(&path)?;
+
+    let Some(domain) = domain else {
+        if store.entries().is_empty() {
+            println!("nothing pinned yet — {}", path.display());
+            return Ok(());
+        }
+        println!("pinned in {}:", path.display());
+        for e in store.entries() {
+            if e.comment.is_empty() {
+                println!("  {}  {}", e.domain, e.key);
+            } else {
+                println!("  {}  {}  ({})", e.domain, e.key, e.comment);
+            }
+        }
+        return Ok(());
+    };
+
+    let records = sqex_discovery::dns::lookup(domain)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    println!(
+        "{domain} publishes {} record(s) at _sqex.{domain}, DNSSEC-validated:",
+        records.len()
+    );
+    for r in &records {
+        let host = r.host.as_deref().unwrap_or(domain);
+        println!("  {}  at {host}:{}", r.key, r.port);
+    }
+
+    // What would happen next, said plainly, without doing it.
+    let offered: Vec<_> = records.iter().map(|r| r.key).collect();
+    match sqex_discovery::known::decide(&offered, store.lookup(domain)) {
+        Some(sqex_discovery::Decision::Pinned(k)) => {
+            println!("\npinned already: {k}");
+            if offered.len() > 1 {
+                println!(
+                    "A rotation is in progress. The pin stays put until the key it names \n\
+                     stops being published — a key seen beside it earns nothing."
+                );
+            }
+        }
+        Some(sqex_discovery::Decision::FirstContact(k)) => {
+            println!("\nnothing pinned for {domain} yet.");
+            println!("Connecting would pin {k} and refuse any later change.");
+        }
+        Some(sqex_discovery::Decision::Changed { pinned, offered }) => {
+            println!();
+            println!("{}", sqex_discovery::known::changed_message(domain, &pinned, &offered));
+            return Err("the published key is not the pinned one".into());
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 // ---- relayed session --------------------------------------------------------
@@ -685,11 +774,38 @@ fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
             "no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)"
                 .to_string()
         })?;
-    let socket: SocketAddr = addr
-        .parse()
-        .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
+    let socket = resolve(&addr)?;
     let server: PubKey = key.trim().parse().map_err(|e| format!("bad server key: {e}"))?;
     Ok((socket, server))
+}
+
+/// `host:port`, `host`, or an IP literal.
+///
+/// A bare host is not an error — an exchange has a well-known port — and a name
+/// is not one either: this used to parse straight to a `SocketAddr`, which
+/// accepts only an IP, so `sqex --server ex.example.com` failed with a message
+/// about the address being bad when it was perfectly good.
+fn resolve(address: &str) -> Result<SocketAddr, String> {
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return Ok(socket);
+    }
+    let with_port = if address.starts_with('[') || !has_port(address) {
+        format!("{address}:{}", sqex_discovery::DEFAULT_PORT)
+    } else {
+        address.to_string()
+    };
+    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
+        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
+}
+
+/// Whether a trailing `:port` is present, leaving IPv6 literals alone.
+fn has_port(address: &str) -> bool {
+    !address.starts_with('[')
+        && address
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
 }
 
 async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {

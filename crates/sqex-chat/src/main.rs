@@ -205,10 +205,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         _ => {}
     }
 
-    let (addr, server) = endpoint(&cli, &cfg)?;
-    let client = Client::connect_as(addr, server.as_bytes(), &seed)
-        .await
-        .map_err(|e| format!("could not reach {addr}: {e}"))?;
+    let (client, addr, server) = connect(&cli, &cfg, &seed).await?;
     // The exchange we are talking to is bound into every SIP-31 signature, so
     // an entry signed here cannot be lifted into another exchange's copy of the
     // same conversation — which for a direct message is byte-identical.
@@ -2890,7 +2887,32 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-fn endpoint(cli: &Cli, cfg: &Config) -> Result<(std::net::SocketAddr, PubKey), String> {
+/// How long a remembered or host-derived address gets before we move on.
+///
+/// `connect_as` allows five seconds, which is right for the address we believe
+/// in and wrong for one we are merely guessing at: two stale guesses would
+/// otherwise cost ten seconds before discovery is even tried, every start, for
+/// as long as the cache is wrong.
+const CACHED_ATTEMPT: Duration = Duration::from_millis(1500);
+
+/// Connect, climbing SIP-33's ladder: a remembered address, then the host we
+/// know, then a fresh DNSSEC lookup.
+///
+/// Whichever rung answers is written back, so the next start begins there.
+async fn connect(
+    cli: &Cli,
+    cfg: &Config,
+    seed: &[u8; 32],
+) -> Result<(Client, std::net::SocketAddr, PubKey), String> {
+    // An explicitly configured key means no discovery and no ladder: the caller
+    // said where to go.
+    if let Some((addr, server)) = configured(cli, cfg)? {
+        let client = Client::connect_as(addr, server.as_bytes(), seed)
+            .await
+            .map_err(|e| format!("could not reach {addr}: {e}"))?;
+        return Ok((client, addr, server));
+    }
+
     let addr = cli
         .server
         .clone()
@@ -2900,20 +2922,118 @@ fn endpoint(cli: &Cli, cfg: &Config) -> Result<(std::net::SocketAddr, PubKey), S
             "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
                 .to_string()
         })?;
-    let key = cli
+    let (domain, _) = split_port(&addr);
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return Err(format!(
+            "no server key for {domain}, and an address cannot be discovered — \
+             pass --server-key, set SQEX_SERVER_KEY, put it in ~/.sqnr/config, or \
+             use a domain that publishes an _sqex record (SIP-33)"
+        ));
+    }
+
+    let (server, candidates, newly_pinned) = sqex_discovery::candidates(domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    if newly_pinned {
+        eprintln!(
+            "{domain}: discovered {server} over DNSSEC and pinned it.\n\
+             It will not change without telling you. Forget it with \
+             `sqex discover --forget {domain}`."
+        );
+    }
+
+    let mut last = String::new();
+    for c in &candidates {
+        let budget = match c.source {
+            sqex_discovery::Source::Discovered => None,
+            _ => Some(CACHED_ATTEMPT),
+        };
+        let attempt = Client::connect_as(c.addr, server.as_bytes(), seed);
+        let outcome = match budget {
+            Some(d) => match tokio::time::timeout(d, attempt).await {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(_) => Err(format!("no answer within {}ms", d.as_millis())),
+            },
+            None => attempt.await.map_err(|e| e.to_string()),
+        };
+        match outcome {
+            Ok(client) => {
+                // Note where it answered. A failure to write is not a failure to
+                // connect — the worst it costs is rediscovery next time.
+                if let Err(e) = sqex_discovery::remember(domain, c.host.as_deref(), c.addr) {
+                    // Not a failure to connect. The cost is rediscovery next
+                    // time, so it is said once and not treated as fatal.
+                    eprintln!("note: could not remember where {domain} answered: {e}");
+                }
+                return Ok((client, c.addr, server));
+            }
+            Err(e) => {
+                // Quiet per candidate: a stale cached address is ordinary and
+                // self-healing, and a line about it on every start would be
+                // noise. The final error names the last thing tried.
+                last = format!("{}: {e}", c.addr);
+            }
+        }
+    }
+    Err(format!(
+        "could not reach {domain} at any of its {} address(es) — last was {last}",
+        candidates.len()
+    ))
+}
+
+/// The configured address and key, when both are given. `None` means discovery.
+fn configured(cli: &Cli, cfg: &Config) -> Result<Option<(std::net::SocketAddr, PubKey)>, String> {
+    let Some(key) = cli
         .server_key
         .clone()
         .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
         .or_else(|| cfg.server_key.clone())
+    else {
+        return Ok(None);
+    };
+    let addr = cli
+        .server
+        .clone()
+        .or_else(|| env_nonempty("SQEX_SERVER"))
+        .or_else(|| cfg.server.clone())
         .ok_or_else(|| {
-            "no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)"
+            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
                 .to_string()
         })?;
-    let socket = addr
-        .parse()
-        .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
     let server = key.trim().parse().map_err(|e| format!("bad server key: {e}"))?;
-    Ok((socket, server))
+    Ok(Some((resolve_one_sync(&addr)?, server)))
+}
+
+/// `host:port` for the configured path, which may name a host.
+fn resolve_one_sync(address: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Ok(socket);
+    }
+    let (_, port) = split_port(address);
+    let with_port = match port {
+        Some(_) => address.to_string(),
+        None => format!("{address}:{}", sqex_discovery::DEFAULT_PORT),
+    };
+    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
+        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
+}
+
+
+
+/// Split a trailing `:port`, leaving an IPv6 literal alone.
+fn split_port(addr: &str) -> (&str, Option<u16>) {
+    if addr.starts_with('[') {
+        return (addr, None);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(p) => (host, Some(p)),
+            Err(_) => (addr, None),
+        },
+        None => (addr, None),
+    }
 }
 
 /// Load the identity, and its seed.

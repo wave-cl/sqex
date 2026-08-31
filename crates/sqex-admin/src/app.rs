@@ -39,7 +39,7 @@ impl App {
         Self {
             cmd_tx,
             msg_rx,
-            server_addr: "127.0.0.1:5400".to_string(),
+            server_addr: "127.0.0.1:443".to_string(),
             server_key: String::new(),
             connected: false,
             admin_key: None,

@@ -7,10 +7,11 @@ members = [
     "crates/sqex-admin",
     "crates/sqex-voice",
     "crates/sqex-chat",
+    "crates/sqex-discovery",
 ]
 
 [workspace.package]
-version = "0.22.0"
+version = "0.23.0"
 edition = "2024"
 license = "MIT"
 
@@ -22,6 +23,7 @@ squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.18.0" }
 sqnr-core = { git = "https://github.com/wave-cl/sqnr", tag = "v0.7.1" }
 sqnr = { git = "https://github.com/wave-cl/sqnr", tag = "v0.7.1" }
 sqex-proto = { path = "crates/sqex-proto" }
+sqex-discovery = { path = "crates/sqex-discovery" }
 tokio = { version = "1", features = ["full"] }
 quinn = "0.11"
 h3 = "0.0.8"
@@ -44,6 +46,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tempfile = "3"
+# SIP-33 discovery. The same resolver sqns-client uses, with the same
+# features: validation happens locally against the root anchor.
+hickory-resolver = { version = "0.26", default-features = false, features = ["dnssec-ring", "system-config", "tokio"] }
 
 [profile.release]
 lto = true

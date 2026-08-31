@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 sqex-proto = { workspace = true }
+sqex-discovery = { workspace = true }
 sqnr = { workspace = true }
 sqnr-core = { workspace = true }
 tokio = { workspace = true }

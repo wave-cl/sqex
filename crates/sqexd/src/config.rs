@@ -12,7 +12,8 @@ use sqnr_core::key::PubKey;
 use sqnr_core::{Error, Result};
 
 /// Default UDP port for sqex.
-pub const DEFAULT_PORT: u16 = 5400;
+/// 443/udp — HTTP/3's own port. See `sqex_discovery::DEFAULT_PORT`.
+pub const DEFAULT_PORT: u16 = 443;
 
 fn default_listen() -> String {
     format!("[::]:{DEFAULT_PORT}")
@@ -30,7 +31,7 @@ fn default_welcome_channel() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
-    /// Address to listen on. Default `[::]:5400`.
+    /// Address to listen on. Default `[::]:443`.
     #[serde(default = "default_listen")]
     pub listen: String,
     /// Hex Ed25519 seed for this server's identity.
