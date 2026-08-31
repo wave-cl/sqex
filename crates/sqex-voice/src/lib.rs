@@ -10,9 +10,12 @@
 //! a mesh of ordinary two-party sessions rather than anything new, and [`mix`],
 //! which adds the resulting streams back together.
 //!
-//! See `src/main.rs` for the calls themselves.
+//! The calls themselves are in [`engine`]. They used to live in `src/main.rs`,
+//! which meant holding one required being a terminal; a desktop client and the
+//! CLI now run the same loop rather than two that drift apart.
 
 pub mod audio;
+pub mod engine;
 pub mod jitter;
 pub mod media;
 pub mod mix;
