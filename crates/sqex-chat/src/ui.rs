@@ -2086,7 +2086,6 @@ mod tests {
         assert!(!t.is_quiet());
     }
 
-    #[test]
     /// SIP-31 requires a client to surface a fork: it is the one verdict there
     /// that is evidence rather than housekeeping.
     ///
@@ -2095,13 +2094,15 @@ mod tests {
     /// looked exactly like a quiet one, and the reader was told nothing.
     #[test]
     fn a_fork_is_not_a_quiet_conversation() {
-        let mut t = Trouble::default();
         assert!(
-            t.is_quiet(),
+            Trouble::default().is_quiet(),
             "an empty Trouble must be quiet, or this test proves nothing"
         );
 
-        t.forked = vec![41, 42];
+        let t = Trouble {
+            forked: vec![41, 42],
+            ..Default::default()
+        };
         assert!(!t.is_quiet(), "a fork is something to act on");
         let line = t.line();
         assert!(line.contains("41") && line.contains("42"), "{line}");
@@ -2115,8 +2116,10 @@ mod tests {
     /// a gap is ordinary and MUST NOT be presented as misconduct.
     #[test]
     fn a_gap_does_not_read_as_misconduct() {
-        let mut t = Trouble::default();
-        t.gap = true;
+        let t = Trouble {
+            gap: true,
+            ..Default::default()
+        };
         let line = t.line();
         assert!(
             !line.contains("signed twice"),
@@ -2129,12 +2132,15 @@ mod tests {
     /// the account it names is reported, not quietly accepted (SIP-32).
     #[test]
     fn an_unattributable_signature_is_reported() {
-        let mut t = Trouble::default();
-        t.unattributed = 1;
+        let t = Trouble {
+            unattributed: 1,
+            ..Default::default()
+        };
         assert!(!t.is_quiet());
         assert!(t.line().contains("nobody can bind"), "{}", t.line());
     }
 
+    #[test]
     fn a_retention_gap_is_marked_in_the_transcript() {
         let mut app = sample();
         app.trouble.gap = true;
