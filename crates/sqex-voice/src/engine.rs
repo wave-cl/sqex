@@ -179,11 +179,18 @@ impl Event {
 ///
 /// Implemented for any `FnMut(Event)`, so a caller that only wants to print
 /// can pass a closure and be done.
-pub trait Report {
+///
+/// `Send` is required, and it is not incidental: the call loops are futures,
+/// and anything that wants to hold a call *while doing something else* — a
+/// desktop client, say — has to spawn one onto an executor. A reporter that
+/// could not cross a thread would make `&mut dyn Report` un-`Send`, and with it
+/// the whole future, so the loop could only ever be awaited by whoever built
+/// it. That is the shape this module exists to get away from.
+pub trait Report: Send {
     fn event(&mut self, event: Event);
 }
 
-impl<F: FnMut(Event)> Report for F {
+impl<F: FnMut(Event) + Send> Report for F {
     fn event(&mut self, event: Event) {
         self(event)
     }
