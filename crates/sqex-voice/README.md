@@ -246,8 +246,39 @@ received audio was still a 440.0 Hz tone at the amplitude it left with.
   packet, the descriptor that says what the pause sounds like, the detector
   that decides, and the synthesiser.
 - `src/mix.rs` — adding several people together without pumping.
-- `src/main.rs` — the rendezvous and the call loops.
+- `src/engine.rs` — the rendezvous and the call loops. **In the library, not
+  the binary**, so that something other than a terminal can hold a call: see
+  below.
+- `src/main.rs` — the terminal around the engine. Arguments, unlocking an
+  identity, printing what the engine reports, and SIGINT.
 - `tests/voice_flow.rs` — a tone through a real `sqexd`, out the far side still
   a tone; and the same with frames deliberately dropped.
 - `tests/room_flow.rs` — three people, three notes, each hearing the other two
   and not themselves.
+- `tests/engine_flow.rs` — a whole call driven through `engine`'s own API, both
+  ways, tone in and WAV out. This is the loop itself under test, which was not
+  possible while it lived in `main.rs`.
+
+### Why the engine is a library
+
+The call loops used to live in `src/main.rs`. Everything around them was
+already a library — the codec, the jitter buffer, the gate — but the loop that
+*ran* them was not, so holding a call meant being a terminal, and the loop was
+reachable from no test at all.
+
+Three things were welded to that terminal and are now the caller's:
+
+- **Saying things.** Every `eprintln!` is an `engine::Event` handed to an
+  `engine::Report`. `Event::describe` still carries the exact wording, because
+  those sentences are accumulated answers to real confusion — the two causes of
+  a silent wait, the Bluetooth profile trap — and none of them should be lost
+  to a refactor.
+- **The identity.** Unlocking one may need a passphrase, and asking for a
+  passphrase is not something a library can do: a terminal prompts on stdin, a
+  window opens a dialog. The engine takes an already-unlocked signer.
+- **Interruption.** Nothing in the engine installs a signal handler or exits
+  the process.
+
+The loops themselves were moved, not rewritten. They are the subtlest code
+here, and `tests/voice_flow.rs` and `tests/room_flow.rs` pass unchanged across
+the move — which is the evidence that it was a move.

@@ -68,7 +68,7 @@ impl Peer {
 }
 
 /// What changed on the last poll, so the caller can say so.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// A session is up; we can hear them now.
     Joined(PubKey),
