@@ -248,7 +248,7 @@ impl Report for Silent {
 /// Decode a refusal into something worth reading. A refusal has been a typed
 /// binary value since v0.21.0, not JSON, and branching on a substring of the
 /// body is how three call sites used to get this wrong.
-fn said(body: &[u8]) -> String {
+pub(crate) fn said(body: &[u8]) -> String {
     match sqex_proto::refusal::Refusal::decode(body) {
         Ok(r) => r.to_string(),
         Err(_) => String::from_utf8_lossy(body).into_owned(),
