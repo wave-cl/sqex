@@ -211,6 +211,20 @@ pub struct Trouble {
     /// dropped. Worth saying once: the reader had messages here and now does
     /// not, and nothing else would explain where they went.
     pub restarted: bool,
+    /// Entries a device signed at a chain position it had already used
+    /// (SIP-31). The sequence numbers, because a count says misconduct
+    /// happened and a reader wants to know *where*.
+    ///
+    /// This is the one verdict in SIP-31 that is evidence rather than
+    /// housekeeping — it cannot occur without a device signing twice or
+    /// somebody replaying — and the SIP requires a client to surface it. A
+    /// gap, by contrast, is ordinary and lives in `gap` above.
+    pub forked: Vec<u64>,
+    /// Entries whose signature verifies and whose signing device nobody could
+    /// bind to the account the entry names (SIP-32). The first step proves a
+    /// key signed and says nothing about whose it is, so the attribution is
+    /// withheld rather than assumed.
+    pub unattributed: usize,
     /// Anything else — a refusal, a dropped connection.
     pub message: Option<String>,
 }
@@ -226,6 +240,8 @@ impl Trouble {
             && self.no_key.is_none()
             && !self.gap
             && !self.restarted
+            && self.forked.is_empty()
+            && self.unattributed == 0
             && self.message.is_none()
     }
 
@@ -236,6 +252,26 @@ impl Trouble {
     /// does not.
     pub fn line(&self) -> String {
         let mut parts = Vec::new();
+        if !self.forked.is_empty() {
+            parts.push(format!(
+                "signed twice at one chain position: message{} {} \u{2014} this cannot happen \
+                 without a device signing twice or somebody replaying",
+                if self.forked.len() == 1 { "" } else { "s" },
+                self.forked
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if self.unattributed > 0 {
+            parts.push(format!(
+                "{} message{} signed by a key nobody can bind to the name on {}",
+                self.unattributed,
+                if self.unattributed == 1 { "" } else { "s" },
+                if self.unattributed == 1 { "it" } else { "them" }
+            ));
+        }
         if let Some(epoch) = self.no_key {
             parts.push(format!(
                 "no key for epoch {epoch} — nobody has sent you one, so this cannot be read"
@@ -1795,6 +1831,8 @@ mod tests {
             no_key: Some(2),
             gap: true,
             restarted: false,
+            forked: Vec::new(),
+            unattributed: 0,
             message: None,
         };
         let line = t.line();
@@ -2049,6 +2087,54 @@ mod tests {
     }
 
     #[test]
+    /// SIP-31 requires a client to surface a fork: it is the one verdict there
+    /// that is evidence rather than housekeeping.
+    ///
+    /// It was being classified and thrown away. `Timeline::broken()` had no
+    /// caller anywhere in the workspace, so a conversation carrying a fork
+    /// looked exactly like a quiet one, and the reader was told nothing.
+    #[test]
+    fn a_fork_is_not_a_quiet_conversation() {
+        let mut t = Trouble::default();
+        assert!(
+            t.is_quiet(),
+            "an empty Trouble must be quiet, or this test proves nothing"
+        );
+
+        t.forked = vec![41, 42];
+        assert!(!t.is_quiet(), "a fork is something to act on");
+        let line = t.line();
+        assert!(line.contains("41") && line.contains("42"), "{line}");
+        assert!(
+            line.contains("signed twice"),
+            "the line must say what happened: {line}"
+        );
+    }
+
+    /// The other half, and the reason the two are separate fields: SIP-31 says
+    /// a gap is ordinary and MUST NOT be presented as misconduct.
+    #[test]
+    fn a_gap_does_not_read_as_misconduct() {
+        let mut t = Trouble::default();
+        t.gap = true;
+        let line = t.line();
+        assert!(
+            !line.contains("signed twice"),
+            "pruning is not somebody signing twice: {line}"
+        );
+        assert!(line.contains("retention"), "{line}");
+    }
+
+    /// An entry whose signature verifies and whose device nobody can bind to
+    /// the account it names is reported, not quietly accepted (SIP-32).
+    #[test]
+    fn an_unattributable_signature_is_reported() {
+        let mut t = Trouble::default();
+        t.unattributed = 1;
+        assert!(!t.is_quiet());
+        assert!(t.line().contains("nobody can bind"), "{}", t.line());
+    }
+
     fn a_retention_gap_is_marked_in_the_transcript() {
         let mut app = sample();
         app.trouble.gap = true;
