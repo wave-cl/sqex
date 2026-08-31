@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use sqex_proto::room::{Join, Leave, RoomId, Roster};
 use sqex_proto::session::{BySession, Open, OpenAck, OpenState, Session};
+use sqex_proto::refusal::{Code, Refusal};
 use sqnr::Client;
 use sqnr_core::PubKey;
 
@@ -226,11 +227,16 @@ impl Membership {
             .await?;
         match code {
             200 => Roster::decode(&body).map_err(|e| e.to_string()),
-            507 => Err("the room is full".into()),
-            _ => Err(format!(
-                "join failed ({code}): {}",
-                String::from_utf8_lossy(&body)
-            )),
+            // Was `507 => "the room is full"`, which inferred a reason from a
+            // status that several quota refusals share. The exchange says which.
+            _ => match Refusal::decode(&body) {
+                Ok(r) if r.code == Code::RoomFull => Err("the room is full".into()),
+                Ok(r) => Err(format!("join failed ({code}): {r}")),
+                Err(_) => Err(format!(
+                    "join failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                )),
+            },
         }
     }
 

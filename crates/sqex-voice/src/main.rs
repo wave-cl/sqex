@@ -179,6 +179,17 @@ async fn main() {
     }
 }
 
+/// What the exchange said about a refusal.
+///
+/// Refusals are `sqex_proto::refusal::Refusal`; anything else — an exchange
+/// older than sqex 0.21 — is shown as it came rather than guessed at.
+fn said(body: &[u8]) -> String {
+    match sqex_proto::refusal::Refusal::decode(body) {
+        Ok(r) => r.to_string(),
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    }
+}
+
 async fn run(cli: Cli) -> Result<(), String> {
     if cli.list_devices {
         return audio::list_devices();
@@ -342,10 +353,7 @@ async fn rendezvous(
     let ack = loop {
         let (code, body) = client.post("/session/open", open.encode()).await?;
         if code != 200 {
-            return Err(format!(
-                "open failed ({code}): {}",
-                String::from_utf8_lossy(&body)
-            ));
+            return Err(format!("open failed ({code}): {}", said(&body)));
         }
         let ack = OpenAck::decode(&body).map_err(|e| e.to_string())?;
         if ack.state == OpenState::Established {
