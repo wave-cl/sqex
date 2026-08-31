@@ -83,6 +83,18 @@ pub enum Event {
 }
 
 /// This client's membership of one room.
+///
+/// # A rule for async methods here
+///
+/// Every `async` method must take `&mut self`, or borrow nothing from it at
+/// all. A `Peer` owns an `opus::Decoder`, which is `Send` but **not `Sync`**,
+/// so a shared borrow of a `Membership` held across an await makes the whole
+/// future require `Membership: Sync` — which it is not, and cannot be.
+///
+/// The consequence is not subtle but it is remote from the cause: the room
+/// could only ever be awaited by whoever built it, never spawned onto an
+/// executor, so nothing but a program dedicated to that one call could hold a
+/// room. `&self` here reads as harmless and is not.
 pub struct Membership {
     room: RoomId,
     me: PubKey,
@@ -152,7 +164,7 @@ impl Membership {
     /// every two seconds. Media never waits behind it — datagrams need only a
     /// shared reference to the connection.
     pub async fn poll(&mut self, client: &mut Client) -> Result<Vec<Event>, String> {
-        let roster = self.heartbeat(client).await?;
+        let roster = Self::heartbeat(self.room, self.me, client).await?;
         let mut events = Vec::new();
 
         // 1. Keep only the members who can prove they belong here.
@@ -208,9 +220,18 @@ impl Membership {
                 x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng)
             });
         }
-        let waiting: Vec<PubKey> = self.pending.keys().copied().collect();
-        for id in waiting {
-            if let Some(peer) = self.try_establish(client, id).await? {
+        // Take the ephemeral out by value, so no borrow of `self` is alive
+        // across the await inside. See the note on `Membership`.
+        let waiting: Vec<(PubKey, x25519_dalek::StaticSecret)> = self
+            .pending
+            .iter()
+            .map(|(id, eph)| (*id, eph.clone()))
+            .collect();
+        let (seed, depth, rate) = (self.seed, self.depth, self.rate);
+        for (id, eph) in waiting {
+            if let Some(peer) =
+                Self::try_establish(seed, depth, rate, eph, client, id).await?
+            {
                 events.push(Event::Joined(peer.identity));
                 self.by_identity.insert(peer.identity, peer.session_id);
                 self.peers.insert(peer.session_id, peer);
@@ -221,9 +242,15 @@ impl Membership {
         Ok(events)
     }
 
-    async fn heartbeat(&self, client: &mut Client) -> Result<Roster, String> {
+    /// Say we are still here, and get back who else is.
+    ///
+    /// Takes the room and our own key by value rather than borrowing `self`.
+    /// See the note on [`Membership`]: a borrow of this struct held across an
+    /// await makes every future containing it unspawnable, and both of these
+    /// are `Copy`, so there is nothing to gain by borrowing.
+    async fn heartbeat(room: RoomId, me: PubKey, client: &mut Client) -> Result<Roster, String> {
         let (code, body) = client
-            .post("/room/join", Join::new(&self.room, &self.me).encode())
+            .post("/room/join", Join::new(&room, &me).encode())
             .await?;
         match code {
             200 => Roster::decode(&body).map_err(|e| e.to_string()),
@@ -242,17 +269,24 @@ impl Membership {
 
     /// One attempt at a SIP-12 session with `id`. `Ok(None)` means the peer has
     /// not asked for us yet, which is ordinary and not an error.
+    /// Offer a session to `id` and build a [`Peer`] if they have offered back.
+    ///
+    /// Borrows nothing from `self` — see the note on [`Membership`]. Everything
+    /// it needs is `Copy` but for the ephemeral secret, which is cloned by the
+    /// caller; re-offering the *same* ephemeral each tick is what SIP-12
+    /// expects, so it must be the stored one and not a fresh one.
+    #[allow(clippy::too_many_arguments)]
     async fn try_establish(
-        &self,
+        seed: [u8; 32],
+        depth: u64,
+        rate: Rate,
+        eph: x25519_dalek::StaticSecret,
         client: &mut Client,
         id: PubKey,
     ) -> Result<Option<Peer>, String> {
-        let Some(eph) = self.pending.get(&id) else {
-            return Ok(None);
-        };
         let open = Open {
             peer: id,
-            ephemeral: x25519_dalek::PublicKey::from(eph).to_bytes(),
+            ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
         };
         let (code, body) = client.post("/session/open", open.encode()).await?;
         if code != 200 {
@@ -264,14 +298,14 @@ impl Membership {
         if ack.state != OpenState::Established {
             return Ok(None);
         }
-        let session = Session::derive(&self.seed, eph, &id, &ack.peer_ephemeral)
+        let session = Session::derive(&seed, &eph, &id, &ack.peer_ephemeral)
             .map_err(|e| e.to_string())?;
         Ok(Some(Peer {
             identity: id,
             session,
             session_id: ack.session_id,
-            jitter: Jitter::new(self.depth),
-            playback: Playback::new(self.rate.hz())?,
+            jitter: Jitter::new(depth),
+            playback: Playback::new(rate.hz())?,
             out_seq: 0,
             level: 0.0,
             last_heard: std::time::Instant::now(),
@@ -284,10 +318,24 @@ impl Membership {
     /// The sessions are closed too, and that matters more than tidiness: a
     /// session outlives the call by an hour, and a stale one left lying about
     /// is what the next conversation between the same two people trips over.
-    pub async fn leave(&self, client: &mut Client) {
-        for sid in self.peers.keys() {
+    ///
+    /// Takes `&mut self` although it reads only. Holding a `&Membership` across
+    /// an await makes the whole future require `Membership: Sync`, and it is
+    /// not — a `Peer` owns an `opus::Decoder`, which is `Send` but not `Sync`.
+    /// So a room could be awaited only by whoever built it, and never spawned,
+    /// which is exactly what a desktop client has to do. Leaving is a mutation
+    /// in every sense but the borrow checker's, so this costs nothing.
+    pub async fn leave(&mut self, client: &mut Client) {
+        // Collect the ids before awaiting anything. Iterating the map across an
+        // await keeps a `Keys<'_, u64, Peer>` alive over it, and a borrow of a
+        // `Peer` is not `Send` because the decoder inside it is not `Sync` --
+        // which would make this whole future unspawnable. A handful of u64s is
+        // a cheap price for a room that something other than a terminal can
+        // hold.
+        let sessions: Vec<u64> = self.peers.keys().copied().collect();
+        for sid in sessions {
             let _ = client
-                .post("/session/close", BySession::close(*sid).encode())
+                .post("/session/close", BySession::close(sid).encode())
                 .await;
         }
         let _ = client

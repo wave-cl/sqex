@@ -284,6 +284,15 @@ async fn a_room_reports_who_is_present_and_who_is_speaking() {
     let mut a_report = a_events.handle();
     let mut b_report = Silent;
 
+    // Long enough for several heartbeats. Peers pair up on the two-second
+    // roster tick, and the two sides' ticks are not in phase: if A offers at
+    // t=2.0 and B has not yet, A's open returns `Waiting` and A does not try
+    // again until t=4.0. At four seconds that race lost about one run in
+    // three. Eight gives it three more chances, and the test still takes
+    // longer than anything else here -- which is the price of driving two real
+    // clients through a real exchange rather than asserting against a mock.
+    const SECONDS: u64 = 8;
+
     // A listens on a tone, B talks. Both must be in the room at once for
     // either to hear anything, so they run together.
     let a = async {
@@ -292,7 +301,7 @@ async fn a_room_reports_who_is_present_and_who_is_speaking() {
             client,
             &a_signer,
             room,
-            tone_call(&dir.path().join("a.wav"), 4),
+            tone_call(&dir.path().join("a.wav"), SECONDS),
             &mut a_report,
         )
         .await
@@ -303,7 +312,7 @@ async fn a_room_reports_who_is_present_and_who_is_speaking() {
             client,
             &b_signer,
             room,
-            tone_call(&dir.path().join("b.wav"), 4),
+            tone_call(&dir.path().join("b.wav"), SECONDS),
             &mut b_report,
         )
         .await
