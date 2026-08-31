@@ -465,12 +465,12 @@ impl Chat {
     ///
     /// A system entry carries no signature of its own; its actor's is inside
     /// the body, and the exchange verified it before writing the row.
-    fn verdict_for(&self, channel: &[u8; 32], instance: [u8; 32], e: &Entry, chain: &mut HashMap<PubKey, (u64, [u8; 32])>, bound: &HashMap<PubKey, Option<PubKey>>) -> Verdict {
+    fn verdict_for(exchange: PubKey, channel: &[u8; 32], instance: [u8; 32], e: &Entry, chain: &mut HashMap<PubKey, (u64, [u8; 32])>, bound: &HashMap<PubKey, Option<PubKey>>) -> Verdict {
         if e.kind == KIND_SYSTEM {
             return Verdict::Valid;
         }
         let terms = EntryTerms {
-            place: Place { exchange: self.exchange, instance, channel: *channel },
+            place: Place { exchange, instance, channel: *channel },
             account: e.account,
             device: e.device,
             epoch: e.epoch,
@@ -511,10 +511,29 @@ impl Chat {
                 chain.insert(e.device, (e.chain_seq + 1, link(&input)));
                 Verdict::Valid
             }
-            Some(&(seq, _)) if e.chain_seq == seq => {
-                chain.insert(e.device, (e.chain_seq + 1, link(&input)));
+            // At or below a position this device has already signed at. SIP-31
+            // defines the fork literally — "two entries by one device at one
+            // `chain_seq`, both validly signed" — and it is the only verdict
+            // here that is evidence rather than housekeeping.
+            //
+            // Comparing for equality alone missed the literal case: after an
+            // entry at position N the mark holds N+1, so a *second* entry at N
+            // failed the equality and fell through to `Gap`, which SIP-31 says
+            // MUST NOT be presented as misconduct.
+            //
+            // A repeat below the mark does **not** rewind it. Rewinding would
+            // reset the chain to the replayed position and make every honest
+            // entry after it look like misconduct too — one replay turning
+            // into a transcript full of them.
+            Some(&(seq, _)) if e.chain_seq <= seq => {
+                if e.chain_seq == seq {
+                    chain.insert(e.device, (e.chain_seq + 1, link(&input)));
+                }
                 Verdict::Fork
             }
+            // Above the mark: positions are missing rather than repeated.
+            // Pruning, retention and joining a channel without its history all
+            // produce this, and it is ordinary.
             Some(_) => {
                 chain.insert(e.device, (e.chain_seq + 1, link(&input)));
                 Verdict::Gap
@@ -2877,7 +2896,8 @@ impl Chat {
             // SIP-31, before anything is stored or shown: an entry nobody
             // signed for is not a message, and folding it first would put it in
             // front of a reader while the check was still pending.
-            let verdict = self.verdict_for(channel, info.instance, e, &mut seen_chains, &bound);
+            let verdict =
+                Self::verdict_for(self.exchange, channel, info.instance, e, &mut seen_chains, &bound);
             if verdict == Verdict::Forged {
                 // Not stored, not folded, and not counted as read. `history`
                 // rebuilds from this store without the signatures — they are
@@ -3050,6 +3070,136 @@ impl Chat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ed25519_dalek::SigningKey;
+    use sqex_proto::channel::KIND_MEMBER;
+
+    fn dev(n: u8) -> ([u8; 32], PubKey) {
+        let seed = [n; 32];
+        (seed, PubKey::new(SigningKey::from_bytes(&seed).verifying_key().to_bytes()))
+    }
+
+    /// One entry, honestly signed, at whatever chain position it is given.
+    fn entry_at(seq: u64, chain_seq: u64, prev: [u8; 32], body: &[u8]) -> Entry {
+        let (seed, device) = dev(1);
+        let (_, exchange) = dev(9);
+        let terms = EntryTerms {
+            place: Place { exchange, instance: [4; 32], channel: [7; 32] },
+            account: device,
+            device,
+            epoch: 0,
+            msg_seq: 0,
+            expires_after: 0,
+            chain_seq,
+            prev,
+            body,
+        };
+        Entry {
+            seq,
+            kind: KIND_MEMBER,
+            account: device,
+            device,
+            posted: 100 + seq,
+            expires_after: 0,
+            epoch: 0,
+            msg_seq: 0,
+            chain_seq,
+            prev,
+            body_hash: Sha256::digest(body).into(),
+            sig: sign_entry(&seed, &terms),
+            body: body.to_vec(),
+        }
+    }
+
+    /// The chain link an entry produces, so a test can build the next one.
+    fn link_of(chain_seq: u64, prev: [u8; 32], body: &[u8]) -> [u8; 32] {
+        let (_, device) = dev(1);
+        let (_, exchange) = dev(9);
+        let terms = EntryTerms {
+            place: Place { exchange, instance: [4; 32], channel: [7; 32] },
+            account: device,
+            device,
+            epoch: 0,
+            msg_seq: 0,
+            expires_after: 0,
+            chain_seq,
+            prev,
+            body,
+        };
+        link(&terms.input_hashed(&Sha256::digest(body).into()))
+    }
+
+    fn judge(entries: &[Entry]) -> Vec<Verdict> {
+        let (_, exchange) = dev(9);
+        let mut chain = HashMap::new();
+        let bound = HashMap::new();
+        entries
+            .iter()
+            .map(|e| Chat::verdict_for(exchange, &[7u8; 32], [4u8; 32], e, &mut chain, &bound))
+            .collect()
+    }
+
+    /// SIP-31's own definition: "two entries by one device at one `chain_seq`,
+    /// both validly signed" is a **fork**, and a client MUST surface it.
+    ///
+    /// This is the case nothing produces by accident, so nothing had tested it.
+    /// Both entries below are honestly signed — the misconduct is that the
+    /// device signed twice at position 0, which cannot happen without that
+    /// device signing twice or somebody replaying.
+    #[test]
+    fn two_entries_at_one_chain_position_are_a_fork() {
+        let first = entry_at(1, 0, GENESIS, b"first");
+        let second = entry_at(2, 0, GENESIS, b"second");
+        let v = judge(&[first, second]);
+        assert_eq!(v[0], Verdict::Valid, "the first entry is honest");
+        assert_eq!(
+            v[1],
+            Verdict::Fork,
+            "a second entry at chain position 0 is a fork, not a gap"
+        );
+    }
+
+    /// The other half of the distinction, and the reason it matters: a gap is
+    /// ordinary — pruning and retention both produce one — and SIP-31 says a
+    /// client MUST NOT present it as misconduct. Without this the fix above
+    /// could pass by calling everything a fork.
+    #[test]
+    fn a_skipped_chain_position_is_an_ordinary_gap() {
+        let first = entry_at(1, 0, GENESIS, b"first");
+        let later = entry_at(2, 7, [3u8; 32], b"after a prune");
+        let v = judge(&[first, later]);
+        assert_eq!(v[0], Verdict::Valid);
+        assert_eq!(
+            v[1],
+            Verdict::Gap,
+            "a forward jump is pruning, and must not be reported as misconduct"
+        );
+    }
+
+    /// One replay must not poison everything after it.
+    ///
+    /// The mark is not rewound to the replayed position, so the device's next
+    /// honest entry still lands where the chain expects it. Rewinding would
+    /// turn a single act of misconduct into a transcript that reports it on
+    /// every line, and a reader cannot tell one forged entry from a broken
+    /// client if the whole conversation is flagged.
+    #[test]
+    fn a_replay_does_not_make_the_entries_after_it_look_forged() {
+        let v = judge(&[
+            entry_at(1, 0, GENESIS, b"first"),
+            entry_at(2, 1, link_of(0, GENESIS, b"first"), b"second"),
+            entry_at(3, 0, GENESIS, b"first"),
+            entry_at(4, 2, link_of(1, link_of(0, GENESIS, b"first"), b"second"), b"third"),
+        ]);
+        assert_eq!(v[0], Verdict::Valid);
+        assert_eq!(v[1], Verdict::Valid);
+        assert_eq!(v[2], Verdict::Fork, "the replay is the evidence");
+        assert_eq!(
+            v[3],
+            Verdict::Valid,
+            "the honest entry after a replay must still read as honest"
+        );
+    }
 
     /// The case that could not be written before this change.
     ///
