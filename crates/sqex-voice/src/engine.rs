@@ -53,7 +53,36 @@ const PATIENCE: Duration = Duration::from_secs(10);
 /// nothing is coming back. Three seconds at fifty frames a second.
 const DEAF_AFTER: u64 = 150;
 
+/// How often a room may re-describe who is speaking.
+///
+/// A speaking indicator at one hertz reads as broken — it lags a conversation
+/// badly enough that people stop trusting it. Fifty hertz, the playout rate, is
+/// far more than an eye needs and would have the interface repainting
+/// constantly through an hour-long meeting. Ten is the compromise, and it only
+/// fires when the set of people speaking has actually *changed*, so a room
+/// listening to one person costs one update a second like everything else.
+const ROSTER_MS: u64 = 100;
+
 // ---- what the engine has to say ---------------------------------------------
+
+/// One peer in a room, as of the last look.
+///
+/// The roster used to leave the engine only as a formatted line. That is enough
+/// for a terminal and no use at all to something that wants to draw a ring
+/// around whoever is talking, so the numbers come out as numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerStatus {
+    pub identity: PubKey,
+    /// Whether they are speaking now — smoothed, so it follows a conversation
+    /// rather than flickering between syllables.
+    pub speaking: bool,
+    /// Smoothed loudness, for a level meter. Roughly 0..1.
+    pub level: f32,
+    pub loss_pct: f64,
+    pub concealed: u64,
+    /// Frames held for this peer. Each is 20 ms of delay bought against jitter.
+    pub buffered: usize,
+}
 
 /// Something worth telling the person holding the call.
 ///
@@ -83,6 +112,12 @@ pub enum Event {
     RoomJoined { me: PubKey, bitrate: i32, buffer_ms: u64 },
     /// Somebody joined, left, was rejected, or had their session rebuilt.
     Roster(RoomEvent),
+    /// Who is in the room right now, and who is talking.
+    ///
+    /// Sent when the set of people speaking changes, and once a second
+    /// regardless. `connecting` counts members whose session is not up yet —
+    /// they are in the room and cannot be heard.
+    Present { peers: Vec<PeerStatus>, connecting: usize },
     /// The once-a-second line: what the buffer has seen. A caller that wants
     /// less noise suppresses these.
     Stats(String),
@@ -154,6 +189,12 @@ impl Event {
             ),
             Event::Roster(RoomEvent::Restarted(id)) => {
                 format!("~ {} went quiet — rebuilding the session", room::short(id))
+            }
+            // Deliberately terse: this arrives ten times a second at worst, and
+            // the once-a-second `Stats` line already says it properly. A
+            // terminal should print that one and ignore this.
+            Event::Present { peers, connecting } => {
+                format!("{} present, {connecting} connecting", peers.len())
             }
             Event::Stats(line) | Event::FinalStats(line) => line.clone(),
             Event::Deaf => String::from(
@@ -628,8 +669,12 @@ pub async fn room_call(
 
     let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
     let mut roster = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    let mut speaking_watch = tokio::time::interval(Duration::from_millis(ROSTER_MS));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.tick().await;
+    // Who was speaking when the roster was last described, so it is only
+    // re-described when that changes.
+    let mut spoke: Vec<PubKey> = Vec::new();
 
     report.event(Event::RoomJoined {
         me,
@@ -746,7 +791,28 @@ pub async fn room_call(
                 }
             }
 
-            _ = tick.tick() => report.event(Event::Stats(room_summary(&members))),
+            // A speaking indicator has to keep up with a conversation, but a
+            // room where one person is talking must not repaint ten times a
+            // second to say so. Only a *change* in who is speaking is worth an
+            // update; the tick below carries the rest.
+            _ = speaking_watch.tick() => {
+                let mut now: Vec<PubKey> = members
+                    .present()
+                    .iter()
+                    .filter(|p| p.is_speaking())
+                    .map(|p| p.identity)
+                    .collect();
+                now.sort_unstable_by_key(|k| *k.as_bytes());
+                if now != spoke {
+                    spoke = now;
+                    report.event(present_of(&members));
+                }
+            }
+
+            _ = tick.tick() => {
+                report.event(present_of(&members));
+                report.event(Event::Stats(room_summary(&members)));
+            }
         }
     };
 
@@ -754,6 +820,29 @@ pub async fn room_call(
     out.finish()?;
     members.leave(&mut client).await;
     result
+}
+
+/// The roster as structured data, for something that draws rather than prints.
+///
+/// Sorted by identity, and that is not cosmetic: `Membership::peers` is a
+/// `HashMap`, so its order changes between looks. A list that reshuffles itself
+/// ten times a second is unusable, and anything keyed on position in it — a
+/// selection, a hover — would land on whoever happened to be there.
+fn present_of(members: &Membership) -> Event {
+    let mut peers: Vec<PeerStatus> = members
+        .present()
+        .iter()
+        .map(|p| PeerStatus {
+            identity: p.identity,
+            speaking: p.is_speaking(),
+            level: p.level,
+            loss_pct: p.jitter.stats.loss_pct(p.jitter.span()),
+            concealed: p.jitter.stats.concealed,
+            buffered: p.jitter.depth_now(),
+        })
+        .collect();
+    peers.sort_unstable_by_key(|p| *p.identity.as_bytes());
+    Event::Present { peers, connecting: members.connecting() }
 }
 
 /// Who is here, who is talking, and how the paths to them are holding up.

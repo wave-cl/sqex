@@ -261,3 +261,99 @@ async fn calling_yourself_is_refused_locally() {
     };
     assert!(err.contains("two identities"), "unexpected: {err}");
 }
+
+/// A room reports its roster as data, not only as a printed line.
+///
+/// This is what a window needs and a terminal never did: who is here, who is
+/// speaking, and how their path is holding up, as numbers it can draw rather
+/// than a sentence it would have to parse back.
+#[tokio::test]
+async fn a_room_reports_who_is_present_and_who_is_speaking() {
+    use sqex_proto::room::RoomId;
+    use sqex_voice::engine::{Event as E, PeerStatus};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let endpoint = Endpoint { address: addr, server: PubKey::new(server_pub) };
+    let room = RoomId::generate();
+
+    let (a_signer, a_id) = signer(1);
+    let (b_signer, b_id) = signer(2);
+
+    let a_events = Collected::default();
+    let mut a_report = a_events.handle();
+    let mut b_report = Silent;
+
+    // A listens on a tone, B talks. Both must be in the room at once for
+    // either to hear anything, so they run together.
+    let a = async {
+        let client = engine::connect(endpoint, &a_signer, &mut a_report).await?;
+        engine::room_call(
+            client,
+            &a_signer,
+            room,
+            tone_call(&dir.path().join("a.wav"), 4),
+            &mut a_report,
+        )
+        .await
+    };
+    let b = async {
+        let client = engine::connect(endpoint, &b_signer, &mut b_report).await?;
+        engine::room_call(
+            client,
+            &b_signer,
+            room,
+            tone_call(&dir.path().join("b.wav"), 4),
+            &mut b_report,
+        )
+        .await
+    };
+    let (ra, rb) = tokio::join!(a, b);
+    ra.expect("A's room");
+    rb.expect("B's room");
+
+    let events = a_events.events();
+    let rosters: Vec<(Vec<PeerStatus>, usize)> = events
+        .iter()
+        .filter_map(|e| match e {
+            E::Present { peers, connecting } => Some((peers.clone(), *connecting)),
+            _ => None,
+        })
+        .collect();
+    assert!(!rosters.is_empty(), "a room describes its roster: {events:?}");
+
+    // B is in the room and eventually present, having joined via the heartbeat.
+    let saw_b = rosters
+        .iter()
+        .any(|(peers, _)| peers.iter().any(|p| p.identity == b_id));
+    assert!(saw_b, "B should appear in A's roster");
+
+    // And with a tone playing, B is heard as speaking.
+    let heard_b_speak = rosters
+        .iter()
+        .any(|(peers, _)| peers.iter().any(|p| p.identity == b_id && p.speaking));
+    assert!(
+        heard_b_speak,
+        "B is playing a tone, so B should read as speaking: {rosters:?}"
+    );
+
+    // A never appears in A's own roster: you are not a peer of yourself, and a
+    // room showing you back to yourself would double every count.
+    assert!(
+        !rosters
+            .iter()
+            .any(|(peers, _)| peers.iter().any(|p| p.identity == a_id)),
+        "you are not one of your own peers"
+    );
+
+    // The roster is sorted, so a list drawn from it does not reshuffle.
+    for (peers, _) in &rosters {
+        let mut sorted = peers.clone();
+        sorted.sort_unstable_by_key(|p| *p.identity.as_bytes());
+        assert_eq!(
+            peers.iter().map(|p| p.identity).collect::<Vec<_>>(),
+            sorted.iter().map(|p| p.identity).collect::<Vec<_>>(),
+            "the roster arrives in a stable order"
+        );
+    }
+}
