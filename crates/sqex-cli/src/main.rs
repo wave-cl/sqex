@@ -23,12 +23,16 @@ use sqnr_core::{Operation, PubKey, Signer, Transaction};
 #[derive(Parser)]
 #[command(name = "sqex", version, about = "Administer a sqex server with signed transactions")]
 struct Cli {
-    /// Server address, host:port (overrides SQEX_SERVER and ~/.sqnr/config).
-    #[arg(long, global = true)]
+    /// A domain that publishes an exchange (SIP-33). Its key is discovered over
+    /// DNSSEC, pinned on first contact, and refused if it later changes.
+    #[arg(long)]
     server: Option<String>,
-
-    /// Server's pinned Ed25519 public key, base58 (overrides SQEX_SERVER_KEY and ~/.sqnr/config).
-    #[arg(long = "server-key", global = true)]
+    /// A literal address, host:port, to dial. Requires --server-key.
+    #[arg(long)]
+    server_host: Option<String>,
+    /// The server's base58 public key. Goes with --server-host; a --server
+    /// domain supplies its own.
+    #[arg(long)]
     server_key: Option<String>,
 
     /// Sign with a YubiKey instead of a file identity.
@@ -477,7 +481,7 @@ async fn mail_client(
         );
     }
     let signer = load_software_identity(cli, cfg)?;
-    let (addr, server) = endpoint(cli, cfg)?;
+    let (addr, server) = endpoint(cli, cfg).await?;
     let client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
     Ok((client, signer))
 }
@@ -662,7 +666,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             }
             let signer = load_software_identity(cli, cfg)?;
             let seed = signer.seed();
-            let (addr, server) = endpoint(cli, cfg)?;
+            let (addr, server) = endpoint(cli, cfg).await?;
             let mut client = Client::connect_as(addr, server.as_bytes(), &seed).await?;
 
             let beat = Beat {
@@ -693,7 +697,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
                 Some(k) => parse_key(k)?,
                 None => own_identity(cli, cfg)?,
             };
-            let (addr, server) = endpoint(cli, cfg)?;
+            let (addr, server) = endpoint(cli, cfg).await?;
             let mut client = match load_software_identity(cli, cfg) {
                 Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?,
                 // No usable identity: ask anonymously. Withheld records stay hidden.
@@ -754,29 +758,57 @@ fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
     identity::read_public(&identity_path(cli, cfg)?)
 }
 
+
+/// The layers a caller can speak through, most specific first. Resolution is
+/// shared with the other clients in `sqex_discovery::target`, because three
+/// copies of it is what produced two bugs in a day.
+fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
+    [
+        sqex_discovery::Layer {
+            server: cli.server.clone(),
+            host: cli.server_host.clone(),
+            key: cli.server_key.clone(),
+        },
+        sqex_discovery::Layer {
+            server: env_nonempty("SQEX_SERVER"),
+            host: env_nonempty("SQEX_SERVER_HOST"),
+            key: env_nonempty("SQEX_SERVER_KEY"),
+        },
+        // The config is `sqnr`'s type and has no `server_host`, so the pairing
+        // rule is read off the two fields it does have.
+        match (&cfg.server, &cfg.server_key) {
+            (Some(s), Some(k)) => sqex_discovery::Layer {
+                host: Some(s.clone()),
+                key: Some(k.clone()),
+                ..Default::default()
+            },
+            (Some(s), None) => sqex_discovery::Layer {
+                server: Some(s.clone()),
+                ..Default::default()
+            },
+            _ => sqex_discovery::Layer::default(),
+        },
+    ]
+}
+
 /// Resolve the server address and pinned key without connecting.
-fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
-    let addr = cli
-        .server
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER"))
-        .or_else(|| cfg.server.clone())
-        .ok_or_else(|| {
-            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
-                .to_string()
-        })?;
-    let key = cli
-        .server_key
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
-        .or_else(|| cfg.server_key.clone())
-        .ok_or_else(|| {
-            "no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)"
-                .to_string()
-        })?;
-    let socket = resolve(&addr)?;
-    let server: PubKey = key.trim().parse().map_err(|e| format!("bad server key: {e}"))?;
-    Ok((socket, server))
+async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
+    match sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())? {
+        sqex_discovery::Target::Direct { address, key } => Ok((resolve(&address)?, key)),
+        sqex_discovery::Target::Discover(domain) => {
+            let found = sqex_discovery::discover(&domain)
+                .await
+                .map_err(|e| e.to_string())?;
+            if found.newly_pinned {
+                eprintln!(
+                    "{domain}: discovered {} over DNSSEC and pinned it. \
+                     Forget it with `sqex discover --forget {domain}`.",
+                    found.key
+                );
+            }
+            Ok((resolve(&found.address)?, found.key))
+        }
+    }
 }
 
 /// `host:port`, `host`, or an IP literal.
@@ -972,7 +1004,7 @@ fn print_audit(v: &serde_json::Value) {
 
 async fn connect(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey), String> {
     // Precedence for both address and key: CLI flag > env var > config file.
-    let (socket, server) = endpoint(cli, cfg)?;
+    let (socket, server) = endpoint(cli, cfg).await?;
     let client = Client::connect(socket, server.as_bytes()).await?;
     Ok((client, server))
 }

@@ -64,11 +64,21 @@ is in it, and removing somebody rotates the key so what follows is not theirs. \
 A group's name is a sealed entry, so the exchange never learns it."
 )]
 struct Cli {
-    /// Server address, host:port (overrides SQEX_SERVER and ~/.sqnr/config).
-    #[arg(long, global = true)]
+    /// A domain that publishes an exchange (SIP-33). Its key is discovered over
+    /// DNSSEC, pinned on first contact, and refused if it later changes.
+    ///
+    /// Overrides SQEX_SERVER and ~/.sqnr/config. Use --server-host instead to
+    /// dial an address with a key you already hold.
+    #[arg(long)]
     server: Option<String>,
-    /// Server's base58 public key (overrides SQEX_SERVER_KEY and the config).
-    #[arg(long = "server-key", global = true)]
+    /// A literal address, host:port, to dial. Requires --server-key.
+    ///
+    /// Overrides SQEX_SERVER_HOST. The port defaults to 443.
+    #[arg(long)]
+    server_host: Option<String>,
+    /// The server's base58 public key. Goes with --server-host; a --server
+    /// domain supplies its own.
+    #[arg(long)]
     server_key: Option<String>,
     /// Identity file (default ~/.sqnr/identity).
     #[arg(short = 'i', long, global = true)]
@@ -2904,30 +2914,24 @@ async fn connect(
     cfg: &Config,
     seed: &[u8; 32],
 ) -> Result<(Client, std::net::SocketAddr, PubKey), String> {
-    // An explicitly configured key means no discovery and no ladder: the caller
-    // said where to go.
-    if let Some((addr, server)) = configured(cli, cfg)? {
-        let client = Client::connect_as(addr, server.as_bytes(), seed)
-            .await
-            .map_err(|e| format!("could not reach {addr}: {e}"))?;
-        return Ok((client, addr, server));
-    }
+    let target = sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())?;
 
-    let addr = cli
-        .server
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER"))
-        .or_else(|| cfg.server.clone())
-        .ok_or_else(|| {
-            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
-                .to_string()
-        })?;
+    let addr = match target {
+        sqex_discovery::Target::Direct { address, key } => {
+            let socket = resolve_one_sync(&address)?;
+            let client = Client::connect_as(socket, key.as_bytes(), seed)
+                .await
+                .map_err(|e| format!("could not reach {socket}: {e}"))?;
+            return Ok((client, socket, key));
+        }
+        sqex_discovery::Target::Discover(d) => d,
+    };
+
     let (domain, _) = split_port(&addr);
     if domain.parse::<std::net::IpAddr>().is_ok() {
         return Err(format!(
-            "no server key for {domain}, and an address cannot be discovered — \
-             pass --server-key, set SQEX_SERVER_KEY, put it in ~/.sqnr/config, or \
-             use a domain that publishes an _sqex record (SIP-33)"
+            "--server {domain} is an address, not a domain, and an address cannot \
+             be discovered. Use --server-host {addr} --server-key <key>"
         ));
     }
 
@@ -2981,27 +2985,39 @@ async fn connect(
     ))
 }
 
-/// The configured address and key, when both are given. `None` means discovery.
-fn configured(cli: &Cli, cfg: &Config) -> Result<Option<(std::net::SocketAddr, PubKey)>, String> {
-    let Some(key) = cli
-        .server_key
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
-        .or_else(|| cfg.server_key.clone())
-    else {
-        return Ok(None);
-    };
-    let addr = cli
-        .server
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER"))
-        .or_else(|| cfg.server.clone())
-        .ok_or_else(|| {
-            "no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)"
-                .to_string()
-        })?;
-    let server = key.trim().parse().map_err(|e| format!("bad server key: {e}"))?;
-    Ok(Some((resolve_one_sync(&addr)?, server)))
+/// The layers a caller can speak through, most specific first.
+///
+/// The resolution itself lives in `sqex_discovery::target`, shared with `sqex`
+/// and `sqex-voice` — three copies of it is what produced two bugs in a day.
+fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
+    [
+        sqex_discovery::Layer {
+            server: cli.server.clone(),
+            host: cli.server_host.clone(),
+            key: cli.server_key.clone(),
+        },
+        sqex_discovery::Layer {
+            server: env_nonempty("SQEX_SERVER"),
+            host: env_nonempty("SQEX_SERVER_HOST"),
+            key: env_nonempty("SQEX_SERVER_KEY"),
+        },
+        // The config has no `server_host`: it is `sqnr`'s type, in another repo.
+        // A `server` there with a key beside it is a literal address, and
+        // without one it is a domain — the same pairing rule, read off the two
+        // fields that exist.
+        match (&cfg.server, &cfg.server_key) {
+            (Some(s), Some(k)) => sqex_discovery::Layer {
+                host: Some(s.clone()),
+                key: Some(k.clone()),
+                ..Default::default()
+            },
+            (Some(s), None) => sqex_discovery::Layer {
+                server: Some(s.clone()),
+                ..Default::default()
+            },
+            _ => sqex_discovery::Layer::default(),
+        },
+    ]
 }
 
 /// `host:port` for the configured path, which may name a host.

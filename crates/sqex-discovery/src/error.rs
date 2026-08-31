@@ -41,6 +41,9 @@ pub enum Error {
     Resolve(String),
     /// The pin store could not be read or written.
     Store(String),
+    /// The caller asked for something contradictory, or for nothing at all.
+    /// Carries its own advice, so it is printed as it stands.
+    Usage(String),
 }
 
 impl std::fmt::Display for Error {
@@ -92,6 +95,7 @@ impl std::fmt::Display for Error {
             ),
             Error::Resolve(e) => write!(f, "{e}"),
             Error::Store(e) => write!(f, "the known-servers file could not be used: {e}"),
+            Error::Usage(e) => write!(f, "{e}"),
         }
     }
 }

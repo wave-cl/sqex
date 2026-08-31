@@ -41,12 +41,16 @@ use sqex_voice::room::{self, Event as RoomEvent, Membership};
                   There is no echo cancellation. On speakers this will howl. Wear headphones."
 )]
 struct Cli {
-    /// Server address, host:port (overrides SQEX_SERVER and ~/.sqnr/config).
-    #[arg(long, global = true)]
+    /// A domain that publishes an exchange (SIP-33). Its key is discovered over
+    /// DNSSEC, pinned on first contact, and refused if it later changes.
+    #[arg(long)]
     server: Option<String>,
-
-    /// Server's pinned Ed25519 public key, base58 (overrides SQEX_SERVER_KEY).
-    #[arg(long = "server-key", global = true)]
+    /// A literal address, host:port, to dial. Requires --server-key.
+    #[arg(long)]
+    server_host: Option<String>,
+    /// The server's base58 public key. Goes with --server-host; a --server
+    /// domain supplies its own.
+    #[arg(long)]
     server_key: Option<String>,
 
     /// Software identity file (default ~/.sqnr/identity).
@@ -171,9 +175,39 @@ enum Cmd {
     },
 }
 
+/// 130 is the shell's convention for "terminated by SIGINT".
+extern "C" fn handle_sigint(_sig: libc::c_int) {
+    // Nothing else. Anything that allocates or takes a lock may deadlock here,
+    // because this runs on top of whatever the interrupted thread was doing.
+    unsafe { libc::_exit(130) }
+}
+
 #[tokio::main]
 async fn main() {
-    if let Err(e) = run(Cli::parse()).await {
+    // SIGINT is handled by the kernel, not by the runtime.
+    //
+    // Three async attempts at this failed intermittently and I could not
+    // isolate why: a `select!` arm is starved by any blocking call in the other
+    // arm, and a spawned task still depends on the executor being able to run
+    // it. What is certain is the trap underneath them all — the first
+    // `tokio::signal::ctrl_c()` anywhere in a process replaces SIGINT's default
+    // disposition, so any moment nobody is awaiting it swallows the signal
+    // instead of dying on it, leaving this harder to kill than if nothing had
+    // handled it at all.
+    //
+    // A plain handler cannot be starved: the kernel runs it on whatever thread
+    // takes the signal, whatever the runtime is doing. `_exit` is one of the
+    // few things async-signal-safe enough to call from one.
+    //
+    // The cost is real and worth stating: an abandoned session is not closed on
+    // the way out, so the exchange carries it until it times it out. That is a
+    // better trade than a program you cannot stop.
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
+    }
+
+    let outcome = run(Cli::parse()).await;
+    if let Err(e) = outcome {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -314,7 +348,7 @@ async fn dial(
     if me == peer {
         return Err("a session needs two identities".into());
     }
-    let (addr, server) = endpoint(cli, cfg)?;
+    let (addr, server) = endpoint(cli, cfg).await?;
     let client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
 
     if client.max_datagram_size().is_none() {
@@ -349,6 +383,7 @@ async fn rendezvous(
     eprintln!("waiting for {peer} to open a session with you…");
     let started = Instant::now();
     let deadline = started + Duration::from_secs(wait);
+
     let mut hinted = false;
     let ack = loop {
         let (code, body) = client.post("/session/open", open.encode()).await?;
@@ -359,9 +394,9 @@ async fn rendezvous(
         if ack.state == OpenState::Established {
             break ack;
         }
-        // Waiting is normal for a few seconds and suspicious after ten. The two
-        // causes are both invisible from here, so say them out loud rather than
-        // let someone watch a silent line forever.
+        // Waiting is normal for a few seconds and suspicious after ten. The
+        // two causes are both invisible from here, so say them out loud
+        // rather than let someone watch a silent line forever.
         if !hinted && started.elapsed() > Duration::from_secs(10) {
             eprintln!(
                 "  still waiting. Two things do this:\n    \
@@ -549,11 +584,6 @@ async fn call(
                     deaf = true;
                 }
             }
-
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!();
-                break;
-            }
         }
     }
 
@@ -609,7 +639,7 @@ async fn room_call(
 ) -> Result<(), String> {
     let signer = load_identity(cli, cfg)?;
     let me = PubKey::new(signer.public());
-    let (addr, server) = endpoint(cli, cfg)?;
+    let (addr, server) = endpoint(cli, cfg).await?;
     let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
     if client.max_datagram_size().is_none() {
         return Err("this path does not carry datagrams, so it cannot carry a room".into());
@@ -755,11 +785,6 @@ async fn room_call(
             }
 
             _ = report.tick(), if !opts.quiet => eprintln!("{}", room_summary(&members)),
-
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!();
-                break Ok(());
-            }
         }
     };
 
@@ -820,7 +845,6 @@ const CALLER_GONE: Duration = Duration::from_secs(15);
 
 /// Why the reflect loop stopped.
 enum Stopped {
-    Interrupted,
     CallerGone,
 }
 
@@ -875,10 +899,6 @@ async fn echo(
                         break Stopped::CallerGone;
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    eprintln!();
-                    break Stopped::Interrupted;
-                }
             }
         };
 
@@ -887,7 +907,9 @@ async fn echo(
             .post("/session/close", BySession::close(id).encode())
             .await;
         match stopped {
-            Stopped::Interrupted => return Ok(()),
+            // Interruption no longer arrives here: SIGINT is handled by the
+            // kernel handler in `main`, which exits without unwinding. The only
+            // way out of the reflect loop now is the caller going quiet.
             Stopped::CallerGone => {
                 eprintln!("(quiet for {}s — waiting for the next caller)", CALLER_GONE.as_secs());
             }
@@ -920,27 +942,75 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::SoftwareSigner, S
     }
 }
 
-fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
-    let addr = cli
-        .server
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER"))
-        .or_else(|| cfg.server.clone())
-        .ok_or("no server address (pass --server, set SQEX_SERVER, or put it in ~/.sqnr/config)")?;
-    let key = cli
-        .server_key
-        .clone()
-        .or_else(|| env_nonempty("SQEX_SERVER_KEY"))
-        .or_else(|| cfg.server_key.clone())
-        .ok_or("no server key (pass --server-key, set SQEX_SERVER_KEY, or put it in ~/.sqnr/config)")?;
-    let socket: SocketAddr = addr
-        .parse()
-        .map_err(|_| format!("bad server address {addr:?} (use host:port)"))?;
-    let server: PubKey = key
-        .trim()
-        .parse()
-        .map_err(|e| format!("bad server key: {e}"))?;
-    Ok((socket, server))
+
+/// The layers a caller can speak through, most specific first. Resolution is
+/// shared with the other clients in `sqex_discovery::target`, because three
+/// copies of it is what produced two bugs in a day.
+fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
+    [
+        sqex_discovery::Layer {
+            server: cli.server.clone(),
+            host: cli.server_host.clone(),
+            key: cli.server_key.clone(),
+        },
+        sqex_discovery::Layer {
+            server: env_nonempty("SQEX_SERVER"),
+            host: env_nonempty("SQEX_SERVER_HOST"),
+            key: env_nonempty("SQEX_SERVER_KEY"),
+        },
+        // The config is `sqnr`'s type and has no `server_host`, so the pairing
+        // rule is read off the two fields it does have.
+        match (&cfg.server, &cfg.server_key) {
+            (Some(s), Some(k)) => sqex_discovery::Layer {
+                host: Some(s.clone()),
+                key: Some(k.clone()),
+                ..Default::default()
+            },
+            (Some(s), None) => sqex_discovery::Layer {
+                server: Some(s.clone()),
+                ..Default::default()
+            },
+            _ => sqex_discovery::Layer::default(),
+        },
+    ]
+}
+
+async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
+    match sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())? {
+        sqex_discovery::Target::Direct { address, key } => Ok((resolve_addr(&address)?, key)),
+        sqex_discovery::Target::Discover(domain) => {
+            let found = sqex_discovery::discover(&domain)
+                .await
+                .map_err(|e| e.to_string())?;
+            if found.newly_pinned {
+                eprintln!(
+                    "{domain}: discovered {} over DNSSEC and pinned it. \
+                     Forget it with `sqex discover --forget {domain}`.",
+                    found.key
+                );
+            }
+            Ok((resolve_addr(&found.address)?, found.key))
+        }
+    }
+}
+
+/// `host:port`, `host`, or an IP literal. This used to parse straight to a
+/// `SocketAddr`, which accepts only an IP.
+fn resolve_addr(address: &str) -> Result<SocketAddr, String> {
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return Ok(socket);
+    }
+    let has_port = !address.starts_with('[')
+        && address.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok());
+    let with_port = if has_port {
+        address.to_string()
+    } else {
+        format!("{address}:{}", sqex_discovery::DEFAULT_PORT)
+    };
+    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
+        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
 }
 
 fn parse_key(s: &str) -> Result<PubKey, String> {

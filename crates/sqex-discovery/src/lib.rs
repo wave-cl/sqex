@@ -14,9 +14,11 @@ pub mod dns;
 pub mod error;
 pub mod known;
 pub mod record;
+pub mod target;
 
 pub use error::{Error, Result};
 pub use known::{Decision, Known};
+pub use target::{Layer, Target};
 pub use record::{DEFAULT_PORT, Invalid, LABEL, Parsed, Record, VERSION};
 
 /// Where one rung of the ladder came from, so a caller can say what it did and

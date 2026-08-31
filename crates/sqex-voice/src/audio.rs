@@ -468,7 +468,7 @@ fn speaker(want: Option<&str>) -> Result<(Output, Rate), String> {
                     |e| eprintln!("speaker: {e}"),
                     None,
                 )
-                .map_err(|e| format!("open speaker: {e}"))?;
+                .map_err(|e| speaker_error(&name, &e.to_string()))?;
             stream.play().map_err(|e| format!("start playback: {e}"))?;
             let _ = ready_tx.send(Ok((name, chosen)));
             loop {
@@ -585,6 +585,96 @@ fn choose(
 /// Find a device by case-insensitive substring, or the system default.
 ///
 /// Returns the devices it did find when a name matches nothing, because the
+/// What to say when a speaker will not open.
+///
+/// One cause dominates and the bare error names none of it. A Bluetooth headset
+/// is a single device offering both a microphone and a speaker; opening the
+/// microphone switches it from A2DP to HFP, and the speaker's sample rate
+/// changes underneath whoever is opening it. CoreAudio reports that as
+/// "Sample rate update timed out", which reads as a broken speaker and is
+/// really a profile switch caused by the *capture* device.
+///
+/// The remedy is therefore on the other side of the call from the error, which
+/// is why saying so matters: nobody debugging a speaker failure looks at their
+/// microphone.
+fn speaker_error(name: &str, e: &str) -> String {
+    let profile_switch = e.contains("Sample rate")
+        || e.contains("timed out")
+        || e.contains("nope")
+        || e.contains("Device unavailable");
+    if profile_switch {
+        format!(
+            "open speaker {name}: {e}\n  \
+             This usually means the device changed profile while it was opening. A \
+             Bluetooth headset does that when its own microphone is opened: it drops \
+             from A2DP to HFP, and the speaker does not survive the switch.\n  \
+             Capture from somewhere else and the headset stays put — \
+             --in \"MacBook Pro Microphone\", or --source tone to use no microphone at all."
+        )
+    } else {
+        format!("open speaker {name}: {e}")
+    }
+}
+
+/// The default input, unless taking it would drag a headset into narrowband.
+///
+/// A Bluetooth headset offers a microphone and a speaker as one device, and
+/// opening the microphone switches the whole thing from A2DP to HFP. Capture
+/// drops to 16 kHz, playback drops with it, and on macOS the speaker often does
+/// not survive the switch at all — it fails with "Sample rate update timed out"
+/// while the profile changes underneath it. The system default input is that
+/// headset whenever one is connected, so the default is the trap.
+///
+/// The tell is that the default input and the default output are the same
+/// device. When they are and a separate microphone exists, that one is used and
+/// the substitution is announced — silently choosing a different microphone
+/// than the system default would be worse than the problem it avoids.
+///
+/// `--in` overrides this entirely: naming a device means the caller has decided.
+fn default_capture(host: &cpal::Host) -> Result<cpal::platform::Device, String> {
+    let default_in = host
+        .default_input_device()
+        .ok_or_else(|| "no input device — is a microphone connected?".to_string())?;
+    let in_name = describe(&default_in);
+    let out_name = host
+        .default_output_device()
+        .map(|d| describe(&d))
+        .unwrap_or_default();
+
+    // Different devices, or names we cannot read: nothing to be clever about.
+    if in_name == "unnamed device" || in_name != out_name {
+        return Ok(default_in);
+    }
+
+    let Ok(devices) = host.devices() else {
+        return Ok(default_in);
+    };
+    // Prefer something that reads as built in. Any other input would dodge the
+    // profile switch, but a virtual or loopback device would be a worse
+    // microphone than the headset, and this is being chosen without being asked.
+    let mut fallback = None;
+    for d in devices {
+        if !d.supports_input() {
+            continue;
+        }
+        let name = describe(&d);
+        if name == in_name {
+            continue;
+        }
+        let lower = name.to_lowercase();
+        if lower.contains("macbook") || lower.contains("built-in") || lower.contains("internal") {
+            eprintln!(
+                "capturing from {name} rather than {in_name}: opening a headset's own \
+                 microphone switches it to narrowband and can stop its speaker opening at \
+                 all. Pass --in {in_name:?} to use it anyway."
+            );
+            return Ok(d);
+        }
+        fallback.get_or_insert(d);
+    }
+    Ok(fallback.unwrap_or(default_in))
+}
+
 /// whole point of naming a device is that the default was wrong.
 fn pick_device(
     want: Option<&str>,
@@ -593,8 +683,7 @@ fn pick_device(
     let host = cpal::default_host();
     let Some(want) = want else {
         return if input {
-            host.default_input_device()
-                .ok_or_else(|| "no input device — is a microphone connected?".to_string())
+            default_capture(&host)
         } else {
             host.default_output_device()
                 .ok_or_else(|| "no output device".to_string())
