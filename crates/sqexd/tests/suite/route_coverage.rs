@@ -118,7 +118,9 @@ const ROUTES: &[(&str, &str, By)] = &[
 /// scan is bounded to the match itself: from `match (method, path) {` to the
 /// wildcard that ends it.
 fn served() -> Vec<(String, String)> {
-    let src = include_str!("../src/server.rs");
+    // Relative to this file, which lives in tests/suite/ — two levels down
+    // from the crate root, not one. Moving this file changes this path.
+    let src = include_str!("../../src/server.rs");
     let start = src
         .find("match (method, path) {")
         .expect("the dispatch match moved or was renamed");
