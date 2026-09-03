@@ -883,6 +883,42 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
         v["requests"].as_u64().unwrap_or(0),
         v["event_streams"].as_u64().unwrap_or(0),
     );
+    // The SIP-29 retirement question, in the only form that can answer it:
+    // which envelope versions this exchange accepts, and which ones callers
+    // are actually still sending. Retiring a version with traffic on it locks
+    // those callers out silently — a refused envelope is dropped without a
+    // reply, so neither end reports anything. This is the arithmetic that
+    // replaces the nerve.
+    let t = &v["transport"];
+    if let Some(arriving) = t["initials_by_envelope_version"].as_object() {
+        let accepted: Vec<String> = t["accepted_envelope_versions"]
+            .as_array()
+            .map(|a| a.iter().map(|x| x.to_string()).collect())
+            .unwrap_or_default();
+        // Sorted: the map comes back keyed by a string, so "10" would
+        // otherwise sort before "2" the day a tenth version exists.
+        let mut counts: Vec<(u64, u64)> = arriving
+            .iter()
+            .filter_map(|(k, n)| Some((k.parse().ok()?, n.as_u64()?)))
+            .collect();
+        counts.sort_unstable();
+        let seen: Vec<String> = counts
+            .iter()
+            .map(|(version, n)| format!("v{version} {n}"))
+            .collect();
+        println!(
+            "  envelope: accepts [{}] · initials seen {}",
+            accepted.join(", "),
+            seen.join(" · "),
+        );
+    }
+    if t["under_load"].as_bool().unwrap_or(false) {
+        println!(
+            "  UNDER LOAD: {} cookie challenge(s) issued, {} answered",
+            t["cookie_replies_sent"].as_u64().unwrap_or(0),
+            t["mac2_verified"].as_u64().unwrap_or(0),
+        );
+    }
     Ok(())
 }
 

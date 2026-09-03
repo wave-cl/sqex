@@ -313,3 +313,66 @@ async fn full_admin_flow() {
     assert_eq!(status["whitelist_count"], 1, "one key persisted");
     handle2.abort();
 }
+
+/// `/status` reports what sQUIC accepts and what is actually arriving.
+///
+/// This is the number the SIP-29 retirement decision turns on. Retiring an
+/// envelope version that clients still send locks them out in silence — a
+/// refused envelope is dropped with no reply, so neither end logs anything —
+/// and until this was surfaced the only way to answer "is anything still on
+/// v2" was to retire it and see who complained.
+///
+/// The test pins both halves against a server configured to accept exactly
+/// one version, so the reported set is the configured one and not sQUIC's
+/// three-version default, and the count is non-zero because this test's own
+/// handshake put it there.
+#[tokio::test]
+async fn status_reports_accepted_and_arriving_envelope_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("host_key");
+    let (server_sk, _) = squic::generate_keypair();
+    std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    let client_seed = [7u8; 32];
+
+    // Accept v3 only — the same posture ex runs. A server left on the default
+    // would report all three, and the assertion below could not then tell the
+    // configured set apart from the default one.
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\naccepted_envelope_versions = [3]\n",
+        key_path.to_string_lossy(),
+    );
+    let config_path = dir.path().join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let (addr, server_pub, handle) = spawn_server(&config_toml, config_path).await;
+    let mut client = Client::connect(addr, &server_pub, &client_seed).await;
+
+    let (code, body) = client.get("/status").await;
+    assert_eq!(code, 200);
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let transport = &status["transport"];
+
+    assert_eq!(
+        transport["accepted_envelope_versions"],
+        serde_json::json!([3]),
+        "the configured set is reported, not squic's default"
+    );
+
+    // This client's own Initial. The client defaults to v3, so the count lands
+    // on v3 and the other versions stay at zero — which is exactly the reading
+    // that would justify retiring them.
+    let arriving = transport["initials_by_envelope_version"]
+        .as_object()
+        .expect("initials are reported per version");
+    assert!(
+        arriving["3"].as_u64().unwrap_or(0) >= 1,
+        "this test's own handshake is counted on v3, got {arriving:?}"
+    );
+    assert_eq!(arriving["1"].as_u64(), Some(0), "nothing arrived on v1");
+    assert_eq!(arriving["2"].as_u64(), Some(0), "nothing arrived on v2");
+
+    // The cookie defence is idle on a server nobody is flooding.
+    assert_eq!(transport["under_load"], false);
+
+    handle.abort();
+}

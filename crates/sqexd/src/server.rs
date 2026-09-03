@@ -186,6 +186,18 @@ pub struct Server {
     /// translation on the request path would be a query per request for an
     /// answer that never changes.
     welcome: Option<[u8; 32]>,
+    /// The transport, kept so something other than the accept loop can read
+    /// it. `/status` is that something: sQUIC counts what arrives on each
+    /// envelope version, and until this field existed nothing outside the
+    /// accept loop could ask for the number.
+    transport: Arc<squic::ServerListener>,
+    /// The envelope versions this exchange accepts (SIP-29), as resolved at
+    /// bind — either sQUIC's default or the config's override. Reported next
+    /// to what is actually arriving, because each is only readable against the
+    /// other: a version with no traffic is safe to retire, and traffic on a
+    /// version already refused is an outage nobody can see, since a refused
+    /// envelope is dropped in silence at both ends.
+    accepted_envelope_versions: Vec<u8>,
 }
 
 impl Server {
@@ -240,7 +252,7 @@ impl Server {
 /// A bound-but-not-yet-serving server, so a caller can read the assigned
 /// address and public key before the accept loop starts.
 pub struct Bound {
-    pub listener: squic::ServerListener,
+    pub listener: Arc<squic::ServerListener>,
     pub server: Arc<Server>,
     pub local_addr: std::net::SocketAddr,
     pub public_key: PubKey,
@@ -295,9 +307,12 @@ pub async fn bind(
         squic_config.accepted_envelope_versions = versions.clone();
     }
 
-    let listener = squic::listen(config.listen, &signing_key, squic_config)
-        .await
-        .map_err(|e| Error::Malformed(format!("cannot listen on {}: {e}", config.listen)))?;
+    let accepted_envelope_versions = squic_config.accepted_envelope_versions.clone();
+    let listener = Arc::new(
+        squic::listen(config.listen, &signing_key, squic_config)
+            .await
+            .map_err(|e| Error::Malformed(format!("cannot listen on {}: {e}", config.listen)))?,
+    );
     let local_addr = listener
         .local_addr()
         .map_err(|e| Error::Malformed(format!("cannot read local address: {e}")))?;
@@ -310,6 +325,8 @@ pub async fn bind(
         state: Mutex::new(state),
         admins: RwLock::new(config.admins),
         welcome: None,
+        transport: Arc::clone(&listener),
+        accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
         mailbox: Mailbox::new(),
@@ -1516,6 +1533,29 @@ impl Server {
             "sessions": self.sessions.len(),
             "rooms": self.rooms.len(),
             "admins": self.admins.read().unwrap().len(),
+            "transport": self.transport_value(),
+        })
+    }
+
+    /// What sQUIC itself can say about the traffic reaching this exchange.
+    ///
+    /// `initials_by_envelope_version` counts accepted Initial packets, not
+    /// connections — a handshake retransmits, so a single client shows up
+    /// several times. Read it as "is anything still arriving on this
+    /// version", which is the only question it needs to answer.
+    fn transport_value(&self) -> serde_json::Value {
+        let load = self.transport.load_stats();
+        let arriving: serde_json::Map<String, serde_json::Value> = load
+            .accepted_by_version
+            .iter()
+            .map(|(version, count)| (version.to_string(), json!(count)))
+            .collect();
+        json!({
+            "under_load": load.under_load,
+            "cookie_replies_sent": load.cookie_replies_sent,
+            "mac2_verified": load.mac2_verified,
+            "accepted_envelope_versions": self.accepted_envelope_versions,
+            "initials_by_envelope_version": arriving,
         })
     }
 
