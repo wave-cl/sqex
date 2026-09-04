@@ -1578,6 +1578,8 @@ fn help(f: &mut Frame, area: Rect) {
             Span::styled("reply  ", dim),
             Span::styled("e ", key),
             Span::styled("rewrite  ", dim),
+            Span::styled("m ", key),
+            Span::styled("message them  ", dim),
             Span::styled("c ", key),
             Span::styled("copy their key  ", dim),
             Span::styled("d ", key),
@@ -1730,7 +1732,7 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
         let hints = if picked.mine {
             " · a react · r reply · e rewrite · d delete · Esc"
         } else {
-            " · a react · r reply · c copy key · d delete · Esc"
+            " · a react · r reply · m message · c copy key · d delete · Esc"
         };
         let key = if picked.mine {
             String::new()
@@ -2528,6 +2530,32 @@ mod tests {
             assert!(out.contains(key), "picking did not give the whole key:\n{out}");
             assert!(out.contains("c copy key"), "no way to take it:\n{out}");
         }
+    }
+
+    /// Picking somebody else's message offers `m`, and picking your own does
+    /// not.
+    ///
+    /// There is no direct message with yourself — a DM's identifier derives
+    /// from two accounts (SIP-16), and both would be you — so offering the key
+    /// there would be advertising a refusal.
+    #[test]
+    fn picking_offers_a_way_to_message_the_author_but_not_yourself() {
+        let mut app = sample();
+        app.said = vec![
+            said("Alice", ALICE, false, "it is me", 3661),
+            said("me", CAROL, true, "and this is mine", 3700),
+        ];
+
+        app.picked = Some(0);
+        let theirs = render(&app, 130, 24);
+        assert!(theirs.contains("m message"), "no way to reach them:\n{theirs}");
+
+        app.picked = Some(1);
+        let mine = render(&app, 130, 24);
+        assert!(
+            !mine.contains("m message"),
+            "offered a direct message with yourself:\n{mine}"
+        );
     }
 
     #[test]
