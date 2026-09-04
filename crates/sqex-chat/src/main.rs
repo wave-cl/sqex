@@ -749,39 +749,62 @@ async fn event_loop(
     let mut dirty = Dirty::default();
     let mut was_selected: Option<usize> = None;
     let mut hover = ui::Drawn::default();
+
+    // A frame costs the whole prelude below — the name map, folding every
+    // message in the selected conversation into `said`, and the draw itself —
+    // and the loop reaches the top of it about twenty times a second, because
+    // that is the input poll's cadence. Drawing the same screen twenty times a
+    // second cost an idle client 2.2% of a core with a hundred messages in
+    // view, and the cost grows with the conversation, since `refresh` walks
+    // all of it.
+    //
+    // So a frame is drawn when something happened, and otherwise at a slow
+    // floor. The floor is not decoration: the link light, the typing line and
+    // a note's linger all expire on a clock rather than on an event, and
+    // without it they would sit stale until somebody pressed a key.
+    const REDRAW_FLOOR: Duration = Duration::from_millis(500);
+    let mut needs_draw = true;
+    let mut drawn_at = tokio::time::Instant::now();
+
     loop {
-        let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
-        refresh(app, open, &chat.me, &names);
-        app.link = chat.link();
-        // Ours arrives with everybody else's, on the profile poll: it is not
-        // known at startup, so the header shows the key stub until the first
-        // one comes back and the name after.
-        app.name = chat.display_name(&chat.me).unwrap_or_default();
-        // Where each message ended up, kept from the frame that drew it: a
-        // second copy of the layout could disagree with the first, and a
-        // pointer that names the message above the one under it is worse than
-        // no pointer at all.
-        let was = (hover.total, app.scroll);
-        terminal
-            .draw(|f| hover = ui::draw(f, app))
-            .map_err(|e| e.to_string())?;
-        // What the wish came to. Storing it back is what keeps a held PgUp
-        // from winding the number past the top of a short conversation, and
-        // what makes `Home` — which asks for `usize::MAX` — land exactly at
-        // the oldest line rather than somewhere unrepresentable.
-        app.scroll = hover.scroll;
-        app.page = hover.room.saturating_sub(2).max(1);
-        // Whether there is anything above the top of the pane, so the footer
-        // can say how to reach it. Taken from the frame that drew, like
-        // `page`: the alternative is a second copy of the layout that can
-        // disagree with the first.
-        app.scrollable = hover.total > hover.room;
-        // Somebody reading history stays where they are when a message
-        // arrives. The lines all sit below them, so without this the text
-        // would creep upward under their eyes at every poll.
-        if was.1 > 0 && hover.total > was.0 {
-            app.scroll += hover.total - was.0;
+        if needs_draw || drawn_at.elapsed() >= REDRAW_FLOOR {
+            let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
+            refresh(app, open, &chat.me, &names);
+            app.link = chat.link();
+            // Ours arrives with everybody else's, on the profile poll: it is not
+            // known at startup, so the header shows the key stub until the first
+            // one comes back and the name after.
+            app.name = chat.display_name(&chat.me).unwrap_or_default();
+            // Where each message ended up, kept from the frame that drew it: a
+            // second copy of the layout could disagree with the first, and a
+            // pointer that names the message above the one under it is worse than
+            // no pointer at all.
+            let was = (hover.total, app.scroll);
+            terminal
+                .draw(|f| hover = ui::draw(f, app))
+                .map_err(|e| e.to_string())?;
+            // What the wish came to. Storing it back is what keeps a held PgUp
+            // from winding the number past the top of a short conversation, and
+            // what makes `Home` — which asks for `usize::MAX` — land exactly at
+            // the oldest line rather than somewhere unrepresentable.
+            app.scroll = hover.scroll;
+            app.page = hover.room.saturating_sub(2).max(1);
+            // Whether there is anything above the top of the pane, so the footer
+            // can say how to reach it. Taken from the frame that drew, like
+            // `page`: the alternative is a second copy of the layout that can
+            // disagree with the first.
+            app.scrollable = hover.total > hover.room;
+            // Somebody reading history stays where they are when a message
+            // arrives. The lines all sit below them, so without this the text
+            // would creep upward under their eyes at every poll.
+            if was.1 > 0 && hover.total > was.0 {
+                app.scroll += hover.total - was.0;
+            }
+            needs_draw = false;
+            drawn_at = tokio::time::Instant::now();
         }
+        // Outside the gate: a client told to quit must go whether or not it
+        // was due a frame.
         if app.should_quit {
             return Ok(());
         }
@@ -841,6 +864,7 @@ async fn event_loop(
                 }
                 _ => {}
             }
+            needs_draw = true;
             continue;
         }
 
@@ -890,6 +914,8 @@ async fn event_loop(
         if dirty.is_empty() {
             continue;
         }
+        // Everything below this line changes something a reader can see.
+        needs_draw = true;
 
         for channel in std::mem::take(&mut dirty.channels) {
             match open.iter().position(|c| c.channel == channel) {
@@ -1403,18 +1429,27 @@ async fn handle_key(
             // cannot begin with that letter, and nothing tells you why —
             // the keystroke is simply swallowed.
             KeyCode::Char('n') => app.adding = Some(String::new()),
-            // Paging from the keyboard, on the keys vi uses for a full screen
-            // back and forward. PageUp and PageDown do the same and always
-            // have; these exist because a laptop without them needs a chord,
-            // and because the ones a hand already knows are the ones worth
-            // spending.
+            // Paging from the keyboard, on the keys `less` and vi use for
+            // half a screen. PageUp and PageDown do the same and always have;
+            // these exist because a laptop without them needs a chord.
             //
-            // Deliberately not Ctrl-U and Ctrl-D. Those are vi's *half* page,
-            // and Ctrl-U in anything with a text field means "clear the line"
-            // to every hand trained on readline — a scroll that ate what
-            // somebody had typed would be the worst kind of surprise.
-            KeyCode::Char('b') => app.scroll += app.page,
-            KeyCode::Char('f') => app.scroll = app.scroll.saturating_sub(app.page),
+            // **Not Ctrl-B and Ctrl-F**, which is what this was first and is
+            // the obvious choice — vi's *full* page, and the pair a hand
+            // reaches for. Ctrl-B is tmux's default prefix. Inside tmux the
+            // multiplexer eats it, and `send-prefix` means two presses deliver
+            // one keystroke to us: it was reported as "it only pages up once",
+            // and then precisely as "I have to hit Ctrl-B twice for one
+            // pagination". A binding that works on a bare terminal and
+            // half-works under the commonest terminal tool is not one worth
+            // keeping for the sake of a mnemonic.
+            //
+            // Ctrl-U carries a "clear the line" expectation from readline,
+            // which is the reason it was passed over first time. That
+            // expectation is unmet here either way — nothing was bound to it —
+            // so meeting a different one costs nothing that was not already
+            // being paid.
+            KeyCode::Char('u') => app.scroll += app.page,
+            KeyCode::Char('d') => app.scroll = app.scroll.saturating_sub(app.page),
             _ => {}
         }
         return;

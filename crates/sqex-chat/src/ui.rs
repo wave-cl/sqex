@@ -1407,7 +1407,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     if scrolled {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("─── {scroll} more below · ^F or PgDn, End for the newest ───"),
+                format!("─── {scroll} more below · ^D or PgDn, End for the newest ───"),
                 Style::default().fg(palette::ATTENTION),
             ))
             .alignment(Alignment::Center)),
@@ -1560,7 +1560,7 @@ fn help(f: &mut Frame, area: Rect) {
             Span::styled("quit", dim),
         ]),
         Line::from(vec![
-            Span::styled("  ^B ^F  ", key),
+            Span::styled("  ^U ^D  ", key),
             Span::styled("a screen back or forward    ", dim),
             Span::styled("Home End ", key),
             Span::styled("the oldest, the newest    ", dim),
@@ -1693,7 +1693,7 @@ fn keys_line(width: usize, scrollable: bool) -> String {
     // rule below governs it too — the first version bypassed that and
     // overflowed a one-column terminal.
     let groups: Vec<&str> = if scrollable {
-        std::iter::once("^B/^F page").chain(GROUPS.iter().copied()).collect()
+        std::iter::once("^U/^D page").chain(GROUPS.iter().copied()).collect()
     } else {
         GROUPS.to_vec()
     };
@@ -2195,7 +2195,7 @@ mod tests {
                 );
                 for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
                     assert!(
-                        ["^B/^F page", "^C quit", "Tab", "Esc pick", "^N add", "/help"]
+                        ["^U/^D page", "^C quit", "Tab", "Esc pick", "^N add", "/help"]
                             .contains(&group),
                         "a group was cut in half at width {width}: {group:?}"
                     );
@@ -2221,16 +2221,16 @@ mod tests {
     fn the_key_line_offers_paging_once_there_is_something_to_page_to() {
         let quiet = keys_line(120, false);
         assert!(
-            !quiet.contains("^B"),
+            !quiet.contains("^U"),
             "a conversation that fits its pane must not advertise scrolling: {quiet:?}"
         );
 
         let scrolled = keys_line(120, true);
-        assert!(scrolled.contains("^B/^F page"), "{scrolled:?}");
+        assert!(scrolled.contains("^U/^D page"), "{scrolled:?}");
         // Ahead of everything but quitting: it is what the reader is looking
         // for, and the line is cut from the right when it does not fit.
         assert!(
-            scrolled.find("^B/^F").unwrap() < scrolled.find("Tab").unwrap(),
+            scrolled.find("^U/^D").unwrap() < scrolled.find("Tab").unwrap(),
             "the paging hint must come before the rest: {scrolled:?}"
         );
         // And it must not push the rest off a narrow screen entirely.
