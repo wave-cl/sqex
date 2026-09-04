@@ -794,6 +794,9 @@ async fn event_loop(
             // `page`: the alternative is a second copy of the layout that can
             // disagree with the first.
             app.scrollable = hover.total > hover.room;
+            // The last message the frame put on screen. `rows` is indexed by
+            // screen row, so the last `Some` in it is the bottom-most one.
+            app.last_visible = hover.rows.iter().rev().flatten().next().copied();
             // Somebody reading history stays where they are when a message
             // arrives. The lines all sit below them, so without this the text
             // would creep upward under their eyes at every poll.
@@ -1526,8 +1529,14 @@ async fn handle_key(
         return;
     }
 
-    // Esc with nothing else to dismiss enters it, on the newest message, which
-    // is the one somebody almost always means.
+    // Esc with nothing else to dismiss enters pick mode, on the last message
+    // **on screen**.
+    //
+    // At the bottom of a conversation that is the newest one, which is what
+    // somebody almost always means. Once they have paged back it is not: the
+    // newest message is then far below the pane, so picking it would throw the
+    // view forward to a message they had deliberately scrolled away from, and
+    // lose their place to boot. Picking what they are looking at keeps both.
     if code == KeyCode::Esc {
         if app.editing.take().is_some() || app.replying.take().is_some() {
             // Abandon what the input line was about to do first. Leaving an
@@ -1537,7 +1546,7 @@ async fn handle_key(
             return;
         }
         if !app.said.is_empty() {
-            app.picked = Some(app.said.len() - 1);
+            app.picked = Some(app.last_visible.unwrap_or(app.said.len() - 1));
         }
         return;
     }

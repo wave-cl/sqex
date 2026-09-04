@@ -384,6 +384,15 @@ pub struct App {
     /// lines. Nought is the bottom, which is where a conversation opens and
     /// where it stays while somebody is reading the newest of it.
     pub scroll: usize,
+    /// The bottom-most message actually on screen, as an index into `said`.
+    ///
+    /// `None` when the pane holds no message at all. Taken from the frame that
+    /// drew, like `page` and `scrollable`: a second copy of the layout could
+    /// disagree with the first, and this decides where the picker lands.
+    ///
+    /// At the bottom of a conversation this *is* the newest message, so it
+    /// changes nothing there — it only matters once somebody has paged back.
+    pub last_visible: Option<usize>,
     /// Whether the conversation is taller than the pane, so there is anything
     /// to scroll back to.
     ///
@@ -1991,6 +2000,14 @@ mod tests {
     const ALICE: &str = "9hMLdY3VpKcR2wNtSbXgFzUqE7vJmA4dHyL8nCxTZk6Q";
     const CAROL: &str = "E4LUkjrZ7mWvTpN3sQhBxYdGcF9aKzUt2LnRe5JqXM8V";
 
+    /// `render`, keeping what the frame reported about itself.
+    fn drawn(app: &App, w: u16, h: u16) -> Drawn {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut out = Drawn::default();
+        t.draw(|f| out = draw(f, app)).unwrap();
+        out
+    }
+
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| { draw(f, app); }).unwrap();
@@ -2555,6 +2572,41 @@ mod tests {
         assert!(
             !mine.contains("m message"),
             "offered a direct message with yourself:\n{mine}"
+        );
+    }
+
+    /// The frame reports the bottom-most message on screen, and once somebody
+    /// has paged back that is **not** the newest one.
+    ///
+    /// This is what decides where `Esc` lands. Picking the newest after a page
+    /// back would throw the view forward to a message deliberately scrolled
+    /// away from, losing the reader's place in the same keystroke.
+    #[test]
+    fn the_frame_reports_the_last_message_on_screen_not_the_newest() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("Alice", ALICE, false, &format!("message {n}"), 3600 + n as u64))
+            .collect();
+        let newest = app.said.len() - 1;
+
+        // At the bottom, the last on screen is the newest — so this changes
+        // nothing for somebody who has not scrolled.
+        app.scroll = 0;
+        let bottom = drawn(&app, 130, 24);
+        assert_eq!(
+            bottom.rows.iter().rev().flatten().next().copied(),
+            Some(newest),
+            "at the bottom the last visible message must be the newest"
+        );
+
+        // Paged back, it must not be.
+        app.scroll = 20;
+        let up = drawn(&app, 130, 24);
+        let last = up.rows.iter().rev().flatten().next().copied();
+        assert!(last.is_some(), "a scrolled pane still shows messages");
+        assert!(
+            last != Some(newest),
+            "after paging back the newest message is still reported as on screen: {last:?}"
         );
     }
 
