@@ -1314,7 +1314,7 @@ async fn settle_here(chat: &mut Chat, open: &mut [Open], app: &mut App, at: usiz
 /// Everything here acts on one message, so it is all guarded by there being
 /// one. The actions that produce text — reply and edit — leave the mode,
 /// because the next thing wanted is the input line.
-async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyCode) {
+async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: KeyCode) {
     let Some(i) = app.picked else { return };
     let Some(said) = app.said.get(i) else {
         app.picked = None;
@@ -1372,6 +1372,32 @@ async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyC
             match selected_index(open, app) {
                 Some(at) => open[at].note = Some((note, std::time::Instant::now())),
                 None => app.trouble.message = Some(note),
+            }
+        }
+        // Message the author of the picked message. `c` puts their key on the
+        // clipboard for somebody to do something with; this does the thing
+        // they were almost always about to do with it.
+        //
+        // Not offered on your own messages, and refused rather than ignored:
+        // a key that silently does nothing on some messages and works on
+        // others teaches nothing about which.
+        KeyCode::Char('m') => {
+            if mine {
+                app.trouble.message = Some("that is you — there is no direct message with yourself".into());
+                return;
+            }
+            match key.parse::<PubKey>() {
+                Ok(account) => {
+                    app.picked = None;
+                    message_account(chat, open, app, account).await;
+                }
+                // `Said::key` is written from an entry the client verified, so
+                // this is unreachable short of a bug — and says so rather than
+                // failing silently if it ever is not.
+                Err(_) => {
+                    app.trouble.message =
+                        Some(format!("the author's key did not parse: {key}"))
+                }
             }
         }
         KeyCode::Char('a') if !redacted => app.reacting = true,
@@ -2504,11 +2530,32 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         app.trouble.message = Some(format!("{typed:?} is not a base58 identity"));
         return;
     };
+    message_account(chat, open, app, account).await;
+}
+
+/// Open a direct message with `account`, or go to the one that is already open.
+///
+/// Both ways in end here — `^N` with a typed key, and `m` on a picked message —
+/// so they cannot drift into meaning different things.
+///
+/// **Going to the existing conversation is the point.** This used to return
+/// the moment it found one, so asking for somebody you already had a
+/// conversation with did nothing at all: no move, no message, no clue that the
+/// key had been understood. A direct message's identifier is derived from the
+/// two accounts (SIP-16), so there is never a second one to make — the only
+/// sensible answer to "talk to this person" is to be there.
+async fn message_account(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, account: PubKey) {
     if account == chat.me {
         app.trouble.message = Some("that is your own key".into());
         return;
     }
-    if open.iter().any(|o| o.peer == Some(account)) {
+    if let Some(existing) = open.iter().find(|o| o.peer == Some(account)).map(|o| o.channel) {
+        app.selected = Some(existing);
+        // The same three things Tab does, for the same reasons: a conversation
+        // arrived at is read from its newest, and carrying a scroll offset
+        // across would land somebody at an arbitrary depth in it.
+        app.scroll = 0;
+        clear_unread(open, app);
         return;
     }
     let label = short(&account);
