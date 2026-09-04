@@ -771,6 +771,11 @@ async fn event_loop(
         // the oldest line rather than somewhere unrepresentable.
         app.scroll = hover.scroll;
         app.page = hover.room.saturating_sub(2).max(1);
+        // Whether there is anything above the top of the pane, so the footer
+        // can say how to reach it. Taken from the frame that drew, like
+        // `page`: the alternative is a second copy of the layout that can
+        // disagree with the first.
+        app.scrollable = hover.total > hover.room;
         // Somebody reading history stays where they are when a message
         // arrives. The lines all sit below them, so without this the text
         // would creep upward under their eyes at every poll.
@@ -1398,6 +1403,18 @@ async fn handle_key(
             // cannot begin with that letter, and nothing tells you why —
             // the keystroke is simply swallowed.
             KeyCode::Char('n') => app.adding = Some(String::new()),
+            // Paging from the keyboard, on the keys vi uses for a full screen
+            // back and forward. PageUp and PageDown do the same and always
+            // have; these exist because a laptop without them needs a chord,
+            // and because the ones a hand already knows are the ones worth
+            // spending.
+            //
+            // Deliberately not Ctrl-U and Ctrl-D. Those are vi's *half* page,
+            // and Ctrl-U in anything with a text field means "clear the line"
+            // to every hand trained on readline — a scroll that ate what
+            // somebody had typed would be the worst kind of surprise.
+            KeyCode::Char('b') => app.scroll += app.page,
+            KeyCode::Char('f') => app.scroll = app.scroll.saturating_sub(app.page),
             _ => {}
         }
         return;
