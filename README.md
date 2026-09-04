@@ -261,7 +261,6 @@ the tests use.
 - `sqex-voice` — calls and rooms: capture, Opus, relay, mix, play.
 - `sqex-chat` — the terminal chat client, and the client-side key store the
   chat stack needs and the exchange cannot provide.
-- `sqex-admin` — the desktop GUI (YubiKey), parked.
 
 ## Running
 
