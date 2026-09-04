@@ -1331,7 +1331,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1630,7 +1630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3006,7 +3006,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3825,7 +3825,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4146,7 +4146,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4203,7 +4203,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4660,7 +4660,7 @@ dependencies = [
  "sqexd",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.22.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4708,7 +4708,7 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "sqnr-core",
- "squic",
+ "squic 0.22.0",
  "x25519-dalek",
 ]
 
@@ -4730,7 +4730,7 @@ dependencies = [
  "sqexd",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.22.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4763,7 +4763,7 @@ dependencies = [
  "sqex-proto",
  "sqnr",
  "sqnr-core",
- "squic",
+ "squic 0.22.0",
  "tempfile",
  "tokio",
  "toml",
@@ -4797,7 +4797,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqnr-core",
- "squic",
+ "squic 0.21.0",
  "tokio",
  "toml",
  "zeroize",
@@ -4826,6 +4826,32 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hmac",
+ "quinn",
+ "quinn-proto",
+ "rand 0.9.5",
+ "rand_core 0.6.4",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "socket2 0.5.10",
+ "thiserror 2.0.20",
+ "tokio",
+ "x25519-dalek",
+ "x509-cert",
+]
+
+[[package]]
+name = "squic"
+version = "0.22.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.22.0#228417a127d060b5dde7da4a0457abe6858464c3"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "libc",
  "quinn",
  "quinn-proto",
  "rand 0.9.5",
@@ -4973,7 +4999,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5808,7 +5834,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
