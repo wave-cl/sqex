@@ -384,6 +384,15 @@ pub struct App {
     /// lines. Nought is the bottom, which is where a conversation opens and
     /// where it stays while somebody is reading the newest of it.
     pub scroll: usize,
+    /// Whether the conversation is taller than the pane, so there is anything
+    /// to scroll back to.
+    ///
+    /// The footer says how to page only while this is true. A hint for
+    /// something that would do nothing is noise, and the moment a
+    /// conversation first outgrows its pane is exactly the moment somebody
+    /// wants to know the keys — which is why this is worth a field rather
+    /// than a permanent entry in the line.
+    pub scrollable: bool,
     /// The message the pointer is over, as an index into `said`.
     ///
     /// Detail on demand, and only detail: nothing a reader *needs* may live
@@ -1398,7 +1407,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     if scrolled {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("─── {scroll} more below · PgDn, or End for the newest ───"),
+                format!("─── {scroll} more below · ^F or PgDn, End for the newest ───"),
                 Style::default().fg(palette::ATTENTION),
             ))
             .alignment(Alignment::Center)),
@@ -1525,7 +1534,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
         ("/block  /unblock  /blocked", "who may reach you"),
         ("/whoami", "your key in full — the header carries only the first six"),
-        ("/mouse [on|off]", "take the mouse, so hovering a message gives its full time; off by default"),
+        ("/mouse [on|off]", "scroll with the wheel, and hover a message for its full time; off by default, because it stops the terminal's own text selection"),
         ("/reconnect", "try the exchange again now, rather than waiting out the backoff"),
     ]),
 ];
@@ -1549,6 +1558,14 @@ fn help(f: &mut Frame, area: Rect) {
             Span::styled("add somebody    ", dim),
             Span::styled("^C ", key),
             Span::styled("quit", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("  ^B ^F  ", key),
+            Span::styled("a screen back or forward    ", dim),
+            Span::styled("Home End ", key),
+            Span::styled("the oldest, the newest    ", dim),
+            Span::styled("/mouse ", key),
+            Span::styled("the wheel", dim),
         ]),
         Line::from(vec![
             Span::styled("  Esc    ", key),
@@ -1662,15 +1679,26 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 /// cut off, so the commands that fell off were undiscoverable and nothing said
 /// so. Ordered by how often each is wanted, and a group is either shown whole
 /// or not at all — half of "/file /save" helps nobody.
-fn keys_line(width: usize) -> String {
+fn keys_line(width: usize, scrollable: bool) -> String {
     // Short, and it stays short. This used to be the only command list there
     // was, and it grew until the end of it was cut off at eighty columns —
     // which left the commands that fell off undiscoverable, with nothing to
     // say they existed. `/help` carries the list now, and this only has to
     // point at it.
     const GROUPS: &[&str] = &["^C quit", "Tab", "Esc pick", "^N add", "/help"];
+    // First, and only while it applies. A reader who has just watched a
+    // message leave the top of the pane is looking for this and nothing else;
+    // the rest of the line is what they already know. It is prepended as an
+    // ordinary group rather than written straight into `out`, so the width
+    // rule below governs it too — the first version bypassed that and
+    // overflowed a one-column terminal.
+    let groups: Vec<&str> = if scrollable {
+        std::iter::once("^B/^F page").chain(GROUPS.iter().copied()).collect()
+    } else {
+        GROUPS.to_vec()
+    };
     let mut out = String::new();
-    for g in GROUPS {
+    for g in &groups {
         let sep = if out.is_empty() { " " } else { " · " };
         if out.chars().count() + sep.len() + g.chars().count() > width {
             break;
@@ -1724,7 +1752,7 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
         )
     } else {
         (
-            keys_line(area.width as usize),
+            keys_line(area.width as usize, app.scrollable),
             Style::default().fg(palette::MUTED),
         )
     };
@@ -2158,24 +2186,55 @@ mod tests {
     fn the_key_line_is_cut_between_groups_and_never_inside_one() {
         // A narrow terminal loses the least-wanted commands, not the tail of a
         // word: "/file /sa" is worse than not mentioning /file at all.
-        for width in 1..140usize {
-            let line = keys_line(width);
-            assert!(
-                line.chars().count() <= width,
-                "the key line overflowed {width} columns: {line:?}"
-            );
-            for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
+        for scrollable in [false, true] {
+            for width in 1..140usize {
+                let line = keys_line(width, scrollable);
                 assert!(
-                    ["^C quit", "Tab", "Esc pick", "^N add", "/help"].contains(&group),
-                    "a group was cut in half at width {width}: {group:?}"
+                    line.chars().count() <= width,
+                    "the key line overflowed {width} columns: {line:?}"
                 );
+                for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
+                    assert!(
+                        ["^B/^F page", "^C quit", "Tab", "Esc pick", "^N add", "/help"]
+                            .contains(&group),
+                        "a group was cut in half at width {width}: {group:?}"
+                    );
+                }
             }
         }
         // And a wide terminal gets all of them.
         // And it fits at eighty columns whole, which the command list it
         // replaced had stopped doing.
-        assert_eq!(keys_line(200), keys_line(80));
-        assert!(keys_line(80).contains("/help"));
+        assert_eq!(keys_line(200, false), keys_line(80, false));
+        assert!(keys_line(80, false).contains("/help"));
+    }
+
+    /// The footer says how to page **only** once there is something above the
+    /// pane to page back to.
+    ///
+    /// This is the whole of the fix: the feature existed, worked, and was
+    /// invisible — the line named four other things and never this one, so a
+    /// reader watching a message leave the top of the screen had nothing to
+    /// go on. A hint shown always would be noise on every short conversation;
+    /// shown here it arrives at the moment somebody wants it.
+    #[test]
+    fn the_key_line_offers_paging_once_there_is_something_to_page_to() {
+        let quiet = keys_line(120, false);
+        assert!(
+            !quiet.contains("^B"),
+            "a conversation that fits its pane must not advertise scrolling: {quiet:?}"
+        );
+
+        let scrolled = keys_line(120, true);
+        assert!(scrolled.contains("^B/^F page"), "{scrolled:?}");
+        // Ahead of everything but quitting: it is what the reader is looking
+        // for, and the line is cut from the right when it does not fit.
+        assert!(
+            scrolled.find("^B/^F").unwrap() < scrolled.find("Tab").unwrap(),
+            "the paging hint must come before the rest: {scrolled:?}"
+        );
+        // And it must not push the rest off a narrow screen entirely.
+        assert!(keys_line(80, true).contains("/help"), "{}", keys_line(80, true));
     }
 
     #[test]
