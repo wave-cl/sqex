@@ -31,10 +31,9 @@ if ! ADMIN=$(sqnr --yubikey pubkey 2>/dev/null); then
     No Ed25519 auth key found on the card.
 
     Provision it ONCE — this GENERATES a new key on the card's Authentication
-    slot and OVERWRITES anything already there, so do it deliberately. From the
-    sqex tree:
+    slot and OVERWRITES anything already there, so do it deliberately:
 
-        cargo run --bin yubikey_spike -- --provision
+        sqnr --yubikey provision
 
     Then re-run this script.
 EOF
