@@ -2274,7 +2274,17 @@ impl Channels {
         let mut bytes = 0usize;
         for row in rows {
             let (mut e, entry_hash, head, receipt) = row.map_err(storage("read pulled entry"))?;
-            e.stamp = Some(Receipted { entry_hash, head, receipt });
+            // An entry written before receipts were stored has none here. An
+            // *origin* can always produce one — Ed25519 is deterministic and it
+            // holds the seed — so it does, rather than serving zeroes a replica
+            // would rightly refuse. A replica has no such fallback, which is
+            // why the column exists.
+            let stamp = if receipt == [0u8; 64] {
+                self.stamp(&place, e.seq, e.posted, &entry_hash, &head)?
+            } else {
+                Receipted { entry_hash, head, receipt }
+            };
+            e.stamp = Some(stamp);
             if !entries.is_empty() && bytes + e.wire_len() > MAX_PULL_BYTES {
                 break;
             }
