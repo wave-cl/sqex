@@ -334,11 +334,12 @@ async fn status_reports_accepted_and_arriving_envelope_versions() {
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
     let client_seed = [7u8; 32];
 
-    // Accept v3 only — the same posture ex runs. A server left on the default
-    // would report all three, and the assertion below could not then tell the
-    // configured set apart from the default one.
+    // Named explicitly rather than left unset, so the assertion below can tell
+    // the configured set apart from squic's default. They happen to be the same
+    // list today — v4 is the only version implemented — which is precisely why
+    // naming it is what makes the assertion mean anything.
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\naccepted_envelope_versions = [3]\n",
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\naccepted_envelope_versions = [4]\n",
         key_path.to_string_lossy(),
     );
     let config_path = dir.path().join("sqexd.toml");
@@ -354,25 +355,76 @@ async fn status_reports_accepted_and_arriving_envelope_versions() {
 
     assert_eq!(
         transport["accepted_envelope_versions"],
-        serde_json::json!([3]),
+        serde_json::json!([4]),
         "the configured set is reported, not squic's default"
     );
 
-    // This client's own Initial. The client defaults to v3, so the count lands
-    // on v3 and the other versions stay at zero — which is exactly the reading
-    // that would justify retiring them.
+    // This client's own Initial, counted against the version it was sent under.
     let arriving = transport["initials_by_envelope_version"]
         .as_object()
         .expect("initials are reported per version");
     assert!(
-        arriving["3"].as_u64().unwrap_or(0) >= 1,
-        "this test's own handshake is counted on v3, got {arriving:?}"
+        arriving["4"].as_u64().unwrap_or(0) >= 1,
+        "this test's own handshake is counted on v4, got {arriving:?}"
     );
-    assert_eq!(arriving["1"].as_u64(), Some(0), "nothing arrived on v1");
-    assert_eq!(arriving["2"].as_u64(), Some(0), "nothing arrived on v2");
+    assert_eq!(
+        arriving.len(),
+        1,
+        "one version is implemented, so one is reported, got {arriving:?}"
+    );
 
     // The cookie defence is idle on a server nobody is flooding.
     assert_eq!(transport["under_load"], false);
+
+    handle.abort();
+}
+
+/// The trap the v4 cut walks past, pinned so nobody rediscovers it on a live
+/// exchange: a server told to accept an envelope version this build does not
+/// implement **starts perfectly happily and then accepts nothing**. There is no
+/// error, no log line and no reply — a refused envelope is dropped in silence
+/// by design (SIP-6), so the operator sees a healthy process and a dead port.
+///
+/// ex was configured `accepted_envelope_versions = [3]` right up to this cut,
+/// which is exactly this state under a v4 binary. The config had to be edited
+/// in the same breath as the binary was installed.
+///
+/// squic validates `envelope_version` on dial but has no equivalent guard on
+/// listen. Until it does, this test is the only thing that says so out loud.
+#[tokio::test]
+async fn a_retired_accepted_version_leaves_the_server_up_and_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("host_key");
+    let (server_sk, _) = squic::generate_keypair();
+    std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\naccepted_envelope_versions = [3]\n",
+        key_path.to_string_lossy(),
+    );
+    let config_path = dir.path().join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    // It binds and serves. That is the whole problem.
+    let (addr, server_pub, handle) = spawn_server(&config_toml, config_path).await;
+
+    let dialled = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        squic::dial(
+            addr,
+            &server_pub,
+            SquicConfig {
+                alpn_protocols: vec![b"h3".to_vec()],
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+
+    assert!(
+        dialled.is_err() || dialled.unwrap().is_err(),
+        "a server accepting only a retired envelope version answered a v4 client"
+    );
 
     handle.abort();
 }

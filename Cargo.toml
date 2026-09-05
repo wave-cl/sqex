@@ -10,17 +10,17 @@ members = [
 ]
 
 [workspace.package]
-version = "0.27.0"
+version = "0.28.0"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.22.0" }
+squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.24.0" }
 # sqnr owns the signed-command protocol + PubKey (sqnr-core) and the signer/
 # client/CLI (sqnr), pinned to a git tag like squic above. For local co-dev,
 # override with a [patch] to ../sqnr, or temporarily swap back to path deps.
-sqnr-core = { git = "https://github.com/wave-cl/sqnr", tag = "v0.9.0" }
-sqnr = { git = "https://github.com/wave-cl/sqnr", tag = "v0.9.0" }
+sqnr-core = { git = "https://github.com/wave-cl/sqnr", tag = "v0.10.0" }
+sqnr = { git = "https://github.com/wave-cl/sqnr", tag = "v0.10.0" }
 sqex-proto = { path = "crates/sqex-proto" }
 sqex-discovery = { path = "crates/sqex-discovery" }
 tokio = { version = "1", features = ["full"] }
