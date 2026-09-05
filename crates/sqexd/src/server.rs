@@ -21,6 +21,7 @@ use crate::admission::Admissions;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::{Config, OriginConfig};
+use crate::resolve::Endpoints;
 use crate::device::Registry;
 use crate::events::Subscribers;
 use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
@@ -51,6 +52,9 @@ use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
 use sqex_proto::message::{RING_RINGING, Signal};
+use sqex_proto::resolve::{
+    Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
+};
 use sqex_proto::peer::{
     Hello as PeerHello, Hi, PEER_VERSION, PullBlob, PullEnvelopes, PullRecord, Pull as PeerPull,
 };
@@ -164,6 +168,11 @@ pub struct Server {
     admins: RwLock<Vec<PubKey>>,
     challenges: Challenges,
     beacons: Beacons,
+    /// SIP-28: where identities say they can be reached. Beside the beacon on
+    /// purpose — this holds what they *said*, the beacon holds what the
+    /// exchange *saw*, and a resolution carries both so a consumer can tell
+    /// them apart.
+    endpoints: Endpoints,
     mailbox: Mailbox,
     rooms: Rooms,
     channels: Channels,
@@ -366,6 +375,7 @@ pub async fn bind(
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
+        endpoints: Endpoints::new(),
         mailbox: Mailbox::new(),
         rooms: Rooms::new(),
         // The channel log lives beside the state file, so a memory-only
@@ -865,11 +875,80 @@ async fn route(
                     let now = server
                         .beacons
                         .record(id, beat.interval_secs, beat.withhold);
+                    // SIP-28: a service proving it is alive should not have to
+                    // separately prove its address is current. The window is
+                    // extended by the interval it declared, so an identity that
+                    // keeps beating keeps its endpoints — and one that stops
+                    // loses them on the same schedule its own beacon claims.
+                    server
+                        .endpoints
+                        .refresh(&id, beat.interval_secs.saturating_mul(2));
                     tracing::debug!(identity = %id.short(), interval = beat.interval_secs, "beat");
                     (200, "application/octet-stream", BeatAck { now }.encode())
                 }
             },
         },
+        // SIP-28 resolution. **The exchange is trusted for availability and
+        // privacy, not for authenticity**: a consumer pins the key it asked for
+        // when it connects, so a wrong address is a failed handshake rather
+        // than an impersonation. Nothing here is signed, and nothing here is
+        // authority.
+        ("POST", "/resolve/publish") => match (peer.identity, ResolvePublish::decode(body)) {
+            (None, _) => no_identity("publishing endpoints"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            // Only for itself. The handshake established which key is speaking,
+            // and a caller may publish for that identity and no other — which
+            // is the whole reason no signature is needed.
+            (Some(id), Ok(req)) => match server.endpoints.publish(id, req.ttl_secs, req.endpoints) {
+                Ok(_) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
+                Err(_) => refuse(
+                    507,
+                    Code::TooManyEndpoints,
+                    Some("an identity may publish at most 8 endpoints"),
+                ),
+            },
+        },
+        ("POST", "/resolve/get") => match (peer.identity, ResolveGet::decode(body)) {
+            (None, _) => no_identity("resolving a key"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(_), Ok(req)) => {
+                // The beacon observation travels with the answer, because it is
+                // the one thing a signed record structurally cannot say: not
+                // where a service claims to be, but that somebody saw it there.
+                // Read on the asker's behalf, so an identity that withholds its
+                // liveness withholds it here too.
+                let seen = server
+                    .beacons
+                    .read(&req.key, peer.identity.as_ref())
+                    .last_seen;
+                (
+                    200,
+                    "application/octet-stream",
+                    server.endpoints.resolve(&req.key, seen).encode(),
+                )
+            }
+        },
+        // A forwarding note, and **not a retirement**: it is authenticated by
+        // the connection, so whoever holds the key can set it — after a theft,
+        // that is the attacker. An exchange cannot express "this key was
+        // stolen, use this one instead".
+        ("POST", "/resolve/successor") => match (peer.identity, ResolveSuccessor::decode(body)) {
+            (None, _) => no_identity("naming a successor"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(id), Ok(req)) => {
+                server.endpoints.set_successor(id, req);
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
+            }
+        },
+
         ("POST", "/beacon/read") => match Read::decode(body) {
             Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(read) => {

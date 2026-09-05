@@ -12,6 +12,7 @@ pub mod peer_client;
 pub mod prekey;
 pub mod profile;
 pub mod replica;
+pub mod resolve;
 pub mod room;
 pub mod server;
 pub mod session;

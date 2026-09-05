@@ -101,6 +101,8 @@ pub enum Code {
     /// SIP-35: this exchange holds two receipts for one position from the
     /// channel's origin, and will present neither branch as the conversation.
     Equivocated,
+    /// SIP-28: more endpoints than an identity may publish.
+    TooManyEndpoints,
 
     // SIP-18 blobs.
     NoSuchUpload,
@@ -186,6 +188,7 @@ impl Code {
             Code::Replicated => 57,
             Code::Underived => 58,
             Code::Equivocated => 59,
+            Code::TooManyEndpoints => 60,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -264,6 +267,7 @@ impl Code {
             57 => Code::Replicated,
             58 => Code::Underived,
             59 => Code::Equivocated,
+            60 => Code::TooManyEndpoints,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -342,6 +346,7 @@ impl Code {
             Code::Replicated => "replicated",
             Code::Underived => "underived",
             Code::Equivocated => "equivocated",
+            Code::TooManyEndpoints => "too_many_endpoints",
 
             Code::NoSuchUpload => "no_such_upload",
             Code::NoSuchBlob => "no_such_blob",
@@ -416,6 +421,7 @@ impl Code {
         Code::Replicated,
         Code::Underived,
         Code::Equivocated,
+        Code::TooManyEndpoints,
         Code::NoSuchUpload,
         Code::NoSuchBlob,
         Code::BadChunk,

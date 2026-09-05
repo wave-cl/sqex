@@ -13,6 +13,10 @@ use clap::{Parser, Subcommand};
 use sqex_proto::Op;
 use sqex_proto::refusal::Refusal;
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
+use sqex_proto::resolve::{
+    Endpoint, KIND_DNS, KIND_IPV4, KIND_IPV6, MAX_HOST, Publish as ResolvePublish,
+    Resolve as ResolveGet, Resolved, Successor as ResolveSuccessor,
+};
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
 use sqex_proto::session::{
     BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
@@ -60,6 +64,12 @@ enum Cmd {
     Beacon {
         #[command(subcommand)]
         cmd: BeaconCmd,
+    },
+    /// Public key resolution: say where this identity can be reached, or ask
+    /// where another one is.
+    Resolve {
+        #[command(subcommand)]
+        cmd: ResolveCmd,
     },
     /// Store-and-forward mailbox: leave sealed messages, collect your own.
     Mail {
@@ -146,6 +156,43 @@ enum BeaconCmd {
 }
 
 #[derive(Subcommand)]
+enum ResolveCmd {
+    /// Publish where this identity can be reached. Replaces the whole set:
+    /// SIP-28 has no partial update, because reconciling one against a
+    /// trusting store is where stale addresses live forever.
+    Publish {
+        /// `host:port` to advertise, repeatable. A bare IP or a DNS name.
+        #[arg(required = true)]
+        endpoint: Vec<String>,
+        /// How long the exchange should believe it, in seconds.
+        #[arg(short = 't', long, default_value_t = 300)]
+        ttl: u32,
+    },
+    /// Ask where a key can be reached.
+    ///
+    /// **The answer is the exchange's word.** Connecting to it pins the key you
+    /// asked for, so a wrong address is a failed handshake rather than somebody
+    /// else answering — the exchange is trusted for availability, not for
+    /// authenticity.
+    Get {
+        /// The identity to ask about, base58. Defaults to your own.
+        key: Option<String>,
+    },
+    /// Say this identity has moved.
+    ///
+    /// **Not a retirement.** It is authenticated by the connection, so whoever
+    /// holds the key can set it — after a theft, that is the attacker. It says
+    /// "I am moving", and only while the mover is still in control.
+    Moved {
+        /// The identity that takes over, base58.
+        successor: String,
+        /// A line for a human, at most 128 bytes.
+        #[arg(default_value = "")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum AdminCmd {
     /// Manage the connection whitelist.
     Whitelist {
@@ -194,6 +241,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Status => status(&cli, &cfg).await,
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
+        Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
         Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
@@ -647,6 +695,161 @@ async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
         return Err(format!("delete failed ({code})"));
     }
     Ok(body.first().copied().unwrap_or(0) != 0)
+}
+
+// ---- resolve ----------------------------------------------------------------
+
+/// Parse a `host:port` an operator typed into the shape SIP-28 publishes.
+///
+/// A bare IPv4 or IPv6 literal becomes an address endpoint; anything else is
+/// taken as a DNS name, which is what an operator behind a changing address
+/// wants and is the only kind an exchange cannot check.
+fn parse_endpoint(text: &str) -> Result<Endpoint, String> {
+    let (host, port) = match text.rsplit_once(':') {
+        // A bracketed IPv6 literal, `[::1]:443`.
+        Some((h, p)) if h.starts_with('[') && h.ends_with(']') => (&h[1..h.len() - 1], p),
+        Some((h, p)) if !h.contains(':') => (h, p),
+        // No port, or an unbracketed IPv6 address, which is ambiguous either
+        // way and is refused rather than guessed at.
+        _ => return Err(format!("{text}: want host:port, and [addr]:port for IPv6")),
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{text}: {port} is not a port"))?;
+    let (kind, host) = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => (KIND_IPV4, a.octets().to_vec()),
+        Ok(std::net::IpAddr::V6(a)) => (KIND_IPV6, a.octets().to_vec()),
+        Err(_) => {
+            if host.is_empty() || host.len() > MAX_HOST {
+                return Err(format!("{text}: a name must be 1..={MAX_HOST} bytes"));
+            }
+            (KIND_DNS, host.as_bytes().to_vec())
+        }
+    };
+    Ok(Endpoint {
+        kind,
+        host,
+        port,
+        priority: 0,
+        weight: 0,
+    })
+}
+
+/// Render an endpoint the way it was typed.
+fn show_endpoint(e: &Endpoint) -> String {
+    match e.kind {
+        KIND_IPV4 if e.host.len() == 4 => {
+            let o: [u8; 4] = e.host[..].try_into().unwrap();
+            format!("{}:{}", std::net::Ipv4Addr::from(o), e.port)
+        }
+        KIND_IPV6 if e.host.len() == 16 => {
+            let o: [u8; 16] = e.host[..].try_into().unwrap();
+            format!("[{}]:{}", std::net::Ipv6Addr::from(o), e.port)
+        }
+        _ => format!("{}:{}", String::from_utf8_lossy(&e.host), e.port),
+    }
+}
+
+async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), String> {
+    match cmd {
+        ResolveCmd::Publish { endpoint: addrs, ttl } => {
+            // Publishing means connecting *as* the identity: the handshake is
+            // what establishes which key is speaking, which is why nothing here
+            // is signed and why a YubiKey cannot do it.
+            if cli.yubikey {
+                return Err(
+                    "a YubiKey cannot publish endpoints: it signs, but cannot be a transport \
+                     identity. Publish with a software identity (see SIP-11 on delegation)."
+                        .into(),
+                );
+            }
+            let signer = load_software_identity(cli, cfg)?;
+            let endpoints: Vec<Endpoint> = addrs
+                .iter()
+                .map(|e| parse_endpoint(e))
+                .collect::<Result<_, _>>()?;
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let req = ResolvePublish {
+                ttl_secs: *ttl,
+                endpoints,
+            };
+            let (code, body) = client.post("/resolve/publish", req.encode()).await?;
+            if code != 200 {
+                return Err(format!("publish refused ({code}): {}", said(&body)));
+            }
+            println!(
+                "published {} endpoint(s) for {}, good for {}s",
+                req.endpoints.len(),
+                PubKey::new(signer.public()),
+                ttl
+            );
+            Ok(())
+        }
+        ResolveCmd::Get { key } => {
+            let target = match key {
+                Some(k) => parse_key(k)?,
+                None => own_identity(cli, cfg)?,
+            };
+            let (addr, server) = endpoint(cli, cfg).await?;
+            // As ourselves where we can: an identity's own withheld liveness is
+            // disclosed to it and to nobody else.
+            let mut client = match load_software_identity(cli, cfg) {
+                Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?,
+                Err(_) => Client::connect(addr, server.as_bytes()).await?,
+            };
+            let (code, body) = client
+                .post("/resolve/get", ResolveGet { key: target }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("resolve failed ({code}): {}", said(&body)));
+            }
+            let r = Resolved::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                println!("{target}: no endpoints published");
+                return Ok(());
+            }
+            for e in &r.endpoints {
+                println!("{}", show_endpoint(e));
+            }
+            // The provenance, because an answer without it cannot be judged.
+            // Ages against the exchange's clock, not this machine's, for the
+            // reason SIP-4 gives.
+            println!(
+                "  published {}s ago, expires in {}s",
+                r.now.saturating_sub(r.published_at),
+                r.expires_at.saturating_sub(r.now)
+            );
+            match r.last_seen {
+                0 => println!("  never seen beating — this exchange has no evidence it is up"),
+                seen => println!("  last seen {}s ago", r.now.saturating_sub(seen)),
+            }
+            Ok(())
+        }
+        ResolveCmd::Moved { successor, reason } => {
+            if cli.yubikey {
+                return Err("a YubiKey cannot be a transport identity".into());
+            }
+            let signer = load_software_identity(cli, cfg)?;
+            let to = parse_key(successor)?;
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let req = ResolveSuccessor {
+                successor: to,
+                reason: reason.clone(),
+            };
+            let (code, body) = client.post("/resolve/successor", req.encode()).await?;
+            if code != 200 {
+                return Err(format!("successor refused ({code}): {}", said(&body)));
+            }
+            println!(
+                "{} now points at {to}. This says you are moving; it does not say \
+                 the old key was stolen, and cannot — whoever holds a key can set this",
+                PubKey::new(signer.public())
+            );
+            Ok(())
+        }
+    }
 }
 
 // ---- beacon -----------------------------------------------------------------

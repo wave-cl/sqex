@@ -27,6 +27,7 @@ pub mod prekey;
 pub mod profile;
 pub mod receipt;
 pub mod refusal;
+pub mod resolve;
 pub mod room;
 pub mod session;
 pub mod timeline;

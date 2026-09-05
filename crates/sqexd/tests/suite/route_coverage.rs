@@ -53,6 +53,10 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/admin/command", Sqnr("signed transactions")),
     ("POST", "/beacon/beat", Cli("sqex beacon")),
     ("POST", "/beacon/read", Cli("sqex beacon read")),
+    // SIP-28 resolution.
+    ("POST", "/resolve/publish", Cli("sqex resolve publish")),
+    ("POST", "/resolve/get", Cli("sqex resolve get")),
+    ("POST", "/resolve/successor", Cli("sqex resolve moved")),
     ("POST", "/admission/request", Chat("sqex-chat admit")),
     ("POST", "/profile/put", Chat("/profile")),
     ("POST", "/profile/get", Chat("Chat::refresh_profiles")),
