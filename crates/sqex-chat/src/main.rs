@@ -749,34 +749,75 @@ async fn event_loop(
     let mut dirty = Dirty::default();
     let mut was_selected: Option<usize> = None;
     let mut hover = ui::Drawn::default();
+
+    // A frame costs the whole prelude below — the name map, folding every
+    // message in the selected conversation into `said`, and the draw itself —
+    // and the loop reaches the top of it about twenty times a second, because
+    // that is the input poll's cadence. Drawing the same screen twenty times a
+    // second cost an idle client 2.2% of a core with a hundred messages in
+    // view, and the cost grows with the conversation, since `refresh` walks
+    // all of it.
+    //
+    // So a frame is drawn when something happened, and otherwise at a slow
+    // floor. The floor is not decoration: the link light, the typing line and
+    // a note's linger all expire on a clock rather than on an event, and
+    // without it they would sit stale until somebody pressed a key.
+    const REDRAW_FLOOR: Duration = Duration::from_millis(500);
+    let mut needs_draw = true;
+    let mut drawn_at = tokio::time::Instant::now();
+
     loop {
-        let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
-        refresh(app, open, &chat.me, &names);
-        app.link = chat.link();
-        // Ours arrives with everybody else's, on the profile poll: it is not
-        // known at startup, so the header shows the key stub until the first
-        // one comes back and the name after.
-        app.name = chat.display_name(&chat.me).unwrap_or_default();
-        // Where each message ended up, kept from the frame that drew it: a
-        // second copy of the layout could disagree with the first, and a
-        // pointer that names the message above the one under it is worse than
-        // no pointer at all.
-        let was = (hover.total, app.scroll);
-        terminal
-            .draw(|f| hover = ui::draw(f, app))
-            .map_err(|e| e.to_string())?;
-        // What the wish came to. Storing it back is what keeps a held PgUp
-        // from winding the number past the top of a short conversation, and
-        // what makes `Home` — which asks for `usize::MAX` — land exactly at
-        // the oldest line rather than somewhere unrepresentable.
-        app.scroll = hover.scroll;
-        app.page = hover.room.saturating_sub(2).max(1);
-        // Somebody reading history stays where they are when a message
-        // arrives. The lines all sit below them, so without this the text
-        // would creep upward under their eyes at every poll.
-        if was.1 > 0 && hover.total > was.0 {
-            app.scroll += hover.total - was.0;
+        if needs_draw || drawn_at.elapsed() >= REDRAW_FLOOR {
+            let names = name_map(chat, open, selected_index(open, app).map(|i| &open[i]));
+            refresh(app, open, &chat.me, &names);
+            app.link = chat.link();
+            // Ours arrives with everybody else's, on the profile poll: it is not
+            // known at startup, so the header shows the key stub until the first
+            // one comes back and the name after.
+            app.name = chat.display_name(&chat.me).unwrap_or_default();
+            // Where each message ended up, kept from the frame that drew it: a
+            // second copy of the layout could disagree with the first, and a
+            // pointer that names the message above the one under it is worse than
+            // no pointer at all.
+            // Lines, the scroll, and **how many messages** there were. The third
+        // is what separates a message arriving from the window being resized:
+        // both grow the line count, and only one of them should move a reader
+        // who is looking at history.
+        let was = (hover.total, app.scroll, app.said.len());
+            terminal
+                .draw(|f| hover = ui::draw(f, app))
+                .map_err(|e| e.to_string())?;
+            // What the wish came to. Storing it back is what keeps a held PgUp
+            // from winding the number past the top of a short conversation, and
+            // what makes `Home` — which asks for `usize::MAX` — land exactly at
+            // the oldest line rather than somewhere unrepresentable.
+            app.scroll = hover.scroll;
+            app.page = hover.room.saturating_sub(2).max(1);
+            // Whether there is anything above the top of the pane, so the footer
+            // can say how to reach it. Taken from the frame that drew, like
+            // `page`: the alternative is a second copy of the layout that can
+            // disagree with the first.
+            app.scrollable = hover.total > hover.room;
+            // The last message the frame put on screen. `rows` is indexed by
+            // screen row, so the last `Some` in it is the bottom-most one.
+            app.last_visible = hover.rows.iter().rev().flatten().next().copied();
+            // The frame has been drawn with the pick in view, so the request is
+            // spent. Leaving it set would make every later frame drag the view
+            // back to the pick, including after somebody scrolled away.
+            app.follow_pick = false;
+            // Spent by the frame that honoured it, like the pick's follow.
+            app.anchor = None;
+            // Somebody reading history stays where they are when a message
+            // arrives. The lines all sit below them, so without this the text
+            // would creep upward under their eyes at every poll.
+            if was.1 > 0 && hover.total > was.0 && app.said.len() > was.2 {
+                app.scroll += hover.total - was.0;
+            }
+            needs_draw = false;
+            drawn_at = tokio::time::Instant::now();
         }
+        // Outside the gate: a client told to quit must go whether or not it
+        // was due a frame.
         if app.should_quit {
             return Ok(());
         }
@@ -834,8 +875,21 @@ async fn event_loop(
                         }
                     }
                 }
+                // A resize rewraps every message, so the line the reader was
+                // parked on stops meaning anything. Anchor to the message that
+                // was at the bottom of the pane and the next frame puts it back
+                // there.
+                Event::Resize(_, _) => {
+                    app.anchor = app.last_visible;
+                    // Picking is the reader working on one message, so that is
+                    // what a resize has to keep. The follow only moves the view
+                    // when the pick has actually left the pane, so this costs
+                    // nothing when it has not.
+                    app.follow_pick = app.picked.is_some();
+                }
                 _ => {}
             }
+            needs_draw = true;
             continue;
         }
 
@@ -885,6 +939,8 @@ async fn event_loop(
         if dirty.is_empty() {
             continue;
         }
+        // Everything below this line changes something a reader can see.
+        needs_draw = true;
 
         for channel in std::mem::take(&mut dirty.channels) {
             match open.iter().position(|c| c.channel == channel) {
@@ -1283,7 +1339,7 @@ async fn settle_here(chat: &mut Chat, open: &mut [Open], app: &mut App, at: usiz
 /// Everything here acts on one message, so it is all guarded by there being
 /// one. The actions that produce text — reply and edit — leave the mode,
 /// because the next thing wanted is the input line.
-async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyCode) {
+async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: KeyCode) {
     let Some(i) = app.picked else { return };
     let Some(said) = app.said.get(i) else {
         app.picked = None;
@@ -1328,9 +1384,11 @@ async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyC
         KeyCode::Esc => app.picked = None,
         KeyCode::Up | KeyCode::Char('k') => {
             app.picked = Some(i.saturating_sub(1));
+            app.follow_pick = true;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.picked = Some((i + 1).min(app.said.len().saturating_sub(1)));
+            app.follow_pick = true;
         }
         // The keyboard's copy, so the one gesture that reaches a key is not a
         // click. Mouse capture is off until asked for, and somebody who never
@@ -1341,6 +1399,32 @@ async fn pick_mode(chat: &mut Chat, open: &mut [Open], app: &mut App, code: KeyC
             match selected_index(open, app) {
                 Some(at) => open[at].note = Some((note, std::time::Instant::now())),
                 None => app.trouble.message = Some(note),
+            }
+        }
+        // Message the author of the picked message. `c` puts their key on the
+        // clipboard for somebody to do something with; this does the thing
+        // they were almost always about to do with it.
+        //
+        // Not offered on your own messages, and refused rather than ignored:
+        // a key that silently does nothing on some messages and works on
+        // others teaches nothing about which.
+        KeyCode::Char('m') => {
+            if mine {
+                app.trouble.message = Some("that is you — there is no direct message with yourself".into());
+                return;
+            }
+            match key.parse::<PubKey>() {
+                Ok(account) => {
+                    app.picked = None;
+                    message_account(chat, open, app, account).await;
+                }
+                // `Said::key` is written from an entry the client verified, so
+                // this is unreachable short of a bug — and says so rather than
+                // failing silently if it ever is not.
+                Err(_) => {
+                    app.trouble.message =
+                        Some(format!("the author's key did not parse: {key}"))
+                }
             }
         }
         KeyCode::Char('a') if !redacted => app.reacting = true,
@@ -1398,6 +1482,27 @@ async fn handle_key(
             // cannot begin with that letter, and nothing tells you why —
             // the keystroke is simply swallowed.
             KeyCode::Char('n') => app.adding = Some(String::new()),
+            // Paging from the keyboard, on the keys `less` and vi use for
+            // half a screen. PageUp and PageDown do the same and always have;
+            // these exist because a laptop without them needs a chord.
+            //
+            // **Not Ctrl-B and Ctrl-F**, which is what this was first and is
+            // the obvious choice — vi's *full* page, and the pair a hand
+            // reaches for. Ctrl-B is tmux's default prefix. Inside tmux the
+            // multiplexer eats it, and `send-prefix` means two presses deliver
+            // one keystroke to us: it was reported as "it only pages up once",
+            // and then precisely as "I have to hit Ctrl-B twice for one
+            // pagination". A binding that works on a bare terminal and
+            // half-works under the commonest terminal tool is not one worth
+            // keeping for the sake of a mnemonic.
+            //
+            // Ctrl-U carries a "clear the line" expectation from readline,
+            // which is the reason it was passed over first time. That
+            // expectation is unmet here either way — nothing was bound to it —
+            // so meeting a different one costs nothing that was not already
+            // being paid.
+            KeyCode::Char('u') => app.scroll += app.page,
+            KeyCode::Char('d') => app.scroll = app.scroll.saturating_sub(app.page),
             _ => {}
         }
         return;
@@ -1448,19 +1553,26 @@ async fn handle_key(
         return;
     }
 
-    // Esc with nothing else to dismiss enters it, on the newest message, which
-    // is the one somebody almost always means.
+    // Esc with nothing else to dismiss enters pick mode, on the last message
+    // **on screen**.
+    //
+    // At the bottom of a conversation that is the newest one, which is what
+    // somebody almost always means. Once they have paged back it is not: the
+    // newest message is then far below the pane, so picking it would throw the
+    // view forward to a message they had deliberately scrolled away from, and
+    // lose their place to boot. Picking what they are looking at keeps both.
+    // Esc is cancel, and only cancel.
+    //
+    // It used to be the way *into* pick mode as well as the way out of six
+    // other things — eight jobs on one key, with no story about what it meant.
+    // The arrows enter pick mode now, which leaves Esc doing the one thing it
+    // means everywhere else: back out of what you are in.
     if code == KeyCode::Esc {
-        if app.editing.take().is_some() || app.replying.take().is_some() {
-            // Abandon what the input line was about to do first. Leaving an
-            // edit half-typed and then entering pick mode would send it to the
-            // wrong place on the next Enter.
-            app.input.clear();
-            return;
-        }
-        if !app.said.is_empty() {
-            app.picked = Some(app.said.len() - 1);
-        }
+        // An edit or a reply half-typed is abandoned, and the line cleared, so
+        // the next Enter cannot send it to the wrong place.
+        app.editing = None;
+        app.replying = None;
+        app.input.clear();
         return;
     }
 
@@ -1468,15 +1580,35 @@ async fn handle_key(
         // Changing conversation lands at the newest of the new one. Carrying
         // a line offset across would put somebody at an arbitrary depth in a
         // conversation they have just arrived in.
-        KeyCode::Tab | KeyCode::Down => {
+        //
+        // Tab and BackTab only. The arrows used to do this too, which spent
+        // the pair of keys everybody reaches for on a job Tab already had —
+        // while scanning the conversation itself, the thing they obviously
+        // mean, needed a mode first.
+        KeyCode::Tab => {
             app.select_next();
             app.scroll = 0;
             clear_unread(open, app);
         }
-        KeyCode::BackTab | KeyCode::Up => {
+        KeyCode::BackTab => {
             app.select_previous();
             app.scroll = 0;
             clear_unread(open, app);
+        }
+        // The arrows scan the conversation, entering pick mode on the way in.
+        //
+        // Down first picks what `Esc` used to: the last message on screen. Up
+        // does the same and then steps back one, so a single press lands on
+        // something rather than merely arming a mode — and pick mode with
+        // nothing picked would be a state with no visible effect.
+        KeyCode::Up | KeyCode::Down if !app.said.is_empty() => {
+            let last = app.last_visible.unwrap_or(app.said.len() - 1);
+            app.picked = Some(if code == KeyCode::Up {
+                last.saturating_sub(1)
+            } else {
+                last
+            });
+            app.follow_pick = true;
         }
         // Scrolling from the keyboard, because the wheel needs `/mouse on`
         // and the mouse stays the terminal's until it is asked for. A feature
@@ -1510,8 +1642,9 @@ async fn handle_key(
             if let Some(target) = app.editing.take() {
                 let Some(at) = selected_index(open, app) else { return };
                 let channel = open[at].channel;
-                if let Err(e) = chat.edit(&channel, target, SipPost::text(&text)).await {
-                    app.trouble.message = Some(e.to_string());
+                match chat.edit(&channel, target, SipPost::text(&text)).await {
+                    Ok(_) => app.scroll = 0,
+                    Err(e) => app.trouble.message = Some(e.to_string()),
                 }
                 settle_here(chat, open, app, at).await;
                 return;
@@ -1519,8 +1652,9 @@ async fn handle_key(
             if let Some((target, _)) = app.replying.take() {
                 let Some(at) = selected_index(open, app) else { return };
                 let channel = open[at].channel;
-                if let Err(e) = chat.reply(&channel, target, &text).await {
-                    app.trouble.message = Some(e.to_string());
+                match chat.reply(&channel, target, &text).await {
+                    Ok(_) => app.scroll = 0,
+                    Err(e) => app.trouble.message = Some(e.to_string()),
                 }
                 settle_here(chat, open, app, at).await;
                 return;
@@ -1677,6 +1811,12 @@ async fn handle_key(
             // a dropped connection destroyed it — the one loss in this client
             // that trying again cannot undo.
             let typed = matches!(cmd, Command::Send(_)).then(|| text.clone());
+            // Whether this puts something of the reader's own into the
+            // transcript. Only those come back to the bottom: a command whose
+            // answer is a note in the status line changes nothing down there,
+            // and `/who` typed while reading history should leave the history
+            // where it is.
+            let posts = matches!(cmd, Command::Send(_) | Command::File(_));
             let outcome = match cmd {
                 Command::Send(text) => chat.send(&channel, &text).await.map(|_| None),
                 Command::File(path) => send_file(chat, &channel, &path).await.map(Some),
@@ -1938,6 +2078,19 @@ async fn handle_key(
             poll_one(chat, &mut open[i], app).await;
             let note = match outcome {
                 Ok(note) => {
+                    // Your own message lands at the newest of the conversation,
+                    // so that is where you have to be to see it. Somebody
+                    // several pages back who sends one would otherwise watch
+                    // nothing happen — the message is there, below the pane,
+                    // and the screen does not move.
+                    //
+                    // Only on success: a refusal puts the words back in the
+                    // composer, and throwing the view to the bottom as well
+                    // would lose the reader's place for a message that was
+                    // never posted.
+                    if posts {
+                        app.scroll = 0;
+                    }
                     open[i].note = note.clone().map(|n| (n, std::time::Instant::now()));
                     note
                 }
@@ -2452,11 +2605,32 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
         app.trouble.message = Some(format!("{typed:?} is not a base58 identity"));
         return;
     };
+    message_account(chat, open, app, account).await;
+}
+
+/// Open a direct message with `account`, or go to the one that is already open.
+///
+/// Both ways in end here — `^N` with a typed key, and `m` on a picked message —
+/// so they cannot drift into meaning different things.
+///
+/// **Going to the existing conversation is the point.** This used to return
+/// the moment it found one, so asking for somebody you already had a
+/// conversation with did nothing at all: no move, no message, no clue that the
+/// key had been understood. A direct message's identifier is derived from the
+/// two accounts (SIP-16), so there is never a second one to make — the only
+/// sensible answer to "talk to this person" is to be there.
+async fn message_account(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, account: PubKey) {
     if account == chat.me {
         app.trouble.message = Some("that is your own key".into());
         return;
     }
-    if open.iter().any(|o| o.peer == Some(account)) {
+    if let Some(existing) = open.iter().find(|o| o.peer == Some(account)).map(|o| o.channel) {
+        app.selected = Some(existing);
+        // The same three things Tab does, for the same reasons: a conversation
+        // arrived at is read from its newest, and carrying a scroll offset
+        // across would land somebody at an arbitrary depth in it.
+        app.scroll = 0;
+        clear_unread(open, app);
         return;
     }
     let label = short(&account);

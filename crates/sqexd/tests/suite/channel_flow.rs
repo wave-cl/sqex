@@ -20,8 +20,8 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-mod common;
-use common::{Signer, instance_for};
+use crate::common;
+use crate::common::{Signer, instance_for};
 use sqex_proto::entry_sig::GENESIS;
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {

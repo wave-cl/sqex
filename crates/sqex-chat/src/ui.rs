@@ -384,6 +384,44 @@ pub struct App {
     /// lines. Nought is the bottom, which is where a conversation opens and
     /// where it stays while somebody is reading the newest of it.
     pub scroll: usize,
+    /// A message to bring back to the bottom of the pane on the next frame,
+    /// set when the window is resized.
+    ///
+    /// `scroll` counts **lines**, and every line is a function of the width:
+    /// narrow the window and each message wraps into more of them, so the same
+    /// offset lands somewhere else entirely. Anchoring to a message is what
+    /// makes a resize keep the reader where they were rather than throwing
+    /// them into a different part of the conversation.
+    pub anchor: Option<usize>,
+    /// Set when the pick has just moved, so the next frame brings it into
+    /// view.
+    ///
+    /// A flag rather than "always keep the pick visible", because the two are
+    /// different: somebody who scrolls with `^U` while a message is picked is
+    /// asking to look elsewhere, and snapping back to the pick would be the
+    /// client arguing with them. This only fires on the keystroke that moved
+    /// the pick, which is the moment the view is meant to follow.
+    ///
+    /// Cleared by the loop once the frame that honoured it has drawn.
+    pub follow_pick: bool,
+    /// The bottom-most message actually on screen, as an index into `said`.
+    ///
+    /// `None` when the pane holds no message at all. Taken from the frame that
+    /// drew, like `page` and `scrollable`: a second copy of the layout could
+    /// disagree with the first, and this decides where the picker lands.
+    ///
+    /// At the bottom of a conversation this *is* the newest message, so it
+    /// changes nothing there — it only matters once somebody has paged back.
+    pub last_visible: Option<usize>,
+    /// Whether the conversation is taller than the pane, so there is anything
+    /// to scroll back to.
+    ///
+    /// The footer says how to page only while this is true. A hint for
+    /// something that would do nothing is noise, and the moment a
+    /// conversation first outgrows its pane is exactly the moment somebody
+    /// wants to know the keys — which is why this is worth a field rather
+    /// than a permanent entry in the line.
+    pub scrollable: bool,
     /// The message the pointer is over, as an index into `said`.
     ///
     /// Detail on demand, and only detail: nothing a reader *needs* may live
@@ -1376,7 +1414,57 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // The caller's number is a wish: it may be left over from a longer
     // conversation, or from before the window was resized.
     let furthest = total.saturating_sub(room);
-    let scroll = app.scroll.min(furthest);
+    // Following the pick. `owners` says which lines belong to the picked
+    // message, so the smallest move that puts the whole of it on screen is
+    // arithmetic rather than guesswork.
+    //
+    // Nudged only as far as it has to go — a pick moving off the top scrolls
+    // by the lines that message occupies, not by a page — so walking up
+    // through a conversation reads as walking rather than jumping.
+    // An anchored message goes back to the bottom of the pane, which is where
+    // it was when the window changed size. Taken before the pick, because a
+    // resize moves the reader's whole view and a pick is one message in it.
+    let anchored = app
+        .anchor
+        .and_then(|i| owners.iter().rposition(|o| *o == Some(i)))
+        .map(|last| {
+            let shown = pane.height as usize;
+            furthest.saturating_sub((last + 1).saturating_sub(shown))
+        });
+    let wish = match app
+        .follow_pick
+        .then_some(app.picked)
+        .flatten()
+        .and_then(|i| {
+            let first = owners.iter().position(|o| *o == Some(i))?;
+            let last = owners.iter().rposition(|o| *o == Some(i))?;
+            Some((first, last))
+        }) {
+        Some((first, last)) => {
+            let here = app.scroll.min(furthest);
+            let top = furthest - here;
+            if first < top {
+                // Above the pane: bring its first line to the top.
+                furthest.saturating_sub(first)
+            } else if last >= top + room {
+                // Below it: bring its last line to the bottom.
+                furthest.saturating_sub((last + 1).saturating_sub(room))
+            } else {
+                app.scroll
+            }
+        }
+        None => app.scroll,
+    };
+    // A followed pick wins over an anchor. Both fire on a resize when a
+    // message is picked, and they want different things: the anchor holds the
+    // bottom of the pane, the follow keeps the pick in view. Narrowing makes
+    // every message above the anchor taller, so holding the bottom is what
+    // pushes the pick off the top — the very fault the follow exists to stop.
+    let scroll = if app.follow_pick {
+        wish.min(furthest)
+    } else {
+        anchored.unwrap_or(wish).min(furthest)
+    };
     let skip = furthest - scroll;
     // A short conversation sits at the bottom, against the input box, rather
     // than floating at the top of an empty pane — where the next message would
@@ -1398,7 +1486,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     if scrolled {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("─── {scroll} more below · PgDn, or End for the newest ───"),
+                format!("─── {scroll} more below · ^D or PgDn, End for the newest ───"),
                 Style::default().fg(palette::ATTENTION),
             ))
             .alignment(Alignment::Center)),
@@ -1406,8 +1494,14 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
         );
     }
 
+    // Clipped to the pane, not merely to the screen. `owners` runs to the end
+    // of the conversation, so writing all of it recorded messages on rows the
+    // transcript does not occupy — down in the composer — and anything reading
+    // the last entry got a message below the fold. That is what `last_visible`
+    // reads to decide where `Esc` starts, and what an anchor reads to put a
+    // message back at the bottom.
     let mut rows = vec![None; height as usize];
-    for (n, owner) in owners.into_iter().enumerate() {
+    for (n, owner) in owners.into_iter().take(pane.height as usize).enumerate() {
         let y = pane.y as usize + n;
         if y < rows.len() {
             rows[y] = owner;
@@ -1525,7 +1619,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
         ("/block  /unblock  /blocked", "who may reach you"),
         ("/whoami", "your key in full — the header carries only the first six"),
-        ("/mouse [on|off]", "take the mouse, so hovering a message gives its full time; off by default"),
+        ("/mouse [on|off]", "scroll with the wheel, and hover a message for its full time; off by default, because it stops the terminal's own text selection"),
         ("/reconnect", "try the exchange again now, rather than waiting out the backoff"),
     ]),
 ];
@@ -1543,24 +1637,36 @@ fn help(f: &mut Frame, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled("keys", head)),
         Line::from(vec![
-            Span::styled("  Tab ↑↓ ", key),
+            Span::styled("  Tab ", key),
             Span::styled("move between conversations    ", dim),
+            Span::styled("↑↓ ", key),
+            Span::styled("scan this one    ", dim),
+            Span::styled("Esc ", key),
+            Span::styled("back out    ", dim),
             Span::styled("^N ", key),
             Span::styled("add somebody    ", dim),
             Span::styled("^C ", key),
             Span::styled("quit", dim),
         ]),
         Line::from(vec![
-            Span::styled("  Esc    ", key),
+            Span::styled("  ^U ^D  ", key),
+            Span::styled("a screen back or forward    ", dim),
+            Span::styled("Home End ", key),
+            Span::styled("the oldest, the newest    ", dim),
+            Span::styled("/mouse ", key),
+            Span::styled("the wheel", dim),
+        ]),
+        Line::from(vec![
+            Span::styled("  ↑↓     ", key),
             Span::styled("pick a message, and then:  ", dim),
-            Span::styled("↑↓ ", key),
-            Span::styled("move  ", dim),
             Span::styled("a ", key),
             Span::styled("react  ", dim),
             Span::styled("r ", key),
             Span::styled("reply  ", dim),
             Span::styled("e ", key),
             Span::styled("rewrite  ", dim),
+            Span::styled("m ", key),
+            Span::styled("message them  ", dim),
             Span::styled("c ", key),
             Span::styled("copy their key  ", dim),
             Span::styled("d ", key),
@@ -1662,15 +1768,26 @@ fn input(f: &mut Frame, app: &App, area: Rect) {
 /// cut off, so the commands that fell off were undiscoverable and nothing said
 /// so. Ordered by how often each is wanted, and a group is either shown whole
 /// or not at all — half of "/file /save" helps nobody.
-fn keys_line(width: usize) -> String {
+fn keys_line(width: usize, scrollable: bool) -> String {
     // Short, and it stays short. This used to be the only command list there
     // was, and it grew until the end of it was cut off at eighty columns —
     // which left the commands that fell off undiscoverable, with nothing to
     // say they existed. `/help` carries the list now, and this only has to
     // point at it.
-    const GROUPS: &[&str] = &["^C quit", "Tab", "Esc pick", "^N add", "/help"];
+    const GROUPS: &[&str] = &["^C quit", "Tab", "↑↓ pick", "^N add", "/help"];
+    // First, and only while it applies. A reader who has just watched a
+    // message leave the top of the pane is looking for this and nothing else;
+    // the rest of the line is what they already know. It is prepended as an
+    // ordinary group rather than written straight into `out`, so the width
+    // rule below governs it too — the first version bypassed that and
+    // overflowed a one-column terminal.
+    let groups: Vec<&str> = if scrollable {
+        std::iter::once("^U/^D page").chain(GROUPS.iter().copied()).collect()
+    } else {
+        GROUPS.to_vec()
+    };
     let mut out = String::new();
-    for g in GROUPS {
+    for g in &groups {
         let sep = if out.is_empty() { " " } else { " · " };
         if out.chars().count() + sep.len() + g.chars().count() > width {
             break;
@@ -1702,7 +1819,7 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
         let hints = if picked.mine {
             " · a react · r reply · e rewrite · d delete · Esc"
         } else {
-            " · a react · r reply · c copy key · d delete · Esc"
+            " · a react · r reply · m message · c copy key · d delete · Esc"
         };
         let key = if picked.mine {
             String::new()
@@ -1724,7 +1841,7 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
         )
     } else {
         (
-            keys_line(area.width as usize),
+            keys_line(area.width as usize, app.scrollable),
             Style::default().fg(palette::MUTED),
         )
     };
@@ -1961,6 +2078,14 @@ mod tests {
     const ALICE: &str = "9hMLdY3VpKcR2wNtSbXgFzUqE7vJmA4dHyL8nCxTZk6Q";
     const CAROL: &str = "E4LUkjrZ7mWvTpN3sQhBxYdGcF9aKzUt2LnRe5JqXM8V";
 
+    /// `render`, keeping what the frame reported about itself.
+    fn drawn(app: &App, w: u16, h: u16) -> Drawn {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut out = Drawn::default();
+        t.draw(|f| out = draw(f, app)).unwrap();
+        out
+    }
+
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| { draw(f, app); }).unwrap();
@@ -2158,24 +2283,55 @@ mod tests {
     fn the_key_line_is_cut_between_groups_and_never_inside_one() {
         // A narrow terminal loses the least-wanted commands, not the tail of a
         // word: "/file /sa" is worse than not mentioning /file at all.
-        for width in 1..140usize {
-            let line = keys_line(width);
-            assert!(
-                line.chars().count() <= width,
-                "the key line overflowed {width} columns: {line:?}"
-            );
-            for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
+        for scrollable in [false, true] {
+            for width in 1..140usize {
+                let line = keys_line(width, scrollable);
                 assert!(
-                    ["^C quit", "Tab", "Esc pick", "^N add", "/help"].contains(&group),
-                    "a group was cut in half at width {width}: {group:?}"
+                    line.chars().count() <= width,
+                    "the key line overflowed {width} columns: {line:?}"
                 );
+                for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
+                    assert!(
+                        ["^U/^D page", "^C quit", "Tab", "↑↓ pick", "^N add", "/help"]
+                            .contains(&group),
+                        "a group was cut in half at width {width}: {group:?}"
+                    );
+                }
             }
         }
         // And a wide terminal gets all of them.
         // And it fits at eighty columns whole, which the command list it
         // replaced had stopped doing.
-        assert_eq!(keys_line(200), keys_line(80));
-        assert!(keys_line(80).contains("/help"));
+        assert_eq!(keys_line(200, false), keys_line(80, false));
+        assert!(keys_line(80, false).contains("/help"));
+    }
+
+    /// The footer says how to page **only** once there is something above the
+    /// pane to page back to.
+    ///
+    /// This is the whole of the fix: the feature existed, worked, and was
+    /// invisible — the line named four other things and never this one, so a
+    /// reader watching a message leave the top of the screen had nothing to
+    /// go on. A hint shown always would be noise on every short conversation;
+    /// shown here it arrives at the moment somebody wants it.
+    #[test]
+    fn the_key_line_offers_paging_once_there_is_something_to_page_to() {
+        let quiet = keys_line(120, false);
+        assert!(
+            !quiet.contains("^U"),
+            "a conversation that fits its pane must not advertise scrolling: {quiet:?}"
+        );
+
+        let scrolled = keys_line(120, true);
+        assert!(scrolled.contains("^U/^D page"), "{scrolled:?}");
+        // Ahead of everything but quitting: it is what the reader is looking
+        // for, and the line is cut from the right when it does not fit.
+        assert!(
+            scrolled.find("^U/^D").unwrap() < scrolled.find("Tab").unwrap(),
+            "the paging hint must come before the rest: {scrolled:?}"
+        );
+        // And it must not push the rest off a narrow screen entirely.
+        assert!(keys_line(80, true).contains("/help"), "{}", keys_line(80, true));
     }
 
     #[test]
@@ -2469,6 +2625,189 @@ mod tests {
             assert!(out.contains(key), "picking did not give the whole key:\n{out}");
             assert!(out.contains("c copy key"), "no way to take it:\n{out}");
         }
+    }
+
+    /// Picking somebody else's message offers `m`, and picking your own does
+    /// not.
+    ///
+    /// There is no direct message with yourself — a DM's identifier derives
+    /// from two accounts (SIP-16), and both would be you — so offering the key
+    /// there would be advertising a refusal.
+    #[test]
+    fn picking_offers_a_way_to_message_the_author_but_not_yourself() {
+        let mut app = sample();
+        app.said = vec![
+            said("Alice", ALICE, false, "it is me", 3661),
+            said("me", CAROL, true, "and this is mine", 3700),
+        ];
+
+        app.picked = Some(0);
+        let theirs = render(&app, 130, 24);
+        assert!(theirs.contains("m message"), "no way to reach them:\n{theirs}");
+
+        app.picked = Some(1);
+        let mine = render(&app, 130, 24);
+        assert!(
+            !mine.contains("m message"),
+            "offered a direct message with yourself:\n{mine}"
+        );
+    }
+
+    /// The frame reports the bottom-most message on screen, and once somebody
+    /// has paged back that is **not** the newest one.
+    ///
+    /// This is what decides where `Esc` lands. Picking the newest after a page
+    /// back would throw the view forward to a message deliberately scrolled
+    /// away from, losing the reader's place in the same keystroke.
+    #[test]
+    fn the_frame_reports_the_last_message_on_screen_not_the_newest() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("Alice", ALICE, false, &format!("message {n}"), 3600 + n as u64))
+            .collect();
+        let newest = app.said.len() - 1;
+
+        // At the bottom, the last on screen is the newest — so this changes
+        // nothing for somebody who has not scrolled.
+        app.scroll = 0;
+        let bottom = drawn(&app, 130, 24);
+        assert_eq!(
+            bottom.rows.iter().rev().flatten().next().copied(),
+            Some(newest),
+            "at the bottom the last visible message must be the newest"
+        );
+
+        // Paged back, it must not be.
+        app.scroll = 20;
+        let up = drawn(&app, 130, 24);
+        let last = up.rows.iter().rev().flatten().next().copied();
+        assert!(last.is_some(), "a scrolled pane still shows messages");
+        assert!(
+            last != Some(newest),
+            "after paging back the newest message is still reported as on screen: {last:?}"
+        );
+    }
+
+    /// Walking the pick upwards takes the view with it.
+    ///
+    /// Without this the picker climbs off the top of the pane and keeps going
+    /// — the selection is somewhere in the conversation, invisible, and every
+    /// key that acts on it is aimed at a message nobody can see.
+    #[test]
+    fn the_view_follows_the_pick_off_the_top_of_the_pane() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("Alice", ALICE, false, &format!("message {n}"), 3600 + n as u64))
+            .collect();
+
+        // Start where Esc would put it: the newest, at the bottom.
+        app.picked = Some(app.said.len() - 1);
+        app.scroll = 0;
+        let at_bottom = drawn(&app, 130, 24);
+        assert_eq!(at_bottom.scroll, 0, "the newest message needs no scrolling");
+
+        // Now walk the pick well above the pane without asking to follow: the
+        // view stays put, which is the behaviour being fixed.
+        app.picked = Some(5);
+        let ignored = drawn(&app, 130, 24);
+        assert_eq!(
+            ignored.scroll, 0,
+            "without the request the view must not move on its own"
+        );
+        assert!(
+            !ignored.rows.iter().flatten().any(|o| *o == 5),
+            "message 5 should be off screen here"
+        );
+
+        // Ask, and it comes into view.
+        app.follow_pick = true;
+        let followed = drawn(&app, 130, 24);
+        assert!(
+            followed.scroll > 0,
+            "following the pick must scroll back: {}",
+            followed.scroll
+        );
+        assert!(
+            followed.rows.iter().flatten().any(|o| *o == 5),
+            "the picked message must be on screen after following"
+        );
+    }
+
+    /// An anchored message comes back to the bottom of the pane, whatever the
+    /// width.
+    ///
+    /// This is what a resize needs: `scroll` counts lines, every line is a
+    /// function of the width, so the same offset lands somewhere else once the
+    /// window changes shape. Anchoring to a message is the only thing that
+    /// survives the rewrap.
+    #[test]
+    fn an_anchored_message_returns_to_the_bottom_at_any_width() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| {
+                said(
+                    "Alice",
+                    ALICE,
+                    false,
+                    &format!("message {n} with enough words in it to wrap when narrow"),
+                    3600 + n as u64,
+                )
+            })
+            .collect();
+
+        for width in [130u16, 90, 70] {
+            app.anchor = Some(30);
+            let d = drawn(&app, width, 24);
+            let last = d.rows.iter().rev().flatten().next().copied();
+            assert_eq!(
+                last,
+                Some(30),
+                "at {width} columns the anchored message did not land at the bottom"
+            );
+        }
+    }
+
+    /// A picked message must still be on screen after the window narrows.
+    ///
+    /// The anchor holds the *bottom* of the pane, and narrowing makes every
+    /// message above it taller — so a pick that was near the top gets pushed
+    /// off it, and the keys that act on a pick are aimed at something nobody
+    /// can see. Exactly the fault the pick's follow exists to prevent, arriving
+    /// by a different route.
+    #[test]
+    fn a_picked_message_is_still_on_screen_after_a_resize() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| {
+                said(
+                    "Alice",
+                    ALICE,
+                    false,
+                    &format!("message {n} with enough words in it to wrap when the pane narrows"),
+                    3600 + n as u64,
+                )
+            })
+            .collect();
+
+        // Wide: anchor the bottom of the pane, and pick something near its top.
+        app.anchor = Some(40);
+        let wide = drawn(&app, 130, 24);
+        let top = wide.rows.iter().flatten().next().copied().unwrap();
+        app.picked = Some(top);
+        assert!(
+            wide.rows.iter().flatten().any(|o| *o == top),
+            "the pick starts on screen"
+        );
+
+        // Narrow, exactly as `Event::Resize` does it: anchor the bottom, and
+        // ask to follow the pick because there is one.
+        app.anchor = Some(40);
+        app.follow_pick = true;
+        let narrow = drawn(&app, 80, 24);
+        assert!(
+            narrow.rows.iter().flatten().any(|o| *o == top),
+            "the picked message ({top}) fell off the pane when the window narrowed"
+        );
     }
 
     #[test]

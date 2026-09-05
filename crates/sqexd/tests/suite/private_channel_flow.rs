@@ -25,8 +25,8 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-mod common;
-use common::{Chain, Signer, instance_for};
+use crate::common;
+use crate::common::{Chain, Signer, instance_for};
 use sqex_proto::channel::{Action, ByChannelSigned, EVENT_ADDED, EVENT_CREATED, EVENT_JOINED, EVENT_LEFT, EVENT_REMOVED, EVENT_ROTATED};
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {

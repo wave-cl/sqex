@@ -19,7 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # sqex-admin links libpcsc (via card-backend-pcsc) for YubiKey access.
+      # sqnr links libpcsc (via card-backend-pcsc) for YubiKey access, and
+      # every crate here depends on sqnr, so this is not optional.
       # macOS has the PCSC framework built in; Linux CI needs the dev package.
       # sqex-voice (the voice demo, not shipped) links ALSA through cpal, and
       # builds libopus from source with cmake, which the runner already has.

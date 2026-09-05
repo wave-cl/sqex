@@ -4,24 +4,23 @@ members = [
     "crates/sqex-proto",
     "crates/sqexd",
     "crates/sqex-cli",
-    "crates/sqex-admin",
     "crates/sqex-voice",
     "crates/sqex-chat",
     "crates/sqex-discovery",
 ]
 
 [workspace.package]
-version = "0.24.1"
+version = "0.28.4"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.18.0" }
+squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.25.1" }
 # sqnr owns the signed-command protocol + PubKey (sqnr-core) and the signer/
 # client/CLI (sqnr), pinned to a git tag like squic above. For local co-dev,
 # override with a [patch] to ../sqnr, or temporarily swap back to path deps.
-sqnr-core = { git = "https://github.com/wave-cl/sqnr", tag = "v0.7.1" }
-sqnr = { git = "https://github.com/wave-cl/sqnr", tag = "v0.7.1" }
+sqnr-core = { git = "https://github.com/wave-cl/sqnr", tag = "v0.10.4" }
+sqnr = { git = "https://github.com/wave-cl/sqnr", tag = "v0.10.4" }
 sqex-proto = { path = "crates/sqex-proto" }
 sqex-discovery = { path = "crates/sqex-discovery" }
 tokio = { version = "1", features = ["full"] }
@@ -54,3 +53,18 @@ hickory-resolver = { version = "0.26", default-features = false, features = ["dn
 lto = true
 codegen-units = 1
 strip = true
+
+# Debug info is the bulk of what a test binary carries, and every test target
+# statically links the whole workspace plus its dependency tree. Workspace
+# crates keep full symbols — that is where a backtrace has to be readable.
+# Dependencies drop to line tables, which still give file:line in a panic.
+#
+# Measured: 78.1 MB -> 50.0 MB for a test binary on x86_64-unknown-linux-gnu,
+# and nothing worth having on macOS, which defaults to
+# split-debuginfo=unpacked and so never carried the debug info in the binary.
+# This is a CI change, not a local one.
+#
+# profile.test inherits from profile.dev, so this reaches test targets without
+# naming them; package."*" restricts it to non-workspace crates.
+[profile.dev.package."*"]
+debug = "line-tables-only"

@@ -21,8 +21,8 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-mod common;
-use common::{Signer, instance_for};
+use crate::common;
+use crate::common::{Signer, instance_for};
 use sqex_proto::channel::{ByChannelSigned, EVENT_JOINED};
 use sqex_proto::entry_sig::GENESIS;
 

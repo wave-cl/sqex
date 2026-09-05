@@ -313,3 +313,111 @@ async fn full_admin_flow() {
     assert_eq!(status["whitelist_count"], 1, "one key persisted");
     handle2.abort();
 }
+
+/// `/status` reports what sQUIC accepts and what is actually arriving.
+///
+/// This is the number the SIP-29 retirement decision turns on. Retiring an
+/// envelope version that clients still send locks them out in silence — a
+/// refused envelope is dropped with no reply, so neither end logs anything —
+/// and until this was surfaced the only way to answer "is anything still on
+/// v2" was to retire it and see who complained.
+///
+/// The test pins both halves against a server configured to accept exactly
+/// one version, so the reported set is the configured one and not sQUIC's
+/// three-version default, and the count is non-zero because this test's own
+/// handshake put it there.
+#[tokio::test]
+async fn status_reports_accepted_and_arriving_envelope_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("host_key");
+    let (server_sk, _) = squic::generate_keypair();
+    std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    let client_seed = [7u8; 32];
+
+    // Named explicitly rather than left unset, so the assertion below can tell
+    // the configured set apart from squic's default. They happen to be the same
+    // list today — v4 is the only version implemented — which is precisely why
+    // naming it is what makes the assertion mean anything.
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\naccepted_envelope_versions = [4]\n",
+        key_path.to_string_lossy(),
+    );
+    let config_path = dir.path().join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let (addr, server_pub, handle) = spawn_server(&config_toml, config_path).await;
+    let mut client = Client::connect(addr, &server_pub, &client_seed).await;
+
+    let (code, body) = client.get("/status").await;
+    assert_eq!(code, 200);
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let transport = &status["transport"];
+
+    assert_eq!(
+        transport["accepted_envelope_versions"],
+        serde_json::json!([4]),
+        "the configured set is reported, not squic's default"
+    );
+
+    // This client's own Initial, counted against the version it was sent under.
+    let arriving = transport["initials_by_envelope_version"]
+        .as_object()
+        .expect("initials are reported per version");
+    assert!(
+        arriving["4"].as_u64().unwrap_or(0) >= 1,
+        "this test's own handshake is counted on v4, got {arriving:?}"
+    );
+    assert_eq!(
+        arriving.len(),
+        1,
+        "one version is implemented, so one is reported, got {arriving:?}"
+    );
+
+    // The cookie defence is idle on a server nobody is flooding.
+    assert_eq!(transport["under_load"], false);
+
+    handle.abort();
+}
+
+/// The trap the v4 cut walked past, now closed at the transport and pinned
+/// here so it stays closed.
+///
+/// It used to be that a server told to accept an envelope version this build
+/// does not implement **started perfectly happily and then accepted nothing** —
+/// no error, no log line and no reply, because a refused envelope is dropped in
+/// silence by design (SIP-6). The operator saw a healthy process and a dead
+/// port. ex was configured `accepted_envelope_versions = [3]` right up to the
+/// cut, which is exactly that state under a v4 binary.
+///
+/// squic v0.24.1 refuses to bind on such a set, so the failure is now loud and
+/// arrives before the socket exists. This test asserts the loudness: that
+/// `bind` fails, and that the error says which versions were the problem rather
+/// than surfacing as some unrelated I/O complaint.
+#[tokio::test]
+async fn a_retired_accepted_version_is_refused_at_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("host_key");
+    let (server_sk, _) = squic::generate_keypair();
+    std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\naccepted_envelope_versions = [3]\n",
+        key_path.to_string_lossy(),
+    );
+    let config_path = dir.path().join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+
+    let err = match sqexd::bind(config, Some(config_path), signing_key).await {
+        Ok(_) => panic!("sqexd bound on an envelope version it cannot parse"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("accepted_envelope_versions"),
+        "bind failed for the wrong reason: {err}"
+    );
+}
