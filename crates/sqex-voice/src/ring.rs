@@ -91,10 +91,20 @@ fn is_ring(plaintext: &[u8]) -> bool {
 pub async fn ring(client: &mut Client, peer: PubKey) -> Result<(), String> {
     let sealed = mailbox::seal(&peer, &body()).map_err(|e| e.to_string())?;
     let (code, reply) = client
-        .post("/mailbox/send", Send { recipient: peer, sealed }.encode())
+        .post(
+            "/mailbox/send",
+            Send {
+                recipient: peer,
+                sealed,
+            }
+            .encode(),
+        )
         .await?;
     if code != 200 {
-        return Err(format!("ring refused ({code}): {}", crate::engine::said(&reply)));
+        return Err(format!(
+            "ring refused ({code}): {}",
+            crate::engine::said(&reply)
+        ));
     }
     Ok(())
 }
@@ -136,7 +146,9 @@ pub async fn collect(
         if code != 200 {
             continue;
         }
-        let Ok(got) = Fetched::decode(&fetched) else { continue };
+        let Ok(got) = Fetched::decode(&fetched) else {
+            continue;
+        };
         if !got.found {
             continue;
         }
@@ -145,7 +157,11 @@ pub async fn collect(
         // it would have us re-fetch it on every sweep forever.
         match mailbox::open(seed, &got.sealed) {
             Ok(plaintext) if is_ring(&plaintext) => {
-                rings.push(Ring { from: entry.sender, at: entry.received, id: entry.id });
+                rings.push(Ring {
+                    from: entry.sender,
+                    at: entry.received,
+                    id: entry.id,
+                });
             }
             _ => {}
         }

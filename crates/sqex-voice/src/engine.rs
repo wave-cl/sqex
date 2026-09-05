@@ -125,7 +125,10 @@ pub enum Event {
     /// Sent when the set of people speaking changes, and once a second
     /// regardless. `connecting` counts members whose session is not up yet —
     /// they are in the room and cannot be heard.
-    Present { peers: Vec<PeerStatus>, connecting: usize },
+    Present {
+        peers: Vec<PeerStatus>,
+        connecting: usize,
+    },
     /// The once-a-second line: what the buffer has seen. A caller that wants
     /// less noise suppresses these.
     Stats(String),
@@ -870,7 +873,10 @@ fn present_of(members: &Membership) -> Event {
         })
         .collect();
     peers.sort_unstable_by_key(|p| *p.identity.as_bytes());
-    Event::Present { peers, connecting: members.connecting() }
+    Event::Present {
+        peers,
+        connecting: members.connecting(),
+    }
 }
 
 /// Who is here, who is talking, and how the paths to them are holding up.

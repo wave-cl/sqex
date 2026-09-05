@@ -293,7 +293,10 @@ async fn a_room_reports_who_is_present_and_who_is_speaking() {
 
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
-    let endpoint = Endpoint { address: addr, server: PubKey::new(server_pub) };
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
     let room = RoomId::generate();
 
     let (a_signer, a_id) = signer(1);
@@ -348,7 +351,10 @@ async fn a_room_reports_who_is_present_and_who_is_speaking() {
             _ => None,
         })
         .collect();
-    assert!(!rosters.is_empty(), "a room describes its roster: {events:?}");
+    assert!(
+        !rosters.is_empty(),
+        "a room describes its roster: {events:?}"
+    );
 
     // B is in the room and eventually present, having joined via the heartbeat.
     let saw_b = rosters

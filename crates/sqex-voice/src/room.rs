@@ -228,9 +228,7 @@ impl Membership {
             .collect();
         let (seed, depth, rate) = (self.seed, self.depth, self.rate);
         for (id, eph) in waiting {
-            if let Some(peer) =
-                Self::try_establish(seed, depth, rate, eph, client, id).await?
-            {
+            if let Some(peer) = Self::try_establish(seed, depth, rate, eph, client, id).await? {
                 events.push(Event::Joined(peer.identity));
                 self.by_identity.insert(peer.identity, peer.session_id);
                 self.peers.insert(peer.session_id, peer);
@@ -297,8 +295,8 @@ impl Membership {
         if ack.state != OpenState::Established {
             return Ok(None);
         }
-        let session = Session::derive(&seed, &eph, &id, &ack.peer_ephemeral)
-            .map_err(|e| e.to_string())?;
+        let session =
+            Session::derive(&seed, &eph, &id, &ack.peer_ephemeral).map_err(|e| e.to_string())?;
         Ok(Some(Peer {
             identity: id,
             session,

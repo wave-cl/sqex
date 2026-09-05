@@ -29,7 +29,9 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
     let config = file.resolve().unwrap();
     let (signing_key, _pub) =
         squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
-    let bound = sqexd::bind(config, Some(config_path), signing_key).await.unwrap();
+    let bound = sqexd::bind(config, Some(config_path), signing_key)
+        .await
+        .unwrap();
     let addr = bound.local_addr;
     let server_pub = bound.public_key.to_bytes();
     let handle = tokio::spawn(async move {
@@ -55,8 +57,12 @@ async fn a_ring_reaches_a_stranger() {
     let (a_seed, a_id) = identity(1);
     let (b_seed, b_id) = identity(2);
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     // A and B have never met: no contact, no channel, no prekeys.
     ring::ring(&mut a, b_id).await.expect("ring a stranger");
@@ -80,8 +86,12 @@ async fn a_blocked_caller_does_not_ring() {
     let (b_seed, _) = identity(2);
     let (_, b_id) = identity(2);
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     ring::ring(&mut a, b_id).await.unwrap();
     let rings = ring::collect(&mut b, &b_seed, &[a_id]).await.unwrap();
@@ -111,8 +121,12 @@ async fn a_stale_ring_is_discarded_rather_than_rung() {
     let (a_seed, _) = identity(1);
     let (b_seed, b_id) = identity(2);
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
     ring::ring(&mut a, b_id).await.unwrap();
 
     // The exchange stamps `received` from its own clock, so a stale ring cannot
@@ -134,12 +148,23 @@ async fn mail_that_is_not_a_ring_is_ignored_and_cleared() {
     let (a_seed, _) = identity(1);
     let (b_seed, b_id) = identity(2);
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     let sealed = seal(&b_id, b"this is not a ring").unwrap();
     let (code, _) = a
-        .post("/mailbox/send", Send { recipient: b_id, sealed }.encode())
+        .post(
+            "/mailbox/send",
+            Send {
+                recipient: b_id,
+                sealed,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
