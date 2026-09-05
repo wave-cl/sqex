@@ -384,6 +384,15 @@ pub struct App {
     /// lines. Nought is the bottom, which is where a conversation opens and
     /// where it stays while somebody is reading the newest of it.
     pub scroll: usize,
+    /// A message to bring back to the bottom of the pane on the next frame,
+    /// set when the window is resized.
+    ///
+    /// `scroll` counts **lines**, and every line is a function of the width:
+    /// narrow the window and each message wraps into more of them, so the same
+    /// offset lands somewhere else entirely. Anchoring to a message is what
+    /// makes a resize keep the reader where they were rather than throwing
+    /// them into a different part of the conversation.
+    pub anchor: Option<usize>,
     /// Set when the pick has just moved, so the next frame brings it into
     /// view.
     ///
@@ -1412,6 +1421,16 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // Nudged only as far as it has to go — a pick moving off the top scrolls
     // by the lines that message occupies, not by a page — so walking up
     // through a conversation reads as walking rather than jumping.
+    // An anchored message goes back to the bottom of the pane, which is where
+    // it was when the window changed size. Taken before the pick, because a
+    // resize moves the reader's whole view and a pick is one message in it.
+    let anchored = app
+        .anchor
+        .and_then(|i| owners.iter().rposition(|o| *o == Some(i)))
+        .map(|last| {
+            let shown = pane.height as usize;
+            furthest.saturating_sub((last + 1).saturating_sub(shown))
+        });
     let wish = match app
         .follow_pick
         .then_some(app.picked)
@@ -1436,7 +1455,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
         }
         None => app.scroll,
     };
-    let scroll = wish.min(furthest);
+    let scroll = anchored.unwrap_or(wish).min(furthest);
     let skip = furthest - scroll;
     // A short conversation sits at the bottom, against the input box, rather
     // than floating at the top of an empty pane — where the next message would
@@ -1466,8 +1485,14 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
         );
     }
 
+    // Clipped to the pane, not merely to the screen. `owners` runs to the end
+    // of the conversation, so writing all of it recorded messages on rows the
+    // transcript does not occupy — down in the composer — and anything reading
+    // the last entry got a message below the fold. That is what `last_visible`
+    // reads to decide where `Esc` starts, and what an anchor reads to put a
+    // message back at the bottom.
     let mut rows = vec![None; height as usize];
-    for (n, owner) in owners.into_iter().enumerate() {
+    for (n, owner) in owners.into_iter().take(pane.height as usize).enumerate() {
         let y = pane.y as usize + n;
         if y < rows.len() {
             rows[y] = owner;
@@ -2695,6 +2720,40 @@ mod tests {
             followed.rows.iter().flatten().any(|o| *o == 5),
             "the picked message must be on screen after following"
         );
+    }
+
+    /// An anchored message comes back to the bottom of the pane, whatever the
+    /// width.
+    ///
+    /// This is what a resize needs: `scroll` counts lines, every line is a
+    /// function of the width, so the same offset lands somewhere else once the
+    /// window changes shape. Anchoring to a message is the only thing that
+    /// survives the rewrap.
+    #[test]
+    fn an_anchored_message_returns_to_the_bottom_at_any_width() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| {
+                said(
+                    "Alice",
+                    ALICE,
+                    false,
+                    &format!("message {n} with enough words in it to wrap when narrow"),
+                    3600 + n as u64,
+                )
+            })
+            .collect();
+
+        for width in [130u16, 90, 70] {
+            app.anchor = Some(30);
+            let d = drawn(&app, width, 24);
+            let last = d.rows.iter().rev().flatten().next().copied();
+            assert_eq!(
+                last,
+                Some(30),
+                "at {width} columns the anchored message did not land at the bottom"
+            );
+        }
     }
 
     #[test]
