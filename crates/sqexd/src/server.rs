@@ -21,6 +21,7 @@ use crate::admission::Admissions;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::{Config, OriginConfig};
+use crate::attest::{Attestations, LodgeError};
 use crate::resolve::Endpoints;
 use crate::device::Registry;
 use crate::events::Subscribers;
@@ -52,6 +53,7 @@ use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
 use sqex_proto::message::{RING_RINGING, Signal};
+use sqex_proto::attest::{Attestation, Query as AttestQuery};
 use sqex_proto::resolve::{
     Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
 };
@@ -168,6 +170,10 @@ pub struct Server {
     admins: RwLock<Vec<PubKey>>,
     challenges: Challenges,
     beacons: Beacons,
+    /// SIP-27: what identities have said about each other. The exchange holds
+    /// these and is not an authority over them — it checks that an issuer
+    /// signed, and cannot check whether a claim is true.
+    attestations: Attestations,
     /// SIP-28: where identities say they can be reached. Beside the beacon on
     /// purpose — this holds what they *said*, the beacon holds what the
     /// exchange *saw*, and a resolution carries both so a consumer can tell
@@ -376,6 +382,7 @@ pub async fn bind(
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
         endpoints: Endpoints::new(),
+        attestations: Attestations::new(),
         mailbox: Mailbox::new(),
         rooms: Rooms::new(),
         // The channel log lives beside the state file, so a memory-only
@@ -888,6 +895,47 @@ async fn route(
                 }
             },
         },
+        // SIP-27 attestation. **Anybody may lodge one**: it carries its own
+        // proof, so who handed it over establishes nothing, and requiring the
+        // issuer to do it would mean an issuer who has gone away can never be
+        // quoted again.
+        ("POST", "/attest/lodge") => match Attestation::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(a) => match server.attestations.lodge(a) {
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
+                Err(LodgeError::Invalid(why)) => refuse(
+                    401,
+                    Code::BadSignature,
+                    Some(&format!("attestation refused: {why:?}")),
+                ),
+                Err(LodgeError::NoSuchAttestation) => refuse(
+                    404,
+                    Code::NoSuchEntry,
+                    Some("a revocation must name an attestation this exchange holds, by its own issuer"),
+                ),
+            },
+        },
+        // Open to anybody, because an attestation is meant to travel. The
+        // exchange returns what it holds and **no count that means anything**:
+        // anyone can generate identities and have them vouch for each other, so
+        // only issuers a consumer already trusts carry weight, which is what
+        // the issuer filter is for.
+        ("POST", "/attest/read") => match AttestQuery::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(q) => (
+                200,
+                "application/octet-stream",
+                server
+                    .attestations
+                    .about(&q.subject, q.issuer.as_ref())
+                    .encode(),
+            ),
+        },
+
         // SIP-28 resolution. **The exchange is trusted for availability and
         // privacy, not for authenticity**: a consumer pins the key it asked for
         // when it connects, so a wrong address is a failed handshake rather

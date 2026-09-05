@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
 use sqex_proto::refusal::Refusal;
+use sqex_proto::attest::{
+    Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVIEWED, CLAIM_REVOKES, Held,
+    Query as AttestQuery,
+};
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::resolve::{
     Endpoint, KIND_DNS, KIND_IPV4, KIND_IPV6, MAX_HOST, Publish as ResolvePublish,
@@ -64,6 +68,12 @@ enum Cmd {
     Beacon {
         #[command(subcommand)]
         cmd: BeaconCmd,
+    },
+    /// Attestation: sign a statement about another identity, or read what has
+    /// been said about one.
+    Attest {
+        #[command(subcommand)]
+        cmd: AttestCmd,
     },
     /// Public key resolution: say where this identity can be reached, or ask
     /// where another one is.
@@ -152,6 +162,49 @@ enum BeaconCmd {
     Read {
         /// The identity to ask about, base58. Defaults to your own.
         key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttestCmd {
+    /// Sign a statement about another identity and lodge it.
+    ///
+    /// **This is not retractable in practice.** A revocation is a signed
+    /// statement a reader may never see, and anything once read can be kept and
+    /// replayed by anybody. Expiry is the only guarantee, so `--days` is the
+    /// setting that matters.
+    Say {
+        /// What is being claimed: `operates`, `known-as`, or `reviewed`.
+        claim: String,
+        /// The identity the claim is about, base58.
+        subject: String,
+        /// The claim's own text — a service name, a nickname, what was
+        /// examined.
+        #[arg(default_value = "")]
+        detail: String,
+        /// How long the statement stands, in days.
+        #[arg(short = 'd', long, default_value_t = 30)]
+        days: u64,
+    },
+    /// Withdraw a statement you made, by its digest.
+    ///
+    /// A reader that never sees this keeps trusting the claim until it expires,
+    /// which is why it is a courtesy rather than a mechanism.
+    Withdraw {
+        /// The identity the withdrawn statement was about, base58.
+        subject: String,
+        /// The statement's digest, base58, as `attest read` prints it.
+        digest: String,
+    },
+    /// Read what has been said about an identity.
+    Read {
+        /// The identity to ask about, base58. Defaults to your own.
+        subject: Option<String>,
+        /// Only statements by this issuer. **The ordinary case**: a count of
+        /// attestations measures how many keys somebody made, and only issuers
+        /// you already trust carry weight.
+        #[arg(short = 'i', long)]
+        issuer: Option<String>,
     },
 }
 
@@ -251,6 +304,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
+        Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
         Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
@@ -704,6 +758,164 @@ async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
         return Err(format!("delete failed ({code})"));
     }
     Ok(body.first().copied().unwrap_or(0) != 0)
+}
+
+// ---- attest -----------------------------------------------------------------
+
+fn claim_code(name: &str) -> Result<u8, String> {
+    match name {
+        "operates" => Ok(CLAIM_OPERATES),
+        "known-as" => Ok(CLAIM_KNOWN_AS),
+        "reviewed" => Ok(CLAIM_REVIEWED),
+        // Deliberately not a list with a gap in it: there is no negative claim
+        // to name, and SIP-27 settles that in the conservative direction
+        // because an unaccountable assertion that somebody misbehaved has no
+        // adjudicator.
+        other => Err(format!(
+            "unknown claim {other}: want operates, known-as or reviewed"
+        )),
+    }
+}
+
+fn claim_name(code: u8) -> &'static str {
+    match code {
+        CLAIM_OPERATES => "operates",
+        CLAIM_KNOWN_AS => "known as",
+        CLAIM_REVIEWED => "reviewed",
+        CLAIM_REVOKES => "withdrew a statement",
+        _ => "unreadable",
+    }
+}
+
+async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> {
+    match cmd {
+        AttestCmd::Say { claim, subject, detail, days } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let about = parse_key(subject)?;
+            let code = claim_code(claim)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let a = Attestation::sign(
+                &signer.seed(),
+                &about,
+                code,
+                detail.as_bytes().to_vec(),
+                now,
+                now + days * 86_400,
+            );
+            let (addr, server) = endpoint(cli, cfg).await?;
+            // Lodging as ourselves is not required — an attestation carries its
+            // own proof — but connecting anonymously would be an odd way to
+            // publish something with your name on it.
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code_out, body) = client.post("/attest/lodge", a.encode()).await?;
+            if code_out != 200 {
+                return Err(format!("lodge refused ({code_out}): {}", said(&body)));
+            }
+            println!(
+                "lodged: {} {} {about}, until {}",
+                PubKey::new(signer.public()),
+                claim_name(code),
+                a.expires_at
+            );
+            println!("  digest {}", bs58::encode(a.digest()).into_string());
+            println!(
+                "  this cannot be taken back — a withdrawal is a statement a reader \
+                 may never see, and anything once read can be kept"
+            );
+            Ok(())
+        }
+        AttestCmd::Withdraw { subject, digest } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let about = parse_key(subject)?;
+            let named = bs58::decode(digest)
+                .into_vec()
+                .map_err(|e| format!("bad digest: {e}"))?;
+            if named.len() != 32 {
+                return Err("a digest is 32 bytes".into());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let a = Attestation::sign(
+                &signer.seed(),
+                &about,
+                CLAIM_REVOKES,
+                named,
+                now,
+                now + 30 * 86_400,
+            );
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code, body) = client.post("/attest/lodge", a.encode()).await?;
+            if code != 200 {
+                return Err(format!("withdrawal refused ({code}): {}", said(&body)));
+            }
+            println!("withdrawn at this exchange. Readers who already have it still have it");
+            Ok(())
+        }
+        AttestCmd::Read { subject, issuer } => {
+            let about = match subject {
+                Some(k) => parse_key(k)?,
+                None => own_identity(cli, cfg)?,
+            };
+            let from = match issuer {
+                Some(k) => Some(parse_key(k)?),
+                None => None,
+            };
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = match load_software_identity(cli, cfg) {
+                Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?,
+                Err(_) => Client::connect(addr, server.as_bytes()).await?,
+            };
+            let (code, body) = client
+                .post("/attest/read", AttestQuery { subject: about, issuer: from }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("read failed ({code}): {}", said(&body)));
+            }
+            let held = Held::decode(&body).map_err(|e| e.to_string())?;
+            if held.attestations.is_empty() {
+                println!("{about}: nothing said, by anyone this exchange holds");
+                return Ok(());
+            }
+            for a in &held.attestations {
+                // Each is verified here rather than taken from the exchange:
+                // the whole point of a signature is that the holder checks it.
+                if a.verify(held.now).is_err() {
+                    println!("{}: a statement that does not verify — ignored", a.issuer);
+                    continue;
+                }
+                // **An unreadable claim is not printed as text about a person.**
+                // The escape hatch lets anybody encode anything, and rendering
+                // it would be carrying it.
+                if !a.readable() {
+                    println!(
+                        "{}: a claim of type {:#x} this build does not know",
+                        a.issuer, a.claim
+                    );
+                    continue;
+                }
+                println!(
+                    "{} says {} {}",
+                    a.issuer,
+                    claim_name(a.claim),
+                    String::from_utf8_lossy(&a.body)
+                );
+                println!("  digest {}", bs58::encode(a.digest()).into_string());
+            }
+            println!(
+                "  {} statement(s). This is not a score: anyone can make identities \
+                 and have them vouch for each other, so only issuers you already \
+                 trust mean anything",
+                held.attestations.len()
+            );
+            Ok(())
+        }
+    }
 }
 
 // ---- resolve ----------------------------------------------------------------

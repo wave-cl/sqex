@@ -10,6 +10,7 @@
 //! decoded payload and checks it matches — so the operator's displayed context
 //! provably corresponds to what executes.
 
+pub mod attest;
 pub mod beacon;
 pub mod blob;
 pub mod blob_store;

@@ -2777,6 +2777,7 @@ dependencies = [
 name = "sqex-cli"
 version = "0.32.0"
 dependencies = [
+ "bs58",
  "clap",
  "rand_core 0.6.4",
  "rpassword",

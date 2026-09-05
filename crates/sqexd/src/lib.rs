@@ -1,6 +1,7 @@
 //! The sqex server, as a library so tests and supervisors can drive it.
 
 pub mod admission;
+pub mod attest;
 pub mod beacon;
 pub mod challenge;
 pub mod channel;
