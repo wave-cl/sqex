@@ -1561,17 +1561,18 @@ async fn handle_key(
     // newest message is then far below the pane, so picking it would throw the
     // view forward to a message they had deliberately scrolled away from, and
     // lose their place to boot. Picking what they are looking at keeps both.
+    // Esc is cancel, and only cancel.
+    //
+    // It used to be the way *into* pick mode as well as the way out of six
+    // other things — eight jobs on one key, with no story about what it meant.
+    // The arrows enter pick mode now, which leaves Esc doing the one thing it
+    // means everywhere else: back out of what you are in.
     if code == KeyCode::Esc {
-        if app.editing.take().is_some() || app.replying.take().is_some() {
-            // Abandon what the input line was about to do first. Leaving an
-            // edit half-typed and then entering pick mode would send it to the
-            // wrong place on the next Enter.
-            app.input.clear();
-            return;
-        }
-        if !app.said.is_empty() {
-            app.picked = Some(app.last_visible.unwrap_or(app.said.len() - 1));
-        }
+        // An edit or a reply half-typed is abandoned, and the line cleared, so
+        // the next Enter cannot send it to the wrong place.
+        app.editing = None;
+        app.replying = None;
+        app.input.clear();
         return;
     }
 
@@ -1579,15 +1580,35 @@ async fn handle_key(
         // Changing conversation lands at the newest of the new one. Carrying
         // a line offset across would put somebody at an arbitrary depth in a
         // conversation they have just arrived in.
-        KeyCode::Tab | KeyCode::Down => {
+        //
+        // Tab and BackTab only. The arrows used to do this too, which spent
+        // the pair of keys everybody reaches for on a job Tab already had —
+        // while scanning the conversation itself, the thing they obviously
+        // mean, needed a mode first.
+        KeyCode::Tab => {
             app.select_next();
             app.scroll = 0;
             clear_unread(open, app);
         }
-        KeyCode::BackTab | KeyCode::Up => {
+        KeyCode::BackTab => {
             app.select_previous();
             app.scroll = 0;
             clear_unread(open, app);
+        }
+        // The arrows scan the conversation, entering pick mode on the way in.
+        //
+        // Down first picks what `Esc` used to: the last message on screen. Up
+        // does the same and then steps back one, so a single press lands on
+        // something rather than merely arming a mode — and pick mode with
+        // nothing picked would be a state with no visible effect.
+        KeyCode::Up | KeyCode::Down if !app.said.is_empty() => {
+            let last = app.last_visible.unwrap_or(app.said.len() - 1);
+            app.picked = Some(if code == KeyCode::Up {
+                last.saturating_sub(1)
+            } else {
+                last
+            });
+            app.follow_pick = true;
         }
         // Scrolling from the keyboard, because the wheel needs `/mouse on`
         // and the mouse stays the terminal's until it is asked for. A feature

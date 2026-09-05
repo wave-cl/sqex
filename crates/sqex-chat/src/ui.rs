@@ -1637,8 +1637,12 @@ fn help(f: &mut Frame, area: Rect) {
     let mut lines = vec![
         Line::from(Span::styled("keys", head)),
         Line::from(vec![
-            Span::styled("  Tab ↑↓ ", key),
+            Span::styled("  Tab ", key),
             Span::styled("move between conversations    ", dim),
+            Span::styled("↑↓ ", key),
+            Span::styled("scan this one    ", dim),
+            Span::styled("Esc ", key),
+            Span::styled("back out    ", dim),
             Span::styled("^N ", key),
             Span::styled("add somebody    ", dim),
             Span::styled("^C ", key),
@@ -1653,10 +1657,8 @@ fn help(f: &mut Frame, area: Rect) {
             Span::styled("the wheel", dim),
         ]),
         Line::from(vec![
-            Span::styled("  Esc    ", key),
+            Span::styled("  ↑↓     ", key),
             Span::styled("pick a message, and then:  ", dim),
-            Span::styled("↑↓ ", key),
-            Span::styled("move  ", dim),
             Span::styled("a ", key),
             Span::styled("react  ", dim),
             Span::styled("r ", key),
@@ -1772,7 +1774,7 @@ fn keys_line(width: usize, scrollable: bool) -> String {
     // which left the commands that fell off undiscoverable, with nothing to
     // say they existed. `/help` carries the list now, and this only has to
     // point at it.
-    const GROUPS: &[&str] = &["^C quit", "Tab", "Esc pick", "^N add", "/help"];
+    const GROUPS: &[&str] = &["^C quit", "Tab", "↑↓ pick", "^N add", "/help"];
     // First, and only while it applies. A reader who has just watched a
     // message leave the top of the pane is looking for this and nothing else;
     // the rest of the line is what they already know. It is prepended as an
@@ -2290,7 +2292,7 @@ mod tests {
                 );
                 for group in line.trim().split(" · ").filter(|g| !g.is_empty()) {
                     assert!(
-                        ["^U/^D page", "^C quit", "Tab", "Esc pick", "^N add", "/help"]
+                        ["^U/^D page", "^C quit", "Tab", "↑↓ pick", "^N add", "/help"]
                             .contains(&group),
                         "a group was cut in half at width {width}: {group:?}"
                     );
