@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-chat"
-version = "0.28.2"
+version = "0.28.3"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-cli"
-version = "0.28.2"
+version = "0.28.3"
 dependencies = [
  "clap",
  "rand_core 0.6.4",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-discovery"
-version = "0.28.2"
+version = "0.28.3"
 dependencies = [
  "bs58",
  "dirs",
@@ -2804,7 +2804,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-proto"
-version = "0.28.2"
+version = "0.28.3"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-voice"
-version = "0.28.2"
+version = "0.28.3"
 dependencies = [
  "clap",
  "cpal",
@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "sqexd"
-version = "0.28.2"
+version = "0.28.3"
 dependencies = [
  "bs58",
  "bytes",
@@ -2879,8 +2879,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr"
-version = "0.10.2"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.2#b806d445e3d9c018bdc0b65c906829d4b51fb2c4"
+version = "0.10.3"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.3#a685467c4c61c8ac6191b43a0c210d6a1b03a395"
 dependencies = [
  "argon2",
  "bs58",
@@ -2911,8 +2911,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr-core"
-version = "0.10.2"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.2#b806d445e3d9c018bdc0b65c906829d4b51fb2c4"
+version = "0.10.3"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.3#a685467c4c61c8ac6191b43a0c210d6a1b03a395"
 dependencies = [
  "bs58",
  "ed25519-dalek",
@@ -2923,8 +2923,8 @@ dependencies = [
 
 [[package]]
 name = "squic"
-version = "0.24.2"
-source = "git+https://github.com/wave-cl/squic-rust?tag=v0.24.2#ccf29e2db694755e5418d6f78f30de230c775b54"
+version = "0.25.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.25.0#6e568f7ac8f2f066379ff3014b062140c7f7c7e1"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
