@@ -638,6 +638,17 @@ impl Channels {
         add_column(&db, "entry", "entry_hash", "BLOB NOT NULL DEFAULT x''")?;
         add_column(&db, "entry", "head", "BLOB NOT NULL DEFAULT x''")?;
         add_column(&db, "entry", "receipt", "BLOB NOT NULL DEFAULT x''")?;
+        // SIP-35's `replicated` shipped in 0.31.0 without `derivable`, which
+        // was added to the `CREATE TABLE` body in 0.32.0 — where it did nothing
+        // for the exchanges that already had the table, because `CREATE TABLE
+        // IF NOT EXISTS` does not add a column. Every `fetch` and `info` reads
+        // it, so a deployed exchange answered `storage` to all of them.
+        //
+        // `0` is the safe default in both directions: a channel this exchange
+        // originated has no row here at all, and a replicated one that cannot
+        // be shown to be derivable is refused rather than served, which is
+        // where SIP-35 wants the failure to land.
+        add_column(&db, "replicated", "derivable", "INTEGER NOT NULL DEFAULT 0")?;
         // SIP-31's columns are deliberately *not* added this way, and carry no
         // defaults. A database predating them is wiped rather than migrated,
         // because a default would make an unsigned entry representable — and
