@@ -228,3 +228,120 @@ async fn an_unidentified_caller_cannot_ask() {
     let (code, _) = ask(&mut anon, bob, 0).await;
     assert_eq!(code, 403);
 }
+
+/// **Two peers introduce themselves and then connect directly**, with the
+/// exchange out of the path.
+///
+/// This is what SIP-25 is for, and it is as far as a test on one machine can
+/// go: on loopback there is no NAT, so what this proves is that the coordination
+/// produces a usable address and that a peer can dial from the port the exchange
+/// observed. Whether that survives a real NAT is a question for two peers behind
+/// two of them — see SIP-25, which stays Draft for exactly that reason.
+///
+/// What it does prove, and what nothing else did: the address an exchange hands
+/// over is one a peer can actually reach, and `local_bind` makes the connection
+/// leave from the port that was introduced rather than a fresh one.
+#[tokio::test]
+async fn two_peers_introduced_by_an_exchange_connect_directly() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+
+    // Each peer picks a port and uses it for *both* connections: the one the
+    // exchange observes and the one the other peer dials. That is the whole
+    // mechanism — an exchange that observed a different socket would be
+    // describing a mapping nothing else can use.
+    let port_of = || {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a = probe.local_addr().unwrap();
+        drop(probe);
+        a
+    };
+    let (alice_seed, alice) = who(71);
+    let (bob_seed, bob) = who(72);
+    let alice_port = port_of();
+    let bob_port = port_of();
+
+    let mut a = sqex_proto::h3::H3Client::connect_from(
+        addr,
+        &server_pub,
+        &alice_seed,
+        Some(alice_port),
+    )
+    .await
+    .unwrap();
+    let mut b = sqex_proto::h3::H3Client::connect_from(
+        addr,
+        &server_pub,
+        &bob_seed,
+        Some(bob_port),
+    )
+    .await
+    .unwrap();
+
+    let (code, _) = a
+        .post("/rendezvous/introduce", Introduce { peer: bob, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let (code, body) = b
+        .post("/rendezvous/introduce", Introduce { peer: alice, wait_secs: 0 }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let for_bob = Introduced::decode(&body).unwrap();
+    assert!(for_bob.ready);
+
+    // **The address the exchange observed is the port Alice chose.** Without
+    // that, everything below would be dialling somewhere nobody is listening.
+    let alice_seen = for_bob.addr.unwrap();
+    assert_eq!(
+        alice_seen.port(),
+        alice_port.port(),
+        "the exchange observed a different mapping from the one that will be used"
+    );
+
+    // Alice listens on hers, Bob dials it from his — the tiebreak the CLI uses,
+    // fixed here so the test does not depend on which key sorts lower.
+    // Both exchange connections go, and the ports come free. Dropping an
+    // `H3Client` aborts its driver, which is what actually releases the socket;
+    // the pause is for the OS, which does not do it synchronously.
+    drop((a, b));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let listening = tokio::spawn(async move {
+        let listener = squic::listen(
+            alice_port,
+            &ed25519_dalek::SigningKey::from_bytes(&alice_seed),
+            squic::Config { punch: vec![bob_port], ..Default::default() },
+        )
+        .await
+        .expect("alice could not listen on the port she was introduced at");
+        let incoming = listener.accept().await.expect("nobody arrived");
+        incoming.await.map(|c| c.remote_address())
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let conn = squic::dial(
+        alice_seen,
+        alice.as_bytes(),
+        squic::Config {
+            local_bind: Some(bob_port),
+            punch: vec![alice_seen],
+            client_key: Some(hex::encode(bob_seed)),
+            advertise_identity: true,
+            handshake_timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("bob could not reach alice at the address the exchange gave him");
+    assert_eq!(conn.remote_address(), alice_seen);
+
+    let seen_by_alice = listening.await.unwrap().unwrap();
+    assert_eq!(
+        seen_by_alice.port(),
+        bob_port.port(),
+        "bob arrived from a port other than the one he was introduced at"
+    );
+    conn.close(0u32.into(), b"done");
+}

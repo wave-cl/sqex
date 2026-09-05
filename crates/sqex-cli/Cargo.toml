@@ -21,3 +21,6 @@ rpassword = "7"
 x25519-dalek = "2"
 rand_core = { workspace = true }
 bs58 = { workspace = true }
+# SIP-25: the punch needs squic's own dial and listen, with a chosen local port.
+squic = { workspace = true }
+ed25519-dalek = { workspace = true }

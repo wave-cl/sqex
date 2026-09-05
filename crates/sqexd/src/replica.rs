@@ -65,7 +65,7 @@ use sha2::{Digest, Sha256};
 use sqnr_core::PubKey;
 
 use crate::channel::Channels;
-use crate::peer_client::PeerClient;
+use sqex_proto::h3::H3Client;
 
 /// One origin this exchange replicates from.
 #[derive(Debug, Clone)]
@@ -295,7 +295,7 @@ pub fn entry_hash_of(place: &Place, e: &Entry) -> [u8; 32] {
 /// the origin's own retention window before anything is asked for. It
 /// authenticates nothing — the sQUIC connection already did that, both ways.
 pub async fn pull_once(
-    client: &mut PeerClient,
+    client: &mut H3Client,
     server: &crate::server::Server,
     origin: &Origin,
 ) -> Result<HashMap<[u8; 32], Took>, String> {
@@ -379,7 +379,7 @@ pub async fn pull_once(
 /// on the way through would be caught here, and a replica that skipped the
 /// check would be handing members a key somebody else chose.
 async fn pull_envelopes(
-    client: &mut PeerClient,
+    client: &mut H3Client,
     store: &Channels,
     origin: &Origin,
     channel: &[u8; 32],
@@ -441,7 +441,7 @@ pub fn acceptable_blob(id: &[u8; 32], chunks: &[Vec<u8>]) -> bool {
 /// of its ciphertext, so a replica that recomputes the hash has checked
 /// everything there is to check — an origin cannot substitute a byte without
 /// changing the name.
-async fn pull_blobs(client: &mut PeerClient, store: &Channels, channel: &[u8; 32]) {
+async fn pull_blobs(client: &mut H3Client, store: &Channels, channel: &[u8; 32]) {
     let Ok((200, body)) = client
         .post(
             "/peer/blobs",
@@ -495,7 +495,7 @@ async fn pull_blobs(client: &mut PeerClient, store: &Channels, channel: &[u8; 32
 /// origin's own store enforces it on the way in, so a replay of an older record
 /// changes nothing.
 async fn pull_profiles(
-    client: &mut PeerClient,
+    client: &mut H3Client,
     server: &crate::server::Server,
     store: &Channels,
     channel: &[u8; 32],
@@ -526,7 +526,7 @@ async fn pull_profiles(
 /// SIP-20 artifact it checks for itself. SIP-20 puts the reason plainly: a
 /// credential naming an account the verifier did not ask about is not evidence
 /// of anything.
-pub async fn account_for(client: &mut PeerClient, device: &PubKey) -> Option<PubKey> {
+pub async fn account_for(client: &mut H3Client, device: &PubKey) -> Option<PubKey> {
     // SIP-22 makes an account with no registered devices its own device, so the
     // registry answers about a device key as readily as an account key, and the
     // row that names this device is the one being looked for.
@@ -562,7 +562,7 @@ pub async fn account_for(client: &mut PeerClient, device: &PubKey) -> Option<Pub
 /// lagged.
 pub async fn run(server: Arc<crate::server::Server>, seed: [u8; 32], origin: Origin) {
     loop {
-        match PeerClient::connect(origin.addr, origin.key.as_bytes(), &seed).await {
+        match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
                 tracing::warn!(origin = %origin.key, error = %e, "cannot reach the origin");
             }

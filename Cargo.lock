@@ -717,7 +717,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -785,7 +785,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1706,7 +1706,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2146,7 +2146,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2398,7 +2398,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2455,7 +2455,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-chat"
-version = "0.33.1"
+version = "0.34.0"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -2775,10 +2775,11 @@ dependencies = [
 
 [[package]]
 name = "sqex-cli"
-version = "0.33.1"
+version = "0.34.0"
 dependencies = [
  "bs58",
  "clap",
+ "ed25519-dalek",
  "rand_core 0.6.4",
  "rpassword",
  "serde_json",
@@ -2786,13 +2787,14 @@ dependencies = [
  "sqex-proto",
  "sqnr",
  "sqnr-core",
+ "squic",
  "tokio",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "sqex-discovery"
-version = "0.33.1"
+version = "0.34.0"
 dependencies = [
  "bs58",
  "dirs",
@@ -2805,22 +2807,28 @@ dependencies = [
 
 [[package]]
 name = "sqex-proto"
-version = "0.33.1"
+version = "0.34.0"
 dependencies = [
  "bs58",
+ "bytes",
  "chacha20poly1305",
  "ed25519-dalek",
+ "h3",
+ "h3-quinn",
+ "hex",
  "hmac",
+ "http",
  "rand_core 0.6.4",
  "sha2",
  "sqnr-core",
  "squic",
+ "tokio",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "sqex-voice"
-version = "0.33.1"
+version = "0.34.0"
 dependencies = [
  "clap",
  "cpal",
@@ -2845,7 +2853,7 @@ dependencies = [
 
 [[package]]
 name = "sqexd"
-version = "0.33.1"
+version = "0.34.0"
 dependencies = [
  "bs58",
  "bytes",
@@ -2880,8 +2888,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr"
-version = "0.10.4"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.4#bf9bad086c87770e5cd23f83a1d81b1eb89ecb1c"
+version = "0.10.5"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.5#ac45f7096fbbd56c462435ee834ae8679f790918"
 dependencies = [
  "argon2",
  "bs58",
@@ -2912,8 +2920,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr-core"
-version = "0.10.4"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.4#bf9bad086c87770e5cd23f83a1d81b1eb89ecb1c"
+version = "0.10.5"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.5#ac45f7096fbbd56c462435ee834ae8679f790918"
 dependencies = [
  "bs58",
  "ed25519-dalek",
@@ -2924,8 +2932,8 @@ dependencies = [
 
 [[package]]
 name = "squic"
-version = "0.25.1"
-source = "git+https://github.com/wave-cl/squic-rust?tag=v0.25.1#a4ce4108473a3c0feced54f896d4136514fc5803"
+version = "0.26.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.26.0#e519e7782ed3ab9907784b6fdbd6327b318ed4e3"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -3064,7 +3072,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3571,7 +3579,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

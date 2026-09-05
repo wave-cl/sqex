@@ -471,7 +471,7 @@ fn a_replica_refuses_a_write_and_says_where_it_belongs() {
 #[tokio::test]
 async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     use sqexd::replica::{Origin, pull_once};
-    use sqexd::peer_client::PeerClient;
+    use sqex_proto::h3::H3Client;
 
     let origin_dir = tempfile::tempdir().unwrap();
     let replica_dir = tempfile::tempdir().unwrap();
@@ -539,7 +539,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     // well as entries, and a replica is an exchange.
     let replica = bind_replica(replica_dir.path()).await;
     let store = replica.channels();
-    let mut client = PeerClient::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .expect("the replica could not reach the origin");
     let spec = Origin {
@@ -583,7 +583,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
 #[tokio::test]
 async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     use sqexd::channel::ChannelError;
-    use sqexd::peer_client::PeerClient;
+    use sqex_proto::h3::H3Client;
     use sqexd::replica::{Origin, pull_once};
 
     let origin_dir = tempfile::tempdir().unwrap();
@@ -649,7 +649,7 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     // From the beginning: the constitution arrives, so the roster is derived.
     let replica = bind_replica(replica_dir.path()).await;
     let whole = replica.channels();
-    let mut client = PeerClient::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .unwrap();
     pull_once(&mut client, &replica, &spec).await.unwrap();
@@ -713,7 +713,7 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     use sqex_proto::channel_key::{ChannelKey, Put as KeyPut, seal_envelope, sign_envelope};
     use sqex_proto::peer::PulledBlob;
     use sqex_proto::profile::{Profile, Put as ProfilePut, Record};
-    use sqexd::peer_client::PeerClient;
+    use sqex_proto::h3::H3Client;
     use sqexd::replica::{Origin, pull_once};
 
     let origin_dir = tempfile::tempdir().unwrap();
@@ -855,7 +855,7 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let replica = bind_replica(replica_dir.path()).await;
-    let mut client = PeerClient::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .unwrap();
     let spec = Origin {
