@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use sqex_proto::resolve::{Endpoint, MAX_ENDPOINTS, Resolved, Successor};
+use sqex_proto::resolve::{Endpoint, MAX_CAPABILITIES, MAX_ENDPOINTS, Resolved, Successor};
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
@@ -24,6 +24,10 @@ use crate::state::now_unix;
 #[derive(Debug, Clone)]
 struct Published {
     endpoints: Vec<Endpoint>,
+    /// SIP-26, held here rather than in its own store: it has the same
+    /// provenance and the same expiry as the endpoints beside it, and a second
+    /// store would give it a second lifetime it does not want.
+    capabilities: Vec<String>,
     published_at: u64,
     expires_at: u64,
     /// SIP-28's successor pointer, which is *not* a retirement — see the type's
@@ -60,8 +64,12 @@ impl Endpoints {
         identity: PubKey,
         ttl_secs: u32,
         endpoints: Vec<Endpoint>,
+        capabilities: Vec<String>,
     ) -> Result<u64, PublishError> {
         if endpoints.len() > MAX_ENDPOINTS {
+            return Err(PublishError::TooMany);
+        }
+        if capabilities.len() > MAX_CAPABILITIES {
             return Err(PublishError::TooMany);
         }
         let now = now_unix();
@@ -71,6 +79,7 @@ impl Endpoints {
             identity,
             Published {
                 endpoints,
+                capabilities,
                 published_at: now,
                 expires_at: now.saturating_add(u64::from(ttl_secs)),
                 successor,
@@ -108,6 +117,7 @@ impl Endpoints {
                     identity,
                     Published {
                         endpoints: Vec::new(),
+                        capabilities: Vec::new(),
                         published_at: now,
                         expires_at: now,
                         successor: Some(successor),
@@ -137,6 +147,7 @@ impl Endpoints {
                 expires_at: p.expires_at,
                 last_seen,
                 now,
+                capabilities: p.capabilities.clone(),
             },
             _ => Resolved::none(now),
         }
@@ -207,13 +218,13 @@ mod tests {
     #[test]
     fn an_expired_publication_is_absent_rather_than_stale() {
         let store = Endpoints::new();
-        store.publish(key(1), 0, vec![v4(1)]).unwrap();
+        store.publish(key(1), 0, vec![v4(1)], vec![]).unwrap();
         let got = store.resolve(&key(1), 0);
         assert!(!got.found, "an expired set was served");
         assert!(got.endpoints.is_empty());
 
         // The same publication with a window is served.
-        store.publish(key(1), 300, vec![v4(1)]).unwrap();
+        store.publish(key(1), 300, vec![v4(1)], vec![]).unwrap();
         assert!(store.resolve(&key(1), 0).found);
     }
 
@@ -223,7 +234,7 @@ mod tests {
     #[test]
     fn a_beat_extends_the_window_without_moving_the_claim() {
         let store = Endpoints::new();
-        store.publish(key(2), 0, vec![v4(2)]).unwrap();
+        store.publish(key(2), 0, vec![v4(2)], vec![]).unwrap();
         assert!(!store.resolve(&key(2), 0).found);
 
         store.refresh(&key(2), 300);
@@ -244,13 +255,13 @@ mod tests {
     #[test]
     fn the_whole_set_is_replaced_and_the_cap_is_enforced() {
         let store = Endpoints::new();
-        store.publish(key(4), 300, vec![v4(1), v4(2)]).unwrap();
-        store.publish(key(4), 300, vec![v4(3)]).unwrap();
+        store.publish(key(4), 300, vec![v4(1), v4(2)], vec![]).unwrap();
+        store.publish(key(4), 300, vec![v4(3)], vec![]).unwrap();
         assert_eq!(store.resolve(&key(4), 0).endpoints, vec![v4(3)]);
 
         let too_many: Vec<Endpoint> = (0..=MAX_ENDPOINTS as u8).map(v4).collect();
         assert_eq!(
-            store.publish(key(5), 300, too_many),
+            store.publish(key(5), 300, too_many, vec![]),
             Err(PublishError::TooMany)
         );
     }
@@ -264,14 +275,14 @@ mod tests {
             successor: key(9),
             reason: "new hardware".into(),
         };
-        store.publish(key(6), 300, vec![v4(1)]).unwrap();
+        store.publish(key(6), 300, vec![v4(1)], vec![]).unwrap();
         store.set_successor(key(6), moved.clone());
-        store.publish(key(6), 300, vec![v4(2)]).unwrap();
+        store.publish(key(6), 300, vec![v4(2)], vec![]).unwrap();
         assert_eq!(store.successor(&key(6)), Some(moved.clone()));
 
         // And a sweep keeps it after the endpoints have gone: a forwarding note
         // outliving the address it forwarded from is the whole use.
-        store.publish(key(6), 0, vec![v4(2)]).unwrap();
+        store.publish(key(6), 0, vec![v4(2)], vec![]).unwrap();
         store.sweep();
         assert_eq!(store.successor(&key(6)), Some(moved));
 
@@ -284,11 +295,11 @@ mod tests {
     #[test]
     fn a_sweep_drops_what_has_expired() {
         let store = Endpoints::new();
-        store.publish(key(8), 0, vec![v4(1)]).unwrap();
+        store.publish(key(8), 0, vec![v4(1)], vec![]).unwrap();
         assert_eq!(store.len(), 0, "an expired set is not counted as live");
         store.sweep();
         assert!(store.is_empty());
-        store.publish(key(8), 300, vec![v4(1)]).unwrap();
+        store.publish(key(8), 300, vec![v4(1)], vec![]).unwrap();
         store.sweep();
         assert_eq!(store.len(), 1);
     }

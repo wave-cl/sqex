@@ -899,7 +899,7 @@ async fn route(
             // Only for itself. The handshake established which key is speaking,
             // and a caller may publish for that identity and no other — which
             // is the whole reason no signature is needed.
-            (Some(id), Ok(req)) => match server.endpoints.publish(id, req.ttl_secs, req.endpoints) {
+            (Some(id), Ok(req)) => match server.endpoints.publish(id, req.ttl_secs, req.endpoints, req.capabilities) {
                 Ok(_) => (
                     200,
                     "application/octet-stream",

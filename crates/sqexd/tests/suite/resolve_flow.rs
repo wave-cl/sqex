@@ -92,6 +92,7 @@ async fn what_an_identity_publishes_is_what_another_resolves() {
 
     let req = Publish {
         ttl_secs: 300,
+        capabilities: vec![],
         endpoints: vec![
             v4([198, 51, 100, 7], 443),
             Endpoint {
@@ -131,6 +132,85 @@ async fn what_an_identity_publishes_is_what_another_resolves() {
     );
 }
 
+/// SIP-26: what a service *speaks* travels with where it is, expires with it,
+/// and is replaced with it.
+///
+/// The last part is the one worth a test. Capability shares the publication's
+/// lifetime, so an identity that republishes its addresses and says nothing
+/// about what it speaks has stopped speaking it — there is no partial update
+/// here either, and a merge would leave a version string behind after the
+/// service it described was upgraded.
+#[tokio::test]
+async fn what_a_service_speaks_is_published_and_replaced_with_its_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(221);
+    let (bob_seed, _) = identity(222);
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &bob_seed).await.unwrap();
+
+    let (code, body) = a
+        .post(
+            "/resolve/publish",
+            Publish {
+                ttl_secs: 300,
+                endpoints: vec![v4([10, 0, 0, 1], 443)],
+                capabilities: vec!["sqssh/1".into(), "sqex-chat/0.32".into()],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    let got = resolve_as(&mut b, alice).await;
+    assert_eq!(got.capabilities, vec!["sqssh/1", "sqex-chat/0.32"]);
+    assert_eq!(
+        got.expires_at.saturating_sub(got.published_at),
+        300,
+        "capability must expire with the address it describes"
+    );
+
+    // A rolling upgrade: the same address, a later version.
+    let (code, _) = a
+        .post(
+            "/resolve/publish",
+            Publish {
+                ttl_secs: 300,
+                endpoints: vec![v4([10, 0, 0, 1], 443)],
+                capabilities: vec!["sqssh/1".into(), "sqex-chat/0.33".into()],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(
+        resolve_as(&mut b, alice).await.capabilities,
+        vec!["sqssh/1", "sqex-chat/0.33"],
+        "an upgrade must be visible, which is most of why this exists"
+    );
+
+    // And dropping it drops it, rather than merging with what came before.
+    let (code, _) = a
+        .post(
+            "/resolve/publish",
+            Publish {
+                ttl_secs: 300,
+                endpoints: vec![v4([10, 0, 0, 1], 443)],
+                capabilities: vec![],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    assert!(
+        resolve_as(&mut b, alice).await.capabilities.is_empty(),
+        "a stale capability survived a republication"
+    );
+}
+
 /// **A beat refreshes a publication**, so a service proving it is alive does not
 /// separately have to prove its address is current.
 ///
@@ -148,7 +228,7 @@ async fn a_beat_keeps_an_expiring_publication_alive() {
     let (code, _) = a
         .post(
             "/resolve/publish",
-            Publish { ttl_secs: 0, endpoints: vec![v4([10, 0, 0, 1], 443)] }.encode(),
+            Publish { ttl_secs: 0, endpoints: vec![v4([10, 0, 0, 1], 443)], capabilities: vec![] }.encode(),
         )
         .await
         .unwrap();
@@ -192,7 +272,7 @@ async fn publishing_replaces_the_set_rather_than_merging_it() {
         let (code, _) = a
             .post(
                 "/resolve/publish",
-                Publish { ttl_secs: 300, endpoints: set.clone() }.encode(),
+                Publish { ttl_secs: 300, endpoints: set.clone(), capabilities: vec![] }.encode(),
             )
             .await
             .unwrap();
@@ -206,7 +286,7 @@ async fn publishing_replaces_the_set_rather_than_merging_it() {
     let (code, _) = a
         .post(
             "/resolve/publish",
-            Publish { ttl_secs: 300, endpoints: vec![] }.encode(),
+            Publish { ttl_secs: 300, endpoints: vec![], capabilities: vec![] }.encode(),
         )
         .await
         .unwrap();
@@ -229,7 +309,7 @@ async fn an_identity_cannot_publish_for_anybody_else() {
     let (code, _) = m
         .post(
             "/resolve/publish",
-            Publish { ttl_secs: 300, endpoints: vec![v4([203, 0, 113, 9], 443)] }.encode(),
+            Publish { ttl_secs: 300, endpoints: vec![v4([203, 0, 113, 9], 443)], capabilities: vec![] }.encode(),
         )
         .await
         .unwrap();
@@ -249,7 +329,7 @@ async fn an_identity_cannot_publish_for_anybody_else() {
     let (code, _) = anon
         .post(
             "/resolve/publish",
-            Publish { ttl_secs: 300, endpoints: vec![v4([203, 0, 113, 10], 443)] }.encode(),
+            Publish { ttl_secs: 300, endpoints: vec![v4([203, 0, 113, 10], 443)], capabilities: vec![] }.encode(),
         )
         .await
         .unwrap();
@@ -269,6 +349,7 @@ async fn the_endpoint_cap_is_enforced_by_the_exchange_too() {
     // two checks; the store's own is unit-tested beside it.
     let too_many = Publish {
         ttl_secs: 300,
+        capabilities: vec![],
         endpoints: (0..=MAX_ENDPOINTS).map(|i| v4([10, 0, 0, i as u8], 443)).collect(),
     };
     let (code, _) = a.post("/resolve/publish", too_many.encode()).await.unwrap();
@@ -290,7 +371,7 @@ async fn a_successor_forwards_and_does_not_retire() {
     let (code, _) = a
         .post(
             "/resolve/publish",
-            Publish { ttl_secs: 300, endpoints: vec![v4([10, 0, 0, 1], 443)] }.encode(),
+            Publish { ttl_secs: 300, endpoints: vec![v4([10, 0, 0, 1], 443)], capabilities: vec![] }.encode(),
         )
         .await
         .unwrap();

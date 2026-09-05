@@ -28,6 +28,16 @@ pub const TYPE_PUBLISH: u8 = 0x10;
 pub const TYPE_RESOLVE: u8 = 0x11;
 pub const TYPE_SUCCESSOR: u8 = 0x12;
 
+/// Capabilities one identity may publish alongside its endpoints (SIP-26).
+///
+/// Small on purpose. Advertising capability advertises attack surface — a
+/// version string tells an attacker which vulnerabilities apply — and an
+/// exchange makes that queryable for every identity at once, which a
+/// distributed set of signed records does not.
+pub const MAX_CAPABILITIES: usize = 8;
+/// Bytes one capability string may occupy.
+pub const MAX_CAPABILITY: usize = 64;
+
 /// Endpoints one identity may publish.
 ///
 /// Bounded because publication is self-asserted: an identity may name any
@@ -119,7 +129,7 @@ impl Endpoint {
     }
 }
 
-/// Publish this identity's endpoints.
+/// Publish this identity's endpoints, and what it speaks.
 ///
 /// **The whole set is replaced.** There is no partial update, and that is
 /// deliberate: partial updates require reconciliation, and reconciliation
@@ -129,6 +139,24 @@ impl Endpoint {
 pub struct Publish {
     pub ttl_secs: u32,
     pub endpoints: Vec<Endpoint>,
+    /// SIP-26: what this identity offers — an ALPN, a service name, a version.
+    ///
+    /// **Here rather than anywhere else because it has the same provenance as
+    /// the address it accompanies**, and splitting them across two mechanisms
+    /// would be the odd choice. SIP-26 spent most of its length arguing the
+    /// opposite, correctly, while resolution lived in a signed record: a signed
+    /// capability is replicated, cached, and still readable when the service is
+    /// down, and an exchange's answer is none of those. Once the address itself
+    /// became unsigned and transport-authenticated, that argument applied to
+    /// both halves or neither.
+    ///
+    /// The test that survives, and that every proposed field should meet:
+    /// **why can this not simply be published as part of the endpoint set?** A
+    /// field that needs different durability, a different signer or a different
+    /// lifetime does not belong here. Readiness is the example that fails it —
+    /// SIP-4's beacon flags already carry that, and it changes faster than a
+    /// publication.
+    pub capabilities: Vec<String>,
 }
 
 impl Publish {
@@ -139,6 +167,11 @@ impl Publish {
         out.push(self.endpoints.len() as u8);
         for e in &self.endpoints {
             e.write(&mut out);
+        }
+        out.push(self.capabilities.len() as u8);
+        for c in &self.capabilities {
+            out.push(c.len() as u8);
+            out.extend_from_slice(c.as_bytes());
         }
         out
     }
@@ -161,6 +194,7 @@ impl Publish {
         for _ in 0..count {
             endpoints.push(Endpoint::read(b, &mut o)?);
         }
+        let capabilities = read_capabilities(b, &mut o)?;
         if o != b.len() {
             return Err(Error::Malformed(format!(
                 "publish has {} trailing bytes",
@@ -168,6 +202,7 @@ impl Publish {
             )));
         }
         Ok(Publish {
+            capabilities,
             // Clamped rather than refused, the way SIP-16 clamps a fetch's
             // wait: a publisher asking to be believed for longer than this
             // exchange will believe anybody is not making an error.
@@ -175,6 +210,43 @@ impl Publish {
             endpoints,
         })
     }
+}
+
+/// Read a capability list, which `Publish` and `Resolved` share.
+fn read_capabilities(b: &[u8], o: &mut usize) -> Result<Vec<String>> {
+    if b.len() < *o + 1 {
+        return Err(Error::Malformed("capabilities are truncated".into()));
+    }
+    let count = b[*o] as usize;
+    *o += 1;
+    if count > MAX_CAPABILITIES {
+        return Err(Error::Malformed(format!(
+            "publish carries {count} capabilities, limit is {MAX_CAPABILITIES}"
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if b.len() < *o + 1 {
+            return Err(Error::Malformed("capability is truncated".into()));
+        }
+        let len = b[*o] as usize;
+        *o += 1;
+        if len > MAX_CAPABILITY {
+            return Err(Error::Malformed(format!(
+                "capability is {len} bytes, limit is {MAX_CAPABILITY}"
+            )));
+        }
+        if b.len() < *o + len {
+            return Err(Error::Malformed("capability is truncated".into()));
+        }
+        out.push(
+            std::str::from_utf8(&b[*o..*o + len])
+                .map_err(|_| Error::Malformed("capability is not UTF-8".into()))?
+                .to_string(),
+        );
+        *o += len;
+    }
+    Ok(out)
 }
 
 /// Ask where a key can be reached.
@@ -230,6 +302,9 @@ pub struct Resolved {
     /// The exchange's own clock. Staleness is computed against the observer's
     /// clock and not the consumer's, for the reason SIP-4 gives.
     pub now: u64,
+    /// SIP-26: what the identity said it speaks, with the same provenance and
+    /// the same expiry as the endpoints beside it.
+    pub capabilities: Vec<String>,
 }
 
 impl Resolved {
@@ -242,6 +317,7 @@ impl Resolved {
             expires_at: 0,
             last_seen: 0,
             now,
+            capabilities: Vec::new(),
         }
     }
 
@@ -256,6 +332,11 @@ impl Resolved {
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.extend_from_slice(&self.last_seen.to_be_bytes());
         out.extend_from_slice(&self.now.to_be_bytes());
+        out.push(self.capabilities.len() as u8);
+        for c in &self.capabilities {
+            out.push(c.len() as u8);
+            out.extend_from_slice(c.as_bytes());
+        }
         out
     }
 
@@ -274,17 +355,27 @@ impl Resolved {
         for _ in 0..count {
             endpoints.push(Endpoint::read(b, &mut o)?);
         }
-        if b.len() != o + 32 {
+        if b.len() < o + 32 {
             return Err(Error::Malformed("resolved is truncated".into()));
         }
         let at = |i: usize| u64::from_be_bytes(b[o + i..o + i + 8].try_into().unwrap());
+        let (published_at, expires_at, last_seen, now) = (at(0), at(8), at(16), at(24));
+        o += 32;
+        let capabilities = read_capabilities(b, &mut o)?;
+        if o != b.len() {
+            return Err(Error::Malformed(format!(
+                "resolved has {} trailing bytes",
+                b.len() - o
+            )));
+        }
         Ok(Resolved {
             found: b[0] != 0,
             endpoints,
-            published_at: at(0),
-            expires_at: at(8),
-            last_seen: at(16),
-            now: at(24),
+            published_at,
+            expires_at,
+            last_seen,
+            now,
+            capabilities,
         })
     }
 }
@@ -382,6 +473,7 @@ mod tests {
         };
         let p = Publish {
             ttl_secs: 300,
+            capabilities: vec![],
             endpoints: vec![v4(443), v6, named("ex.squic.org")],
         };
         assert_eq!(Publish::decode(&p.encode()).unwrap(), p);
@@ -397,6 +489,7 @@ mod tests {
     fn a_long_ttl_is_clamped_and_not_refused() {
         let p = Publish {
             ttl_secs: u32::MAX,
+            capabilities: vec![],
             endpoints: vec![v4(443)],
         };
         assert_eq!(Publish::decode(&p.encode()).unwrap().ttl_secs, MAX_TTL);
@@ -410,11 +503,13 @@ mod tests {
     fn more_endpoints_than_the_cap_is_refused() {
         let p = Publish {
             ttl_secs: 60,
+            capabilities: vec![],
             endpoints: (0..=MAX_ENDPOINTS).map(|i| v4(i as u16)).collect(),
         };
         assert!(Publish::decode(&p.encode()).is_err());
         let ok = Publish {
             ttl_secs: 60,
+            capabilities: vec![],
             endpoints: (0..MAX_ENDPOINTS).map(|i| v4(i as u16)).collect(),
         };
         assert_eq!(Publish::decode(&ok.encode()).unwrap(), ok);
@@ -426,6 +521,7 @@ mod tests {
     fn a_name_that_is_not_utf8_is_refused() {
         let bad = Publish {
             ttl_secs: 60,
+            capabilities: vec![],
             endpoints: vec![Endpoint {
                 kind: KIND_DNS,
                 host: vec![0xff, 0xfe],
@@ -438,6 +534,7 @@ mod tests {
         // And an over-long one, which a length byte alone would let through.
         let long = Publish {
             ttl_secs: 60,
+            capabilities: vec![],
             endpoints: vec![named(&"a".repeat(MAX_HOST + 1))],
         };
         assert!(Publish::decode(&long.encode()).is_err());
@@ -450,10 +547,63 @@ mod tests {
         // difference is why this refuses where a body type would not.
         let mut bytes = Publish {
             ttl_secs: 60,
+            capabilities: vec![],
             endpoints: vec![v4(443)],
         }
         .encode();
         bytes[6] = 9;
+        assert!(Publish::decode(&bytes).is_err());
+    }
+
+    /// SIP-26: capability travels with the address, expires with it, and has
+    /// the same provenance. Anything that wants a different lifetime, signer or
+    /// durability fails the test the SIP leaves behind and does not belong.
+    #[test]
+    fn capability_rides_with_the_endpoints_it_describes() {
+        let p = Publish {
+            ttl_secs: 300,
+            capabilities: vec!["sqssh/1".into(), "h3".into()],
+            endpoints: vec![v4(443)],
+        };
+        assert_eq!(Publish::decode(&p.encode()).unwrap(), p);
+
+        // And it is optional: an identity may say where it is without saying
+        // what it speaks, which is what every publisher did before SIP-26.
+        let bare = Publish {
+            ttl_secs: 300,
+            capabilities: vec![],
+            endpoints: vec![v4(443)],
+        };
+        assert_eq!(Publish::decode(&bare.encode()).unwrap(), bare);
+    }
+
+    #[test]
+    fn capability_is_bounded_in_count_and_in_length() {
+        let many = Publish {
+            ttl_secs: 60,
+            capabilities: (0..=MAX_CAPABILITIES).map(|i| format!("s/{i}")).collect(),
+            endpoints: vec![],
+        };
+        assert!(Publish::decode(&many.encode()).is_err());
+        let long = Publish {
+            ttl_secs: 60,
+            capabilities: vec!["x".repeat(MAX_CAPABILITY + 1)],
+            endpoints: vec![],
+        };
+        assert!(Publish::decode(&long.encode()).is_err());
+    }
+
+    #[test]
+    fn a_capability_that_is_not_text_is_refused() {
+        let mut bytes = Publish {
+            ttl_secs: 60,
+            capabilities: vec!["ok".into()],
+            endpoints: vec![],
+        }
+        .encode();
+        let at = bytes.len() - 2;
+        bytes[at] = 0xff;
+        bytes[at + 1] = 0xfe;
         assert!(Publish::decode(&bytes).is_err());
     }
 
@@ -466,6 +616,7 @@ mod tests {
             expires_at: 1_700_000_300,
             last_seen: 1_700_000_290,
             now: 1_700_000_295,
+            capabilities: vec!["sqssh/1".into(), "sqex-chat/2".into()],
         };
         assert_eq!(Resolved::decode(&r.encode()).unwrap(), r);
         let none = Resolved::none(1_700_000_000);
@@ -496,7 +647,7 @@ mod tests {
     /// else's address by accident.
     #[test]
     fn each_type_refuses_the_others() {
-        let p = Publish { ttl_secs: 60, endpoints: vec![v4(443)] }.encode();
+        let p = Publish { ttl_secs: 60, endpoints: vec![v4(443)], capabilities: vec![] }.encode();
         let r = Resolve { key: PubKey::new([1; 32]) }.encode();
         let s = Successor { successor: PubKey::new([2; 32]), reason: String::new() }.encode();
         assert!(Resolve::decode(&p).is_err());

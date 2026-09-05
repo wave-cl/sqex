@@ -164,6 +164,15 @@ enum ResolveCmd {
         /// `host:port` to advertise, repeatable. A bare IP or a DNS name.
         #[arg(required = true)]
         endpoint: Vec<String>,
+        /// What this identity speaks — an ALPN, a service name, a version.
+        /// Repeatable. Published alongside the addresses and expiring with
+        /// them, because it has the same provenance they do.
+        ///
+        /// **Advertising capability advertises attack surface.** A version
+        /// string tells an attacker which vulnerabilities apply, and an
+        /// exchange makes that queryable for every identity at once.
+        #[arg(short = 'c', long = "capability")]
+        capability: Vec<String>,
         /// How long the exchange should believe it, in seconds.
         #[arg(short = 't', long, default_value_t = 300)]
         ttl: u32,
@@ -752,7 +761,7 @@ fn show_endpoint(e: &Endpoint) -> String {
 
 async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), String> {
     match cmd {
-        ResolveCmd::Publish { endpoint: addrs, ttl } => {
+        ResolveCmd::Publish { endpoint: addrs, capability, ttl } => {
             // Publishing means connecting *as* the identity: the handshake is
             // what establishes which key is speaking, which is why nothing here
             // is signed and why a YubiKey cannot do it.
@@ -773,6 +782,7 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
             let req = ResolvePublish {
                 ttl_secs: *ttl,
                 endpoints,
+                capabilities: capability.clone(),
             };
             let (code, body) = client.post("/resolve/publish", req.encode()).await?;
             if code != 200 {
@@ -811,6 +821,9 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
             }
             for e in &r.endpoints {
                 println!("{}", show_endpoint(e));
+            }
+            if !r.capabilities.is_empty() {
+                println!("  speaks {}", r.capabilities.join(", "));
             }
             // The provenance, because an answer without it cannot be judged.
             // Ages against the exchange's clock, not this machine's, for the
