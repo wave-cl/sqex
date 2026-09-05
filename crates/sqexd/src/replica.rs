@@ -33,16 +33,39 @@
 //! would require the signed, portable statement about somebody that SIP-32
 //! refused to create.
 
+//! # The two halves
+//!
+//! [`take`] is the verification and storage half: given a batch and a way to
+//! resolve devices to accounts, it decides what may be written and writes it.
+//! It is synchronous and has no transport, which is what lets an equivocating
+//! origin be played against it in a test without writing a dishonest exchange.
+//!
+//! [`pull_once`] and [`run`] are the transport half, over
+//! [`crate::peer_client`] — the eighty lines of h3-over-sQUIC a replica needs,
+//! rather than a dependency on `sqnr` and, through it, on libpcsclite for a
+//! YubiKey no server touches.
+
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use sqex_proto::channel::{Entry, KIND_MEMBER};
+use sqex_proto::credential::SCOPE_CHAT;
+use sqex_proto::device::{Devices, ListDevices};
 use sqex_proto::entry_sig::{EntryTerms, Place, link, verify_entry, verify_entry_hashed};
-use sqex_proto::peer::Pulled;
+use sqex_proto::blob_store::blob_id;
+use sqex_proto::channel_key::{Envelope, verify_envelope};
+use sqex_proto::peer::{
+    BLOB_LIST, Hello, Hi, MAX_PULL, PEER_VERSION, Pull, PullBlob, PullEnvelopes, PullRecord,
+    Pulled, PulledBlob, PulledEnvelopes,
+};
+use sqex_proto::profile::Got as ProfileGot;
 use sqex_proto::receipt::{self, Branch, Equivocation, ReceiptTerms};
 use sha2::{Digest, Sha256};
 use sqnr_core::PubKey;
 
 use crate::channel::Channels;
+use crate::peer_client::PeerClient;
 
 /// One origin this exchange replicates from.
 #[derive(Debug, Clone)]
@@ -55,6 +78,7 @@ pub struct Origin {
     pub key: PubKey,
     pub addr: SocketAddr,
     pub channels: Vec<[u8; 32]>,
+    pub interval: std::time::Duration,
 }
 
 /// Why an entry was refused. Kept apart from the storage errors because these
@@ -263,4 +287,394 @@ pub fn entry_hash_of(place: &Place, e: &Entry) -> [u8; 32] {
         body: &e.body,
     };
     link(&terms.input_hashed(&e.body_hash))
+}
+
+/// Pull once from an origin and take what verifies.
+///
+/// A `Hello` first, so the two ends agree on a version and this replica learns
+/// the origin's own retention window before anything is asked for. It
+/// authenticates nothing — the sQUIC connection already did that, both ways.
+pub async fn pull_once(
+    client: &mut PeerClient,
+    server: &crate::server::Server,
+    origin: &Origin,
+) -> Result<HashMap<[u8; 32], Took>, String> {
+    let store = server.channels();
+    let (code, body) = client
+        .post(
+            "/peer/hello",
+            Hello { version: PEER_VERSION, since: 0 }.encode(),
+        )
+        .await?;
+    if code != 200 {
+        // The origin refuses every peering route identically, so this says
+        // "not served" and deliberately not why.
+        return Err(format!("the origin refused peering ({code})"));
+    }
+    let hi = Hi::decode(&body).map_err(|e| e.to_string())?;
+    if hi.exchange != origin.key {
+        // The connection was authenticated against the pinned key, so this
+        // cannot normally differ — and if it ever does, the party supplying the
+        // entries is not the party we pinned and nothing it says is checkable.
+        return Err("the origin reported an identity we did not pin".into());
+    }
+
+    let mut all = HashMap::new();
+    for channel in &origin.channels {
+        // **Stop pulling a channel this origin has already contradicted itself
+        // about.** SIP-35 requires it, and the reason is not squeamishness:
+        // continuing would accumulate history from a party already caught
+        // telling two of them, with no basis for preferring what comes next.
+        if store.equivocation_for(channel).is_some() {
+            continue;
+        }
+        let since = store.highest(channel);
+        let (code, body) = client
+            .post(
+                "/peer/pull",
+                Pull { channel: *channel, since, max: MAX_PULL }.encode(),
+            )
+            .await?;
+        if code != 200 {
+            // Not authorised, not held, or not served — which one is exactly
+            // what the origin declines to say, so this declines to guess.
+            continue;
+        }
+        let pulled = Pulled::decode(&body).map_err(|e| e.to_string())?;
+        if pulled.origin != origin.key {
+            return Err("a pull reported an origin we did not pin".into());
+        }
+
+        // SIP-31's step 2 needs a credential per device, and the devices are
+        // only known once the batch is in hand. Resolved before anything is
+        // verified, so `take` stays synchronous and testable without a network
+        // — and so a device appearing twice costs one lookup.
+        let mut creds: HashMap<PubKey, Option<PubKey>> = HashMap::new();
+        for e in &pulled.entries {
+            if e.kind == KIND_MEMBER && e.device != e.account && !creds.contains_key(&e.device) {
+                creds.insert(e.device, account_for(client, &e.device).await);
+            }
+        }
+        let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
+        let took = take(store, &origin.key, channel, &pulled, &lookup);
+
+        // The rest of what a member needs to actually read this channel here.
+        // Skipped when the origin has just been caught contradicting itself:
+        // there is no point accumulating more from a party already refused.
+        if !took.equivocated {
+            pull_envelopes(client, store, origin, channel, &pulled.instance).await;
+            pull_blobs(client, store, channel).await;
+            pull_profiles(client, server, store, channel).await;
+        }
+        all.insert(*channel, took);
+    }
+    Ok(all)
+}
+
+/// Pull a channel's SIP-17 key envelopes and keep the ones that verify.
+///
+/// **Each is checked under its publisher's key, not taken on the origin's
+/// word.** SIP-32 made an envelope a self-contained signed object for exactly
+/// this: a copy-holder can check it. An origin that substituted a key envelope
+/// on the way through would be caught here, and a replica that skipped the
+/// check would be handing members a key somebody else chose.
+async fn pull_envelopes(
+    client: &mut PeerClient,
+    store: &Channels,
+    origin: &Origin,
+    channel: &[u8; 32],
+    instance: &[u8; 32],
+) {
+    let Ok((200, body)) = client
+        .post(
+            "/peer/envelopes",
+            PullEnvelopes { channel: *channel, since_epoch: 0 }.encode(),
+        )
+        .await
+    else {
+        return;
+    };
+    let Ok(got) = PulledEnvelopes::decode(&body) else {
+        return;
+    };
+    for (epoch, e) in &got.envelopes {
+        if acceptable_envelope(&origin.key, instance, channel, *epoch, e) {
+            let _ = store.store_envelope(channel, *epoch, e);
+        } else {
+            tracing::warn!(
+                origin = %origin.key,
+                channel = %bs58::encode(channel).into_string(),
+                "an envelope did not verify under its publisher and was not stored"
+            );
+        }
+    }
+}
+
+/// Whether a pulled envelope may be stored.
+///
+/// A thin name over SIP-32's own check, and it exists as a name so a test can
+/// prove the replica *calls* it. The check itself is that the publisher signed
+/// this envelope for this place — an origin that substituted a key envelope on
+/// the way through changes the bytes the publisher signed over.
+pub fn acceptable_envelope(
+    origin: &PubKey,
+    instance: &[u8; 32],
+    channel: &[u8; 32],
+    epoch: u32,
+    e: &Envelope,
+) -> bool {
+    verify_envelope(origin, instance, channel, epoch, e)
+}
+
+/// Whether a pulled blob's bytes are the blob they were served as.
+///
+/// **This is the whole check a blob needs**, and the reason it carries no
+/// signature: SIP-18 names a blob by the hash of its ciphertext, so bytes that
+/// hash to the name *are* the blob and bytes that do not are something else.
+pub fn acceptable_blob(id: &[u8; 32], chunks: &[Vec<u8>]) -> bool {
+    &blob_id(chunks) == id
+}
+
+/// Pull a channel's blobs, keeping only those whose bytes hash to the id.
+///
+/// **This is why a blob needs no signature.** SIP-18 names a blob by the hash
+/// of its ciphertext, so a replica that recomputes the hash has checked
+/// everything there is to check — an origin cannot substitute a byte without
+/// changing the name.
+async fn pull_blobs(client: &mut PeerClient, store: &Channels, channel: &[u8; 32]) {
+    let Ok((200, body)) = client
+        .post(
+            "/peer/blobs",
+            PullBlob { channel: *channel, blob: [0; 32], chunk: BLOB_LIST }.encode(),
+        )
+        .await
+    else {
+        return;
+    };
+    let Ok(list) = PulledBlob::decode(&body) else {
+        return;
+    };
+    for (id, size, chunks) in list.blobs {
+        if store.holds_blob(&id) {
+            continue;
+        }
+        let mut sealed = Vec::with_capacity(chunks as usize);
+        for idx in 0..chunks {
+            let Ok((200, body)) = client
+                .post(
+                    "/peer/blobs",
+                    PullBlob { channel: *channel, blob: id, chunk: idx }.encode(),
+                )
+                .await
+            else {
+                break;
+            };
+            match PulledBlob::decode(&body) {
+                Ok(chunk) => sealed.push(chunk.sealed),
+                Err(_) => break,
+            }
+        }
+        if sealed.len() != chunks as usize {
+            continue;
+        }
+        if !acceptable_blob(&id, &sealed) {
+            tracing::warn!(
+                blob = %bs58::encode(id).into_string(),
+                "a pulled blob did not hash to its own name and was not stored"
+            );
+            continue;
+        }
+        let _ = store.store_blob(channel, &id, size, &sealed);
+    }
+}
+
+/// Pull the signed profile of every member this replica now derives.
+///
+/// Highest serial wins, which is the supersession rule `sqns` has used between
+/// servers since its first release and the one SIP-35 adopts wholesale. The
+/// origin's own store enforces it on the way in, so a replay of an older record
+/// changes nothing.
+async fn pull_profiles(
+    client: &mut PeerClient,
+    server: &crate::server::Server,
+    store: &Channels,
+    channel: &[u8; 32],
+) {
+    for account in store.members_of(channel) {
+        let Ok((200, body)) = client
+            .post("/peer/records", PullRecord { account }.encode())
+            .await
+        else {
+            continue;
+        };
+        let Ok(got) = ProfileGot::decode(&body) else {
+            continue;
+        };
+        // A record the subject signed, or nothing. `put` verifies it and
+        // refuses a lower serial than the one held.
+        if let Some(record) = got.record {
+            let _ = server.profiles().put(&account, &record);
+        }
+    }
+}
+
+/// Ask an origin which account a device belongs to, and **verify the credential
+/// it hands back** rather than trusting the mapping.
+///
+/// The registry is served on an ordinary client route, so a replica needs no
+/// peering privilege for SIP-31's step 2 — and what comes back is a signed
+/// SIP-20 artifact it checks for itself. SIP-20 puts the reason plainly: a
+/// credential naming an account the verifier did not ask about is not evidence
+/// of anything.
+pub async fn account_for(client: &mut PeerClient, device: &PubKey) -> Option<PubKey> {
+    // SIP-22 makes an account with no registered devices its own device, so the
+    // registry answers about a device key as readily as an account key, and the
+    // row that names this device is the one being looked for.
+    let (code, body) = client
+        .post("/device/list", ListDevices { account: *device }.encode())
+        .await
+        .ok()?;
+    if code != 200 {
+        return None;
+    }
+    let devices = Devices::decode(&body).ok()?;
+    for d in &devices.devices {
+        if &d.device == device
+            && let Some(c) = &d.credential
+            // Verified against the account the credential itself names, and
+            // the caller then checks that account against the entry's — SIP-20
+            // is explicit that a credential naming an account the verifier did
+            // not ask about is not evidence of anything.
+            && c.verify(&c.account, SCOPE_CHAT, devices.now).is_ok()
+        {
+            return Some(c.account);
+        }
+    }
+    None
+}
+
+/// Replicate from one origin, for as long as this exchange runs.
+///
+/// Redials on failure rather than giving up: an origin that is down is an
+/// availability problem, and outliving one is half the reason to replicate.
+/// Waits its interval between pulls, floored by SIP-35 at `PEER_MIN_INTERVAL`
+/// — a replica that hammered an origin would be a worse citizen than one that
+/// lagged.
+pub async fn run(server: Arc<crate::server::Server>, seed: [u8; 32], origin: Origin) {
+    loop {
+        match PeerClient::connect(origin.addr, origin.key.as_bytes(), &seed).await {
+            Err(e) => {
+                tracing::warn!(origin = %origin.key, error = %e, "cannot reach the origin");
+            }
+            Ok(mut client) => {
+                // One connection, many pulls: a fresh handshake per pull would
+                // cost more than the pull.
+                loop {
+                    match pull_once(&mut client, &server, &origin).await {
+                        Err(e) => {
+                            tracing::warn!(origin = %origin.key, error = %e, "pull failed");
+                            break;
+                        }
+                        Ok(took) => report(&origin, &took),
+                    }
+                    tokio::time::sleep(origin.interval).await;
+                }
+            }
+        }
+        tokio::time::sleep(origin.interval).await;
+    }
+}
+
+/// Say what a pull did, at the level each outcome deserves.
+///
+/// An equivocation is an error and is meant to be found in a log by somebody
+/// who was not looking for it — it is the finding this whole arrangement exists
+/// to produce, and a replica that noticed one quietly would have wasted the
+/// noticing.
+fn report(origin: &Origin, took: &HashMap<[u8; 32], Took>) {
+    for (channel, t) in took {
+        let channel = bs58::encode(channel).into_string();
+        if t.equivocated {
+            tracing::error!(
+                origin = %origin.key,
+                %channel,
+                "the origin equivocated: two receipts for one position, and this replica has the proof"
+            );
+        } else if !t.refused.is_empty() {
+            tracing::warn!(
+                origin = %origin.key, %channel,
+                stored = t.stored, refused = t.refused.len(),
+                "pulled, with entries refused"
+            );
+        } else if t.stored > 0 {
+            tracing::info!(origin = %origin.key, %channel, stored = t.stored, "pulled");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use sqex_proto::blob_store::blob_id;
+    use sqex_proto::channel_key::{ChannelKey, seal_envelope, sign_envelope};
+
+    /// **An envelope is checked under its publisher, not taken on the origin's
+    /// word.** SIP-32 made it a self-contained signed object precisely so a
+    /// copy-holder could check it; a replica that skipped this would be handing
+    /// members a channel key somebody else chose.
+    #[test]
+    fn an_envelope_the_publisher_did_not_sign_is_not_acceptable() {
+        let seed = [3u8; 32];
+        let recipient =
+            PubKey::new(SigningKey::from_bytes(&[4u8; 32]).verifying_key().to_bytes());
+        let origin = PubKey::new(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        let instance = [5u8; 32];
+        let channel = [6u8; 32];
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let prekey = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let good = sign_envelope(
+            &seed,
+            &origin,
+            &instance,
+            &channel,
+            1,
+            seal_envelope(&recipient, 7, &prekey, 1, &[ChannelKey::generate()]).unwrap(),
+        );
+        assert!(acceptable_envelope(&origin, &instance, &channel, 1, &good));
+
+        // Every term the signature binds, one at a time. An envelope that
+        // survived a changed channel or epoch would lift from one place into
+        // another, which is the whole reason those terms are in the input.
+        let mut tampered = good.clone();
+        tampered.ciphertext[0] ^= 1;
+        assert!(!acceptable_envelope(&origin, &instance, &channel, 1, &tampered));
+        assert!(!acceptable_envelope(&origin, &instance, &channel, 2, &good));
+        assert!(!acceptable_envelope(&origin, &instance, &[7u8; 32], 1, &good));
+        assert!(!acceptable_envelope(&origin, &[8u8; 32], &channel, 1, &good));
+        assert!(!acceptable_envelope(
+            &PubKey::new([1u8; 32]),
+            &instance,
+            &channel,
+            1,
+            &good
+        ));
+    }
+
+    /// A blob is its hash, so bytes that do not hash to the name are not the
+    /// blob — and the check needs no key, which is why blobs replicate at all.
+    #[test]
+    fn bytes_that_do_not_hash_to_the_name_are_not_the_blob() {
+        let chunks = vec![b"one".to_vec(), b"two".to_vec()];
+        let id = blob_id(&chunks);
+        assert!(acceptable_blob(&id, &chunks));
+
+        let mut altered = chunks.clone();
+        altered[1][0] ^= 1;
+        assert!(!acceptable_blob(&id, &altered));
+        // Order is part of the name: two chunks swapped are a different blob,
+        // and a replica that accepted them would hold a file nobody uploaded.
+        assert!(!acceptable_blob(&id, &[chunks[1].clone(), chunks[0].clone()]));
+        assert!(!acceptable_blob(&id, &chunks[..1]));
+    }
 }

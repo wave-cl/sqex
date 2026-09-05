@@ -1890,6 +1890,30 @@ async fn handle_key(
                     }),
                     Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
                 },
+                // SIP-35 requires this to be presented as publication to
+                // another operator rather than as a setting, and the wording
+                // here is that requirement: a replica learns the whole shape of
+                // the conversation, and there is no undo.
+                Command::Replicate(key, on) => match key.parse::<PubKey>() {
+                    Ok(who) => chat.replicate(&channel, &who, on).await.map(|()| {
+                        Some(if on {
+                            format!(
+                                "{} may now hold a copy of this conversation. It learns who \
+                                 is here, when, and how much was said — not what. This cannot \
+                                 be taken back: /unreplicate stops it receiving more and \
+                                 recalls nothing",
+                                short(&who)
+                            )
+                        } else {
+                            format!(
+                                "{} will receive nothing further. What it already holds was \
+                                 lawfully obtained and stays where it is",
+                                short(&who)
+                            )
+                        })
+                    }),
+                    Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+                },
                 Command::Rotate => chat.rotate(&channel).await.map(|epoch| {
                     Some(format!(
                         "rotated to epoch {epoch} — everyone here has the new key, \
@@ -2154,6 +2178,10 @@ enum Command {
     Invite(String),
     /// `/kick <key>` — remove somebody, and rotate so what follows is not theirs.
     Kick(String),
+    /// `/replicate <exchange key>` — let another exchange hold a copy of this
+    /// channel. `bool` is false for `/unreplicate`, which ends the
+    /// subscription and recalls nothing.
+    Replicate(String, bool),
     /// `/name <name>` — rename, as a sealed entry the exchange cannot read.
     Name(String),
     /// `/topic <text>` — set what this channel is for, likewise sealed.
@@ -2278,6 +2306,14 @@ impl Command {
             "/invite" => Command::Unknown("/invite needs a public key".into()),
             "/kick" if !first.is_empty() => Command::Kick(first.to_string()),
             "/kick" => Command::Unknown("/kick needs a public key".into()),
+            "/replicate" if !first.is_empty() => Command::Replicate(first.to_string(), true),
+            "/replicate" => Command::Unknown(
+                "/replicate needs an exchange's public key. It lets that exchange hold a \
+                 copy of this conversation, and cannot be undone"
+                    .into(),
+            ),
+            "/unreplicate" if !first.is_empty() => Command::Replicate(first.to_string(), false),
+            "/unreplicate" => Command::Unknown("/unreplicate needs an exchange's public key".into()),
             "/rotate" => Command::Rotate,
             "/leave" => Command::Leave,
             "/redact" => match first.parse::<u64>() {

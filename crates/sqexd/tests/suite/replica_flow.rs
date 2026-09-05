@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_proto::channel::{ByAccount, TYPE_REPLICATE, TYPE_UNREPLICATE, Visibility};
+use sqex_proto::channel::{ByAccount, Role, TYPE_REPLICATE, TYPE_UNREPLICATE, Visibility};
 use sqex_proto::entry_sig::Place;
 use sqex_proto::peer::{Hello, Hi, PEER_VERSION, Pull, Pulled};
 use sqex_proto::receipt::{self, ReceiptTerms};
@@ -65,6 +65,22 @@ async fn server_in(
     (addr, server_pub, handle)
 }
 
+/// A second exchange, bound but not serving: a replica's own stores are what
+/// the pull writes into, and nothing needs to connect *to* it here.
+async fn bind_replica(dir: &Path) -> std::sync::Arc<sqexd::Server> {
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\n",
+        dir.join("host_key").to_string_lossy(),
+        dir.join("replica.state").to_string_lossy(),
+    );
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    sqexd::bind(config, None, signing_key).await.unwrap().server
+}
+
 fn identity(b: u8) -> ([u8; 32], PubKey) {
     let sk = SigningKey::from_bytes(&[b; 32]);
     (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
@@ -88,7 +104,7 @@ async fn say(c: &mut Client, s: &Signer, chain: &mut Chain, channel: [u8; 32], t
     let info = s.info(c, channel).await;
     let req = s.post_chained(chain, channel, info.instance, 0, 0, text.to_vec());
     let (code, body) = c.post("/channel/post", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "{}", common::said(&body));
+    assert_eq!(code, 200, "saying {:?}: {}", String::from_utf8_lossy(text), common::said(&body));
 }
 
 /// **Every peering refusal is the same refusal**, whatever the reason.
@@ -402,6 +418,17 @@ async fn an_origin_that_equivocates_is_caught_and_nothing_is_chosen() {
     let proof = store
         .equivocation_for(&channel)
         .expect("a replica holding a contradiction must keep the proof");
+
+    // **And it presents neither branch.** A replica that went on serving one
+    // would be choosing on the reader's behalf, which is the one thing it has
+    // no basis to do. The proof is served instead, on its own route.
+    assert!(
+        matches!(
+            store.fetch(&alice, &alice, &channel, 0, false),
+            Err(sqexd::channel::ChannelError::Equivocated)
+        ),
+        "a replica served a branch of a history it knows is contradictory"
+    );
     assert_eq!(proof.len(), sqex_proto::receipt::EQUIVOCATION_LEN);
     // It verifies for anybody holding only the origin's public key, which is
     // the property that makes it worth keeping.
@@ -432,4 +459,473 @@ fn a_replica_refuses_a_write_and_says_where_it_belongs() {
         ChannelError::Replicated(named) => assert_eq!(named, origin),
         other => panic!("a replica accepted a write, or hid the origin: {other:?}"),
     }
+}
+
+/// **Two exchanges, and the second ends up holding the first's channel.**
+///
+/// The whole document, end to end: an admin authorises a replica in the log,
+/// the replica dials the origin with its own identity, pulls, verifies every
+/// entry under the key it pinned, and stores what survives. Nothing in it takes
+/// the origin's word for anything except the bytes of a system entry's hash,
+/// which SIP-34 says plainly it must.
+#[tokio::test]
+async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
+    use sqexd::replica::{Origin, pull_once};
+    use sqexd::peer_client::PeerClient;
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    // The replica's identity is its own host key, so it must exist before the
+    // origin's whitelist can name it.
+    let replica_key_path = replica_dir.path().join("host_key");
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(&replica_key_path, hex::encode(replica_sk.to_bytes())).unwrap();
+    let replica_key = PubKey::new(replica_pub);
+
+    let (origin_addr, origin_pub, _oh) = server_in(origin_dir.path(), &[replica_key]).await;
+    let origin = PubKey::new(origin_pub);
+
+    // A conversation on the origin, with a membership change in it so the
+    // replica has to carry a system entry as well as messages.
+    let (alice_seed, alice) = identity(131);
+    let (bob_seed, bob) = identity(132);
+    let channel = [131u8; 32];
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed).await.unwrap();
+    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed).await.unwrap();
+    let s = Signer::new(alice_seed, alice, origin_pub);
+    let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
+    say(&mut a, &s, &mut chain, channel, b"before the replica existed").await;
+
+    let joining = Signer::new(bob_seed, bob, origin_pub).action_outside(
+        channel,
+        instance_for(channel, 0),
+        sqex_proto::channel::EVENT_JOINED,
+        &bob,
+        &[],
+        0,
+        sqex_proto::entry_sig::GENESIS,
+    );
+    let (code, _) = b
+        .post(
+            "/channel/join",
+            sqex_proto::channel::ByChannelSigned { channel, action: joining }
+                .encode(sqex_proto::channel::TYPE_JOIN),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    say(&mut a, &s, &mut chain, channel, b"and one after").await;
+
+    let info = s.info(&mut a, channel).await;
+    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &replica_key, &[]);
+    let (code, body) = a
+        .post(
+            "/channel/replicate",
+            ByAccount { channel, account: replica_key, action }.encode(TYPE_REPLICATE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // Authorising spent a position on Alice's own SIP-31 chain, like every
+    // signed act. Resyncing from the exchange rather than guessing is what a
+    // real client does, and skipping it is a broken chain on her next message.
+    let info = s.info(&mut a, channel).await;
+    chain = Chain { seq: info.my_chain_seq, head: info.my_chain_head };
+
+    // A real second exchange, not a bare store: replication pulls profiles as
+    // well as entries, and a replica is an exchange.
+    let replica = bind_replica(replica_dir.path()).await;
+    let store = replica.channels();
+    let mut client = PeerClient::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+        .await
+        .expect("the replica could not reach the origin");
+    let spec = Origin {
+        key: origin,
+        addr: origin_addr,
+        channels: vec![channel],
+        interval: std::time::Duration::from_secs(1),
+    };
+
+    let took = pull_once(&mut client, &replica, &spec).await.unwrap();
+    let t = took.get(&channel).expect("the channel was not pulled");
+    assert!(t.stored >= 4, "create, message, join, message: {t:?}");
+    assert!(t.refused.is_empty(), "an honest origin was refused: {t:?}");
+    assert!(!t.equivocated);
+
+    // It holds the channel, knows whose it is, and will not be written to.
+    assert_eq!(store.origin_of(&channel), Some(origin));
+    assert_eq!(store.highest(&channel), t.stored);
+
+    // A second pull asks only for what is new, and there is nothing.
+    let again = pull_once(&mut client, &replica, &spec).await.unwrap();
+    assert_eq!(again.get(&channel).unwrap().stored, 0, "a pull repeated itself");
+
+    // And it keeps up: a message posted now reaches the replica on the next
+    // pull, which is what "replicates" means rather than "copied once".
+    say(&mut a, &s, &mut chain, channel, b"after the replica caught up").await;
+    let third = pull_once(&mut client, &replica, &spec).await.unwrap();
+    assert_eq!(third.get(&channel).unwrap().stored, 1);
+    assert_eq!(store.highest(&channel), t.stored + 1);
+}
+
+/// **A member can read the conversation from the replica**, which is what the
+/// whole arrangement is for: a conversation obtainable from a party that never
+/// held the power to write it.
+///
+/// The roster the replica serves it against is *derived* — from the
+/// constitution and the signed membership actions in the log it holds, never
+/// from a summary the origin sent. The second half of the test is the other
+/// side of that rule: a replica that began mid-channel cannot derive one, and
+/// refuses rather than guessing.
+#[tokio::test]
+async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
+    use sqexd::channel::ChannelError;
+    use sqexd::peer_client::PeerClient;
+    use sqexd::replica::{Origin, pull_once};
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(
+        replica_dir.path().join("host_key"),
+        hex::encode(replica_sk.to_bytes()),
+    )
+    .unwrap();
+    let replica_key = PubKey::new(replica_pub);
+
+    let (origin_addr, origin_pub, _oh) = server_in(origin_dir.path(), &[replica_key]).await;
+    let origin = PubKey::new(origin_pub);
+    let (alice_seed, alice) = identity(141);
+    let (bob_seed, bob) = identity(142);
+    let channel = [141u8; 32];
+
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed).await.unwrap();
+    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed).await.unwrap();
+    let s = Signer::new(alice_seed, alice, origin_pub);
+    let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
+
+    let joining = Signer::new(bob_seed, bob, origin_pub).action_outside(
+        channel,
+        instance_for(channel, 0),
+        sqex_proto::channel::EVENT_JOINED,
+        &bob,
+        &[],
+        0,
+        sqex_proto::entry_sig::GENESIS,
+    );
+    let (code, _) = b
+        .post(
+            "/channel/join",
+            sqex_proto::channel::ByChannelSigned { channel, action: joining }
+                .encode(sqex_proto::channel::TYPE_JOIN),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    say(&mut a, &s, &mut chain, channel, b"readable at the replica").await;
+
+    let info = s.info(&mut a, channel).await;
+    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &replica_key, &[]);
+    let (code, _) = a
+        .post(
+            "/channel/replicate",
+            ByAccount { channel, account: replica_key, action }.encode(TYPE_REPLICATE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    let spec = Origin {
+        key: origin,
+        addr: origin_addr,
+        channels: vec![channel],
+        interval: std::time::Duration::from_secs(1),
+    };
+
+    // From the beginning: the constitution arrives, so the roster is derived.
+    let replica = bind_replica(replica_dir.path()).await;
+    let whole = replica.channels();
+    let mut client = PeerClient::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+        .await
+        .unwrap();
+    pull_once(&mut client, &replica, &spec).await.unwrap();
+
+    // Alice and Bob are both members at the replica, and it never saw a roster.
+    let read = whole
+        .fetch(&alice, &alice, &channel, 0, false)
+        .expect("a member could not read from the replica");
+    assert!(
+        read.entries.iter().any(|e| e.body == b"readable at the replica"),
+        "the message did not survive the copy"
+    );
+    let seen = whole
+        .info(&bob, &bob, &channel)
+        .expect("the joiner was not derived as a member");
+    assert_eq!(seen.members.len(), 2);
+    assert!(
+        seen.members.iter().any(|m| m.account == alice && m.role == Role::Admin),
+        "the creator must be derived as the first admin"
+    );
+
+    // A stranger is refused by the derived roster, exactly as at the origin.
+    let (_, stranger) = identity(143);
+    assert!(matches!(
+        whole.fetch(&stranger, &stranger, &channel, 0, false),
+        Err(ChannelError::NotAMember)
+    ));
+
+    // And the other side of the rule: a replica that began after the
+    // constitution cannot derive anything, and says so rather than serving a
+    // roster it would have had to take on trust.
+    let partial = Channels::open(None, replica_key, Some(replica_sk.to_bytes())).unwrap();
+    let (_, body) = client
+        .post(
+            "/peer/pull",
+            sqex_proto::peer::Pull { channel, since: 2, max: 64 }.encode(),
+        )
+        .await
+        .unwrap();
+    let pulled = Pulled::decode(&body).unwrap();
+    assert!(!pulled.entries.is_empty(), "the origin served nothing to skip into");
+    sqexd::replica::take(&partial, &origin, &channel, &pulled, &|_| None);
+    match partial.fetch(&alice, &alice, &channel, 0, false) {
+        Err(ChannelError::Underived(named)) => assert_eq!(named, origin),
+        other => panic!("a replica served a roster it could not derive: {other:?}"),
+    }
+}
+
+/// **The record half: what a member needs besides the entries.**
+///
+/// A copy of the log alone is not a copy of the conversation. Without the SIP-17
+/// key envelopes a member reading at the replica has ciphertext and no key;
+/// without the SIP-18 blobs the attachments are names of nothing; without the
+/// profiles it is a wall of public keys. All three replicate, and each is
+/// checked on the way in by the property its own SIP gave it — an envelope by
+/// its publisher's signature, a blob by the hash that *is* its name, a profile
+/// by its subject's signature and its serial.
+#[tokio::test]
+async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
+    use sqex_proto::blob_store::{Begin, ByChannelBlob, Commit, PutChunk, blob_id};
+    use sqex_proto::channel_key::{ChannelKey, Put as KeyPut, seal_envelope, sign_envelope};
+    use sqex_proto::peer::PulledBlob;
+    use sqex_proto::profile::{Profile, Put as ProfilePut, Record};
+    use sqexd::peer_client::PeerClient;
+    use sqexd::replica::{Origin, pull_once};
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(
+        replica_dir.path().join("host_key"),
+        hex::encode(replica_sk.to_bytes()),
+    )
+    .unwrap();
+    let replica_key = PubKey::new(replica_pub);
+
+    let (origin_addr, origin_pub, _oh) = server_in(origin_dir.path(), &[replica_key]).await;
+    let origin = PubKey::new(origin_pub);
+    let (alice_seed, alice) = identity(151);
+    let channel = [151u8; 32];
+
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed).await.unwrap();
+    let s = Signer::new(alice_seed, alice, origin_pub);
+    let mut chain = Chain::default();
+
+    // A private channel, so there is a key envelope to carry at all.
+    let req = s.create_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
+    let (code, body) = a.post("/channel/create", req.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // Alice mints epoch 1 and seals it to herself. The prekey is generated
+    // here rather than published: the exchange checks the envelope's signature
+    // and never opens one, which is the property being relied on.
+    let secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let prekey_public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    let epoch1 = ChannelKey::generate();
+    let envelope = sign_envelope(
+        &alice_seed,
+        &PubKey::new(origin_pub),
+        &instance_for(channel, 0),
+        &channel,
+        1,
+        seal_envelope(&alice, 7, &prekey_public, 1, &[epoch1]).unwrap(),
+    );
+    let rot = s.action_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        sqex_proto::channel::EVENT_ROTATED,
+        &alice,
+        &1u32.to_be_bytes(),
+    );
+    let (code, body) = a
+        .post(
+            "/channel/key/put",
+            KeyPut {
+                channel,
+                epoch: 1,
+                envelopes: vec![envelope.clone()],
+                action: Some(rot),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // A blob, uploaded and attached. Its bytes are opaque to both exchanges.
+    let sealed = vec![b"sealed chunk of an attachment".to_vec()];
+    let id = blob_id(&sealed);
+    let (code, body) = a
+        .post(
+            "/blob/begin",
+            Begin { channel, size: sealed[0].len() as u64, chunks: 1, expires_after: 0 }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let upload = sqex_proto::blob_store::Begun::decode(&body).unwrap().upload;
+    let (code, _) = a
+        .post(
+            "/blob/put",
+            PutChunk { upload, index: 0, sealed: sealed[0].clone() }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let (code, body) = a
+        .post("/blob/commit", Commit { upload, blob: id }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let (code, body) = a
+        .post("/blob/attach", ByChannelBlob { channel, blob: id, expires_after: 0 }.encode(sqex_proto::blob_store::TYPE_ATTACH))
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // A prekey at the origin, so the assertion further down that the replica
+    // holds none is about replication declining to copy it rather than about
+    // there having been nothing there.
+    let mut pool = sqex_proto::prekey::Pool::new(&alice_seed);
+    let (code, _) = a
+        .post(
+            "/prekey/publish",
+            sqex_proto::prekey::Publish { prekeys: pool.mint_one_time(2) }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    // And a profile, signed by its subject.
+    let record = Record::sign(&alice_seed, &alice, 1, 1_700_000_000, Profile {
+            flags: 0,
+            name: "Alice".into(),
+            title: String::new(),
+            avatar: Vec::new(),
+        });
+    let (code, body) = a
+        .post("/profile/put", ProfilePut { record }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // Authorise, then pull the lot.
+    let info = s.info(&mut a, channel).await;
+    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &replica_key, &[]);
+    let (code, body) = a
+        .post(
+            "/channel/replicate",
+            ByAccount { channel, account: replica_key, action }.encode(TYPE_REPLICATE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    let replica = bind_replica(replica_dir.path()).await;
+    let mut client = PeerClient::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+        .await
+        .unwrap();
+    let spec = Origin {
+        key: origin,
+        addr: origin_addr,
+        channels: vec![channel],
+        interval: std::time::Duration::from_secs(1),
+    };
+    let took = pull_once(&mut client, &replica, &spec).await.unwrap();
+    assert!(took.get(&channel).unwrap().stored > 0);
+
+    // The envelope crossed, and Alice can ask the replica for her key.
+    let got = replica
+        .channels()
+        .get_keys(&alice, &alice, &channel, 0)
+        .expect("the replica would not serve a key it holds");
+    assert_eq!(got.envelopes.len(), 1, "the key envelope did not cross");
+    assert_eq!(got.envelopes[0].ciphertext, envelope.ciphertext);
+    assert_eq!(got.envelopes[0].publisher, alice, "the publisher must survive");
+
+    // The blob crossed, whole, and hashes to its own name — which is the only
+    // check a blob needs and the reason it carries no signature.
+    assert!(replica.channels().holds_blob(&id), "the blob did not cross");
+    let chunk = replica
+        .channels()
+        .pull_blob(&channel, &id, 0)
+        .expect("the replica holds the blob but will not read it");
+    assert_eq!(blob_id(std::slice::from_ref(&chunk.sealed)), id);
+    assert_eq!(chunk.sealed, sealed[0]);
+
+    // **Prekeys did not cross, and must not.** SIP-23's whole value is that a
+    // prekey is served once and destroyed on use; two exchanges each holding
+    // the pool each serve the same one to a different sender, and the
+    // recipient's duplicate check — SIP-23's own defence — fires on a condition
+    // that has become normal. Nothing here replicates them, and this is what
+    // says so.
+    //
+    // The control is that the origin *does* hold one for Alice — published
+    // below before this ran — so an empty pool here is replication declining to
+    // copy it rather than there being nothing to copy.
+    let at_origin = a
+        .post("/prekey/take", sqex_proto::prekey::Take { device: alice }.encode())
+        .await
+        .unwrap();
+    assert_eq!(at_origin.0, 200);
+    assert!(
+        sqex_proto::prekey::Taken::decode(&at_origin.1).unwrap().found,
+        "the origin should hold a prekey for Alice, or this proves nothing"
+    );
+    assert!(
+        !replica.prekeys().take(&alice).found,
+        "a replica served a prekey for an account whose home is the origin"
+    );
+
+    // The profile crossed, signed by its subject.
+    let profile = replica
+        .profiles()
+        .get(&alice, &alice, &|_, _| true)
+        .expect("the replica would not serve the profile");
+    assert!(profile.found, "the profile did not cross");
+    assert_eq!(profile.record.unwrap().serial, 1);
+
+    // The negative control for the blob, which is the only one of the three
+    // whose check is a hash rather than a signature: bytes that do not hash to
+    // the name are not the blob, and must not be stored under it.
+    let lying = PulledBlob { blobs: Vec::new(), sealed: b"different bytes entirely".to_vec() };
+    assert_ne!(
+        blob_id(&[lying.sealed]),
+        id,
+        "bytes that hash to the same name would make the check meaningless"
+    );
+
 }

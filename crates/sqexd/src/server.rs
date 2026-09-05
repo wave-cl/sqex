@@ -20,7 +20,7 @@ use crate::beacon::Beacons;
 use crate::admission::Admissions;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
-use crate::config::Config;
+use crate::config::{Config, OriginConfig};
 use crate::device::Registry;
 use crate::events::Subscribers;
 use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
@@ -37,6 +37,7 @@ use sqex_proto::channel::{
     ByAccount as ChannelByAccount, Invite as ChannelInvite, List as ChannelList, Mine as ChannelMine,
     Directory as ChannelDirectory, Post as ChannelPost, TYPE_REMOVE as CH_REMOVE,
     TYPE_REPLICATE as CH_REPLICATE, TYPE_UNREPLICATE as CH_UNREPLICATE,
+    TYPE_EQUIVOCATION as CH_EQUIVOCATION,
     Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
@@ -50,7 +51,9 @@ use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
 use sqex_proto::message::{RING_RINGING, Signal};
-use sqex_proto::peer::{Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull};
+use sqex_proto::peer::{
+    Hello as PeerHello, Hi, PEER_VERSION, PullBlob, PullEnvelopes, PullRecord, Pull as PeerPull,
+};
 use sqex_proto::device::{
     AdmissionRequest, ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke,
 };
@@ -207,9 +210,31 @@ pub struct Server {
     /// peering routes; it gives it no channel, which takes a signed
     /// authorisation from one of that channel's admins.
     replication_peers: Vec<PubKey>,
+    /// SIP-35: the origins this one replicates *from*, and the seed it dials
+    /// them with — its own SIP-9 identity, because a peering connection is an
+    /// ordinary SIP-3 one and an exchange's identity is that key.
+    replicate: Vec<OriginConfig>,
+    exchange_seed: [u8; 32],
 }
 
 impl Server {
+    /// The channel store, for the replication tasks `serve` spawns — and for
+    /// tests, which is why this crate is a library at all.
+    pub fn channels(&self) -> &Channels {
+        &self.channels
+    }
+
+    /// The profile store, for the same reason.
+    pub fn profiles(&self) -> &Profiles {
+        &self.profiles
+    }
+
+    /// The prekey pool. Exposed so a test can assert that replication does not
+    /// fill it, which is SIP-35's sharpest refusal and is invisible otherwise.
+    pub fn prekeys(&self) -> &Prekeys {
+        &self.prekeys
+    }
+
     fn is_admin(&self, key: &PubKey) -> bool {
         self.admins.read().unwrap().iter().any(|a| a == key)
     }
@@ -335,6 +360,8 @@ pub async fn bind(
         admins: RwLock::new(config.admins),
         welcome: None,
         replication_peers: config.replication_peers.clone(),
+        replicate: config.replicate.clone(),
+        exchange_seed: signing_key.to_bytes(),
         transport: Arc::clone(&listener),
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
@@ -452,6 +479,31 @@ pub async fn serve(bound: Bound) -> Result<()> {
         "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");
+
+    // SIP-35. One task per origin, each dialling with this exchange's own
+    // identity so the origin's whitelist can see who is asking. Started before
+    // the accept loop because a replica is useful whether or not anybody is
+    // talking to *it* — outliving an origin's availability is half the reason
+    // to hold a copy.
+    for origin in &server.replicate {
+        let task = crate::replica::Origin {
+            key: origin.origin,
+            addr: origin.addr,
+            channels: origin.channels.clone(),
+            interval: origin.interval,
+        };
+        tracing::info!(
+            origin = %origin.origin,
+            addr = %origin.addr,
+            channels = origin.channels.len(),
+            "replicating"
+        );
+        tokio::spawn(crate::replica::run(
+            Arc::clone(&server),
+            server.exchange_seed,
+            task,
+        ));
+    }
 
     let accept_loop = async {
         loop {
@@ -1480,6 +1532,63 @@ async fn route(
                     // Not `refused(e)`: the cause is exactly what must not
                     // leak. A peer that got this far is authorised, and
                     // anything still wrong is this exchange's problem.
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+
+        // SIP-35: the proof, for a client whose fetch was refused because this
+        // exchange holds two histories for one position. **Served rather than
+        // resolved**: a replica has no basis to decide which branch is real,
+        // and picking one would turn evidence into a disagreement between two
+        // honest-looking servers. Open to any member, because the artifact is
+        // checkable by anybody holding the origin's public key and is worth
+        // nothing kept private.
+        ("POST", "/channel/equivocation") => match (account, ByChannel::decode(body, CH_EQUIVOCATION)) {
+            (None, _) => no_identity("reading an equivocation"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(_), Ok(req)) => match server.channels.equivocation_for(&req.channel) {
+                Some(proof) => (200, "application/octet-stream", proof),
+                None => refuse(404, Code::NoSuchChannel, None),
+            },
+        },
+
+        ("POST", "/peer/envelopes") => match (peer.identity, PullEnvelopes::decode(body)) {
+            (Some(who), Ok(req))
+                if server.replication_peers.contains(&who)
+                    && server.channels.replicates_to(&req.channel, &who) =>
+            {
+                match server.channels.pull_envelopes(&req.channel, req.since_epoch) {
+                    Ok(got) => (200, "application/octet-stream", got.encode()),
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+        ("POST", "/peer/blobs") => match (peer.identity, PullBlob::decode(body)) {
+            (Some(who), Ok(req))
+                if server.replication_peers.contains(&who)
+                    && server.channels.replicates_to(&req.channel, &who) =>
+            {
+                match server.channels.pull_blob(&req.channel, &req.blob, req.chunk) {
+                    Ok(got) => (200, "application/octet-stream", got.encode()),
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+        // A peer is not a person and has no standing of its own: what it may
+        // hold is what the members of the channels it carries could already
+        // see. So a withheld profile is served to it only where the subject is
+        // in one of those channels, which is SIP-21's "shares a channel" rule
+        // read through the authorisation.
+        ("POST", "/peer/records") => match (peer.identity, PullRecord::decode(body)) {
+            (Some(who), Ok(req)) if server.replication_peers.contains(&who) => {
+                match server.profiles.get(&who, &req.account, &|_, subject| {
+                    server.channels.shares_replicated(&who, subject)
+                }) {
+                    Ok(got) => (200, "application/octet-stream", got.encode()),
                     Err(_) => peering_refused(),
                 }
             }

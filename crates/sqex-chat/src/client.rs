@@ -8,7 +8,9 @@
 use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
     EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
-    EVENT_REMOVED, EVENT_RENAMED,
+    EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_UNREPLICATE, TYPE_EQUIVOCATION,
+    TYPE_REPLICATE,
+    TYPE_UNREPLICATE,
     EVENT_RETENTION, EVENT_ROTATED,
     Entries, Entry, Fetch, Invite, Invitee, constitution,
     KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
@@ -22,7 +24,7 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
 use sqex_proto::refusal::{Code as RefusalCode, Refusal};
-use sqex_proto::receipt::{self, ReceiptTerms};
+use sqex_proto::receipt::{self, Equivocation, ReceiptTerms};
 use sqex_proto::entry_sig::{
     ActionTerms, EntryTerms, GENESIS, Place, link, sign_action, sign_entry, verify_entry,
     verify_entry_hashed,
@@ -192,6 +194,18 @@ pub enum ChatError {
     AlreadyKeyed(u32),
     /// The operation is an admin's and this account is not one.
     NotAnAdmin,
+    /// SIP-35: this exchange holds two receipts for one position from the
+    /// channel's origin, and will present neither branch as the conversation.
+    ///
+    /// **Surfaced rather than worked around.** The proof is 376 bytes anybody
+    /// holding the origin's public key can check, and it is carried here so a
+    /// person can be shown it and can pass it on — the whole value of the
+    /// artifact is that it travels.
+    ///
+    /// Boxed because it is 376 bytes and every other variant is small: an
+    /// error type is returned from every call on this client, and one variant
+    /// should not set the size of all of them.
+    Equivocated(Box<Equivocation>),
     /// The other party has published no prekeys, so SIP-23 forbids sealing to
     /// them at all. Not an error in the conversation — the channel exists and
     /// they are in it — but nothing can be said until they start their client.
@@ -263,6 +277,19 @@ impl std::fmt::Display for ChatError {
                  replace it — if they cannot open it, rotate to hand out a new key"
             ),
             ChatError::NotAnAdmin => write!(f, "that is an admin's to do, and you are not one"),
+            // Said plainly, and without deciding anything. Neither branch is
+            // shown, because a client that picked one would be resolving on the
+            // reader's behalf a contradiction only the exchange could have
+            // created.
+            ChatError::Equivocated(p) => write!(
+                f,
+                "this exchange signed two different histories for position {} of this \
+                 conversation. It is not a disagreement to resolve — one party made both \
+                 claims — so nothing here is being shown as the conversation. The proof is \
+                 {} bytes and anybody holding the exchange's key can check it",
+                p.seq,
+                sqex_proto::receipt::EQUIVOCATION_LEN
+            ),
             ChatError::NotReady(who) => write!(
                 f,
                 "{who} has not started their client yet, so there is nowhere to send a \
@@ -2212,6 +2239,48 @@ impl Chat {
         Ok(())
     }
 
+    /// SIP-35: authorise, or withdraw, another exchange's right to hold a copy
+    /// of this channel.
+    ///
+    /// **This is publication to another operator, not a setting.** A replica
+    /// learns the whole shape of the conversation — who is a member, when each
+    /// joined, who posted and when, and how large every message was — and
+    /// `unreplicate` ends a subscription rather than recalling a copy. SIP-35
+    /// requires an implementation to present it that way, so a caller
+    /// surfacing this to a person must say so; there is no undo below this
+    /// line, and there cannot be.
+    ///
+    /// The authorisation is a signed entry, so it lands in the log the members
+    /// already read. An arrangement between two operators would have been
+    /// simpler and would have made a channel's copies invisible to the people
+    /// in it.
+    pub async fn replicate(
+        &mut self,
+        channel: &[u8; 32],
+        replica: &PubKey,
+        authorise: bool,
+    ) -> Result<()> {
+        let (event, path, type_byte) = if authorise {
+            (EVENT_REPLICATE, "/channel/replicate", TYPE_REPLICATE)
+        } else {
+            (EVENT_UNREPLICATE, "/channel/unreplicate", TYPE_UNREPLICATE)
+        };
+        let info = self.info(channel).await?;
+        let (action, head) = self.sign_action_at(channel, &info, event, replica, &[])?;
+        self.post(
+            path,
+            ByAccount {
+                channel: *channel,
+                account: *replica,
+                action,
+            }
+            .encode(type_byte),
+        )
+        .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
+        Ok(())
+    }
+
     /// Leave a channel.
     pub async fn leave(&mut self, channel: &[u8; 32]) -> Result<()> {
         let info = self.info(channel).await?;
@@ -2845,6 +2914,21 @@ impl Chat {
             .await;
     }
 
+    /// Ask an exchange for the proof behind an `equivocated` refusal.
+    ///
+    /// Checked here, not displayed on trust: `Equivocation::decode` verifies
+    /// both signatures, so a client cannot be talked into accusing an exchange
+    /// by an exchange that simply said so.
+    async fn equivocation(&mut self, channel: &[u8; 32]) -> Result<Equivocation> {
+        let body = self
+            .post(
+                "/channel/equivocation",
+                ByChannel { channel: *channel }.encode(TYPE_EQUIVOCATION),
+            )
+            .await?;
+        Equivocation::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
     /// SIP-36: invite this channel to a call, and return where the invitation
     /// landed along with the room secret.
     ///
@@ -2961,6 +3045,16 @@ impl Chat {
                 self.receipts.store(false, Ordering::Relaxed);
                 req.receipts = false;
                 self.post_within("/channel/fetch", req.encode(), patience).await?
+            }
+            // SIP-35: the exchange is refusing to choose between two histories
+            // its origin signed for one position. Fetch what it has instead of
+            // reporting a bare refusal — a reader told only "no" learns
+            // nothing, and this is the one refusal that comes with evidence.
+            Err(ChatError::Refused(_, r)) if r.code == RefusalCode::Equivocated => {
+                return Err(match self.equivocation(channel).await {
+                    Ok(proof) => ChatError::Equivocated(Box::new(proof)),
+                    Err(e) => e,
+                });
             }
             Err(e) => return Err(e),
         };

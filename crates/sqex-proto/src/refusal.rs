@@ -95,6 +95,12 @@ pub enum Code {
     /// SIP-35: a write to a channel this exchange only replicates. The detail
     /// carries the origin's key, which is where the write belongs.
     Replicated,
+    /// SIP-35: a read of a replicated channel whose membership the replica
+    /// cannot derive. The detail carries the origin's key.
+    Underived,
+    /// SIP-35: this exchange holds two receipts for one position from the
+    /// channel's origin, and will present neither branch as the conversation.
+    Equivocated,
 
     // SIP-18 blobs.
     NoSuchUpload,
@@ -178,6 +184,8 @@ impl Code {
             Code::NoReceipts => 55,
             Code::TooManyReplicas => 56,
             Code::Replicated => 57,
+            Code::Underived => 58,
+            Code::Equivocated => 59,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -254,6 +262,8 @@ impl Code {
             55 => Code::NoReceipts,
             56 => Code::TooManyReplicas,
             57 => Code::Replicated,
+            58 => Code::Underived,
+            59 => Code::Equivocated,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -330,6 +340,8 @@ impl Code {
             Code::NoReceipts => "no_receipts",
             Code::TooManyReplicas => "too_many_replicas",
             Code::Replicated => "replicated",
+            Code::Underived => "underived",
+            Code::Equivocated => "equivocated",
 
             Code::NoSuchUpload => "no_such_upload",
             Code::NoSuchBlob => "no_such_blob",
@@ -402,6 +414,8 @@ impl Code {
         Code::NoReceipts,
         Code::TooManyReplicas,
         Code::Replicated,
+        Code::Underived,
+        Code::Equivocated,
         Code::NoSuchUpload,
         Code::NoSuchBlob,
         Code::BadChunk,

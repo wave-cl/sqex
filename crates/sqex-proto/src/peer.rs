@@ -31,6 +31,7 @@
 use sqnr_core::{Error, PubKey, Result};
 
 use crate::channel::{Entry, Receipted, Tip};
+use crate::channel_key::{Envelope, read_envelope_with_recipient, write_envelope};
 
 /// Maximum entries one `Pull` may ask for.
 pub const MAX_PULL: u16 = 256;
@@ -52,6 +53,9 @@ pub const PEER_VERSION: u8 = 1;
 
 pub const TYPE_HELLO: u8 = 0x01;
 pub const TYPE_PULL: u8 = 0x02;
+pub const TYPE_ENVELOPES: u8 = 0x03;
+pub const TYPE_BLOB: u8 = 0x04;
+pub const TYPE_RECORD: u8 = 0x05;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -359,5 +363,245 @@ mod tests {
         extra.push(0);
         assert!(Pulled::decode(&extra).is_err());
         assert!(Pulled::decode(&got.encode()[..40]).is_err());
+    }
+}
+
+/// SIP-35: pull a channel's SIP-17 key envelopes.
+///
+/// Every recipient's, not one — a replica holds the channel for its members and
+/// cannot open any of them. Each is a signed SIP-32 artifact the replica
+/// verifies for itself, which is what stops a dishonest origin substituting a
+/// key envelope on the way through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullEnvelopes {
+    pub channel: [u8; 32],
+    pub since_epoch: u32,
+}
+
+/// Bytes a `PullEnvelopes` occupies.
+pub const PULL_ENVELOPES_LEN: usize = 1 + 32 + 4;
+
+impl PullEnvelopes {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PULL_ENVELOPES_LEN);
+        out.push(TYPE_ENVELOPES);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.since_epoch.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullEnvelopes> {
+        if b.len() != PULL_ENVELOPES_LEN {
+            return Err(Error::Malformed(format!(
+                "envelope pull is {} bytes, want {PULL_ENVELOPES_LEN}",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_ENVELOPES {
+            return Err(Error::Malformed(format!(
+                "not an envelope pull (type {:#x})",
+                b[0]
+            )));
+        }
+        Ok(PullEnvelopes {
+            channel: b[1..33].try_into().unwrap(),
+            since_epoch: u32::from_be_bytes(b[33..37].try_into().unwrap()),
+        })
+    }
+}
+
+/// One envelope as a peer receives it: the epoch its `Put` was made at, which
+/// is bound into the signature and which a peer has no other way to know, and
+/// the envelope itself with its recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledEnvelopes {
+    pub now: u64,
+    pub envelopes: Vec<(u32, Envelope)>,
+}
+
+impl PulledEnvelopes {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.envelopes.len() as u16).to_be_bytes());
+        for (epoch, e) in &self.envelopes {
+            out.extend_from_slice(&epoch.to_be_bytes());
+            write_envelope(e, &mut out);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PulledEnvelopes> {
+        if b.len() < 10 {
+            return Err(Error::Malformed("pulled envelopes is truncated".into()));
+        }
+        let count = u16::from_be_bytes(b[8..10].try_into().unwrap()) as usize;
+        if count > MAX_PULL as usize {
+            return Err(Error::Malformed(format!(
+                "pulled envelopes holds {count}, limit is {MAX_PULL}"
+            )));
+        }
+        let mut o = 10;
+        let mut envelopes = Vec::with_capacity(count);
+        for _ in 0..count {
+            if b.len() < o + 4 {
+                return Err(Error::Malformed("pulled envelopes is truncated".into()));
+            }
+            let epoch = u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+            o += 4;
+            envelopes.push((epoch, read_envelope_with_recipient(b, &mut o)?));
+        }
+        if o != b.len() {
+            return Err(Error::Malformed(format!(
+                "pulled envelopes has {} trailing bytes",
+                b.len() - o
+            )));
+        }
+        Ok(PulledEnvelopes {
+            now: u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            envelopes,
+        })
+    }
+}
+
+/// SIP-35: pull a blob, or the list of a channel's blobs.
+///
+/// **A replica cannot read a private channel's bodies**, so it cannot see which
+/// attachments they reference. The origin knows — it registers every attachment
+/// against its channel for quota and collection — so it lists them. `chunk` is
+/// `u32::MAX` to ask for that list rather than for bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullBlob {
+    pub channel: [u8; 32],
+    pub blob: [u8; 32],
+    pub chunk: u32,
+}
+
+/// `chunk` value that asks for a channel's blob list rather than for bytes.
+pub const BLOB_LIST: u32 = u32::MAX;
+/// Bytes a `PullBlob` occupies.
+pub const PULL_BLOB_LEN: usize = 1 + 32 + 32 + 4;
+
+impl PullBlob {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PULL_BLOB_LEN);
+        out.push(TYPE_BLOB);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.blob);
+        out.extend_from_slice(&self.chunk.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullBlob> {
+        if b.len() != PULL_BLOB_LEN {
+            return Err(Error::Malformed(format!(
+                "blob pull is {} bytes, want {PULL_BLOB_LEN}",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_BLOB {
+            return Err(Error::Malformed(format!("not a blob pull (type {:#x})", b[0])));
+        }
+        Ok(PullBlob {
+            channel: b[1..33].try_into().unwrap(),
+            blob: b[33..65].try_into().unwrap(),
+            chunk: u32::from_be_bytes(b[65..69].try_into().unwrap()),
+        })
+    }
+}
+
+/// A channel's blobs, or one chunk of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PulledBlob {
+    /// Present when the request asked for the list.
+    pub blobs: Vec<([u8; 32], u64, u32)>,
+    /// Present when it asked for bytes: the sealed chunk, opaque here.
+    pub sealed: Vec<u8>,
+}
+
+impl PulledBlob {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.blobs.len() as u16).to_be_bytes());
+        for (id, size, chunks) in &self.blobs {
+            out.extend_from_slice(id);
+            out.extend_from_slice(&size.to_be_bytes());
+            out.extend_from_slice(&chunks.to_be_bytes());
+        }
+        out.extend_from_slice(&(self.sealed.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.sealed);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PulledBlob> {
+        if b.len() < 2 {
+            return Err(Error::Malformed("pulled blob is truncated".into()));
+        }
+        let count = u16::from_be_bytes(b[0..2].try_into().unwrap()) as usize;
+        let mut o = 2;
+        let mut blobs = Vec::with_capacity(count);
+        for _ in 0..count {
+            if b.len() < o + 44 {
+                return Err(Error::Malformed("pulled blob list is truncated".into()));
+            }
+            blobs.push((
+                b[o..o + 32].try_into().unwrap(),
+                u64::from_be_bytes(b[o + 32..o + 40].try_into().unwrap()),
+                u32::from_be_bytes(b[o + 40..o + 44].try_into().unwrap()),
+            ));
+            o += 44;
+        }
+        if b.len() < o + 4 {
+            return Err(Error::Malformed("pulled blob is truncated".into()));
+        }
+        let len = u32::from_be_bytes(b[o..o + 4].try_into().unwrap()) as usize;
+        o += 4;
+        if b.len() != o + len {
+            return Err(Error::Malformed("pulled blob length disagrees".into()));
+        }
+        Ok(PulledBlob {
+            blobs,
+            sealed: b[o..o + len].to_vec(),
+        })
+    }
+}
+
+/// SIP-35: pull one account's signed profile record.
+///
+/// The record half in miniature, and the one artifact whose supersession rule
+/// this document borrows wholesale: highest serial wins, as `sqns` has done
+/// between servers since its first release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullRecord {
+    pub account: PubKey,
+}
+
+/// Bytes a `PullRecord` occupies.
+pub const PULL_RECORD_LEN: usize = 1 + 32;
+
+impl PullRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PULL_RECORD_LEN);
+        out.push(TYPE_RECORD);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullRecord> {
+        if b.len() != PULL_RECORD_LEN {
+            return Err(Error::Malformed(format!(
+                "record pull is {} bytes, want {PULL_RECORD_LEN}",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_RECORD {
+            return Err(Error::Malformed(format!(
+                "not a record pull (type {:#x})",
+                b[0]
+            )));
+        }
+        Ok(PullRecord {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
     }
 }

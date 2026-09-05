@@ -476,6 +476,27 @@ impl Put {
     }
 }
 
+/// Write one envelope, recipient included.
+///
+/// Exposed for SIP-35: a peer is served every recipient's envelope rather than
+/// its own, so it needs the field `Got` omits.
+pub fn write_envelope(e: &Envelope, out: &mut Vec<u8>) {
+    out.extend_from_slice(e.recipient.as_bytes());
+    out.extend_from_slice(e.publisher.as_bytes());
+    out.extend_from_slice(&e.sig);
+    out.extend_from_slice(&e.from_epoch.to_be_bytes());
+    out.extend_from_slice(&e.to_epoch.to_be_bytes());
+    out.extend_from_slice(&e.prekey_id.to_be_bytes());
+    out.extend_from_slice(&e.ephemeral);
+    out.extend_from_slice(&(e.ciphertext.len() as u32).to_be_bytes());
+    out.extend_from_slice(&e.ciphertext);
+}
+
+/// The pair to [`write_envelope`].
+pub fn read_envelope_with_recipient(b: &[u8], o: &mut usize) -> Result<Envelope> {
+    read_envelope(b, o, true)
+}
+
 fn read_envelope(b: &[u8], o: &mut usize, with_recipient: bool) -> Result<Envelope> {
     let head = if with_recipient { ENVELOPE_HEADER } else { ENVELOPE_HEADER - 32 };
     if b.len() < *o + head {

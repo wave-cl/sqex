@@ -83,6 +83,8 @@ pub const TYPE_REPLICATE: u8 = 0x15;
 /// SIP-35: withdraw that authorisation. **Not a recall** — a replica stops
 /// accepting new entries, and what it holds was lawfully obtained.
 pub const TYPE_UNREPLICATE: u8 = 0x16;
+/// SIP-35: ask for the proof that this exchange's origin equivocated.
+pub const TYPE_EQUIVOCATION: u8 = 0x17;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.

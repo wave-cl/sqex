@@ -82,6 +82,42 @@ pub struct FileConfig {
     /// identically.
     #[serde(default)]
     pub replication_peers: Vec<String>,
+
+    /// SIP-35: origins this exchange replicates *from*.
+    ///
+    /// The other direction from `replication_peers`, and both ends of a link
+    /// need their own entry: an origin lists the peer it will serve, and the
+    /// replica lists the origin it pulls from. Neither implies the other, and
+    /// neither is enough on its own — the origin's members must also have
+    /// signed a `0x0b` for each channel.
+    #[serde(default)]
+    pub replicate: Vec<FileOrigin>,
+}
+
+/// One origin to replicate from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileOrigin {
+    /// The origin's base58 Ed25519 identity — its SIP-9 key.
+    ///
+    /// **Pinned from here and never taken from the wire.** SIP-35 calls this
+    /// the trap in the whole document: a replica that accepted the signing key
+    /// from the party supplying the entries has been handed the forgery power
+    /// the design spends its length removing.
+    pub origin: String,
+    /// `host:port` to dial.
+    pub addr: String,
+    /// Base58 channel identifiers to pull. A channel the origin has not
+    /// authorised us for is refused, in the same words as everything else.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Seconds between pulls. Clamped up to SIP-35's `PEER_MIN_INTERVAL`.
+    #[serde(default = "default_pull_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_pull_interval() -> u64 {
+    30
 }
 
 /// Configuration with everything parsed and resolved.
@@ -97,6 +133,16 @@ pub struct Config {
     pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
     pub replication_peers: Vec<PubKey>,
+    pub replicate: Vec<OriginConfig>,
+}
+
+/// One resolved origin to replicate from.
+#[derive(Debug, Clone)]
+pub struct OriginConfig {
+    pub origin: PubKey,
+    pub addr: SocketAddr,
+    pub channels: Vec<[u8; 32]>,
+    pub interval: std::time::Duration,
 }
 
 impl FileConfig {
@@ -129,6 +175,33 @@ impl FileConfig {
             ));
         }
 
+        let mut replicate = Vec::new();
+        for r in self.replicate {
+            let origin = r
+                .origin
+                .parse::<PubKey>()
+                .map_err(|e| Error::Key(format!("replicate.origin {}: {e}", r.origin)))?;
+            let addr = parse_listen(&r.addr)?;
+            let mut channels = Vec::new();
+            for c in &r.channels {
+                let key = c
+                    .parse::<PubKey>()
+                    .map_err(|e| Error::Key(format!("replicate.channels {c}: {e}")))?;
+                channels.push(*key.as_bytes());
+            }
+            replicate.push(OriginConfig {
+                origin,
+                addr,
+                channels,
+                // Clamped rather than refused: an operator asking to pull more
+                // often than SIP-35 permits is not making an error, and a
+                // replica that hammered an origin would be one.
+                interval: std::time::Duration::from_secs(
+                    r.interval_secs.max(sqex_proto::peer::PEER_MIN_INTERVAL),
+                ),
+            });
+        }
+
         Ok(Config {
             listen,
             key_file: self.key_file,
@@ -139,6 +212,7 @@ impl FileConfig {
             welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
             replication_peers,
+            replicate,
         })
     }
 }

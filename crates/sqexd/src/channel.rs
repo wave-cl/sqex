@@ -55,7 +55,9 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::entry_sig::{ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry};
 use sqex_proto::message::SIGNAL_CALL_STATE;
-use sqex_proto::peer::{MAX_PULL, MAX_PULL_BYTES, MAX_REPLICAS, Pulled};
+use sqex_proto::peer::{
+    BLOB_LIST, MAX_PULL, MAX_PULL_BYTES, MAX_REPLICAS, Pulled, PulledBlob, PulledEnvelopes,
+};
 use sqex_proto::receipt::{self, HEAD_GENESIS, ReceiptTerms};
 use sqnr_core::PubKey;
 use tokio::sync::Notify;
@@ -121,6 +123,15 @@ pub enum ChannelError {
     /// SIP-35: a write to a channel this exchange only replicates, naming the
     /// origin so the caller can go and do it where it can be done.
     Replicated(PubKey),
+    /// SIP-35: a read of a replicated channel whose membership this replica
+    /// cannot derive, because it does not hold the channel's constitution.
+    /// Names the origin, which does.
+    Underived(PubKey),
+    /// SIP-35: this replica holds two receipts for one position under the
+    /// origin's key, and **will not present either branch as the
+    /// conversation**. The proof is served on its own route; a client that
+    /// wants to know why asks for it.
+    Equivocated,
     /// SIP-34: a receipted request to an exchange that cannot issue receipts.
     ///
     /// Refused rather than answered in the unreceipted shape, so a response's
@@ -155,6 +166,8 @@ impl ChannelError {
             ChannelError::NoReceipts => "no_receipts",
             ChannelError::TooManyReplicas => "too_many_replicas",
             ChannelError::Replicated(_) => "replicated",
+            ChannelError::Underived(_) => "underived",
+            ChannelError::Equivocated => "equivocated",
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
@@ -198,6 +211,8 @@ impl ChannelError {
             ChannelError::NoReceipts => Code::NoReceipts,
             ChannelError::TooManyReplicas => Code::TooManyReplicas,
             ChannelError::Replicated(_) => Code::Replicated,
+            ChannelError::Underived(_) => Code::Underived,
+            ChannelError::Equivocated => Code::Equivocated,
             ChannelError::Storage => Code::Storage,
         }
     }
@@ -220,7 +235,10 @@ impl ChannelError {
             | ChannelError::TooManyReplicas => 507,
             // Not a conflict and not a refusal of authority: the caller asked
             // the wrong exchange, and the answer says which is the right one.
-            ChannelError::Replicated(_) => 421,
+            ChannelError::Replicated(_) | ChannelError::Underived(_) => 421,
+            // Not the caller's fault and not a conflict with state: the state
+            // itself is contradictory, and saying so is the whole point.
+            ChannelError::Equivocated => 409,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
@@ -496,6 +514,14 @@ CREATE TABLE IF NOT EXISTS replicated (
     -- pulled entries the origin has since pruned, which is half the reason to
     -- replicate — and must not claim those are still available there.
     window_secs INTEGER NOT NULL,
+    -- Whether this replica holds the channel's constitution (SIP-32's
+    -- `created`), and therefore whether its roster is *derived* rather than
+    -- guessed at. **A replica whose history is too short to derive membership
+    -- refuses the channel rather than falling back on the origin's summary** —
+    -- serving a private channel on the strength of an unsigned roster is
+    -- exactly the trust SIP-35 exists to avoid, and the failure is safe in the
+    -- right direction.
+    derivable INTEGER NOT NULL DEFAULT 0,
     -- Set when this replica holds two receipts for one position under the
     -- origin's key. It stops accepting entries for the channel and **does not
     -- choose** between the branches: picking one silently converts evidence
@@ -1390,6 +1416,12 @@ impl Channels {
     ) -> Result<Entries, ChannelError> {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
+        // SIP-35: a replica serves only what it can vouch for, and **will not
+        // choose** between two histories an origin signed for one position.
+        // Picking one silently would convert evidence into a disagreement
+        // between two honest-looking servers.
+        Channels::not_equivocated(&db, channel)?;
+        Channels::derivable(&db, channel)?;
         if role_of(&db, channel, caller).is_none() {
             return Err(ChannelError::NotAMember);
         }
@@ -1781,6 +1813,12 @@ impl Channels {
     ) -> Result<ChannelInfo, ChannelError> {
         let db = self.db.lock().unwrap();
         let (visibility, epoch, retention, _) = channel_row(&db, channel)?;
+        Channels::not_equivocated(&db, channel)?;
+        // SIP-35: the same rule as `fetch`. A replica that cannot derive the
+        // roster must not describe the channel either — a member list is the
+        // roster, and serving one it could not derive would be the origin's
+        // summary wearing this exchange's name.
+        Channels::derivable(&db, channel)?;
         if role_of(&db, channel, caller).is_none() && !is_admin(&db, channel, caller) {
             return Err(ChannelError::NotAMember);
         }
@@ -2303,6 +2341,202 @@ impl Channels {
         })
     }
 
+    /// SIP-35: every key envelope a channel holds, for a peer.
+    ///
+    /// Every recipient's, not one — a replica holds the channel on behalf of
+    /// its members and can open none of them. Each carries the epoch its `Put`
+    /// was made at, because that is bound into the SIP-32 signature and a peer
+    /// has no other way to know it.
+    pub fn pull_envelopes(
+        &self,
+        channel: &[u8; 32],
+        since_epoch: u32,
+    ) -> Result<PulledEnvelopes, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        let mut stmt = db
+            .prepare(
+                "SELECT epoch, recipient, publisher, sig, from_epoch, to_epoch,
+                        prekey_id, ephemeral, ciphertext FROM envelope
+                 WHERE channel = ?1 AND to_epoch >= ?2 ORDER BY epoch ASC LIMIT ?3",
+            )
+            .map_err(storage("prepare envelope pull"))?;
+        let rows = stmt
+            .query_map(
+                params![&channel[..], since_epoch as i64, MAX_PULL as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u32,
+                        Envelope {
+                            recipient: PubKey::new(
+                                r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32]),
+                            ),
+                            publisher: PubKey::new(
+                                r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32]),
+                            ),
+                            sig: r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 64]),
+                            from_epoch: r.get::<_, i64>(4)? as u32,
+                            to_epoch: r.get::<_, i64>(5)? as u32,
+                            prekey_id: r.get::<_, i64>(6)? as u32,
+                            ephemeral: r.get::<_, Vec<u8>>(7)?.try_into().unwrap_or([0; 32]),
+                            ciphertext: r.get(8)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(storage("query envelope pull"))?;
+        Ok(PulledEnvelopes {
+            now: now_unix(),
+            envelopes: rows.filter_map(|r| r.ok()).collect(),
+        })
+    }
+
+    /// Store one envelope pulled from an origin, its signature already checked.
+    pub fn store_envelope(
+        &self,
+        channel: &[u8; 32],
+        epoch: u32,
+        e: &Envelope,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO envelope
+                (channel, recipient, publisher, sig, epoch, from_epoch, to_epoch,
+                 prekey_id, ephemeral, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &channel[..],
+                e.recipient.as_bytes(),
+                e.publisher.as_bytes(),
+                &e.sig[..],
+                epoch as i64,
+                e.from_epoch as i64,
+                e.to_epoch as i64,
+                e.prekey_id as i64,
+                &e.ephemeral[..],
+                &e.ciphertext,
+            ],
+        )
+        .map_err(storage("store pulled envelope"))?;
+        Ok(())
+    }
+
+    /// SIP-35: the blobs attached to a channel, or one sealed chunk of one.
+    ///
+    /// **The origin lists them because a replica cannot.** Attachments are
+    /// named inside SIP-19 bodies, which are sealed in a private channel, so a
+    /// replica reading the log sees no blob identifiers at all. The exchange
+    /// registers every attachment against its channel for quota and collection
+    /// and therefore knows the set without reading anything.
+    pub fn pull_blob(
+        &self,
+        channel: &[u8; 32],
+        blob: &[u8; 32],
+        chunk: u32,
+    ) -> Result<PulledBlob, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if chunk == BLOB_LIST {
+            let mut stmt = db
+                .prepare(
+                    "SELECT b.id, b.size, b.chunks FROM blob b
+                     JOIN attachment a ON a.blob = b.id
+                     WHERE a.channel = ?1 ORDER BY b.id ASC LIMIT ?2",
+                )
+                .map_err(storage("prepare blob list"))?;
+            let rows = stmt
+                .query_map(params![&channel[..], MAX_PULL as i64], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]),
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u32,
+                    ))
+                })
+                .map_err(storage("query blob list"))?;
+            return Ok(PulledBlob {
+                blobs: rows.filter_map(|r| r.ok()).collect(),
+                sealed: Vec::new(),
+            });
+        }
+        // Attached to *this* channel, so a peer authorised for one channel
+        // cannot use the route to read blobs from another.
+        let attached: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM attachment WHERE channel = ?1 AND blob = ?2",
+                params![&channel[..], &blob[..]],
+                |r| r.get(0),
+            )
+            .map_err(storage("check attachment"))?;
+        if attached == 0 {
+            return Err(ChannelError::NoSuchBlob);
+        }
+        let sealed: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT sealed FROM blob_chunk WHERE blob = ?1 AND idx = ?2",
+                params![&blob[..], chunk as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read chunk"))?;
+        Ok(PulledBlob {
+            blobs: Vec::new(),
+            sealed: sealed.ok_or(ChannelError::NoSuchBlob)?,
+        })
+    }
+
+    /// Whether this exchange already holds a blob's bytes, so a replica does
+    /// not re-pull one it has.
+    pub fn holds_blob(&self, blob: &[u8; 32]) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM blob WHERE id = ?1",
+            params![&blob[..]],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// Store a blob a replica pulled, once its id has been checked against the
+    /// hash of the chunks — which is what makes a blob need no signature.
+    pub fn store_blob(
+        &self,
+        channel: &[u8; 32],
+        blob: &[u8; 32],
+        size: u64,
+        chunks: &[Vec<u8>],
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin store blob"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO blob (id, size, chunks) VALUES (?1, ?2, ?3)",
+            params![&blob[..], size as i64, chunks.len() as i64],
+        )
+        .map_err(storage("store blob"))?;
+        for (i, sealed) in chunks.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO blob_chunk (blob, idx, sealed) VALUES (?1, ?2, ?3)",
+                params![&blob[..], i as i64, sealed],
+            )
+            .map_err(storage("store chunk"))?;
+        }
+        // Attached with no uploader and no timer: a replica did not receive
+        // this from anybody and has no per-message timer to honour — the
+        // origin's `expires_after` follows the *entry*, and the entry came
+        // with its own.
+        tx.execute(
+            "INSERT OR IGNORE INTO attachment
+                (channel, blob, attached, expires_after, uploader)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![&channel[..], &blob[..], now_unix() as i64, &[0u8; 32][..]],
+        )
+        .map_err(storage("attach pulled blob"))?;
+        tx.commit().map_err(storage("commit store blob"))?;
+        Ok(())
+    }
+
     /// SIP-35: authorise or withdraw replication of this channel to a replica.
     ///
     /// **The disclosure belongs to the members, not to the operator.** An
@@ -2380,6 +2614,27 @@ impl Channels {
         Ok(())
     }
 
+    /// Whether `subject` is a present member of any channel replicated to
+    /// `peer`.
+    ///
+    /// The peering analogue of SIP-21's "shares a channel", and it decides
+    /// whether a withheld profile is served to a replica. A replica is not a
+    /// person and has no standing of its own; what it may hold is what the
+    /// members of the channels it carries could already see.
+    pub fn shares_replicated(&self, peer: &PubKey, subject: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM member m JOIN replica r ON r.channel = m.channel
+             WHERE m.account = ?1 AND m.present = 1 AND r.peer = ?2",
+            params![subject.as_bytes(), peer.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
     /// Whether `peer` holds a surviving authorisation for this channel.
     ///
     /// **The only question the pull route asks about a channel**, and it is
@@ -2419,6 +2674,13 @@ impl Channels {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin adopt"))?;
+        // **This exchange's own window, not the origin's.** SIP-35 lets a
+        // replica hold *more* than the origin does — it pulled entries the
+        // origin has since pruned, and outliving that window is half the reason
+        // to replicate — so the local row keeps this exchange's own policy and
+        // the origin's window is recorded separately, to be reported as the
+        // origin's and never as this one's. A per-entry `expires_after` still
+        // binds: that one follows the entry rather than the channel.
         tx.execute(
             "INSERT OR IGNORE INTO channel
                 (id, visibility, retention_secs, max_entries, name, topic, epoch,
@@ -2427,7 +2689,7 @@ impl Channels {
             params![
                 &channel[..],
                 Visibility::Private as i64,
-                window_secs as i64,
+                MAX_RETENTION as i64,
                 MAX_ENTRIES as i64,
                 origin.as_bytes(),
                 now as i64,
@@ -2469,6 +2731,53 @@ impl Channels {
         }
     }
 
+    /// Refuse to serve a channel whose origin has contradicted itself.
+    ///
+    /// SIP-35 requires a client receiving an `Equivocation` to surface it and
+    /// **MUST NOT present either branch as the conversation**. A replica that
+    /// went on serving one branch would be making that choice on the reader's
+    /// behalf, which is exactly what it has no basis to do.
+    fn not_equivocated(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+        let held: Option<Option<Vec<u8>>> = db
+            .query_row(
+                "SELECT equivocation FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read equivocation"))?;
+        match held.flatten() {
+            None => Ok(()),
+            Some(_) => Err(ChannelError::Equivocated),
+        }
+    }
+
+    /// Whether this exchange may serve a channel it replicates.
+    ///
+    /// `Ok(())` for a channel it originated, and for a replicated one whose
+    /// roster it derived from the constitution onward. `Err` where replication
+    /// began mid-channel or the origin had already pruned: **a replica that
+    /// cannot derive membership refuses the channel rather than falling back
+    /// on the origin's summary.**
+    fn derivable(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+        let row: Option<(Vec<u8>, i64)> = db
+            .query_row(
+                "SELECT origin, derivable FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage("read derivable"))?;
+        match row {
+            // Not replicated: this exchange wrote the roster itself.
+            None => Ok(()),
+            Some((_, 1)) => Ok(()),
+            Some((origin, _)) => Err(ChannelError::Underived(PubKey::new(
+                origin.try_into().unwrap_or([0; 32]),
+            ))),
+        }
+    }
+
     /// The origin of a channel this exchange replicates, if it replicates it.
     pub fn origin_of(&self, channel: &[u8; 32]) -> Option<PubKey> {
         let db = self.db.lock().unwrap();
@@ -2480,6 +2789,26 @@ impl Channels {
         .optional()
         .ok()
         .flatten()
+    }
+
+    /// The origin's own retention window for a channel this exchange
+    /// replicates.
+    ///
+    /// Reported as the origin's. A replica that presented it as its own would
+    /// be describing somebody else's policy, and one that presented *its* window
+    /// as the origin's would be claiming entries are still available there when
+    /// they may not be.
+    pub fn origin_window(&self, channel: &[u8; 32]) -> Option<u32> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT window_secs FROM replicated WHERE channel = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|w| w as u32)
     }
 
     /// The SIP-34 proof this replica holds for a channel, if it has caught the
@@ -2571,6 +2900,24 @@ impl Channels {
             ],
         )
         .map_err(storage("store pulled entry"))?;
+        // **Membership is derived here, from the signed action, and never from
+        // a roster the origin sent.** SIP-35 is explicit: a replica works out
+        // who may read a channel from the constitution event and the signed
+        // membership actions in the log it holds. Serving a private channel on
+        // the strength of an unsigned summary is precisely the trust the
+        // document exists to avoid.
+        if e.kind == KIND_SYSTEM
+            && let Ok(Some(sys)) = System::decode(&e.body)
+        {
+            derive_membership(&tx, channel, &sys, e.posted)?;
+            if sys.event == EVENT_CREATED {
+                tx.execute(
+                    "UPDATE replicated SET derivable = 1 WHERE channel = ?1",
+                    params![&channel[..]],
+                )
+                .map_err(storage("mark derivable"))?;
+            }
+        }
         // The replica's head follows the origin's, because it *is* the
         // origin's: a replica never advances a head of its own.
         tx.execute(
@@ -3473,6 +3820,67 @@ fn advance_chain(
         params![&channel[..], device.as_bytes(), chain_seq as i64, &link(input)[..]],
     )
     .map_err(storage("advance chain"))?;
+    Ok(())
+}
+
+/// Apply one signed membership action to a replica's local roster.
+///
+/// The rules mirror the origin's own, because they are the same rules read from
+/// the same events — this is a *derivation*, not a second policy. Nothing here
+/// consults anything the origin asserted: every input is a field of an entry
+/// whose signature has already been checked.
+///
+/// An event this build does not know is ignored rather than refused, which is
+/// SIP-16's own rule for its system space and is what lets a replica hold a
+/// channel from an origin one version ahead of it.
+fn derive_membership(
+    db: &Connection,
+    channel: &[u8; 32],
+    sys: &System,
+    posted: u64,
+) -> Result<(), ChannelError> {
+    let present = |role: Role| -> Result<(), ChannelError> {
+        db.execute(
+            "INSERT INTO member (channel, account, role, joined, present)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT (channel, account) DO UPDATE SET present = 1",
+            params![&channel[..], sys.subject.as_bytes(), role as i64, posted as i64],
+        )
+        .map_err(storage("derive membership"))?;
+        Ok(())
+    };
+    match sys.event {
+        // The creator is the channel's first admin, and the constitution is
+        // what makes the whole derivation possible: without it a replica cannot
+        // know where the roster started.
+        EVENT_CREATED => {
+            db.execute(
+                "INSERT INTO member (channel, account, role, joined, present)
+                 VALUES (?1, ?2, ?3, ?4, 1)
+                 ON CONFLICT (channel, account) DO UPDATE SET role = ?3, present = 1",
+                params![
+                    &channel[..],
+                    sys.actor.as_bytes(),
+                    Role::Admin as i64,
+                    posted as i64
+                ],
+            )
+            .map_err(storage("derive creator"))?;
+        }
+        EVENT_ADDED | EVENT_JOINED => present(Role::Member)?,
+        EVENT_PROMOTED => present(Role::Admin)?,
+        EVENT_DEMOTED => present(Role::Member)?,
+        // Presence and authority are different things here exactly as they are
+        // at an origin: leaving a public channel does not surrender a role.
+        EVENT_LEFT | EVENT_REMOVED => {
+            db.execute(
+                "UPDATE member SET present = 0 WHERE channel = ?1 AND account = ?2",
+                params![&channel[..], sys.subject.as_bytes()],
+            )
+            .map_err(storage("derive departure"))?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
