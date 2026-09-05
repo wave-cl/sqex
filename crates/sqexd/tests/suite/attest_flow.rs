@@ -308,18 +308,37 @@ async fn an_expired_statement_is_not_served() {
     let (_, bob) = who(82);
     let mut c = Client::connect(addr, &server_pub).await.unwrap();
 
-    // Lodged while valid, with a window that closes a second later.
+    // Lodged while valid. The window was one second, and that was a race: it
+    // has to survive a lodge and a read, and on a loaded CI runner those two
+    // round trips took longer than the window, so the statement had already
+    // expired by the assertion below. The test then failed for precisely the
+    // reason it is named after, which is a confusing way to learn that a
+    // margin was too thin. Five seconds is five times the interval that
+    // actually broke it.
     let a = Attestation::sign(
         &alice_seed,
         &bob,
         CLAIM_KNOWN_AS,
         b"Bob".to_vec(),
         now() - 2,
-        now() + 1,
+        now() + 5,
     );
     let (code, _) = c.post("/attest/lodge", a.encode()).await.unwrap();
     assert_eq!(code, 200);
     assert_eq!(read(&mut c, bob, None).await.attestations.len(), 1);
+
+    // The claim this test is named for, which until now it never actually
+    // made. It checked only that an *already*-expired statement is refused at
+    // lodge, which is a different code path -- the read-side filter that drops
+    // a statement stored while valid, once its window closes, had no test at
+    // all. The one-second window looks like it was meant to expire here, but
+    // nothing ever waited for it to.
+    tokio::time::sleep(std::time::Duration::from_millis(5500)).await;
+    assert_eq!(
+        read(&mut c, bob, None).await.attestations.len(),
+        0,
+        "a statement was still served after its window closed"
+    );
 
     // One whose window has already closed is refused outright rather than
     // stored and filtered later.
