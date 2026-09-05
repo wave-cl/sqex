@@ -421,7 +421,7 @@ async fn a_tombstone_keeps_a_signature_that_still_verifies() {
     a_room(&mut a, &s, &mut chain, channel).await;
     let said = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 0, b"regret".to_vec());
     let (_, body) = a.post("/channel/post", said.encode()).await.unwrap();
-    let seq = sqex_proto::channel::Posted::decode(&body).unwrap().seq;
+    let seq = sqex_proto::channel::Posted::decode(&body, false).unwrap().seq;
 
     let (code, _) = a
         .post(
@@ -434,10 +434,10 @@ async fn a_tombstone_keeps_a_signature_that_still_verifies() {
     assert_eq!(code, 200);
 
     let (_, body) = a
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let tomb = seen.entries.iter().find(|e| e.seq == seq).expect("the tombstone is gone");
     assert!(tomb.body.is_empty(), "the body survived the redaction");
     assert_ne!(tomb.sig, [0u8; 64], "the signature was cleared with the body");
@@ -491,6 +491,7 @@ async fn an_unsigned_entry_is_refused() {
         chain_seq: 0,
         prev: [0; 32],
         sig: [0; 64],
+        receipts: false,
         body: b"nobody vouched for this".to_vec(),
     };
     let (code, body) = a.post("/channel/post", bare.encode()).await.unwrap();
@@ -609,10 +610,10 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
     assert_eq!(hand.post("/channel/post", two.encode()).await.unwrap().0, 200);
 
     let (_, body) = desk
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let mine: Vec<_> = seen
         .entries
         .iter()
@@ -718,10 +719,10 @@ async fn a_channel_always_opens_with_a_signed_event() {
     a_room(&mut a, &signer(server_pub, 111), &mut chain, channel).await;
 
     let (_, body) = a
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     assert_eq!(seen.entries.len(), 1, "an empty channel wrote no origin");
 
     let opening = sqex_proto::channel::System::decode(&seen.entries[0].body)
@@ -775,10 +776,10 @@ async fn a_rename_is_recorded_and_signed() {
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let (_, body) = a
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let events: Vec<_> = seen
         .entries
         .iter()

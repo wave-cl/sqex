@@ -67,6 +67,49 @@ pub enum Verdict {
     Unattributed,
 }
 
+/// What SIP-34 verification concluded about the exchange's claim on an entry.
+///
+/// **Deliberately separate from [`Verdict`], and both must be checked.** They
+/// answer different questions — who wrote this, and where the exchange says it
+/// put it. SIP-34 warns that a verifier which checks a receipt and skips
+/// SIP-31's steps has confirmed that an exchange carried something and learned
+/// nothing about who wrote it, and that the reverse omission is the more likely
+/// one.
+///
+/// The distinction that carries the most weight is between the first two.
+/// *Unclaimed* is an exchange that said nothing; *repudiated* is one that said
+/// something untrue. An implementation that collapses them — a single nullable
+/// field whose `None` means both — has built a mechanism the exchange can
+/// switch off by corrupting its own signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Standing {
+    /// No receipt. The exchange was not asked, or does not implement SIP-34.
+    /// It makes no claim, and this says nothing about the entry.
+    #[default]
+    Unclaimed,
+    /// A receipt that verifies under the key this client pinned, over a head
+    /// that follows the one held for the entry before it.
+    Vouched,
+    /// A receipt that verifies, with no predecessor held to link it to.
+    ///
+    /// Ordinary: pruning, retention, `expires_after` and joining a channel with
+    /// history all produce one. A reader SHOULD show that continuity across the
+    /// gap is unverified and MUST NOT present it as misconduct.
+    Unlinked,
+    /// A receipt that verifies and whose head does **not** follow the one held
+    /// for the entry before it.
+    ///
+    /// This cannot happen without the exchange having advanced its head over an
+    /// entry this reader was not shown. It is evidence, and unlike a gap it is
+    /// surfaced.
+    Diverged,
+    /// A receipt that is present and does not verify under the pinned key.
+    ///
+    /// Not absence. The exchange signed something it cannot stand behind, and a
+    /// client surfaces it exactly as it surfaces a forged entry.
+    Repudiated,
+}
+
 /// What a reader can say about a tombstone (SIP-32).
 ///
 /// SIP-16's redaction removes the bytes and keeps the entry, and the removal is
@@ -115,6 +158,9 @@ pub struct Received {
     /// wrote itself, which carries an actor's signature inside its body rather
     /// than one of its own.
     pub verdict: Verdict,
+    /// What SIP-34 verification concluded, which is a different question — see
+    /// [`Standing`].
+    pub standing: Standing,
 }
 
 /// A message as it should be shown.
@@ -367,6 +413,7 @@ mod tests {
             tombstone: true,
             body: None,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -379,6 +426,7 @@ mod tests {
             tombstone: false,
             body: Some(Body::Post(Post::text(text))),
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -391,6 +439,7 @@ mod tests {
             tombstone: false,
             body: Some(b),
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -647,6 +696,7 @@ mod tests {
                     tombstone: false,
                     body: None,
                     verdict: Verdict::Valid,
+                    standing: Standing::Unclaimed,
                 },
             ],
             &[],
@@ -671,6 +721,7 @@ mod tests {
                     tombstone: false,
                     body: None,
                     verdict: Verdict::Valid,
+                    standing: Standing::Unclaimed,
                 },
             ],
             &[],
@@ -738,6 +789,7 @@ mod deletion_tests {
             body: Some(Body::Post(SipPost::text(text))),
             tombstone: false,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -750,6 +802,7 @@ mod deletion_tests {
             body: None,
             tombstone: true,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -762,6 +815,7 @@ mod deletion_tests {
             body: Some(Body::Redact { target }),
             tombstone: false,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 

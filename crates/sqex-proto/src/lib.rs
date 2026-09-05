@@ -24,6 +24,7 @@ pub mod mailbox;
 pub mod message;
 pub mod prekey;
 pub mod profile;
+pub mod receipt;
 pub mod refusal;
 pub mod room;
 pub mod session;

@@ -164,10 +164,10 @@ async fn one_person_two_devices_share_a_membership() {
     );
 
     let (_, body) = p
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     // Three: SIP-32's `created`, then a message from each client.
     assert_eq!(seen.entries.len(), 3);
 
@@ -373,10 +373,10 @@ async fn an_account_with_no_registered_devices_is_its_own_device() {
     assert_eq!(code, 200);
 
     let (_, body) = c
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     // Entry 0 is SIP-32's `created`, which the exchange wrote and so carries
     // zeroes; the message is the member entry after it.
     let said = seen

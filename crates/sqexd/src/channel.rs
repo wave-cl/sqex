@@ -42,7 +42,7 @@ use sqex_proto::channel::{
     ENTRY_HEADER, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
     MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_NAME, MAX_TOPIC,
     MAX_MINE, MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Membership, Mines, Post,
-    Posted, Public, Retain, Role, Visibility,
+    Posted, Public, Receipted, Retain, Role, Tip, Visibility,
 };
 use sqex_proto::blob_store::{
     Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS,
@@ -54,6 +54,7 @@ use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
 };
 use sqex_proto::entry_sig::{ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry};
+use sqex_proto::receipt::{self, HEAD_GENESIS, ReceiptTerms};
 use sqnr_core::PubKey;
 use tokio::sync::Notify;
 
@@ -113,6 +114,14 @@ pub enum ChannelError {
     /// SIP-31: a create reusing an instance this channel identifier has already
     /// used, which would re-admit the entries signed under it.
     UsedInstance,
+    /// SIP-34: a receipted request to an exchange that cannot issue receipts.
+    ///
+    /// Refused rather than answered in the unreceipted shape, so a response's
+    /// shape always follows from the request's type byte. A client recovers by
+    /// asking again on the ordinary type and showing a channel it cannot
+    /// verify — which is the same recovery as from an exchange that has never
+    /// heard of SIP-34.
+    NoReceipts,
     Storage,
 }
 
@@ -136,6 +145,7 @@ impl ChannelError {
             ChannelError::BadSignature => "bad_signature",
             ChannelError::BrokenChain => "broken_chain",
             ChannelError::UsedInstance => "used_instance",
+            ChannelError::NoReceipts => "no_receipts",
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
@@ -176,6 +186,7 @@ impl ChannelError {
             ChannelError::BadSignature => Code::BadSignature,
             ChannelError::BrokenChain => Code::BrokenChain,
             ChannelError::UsedInstance => Code::UsedInstance,
+            ChannelError::NoReceipts => Code::NoReceipts,
             ChannelError::Storage => Code::Storage,
         }
     }
@@ -208,6 +219,11 @@ impl ChannelError {
             // A forged or absent signature is a refusal to authenticate what
             // was sent, not a conflict with stored state.
             ChannelError::BadSignature => 401,
+            // Not an error in the request: the caller asked for something this
+            // exchange does not offer. 501 says so without implying the client
+            // got anything wrong, which matters because the correct client
+            // response is to ask again unreceipted rather than to retry.
+            ChannelError::NoReceipts => 501,
             ChannelError::Storage => 500,
         }
     }
@@ -258,6 +274,10 @@ pub struct Channels {
     /// than defaulted, because a default would be a fixed place that every
     /// deployment shared.
     exchange: PubKey,
+    /// The seed for the SIP-9 identity above, where this exchange issues SIP-34
+    /// receipts. `None` is an exchange that makes no claims about ordering: it
+    /// serves ordinary fetches and refuses receipted ones.
+    exchange_seed: Option<[u8; 32]>,
     /// Stored entry bytes one channel may hold before the oldest are pruned.
     ///
     /// SIP-16 calls its numbers recommended values, and this one is the only
@@ -302,7 +322,16 @@ CREATE TABLE IF NOT EXISTS channel (
     -- every signature, the previous incarnation's entries verify against this
     -- one. Proposed by the creator, because it has to be signed over before the
     -- exchange has minted anything.
-    instance       BLOB    NOT NULL
+    instance       BLOB    NOT NULL,
+    -- SIP-34's running head: SHA-256(previous head || entry hash), advanced
+    -- exactly once per entry as it is numbered.
+    --
+    -- **Never recomputed from the entries held.** Pruning removes entries, so a
+    -- recomputed head is a different head, and every receipt issued before the
+    -- prune stops verifying against every receipt issued after. The head is a
+    -- property of the channel's history, not of its current contents — the same
+    -- rule, for the same reason, as `chain` and `high_water` below.
+    head           BLOB    NOT NULL DEFAULT x''
 );
 -- Instances this channel identifier has already used, so that a recreation
 -- cannot reuse one and re-admit the entries signed under it.
@@ -361,6 +390,18 @@ CREATE TABLE IF NOT EXISTS entry (
     body_hash     BLOB    NOT NULL,
     sig           BLOB    NOT NULL,
     body          BLOB    NOT NULL,
+    -- SIP-34: the entry hash the head was advanced over, and the head *after*
+    -- this entry — so a reader beginning mid-log has both values the signature
+    -- was made over. The receipt itself is not stored: Ed25519 is
+    -- deterministic, so re-signing these same fields reproduces the same 64
+    -- bytes, and a stored copy could only ever disagree with them.
+    --
+    -- `entry_hash` is stored rather than recomputed because a system entry's
+    -- signing input includes `arg`, which SIP-31 deliberately never transmits
+    -- and this table therefore never holds. It is recomputable for a member
+    -- entry and not for a system one, and one column is better than two paths.
+    entry_hash    BLOB    NOT NULL DEFAULT x'',
+    head          BLOB    NOT NULL DEFAULT x'',
     PRIMARY KEY (channel, seq)
 );
 -- SIP-31 chain head per device per channel.
@@ -458,7 +499,11 @@ CREATE INDEX IF NOT EXISTS entry_by_age ON entry (posted);
 impl Channels {
     /// Open the log. `None` gives an in-memory database, which is what a
     /// memory-only deployment and every test get.
-    pub fn open(path: Option<&Path>, exchange: PubKey) -> rusqlite::Result<Channels> {
+    pub fn open(
+        path: Option<&Path>,
+        exchange: PubKey,
+        exchange_seed: Option<[u8; 32]>,
+    ) -> rusqlite::Result<Channels> {
         let db = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -472,6 +517,14 @@ impl Channels {
         // A deployed exchange has a `channel` table without `epoch_at`, and
         // `CREATE TABLE IF NOT EXISTS` will not add it.
         add_column(&db, "channel", "epoch_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // SIP-34, added the same way and for the same reason. A channel that
+        // predates receipts starts its head at genesis and advances from its
+        // next entry: the entries already in the log were never covered by one
+        // and are not retrospectively claimed. A reader sees that as a gap,
+        // which is ordinary, rather than as a divergence.
+        add_column(&db, "channel", "head", "BLOB NOT NULL DEFAULT x''")?;
+        add_column(&db, "entry", "entry_hash", "BLOB NOT NULL DEFAULT x''")?;
+        add_column(&db, "entry", "head", "BLOB NOT NULL DEFAULT x''")?;
         // SIP-31's columns are deliberately *not* added this way, and carry no
         // defaults. A database predating them is wiped rather than migrated,
         // because a default would make an unsigned entry representable — and
@@ -479,9 +532,44 @@ impl Channels {
         Ok(Channels {
             db: Mutex::new(db),
             exchange,
+            exchange_seed,
             max_channel_bytes: MAX_CHANNEL_BYTES,
             waiters: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Sign a SIP-34 receipt for a position this exchange numbered.
+    ///
+    /// The receipt is derived rather than stored. Ed25519 is deterministic, so
+    /// signing the same fields again reproduces the same 64 bytes — a stored
+    /// copy could only ever disagree with the row it came from, and the head,
+    /// which is *not* derivable, is what is persisted instead.
+    ///
+    /// Refuses where this exchange holds no signing seed. **An exchange that
+    /// cannot issue a receipt refuses the receipted request rather than
+    /// answering it unreceipted**: a response whose shape does not follow from
+    /// the request it answers puts the reader back to guessing by length.
+    fn stamp(
+        &self,
+        place: &Place,
+        seq: u64,
+        posted: u64,
+        entry_hash: &[u8; 32],
+        head: &[u8; 32],
+    ) -> Result<Receipted, ChannelError> {
+        let seed = self.exchange_seed.ok_or(ChannelError::NoReceipts)?;
+        let terms = ReceiptTerms {
+            place: *place,
+            seq,
+            posted,
+            entry_hash: *entry_hash,
+            head: *head,
+        };
+        Ok(Receipted {
+            entry_hash: *entry_hash,
+            head: *head,
+            receipt: receipt::sign(&seed, &terms),
         })
     }
 
@@ -1063,6 +1151,9 @@ impl Channels {
     ) -> Result<Posted, ChannelError> {
         let now = now_unix();
         let seq;
+        let head;
+        let place;
+        let entry_hash;
         {
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction().map_err(storage("begin post"))?;
@@ -1087,7 +1178,7 @@ impl Channels {
             // exchange cannot check them*, and this one it can — the signature
             // and the device are both in the clear. Refusing here means no
             // entry is stored that every receiver would reject.
-            let place = self.place(&tx, &req.channel)?;
+            place = self.place(&tx, &req.channel)?;
             let terms = EntryTerms {
                 place,
                 account: *account,
@@ -1113,11 +1204,16 @@ impl Channels {
             let body_hash = Sha256::digest(&req.body);
 
             seq = next;
+            // SIP-34. The entry hash is SHA-256 of the signing input — the same
+            // value SIP-31's chain link is, computed by the same primitive.
+            entry_hash = link(&terms.input());
+            head = advance_head(&tx, &req.channel, &entry_hash)?;
             tx.execute(
                 "INSERT INTO entry (channel, seq, kind, account, device, posted,
                                     expires_after, epoch, msg_seq,
-                                    chain_seq, prev, body_hash, sig, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                    chain_seq, prev, body_hash, sig, body,
+                                    entry_hash, head)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     &req.channel[..],
                     seq as i64,
@@ -1133,6 +1229,8 @@ impl Channels {
                     &body_hash[..],
                     &req.sig[..],
                     &req.body,
+                    &entry_hash[..],
+                    &head[..],
                 ],
             )
             .map_err(storage("insert entry"))?;
@@ -1171,6 +1269,10 @@ impl Channels {
             seq,
             posted: now,
             now,
+            stamp: req
+                .receipts
+                .then(|| self.stamp(&place, seq, now, &entry_hash, &head))
+                .transpose()?,
         })
     }
 
@@ -1183,17 +1285,25 @@ impl Channels {
         caller: &PubKey,
         channel: &[u8; 32],
         since: u64,
+        receipts: bool,
     ) -> Result<Entries, ChannelError> {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
         if role_of(&db, channel, caller).is_none() {
             return Err(ChannelError::NotAMember);
         }
+        // Before anything is read, so a caller asking an exchange that cannot
+        // answer in the shape it asked for is refused rather than served
+        // something it will misparse.
+        if receipts && self.exchange_seed.is_none() {
+            return Err(ChannelError::NoReceipts);
+        }
+        let place = receipts.then(|| self.place(&db, channel)).transpose()?;
         let (first, last) = window(&db, channel);
         let mut stmt = db
             .prepare(
                 "SELECT seq, kind, account, device, posted, expires_after, epoch, msg_seq,
-                        chain_seq, prev, body_hash, sig, body
+                        chain_seq, prev, body_hash, sig, body, entry_hash, head
                  FROM entry WHERE channel = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
             )
             .map_err(storage("prepare fetch"))?;
@@ -1201,7 +1311,8 @@ impl Channels {
             .query_map(
                 params![&channel[..], since as i64, MAX_BATCH as i64],
                 |r| {
-                    Ok(Entry {
+                    Ok((
+                    Entry {
                         seq: r.get::<_, i64>(0)? as u64,
                         kind: r.get::<_, i64>(1)? as u8,
                         account: PubKey::new(r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32])),
@@ -1215,7 +1326,12 @@ impl Channels {
                         body_hash: r.get::<_, Vec<u8>>(10)?.try_into().unwrap_or([0; 32]),
                         sig: r.get::<_, Vec<u8>>(11)?.try_into().unwrap_or([0; 64]),
                         body: r.get(12)?,
-                    })
+                        // Stamped below, where the signing key is in scope.
+                        stamp: None,
+                    },
+                    r.get::<_, Vec<u8>>(13)?.try_into().unwrap_or([0u8; 32]),
+                    r.get::<_, Vec<u8>>(14)?.try_into().unwrap_or([0u8; 32]),
+                ))
                 },
             )
             .map_err(storage("query fetch"))?;
@@ -1223,7 +1339,10 @@ impl Channels {
         let mut entries = Vec::new();
         let mut bytes = 0usize;
         for row in rows {
-            let e = row.map_err(storage("read entry"))?;
+            let (mut e, entry_hash, head) = row.map_err(storage("read entry"))?;
+            if let Some(place) = &place {
+                e.stamp = Some(self.stamp(place, e.seq, e.posted, &entry_hash, &head)?);
+            }
             // Whichever binds first. An entry already counted is never dropped
             // to make room, so a client always makes progress.
             if !entries.is_empty() && bytes + e.wire_len() > MAX_BATCH_BYTES {
@@ -1253,12 +1372,64 @@ impl Channels {
             .map_err(storage("record delivery"))?;
         }
 
+        let tip = match &place {
+            None => None,
+            Some(place) => Some(self.tip(&db, place, last)?),
+        };
         Ok(Entries {
             now: now_unix(),
             first,
             last,
             entries,
             signals: self.take_signals(channel, caller),
+            tip,
+        })
+    }
+
+    /// The head and receipt of the channel's newest entry, whether or not it
+    /// was in the batch.
+    ///
+    /// **What a reader who fetched nothing still learns.** Without it, "nothing
+    /// happened" and "I am not being shown what happened" are the same
+    /// response; with it, a tip that advances while entries do not is the
+    /// exchange saying it is carrying something it did not serve.
+    fn tip(
+        &self,
+        db: &Connection,
+        place: &Place,
+        last: u64,
+    ) -> Result<Tip, ChannelError> {
+        let row: Option<(u64, [u8; 32], [u8; 32])> = db
+            .query_row(
+                "SELECT posted, entry_hash, head FROM entry WHERE channel = ?1 AND seq = ?2",
+                params![&place.channel[..], last as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0u8; 32]),
+                        r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0u8; 32]),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage("read tip"))?;
+        // `seq` 0 means the channel has no entries and there is nothing to
+        // sign, so the stamp is zeroes rather than a signature over nothing.
+        let Some((posted, entry_hash, head)) = row else {
+            return Ok(Tip {
+                seq: 0,
+                posted: 0,
+                stamp: Receipted {
+                    entry_hash: [0u8; 32],
+                    head: HEAD_GENESIS,
+                    receipt: [0u8; 64],
+                },
+            });
+        };
+        Ok(Tip {
+            seq: last,
+            posted,
+            stamp: self.stamp(place, last, posted, &entry_hash, &head)?,
         })
     }
 }
@@ -2801,6 +2972,35 @@ fn advance_chain(
     Ok(())
 }
 
+/// Advance the channel's SIP-34 running head over one entry, and return it.
+///
+/// Read-modify-write inside the caller's transaction, so the head advances
+/// exactly once per entry however the entry got there. A stored head that is
+/// not 32 bytes is a channel that predates receipts and starts at genesis.
+fn advance_head(
+    db: &Connection,
+    channel: &[u8; 32],
+    entry_hash: &[u8; 32],
+) -> Result<[u8; 32], ChannelError> {
+    let held: Vec<u8> = db
+        .query_row(
+            "SELECT head FROM channel WHERE id = ?1",
+            params![&channel[..]],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(storage("read head"))?
+        .ok_or(ChannelError::NoSuchChannel)?;
+    let prev: [u8; 32] = held.try_into().unwrap_or(HEAD_GENESIS);
+    let head = receipt::advance(&prev, entry_hash);
+    db.execute(
+        "UPDATE channel SET head = ?2 WHERE id = ?1",
+        params![&channel[..], &head[..]],
+    )
+    .map_err(storage("advance head"))?;
+    Ok(head)
+}
+
 /// Verify a signed membership action, then take its chain step.
 ///
 /// Returns the terms' signing input so the caller can store the link, and
@@ -2816,7 +3016,7 @@ fn check_action(
     subject: &PubKey,
     arg: &[u8],
     action: &Action,
-) -> Result<(), ChannelError> {
+) -> Result<Vec<u8>, ChannelError> {
     let terms = ActionTerms {
         place: *place,
         actor: *actor,
@@ -2831,7 +3031,8 @@ fn check_action(
         return Err(ChannelError::BadSignature);
     }
     let input = terms.input().map_err(|_| ChannelError::BadSignature)?;
-    advance_chain(db, &place.channel, actor_device, action.chain_seq, &action.prev, &input)
+    advance_chain(db, &place.channel, actor_device, action.chain_seq, &action.prev, &input)?;
+    Ok(input)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2847,7 +3048,7 @@ fn write_system(
     action: &Action,
     now: u64,
 ) -> Result<(), ChannelError> {
-    check_action(db, place, actor, actor_device, event, subject, arg, action)?;
+    let action_input = check_action(db, place, actor, actor_device, event, subject, arg, action)?;
     let seq: u64 = db
         .query_row(
             "SELECT next_seq FROM channel WHERE id = ?1",
@@ -2868,14 +3069,21 @@ fn write_system(
         sig: action.sig,
     }
     .encode();
+    // SIP-34: a system entry is numbered like any other and so advances the
+    // head like any other. A head that skipped them would not be a commitment
+    // to the channel's history, and membership changes are exactly the history
+    // a reader most wants covered.
+    let entry_hash = link(&action_input);
+    let head = advance_head(db, channel, &entry_hash)?;
     // The entry's own `sig` stays zero: the exchange wrote this row and did not
     // sign it. The actor's signature is inside the body, which is where a
     // verifier looks for a system entry — a different key in a different role.
     db.execute(
         "INSERT INTO entry (channel, seq, kind, account, device, posted,
                             expires_after, epoch, msg_seq,
-                            chain_seq, prev, body_hash, sig, body)
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, 0, ?6, ?6, ?7, ?8)",
+                            chain_seq, prev, body_hash, sig, body,
+                            entry_hash, head)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, 0, ?6, ?6, ?7, ?8, ?9, ?10)",
         params![
             &channel[..],
             seq as i64,
@@ -2885,6 +3093,8 @@ fn write_system(
             &GENESIS[..],
             &[0u8; 64][..],
             &body,
+            &entry_hash[..],
+            &head[..],
         ],
     )
     .map_err(storage("insert system entry"))?;
@@ -3277,12 +3487,21 @@ mod tests {
     }
 
     /// The exchange every test in this module runs against.
+    /// The exchange's own seed, so SIP-34 receipts issued in these tests are
+    /// checkable rather than merely present. A store opened on an arbitrary
+    /// public key would sign under one identity and claim another.
+    const EXCHANGE_SEED: [u8; 32] = [200u8; 32];
+
     fn exchange() -> PubKey {
-        key(200)
+        PubKey::new(
+            ed25519_dalek::SigningKey::from_bytes(&EXCHANGE_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
     }
 
     fn open() -> Channels {
-        Channels::open(None, exchange()).unwrap()
+        Channels::open(None, exchange(), Some(EXCHANGE_SEED)).unwrap()
     }
 
     fn place_of(c: &Channels, channel: &[u8; 32]) -> Place {
@@ -3319,6 +3538,7 @@ mod tests {
             chain_seq,
             prev,
             sig: sign_entry(&[b; 32], &terms),
+            receipts: false,
             body,
         }
     }
@@ -3433,7 +3653,7 @@ mod tests {
 
         // Nothing has ever been posted here, so nothing can have been
         // delivered to anybody.
-        c.fetch(&alice, &[7; 32], 9_999).unwrap();
+        c.fetch(&alice, &[7; 32], 9_999, false).unwrap();
 
         let marks = c.cursors(&alice, &[7; 32]).unwrap();
         let mine = marks
@@ -3488,7 +3708,7 @@ mod tests {
         }
 
         assert!(stored_bytes(&c) <= cap, "the cap is not enforced");
-        let got = c.fetch(&alice, &[7; 32], 0).unwrap();
+        let got = c.fetch(&alice, &[7; 32], 0, false).unwrap();
         let member: Vec<&Entry> = got.entries.iter().filter(|e| e.kind == KIND_MEMBER).collect();
         assert_eq!(member.len(), 4, "want the four newest kept");
         // Oldest first, exactly as the count prune does: what survives is the
@@ -3511,7 +3731,7 @@ mod tests {
             )
             .unwrap();
         }
-        let got = c.fetch(&alice, &[7; 32], 0).unwrap();
+        let got = c.fetch(&alice, &[7; 32], 0, false).unwrap();
         assert_eq!(got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(), 20);
     }
 

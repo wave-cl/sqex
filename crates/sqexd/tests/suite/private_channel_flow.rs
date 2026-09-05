@@ -20,7 +20,7 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::message::{Body, Part, Post as SipPost};
 use sqex_proto::prekey::{Pool, Prekey, Publish, Take, Taken};
-use sqex_proto::timeline::{Received, Timeline, Verdict};
+use sqex_proto::timeline::{Received, Timeline, Verdict, Standing};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -290,12 +290,13 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
                 channel,
                 since: 0,
                 wait_secs: 0,
+                receipts: false,
             }
             .encode(),
         )
         .await
         .unwrap();
-    let entries = Entries::decode(&body).unwrap();
+    let entries = Entries::decode(&body, false).unwrap();
     // Creating with an invitee and minting an epoch are both recorded, so the
     // log holds the exchange's entries as well as the one message.
     let mine: Vec<_> = entries
@@ -386,7 +387,7 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
         .client
         .post(
             "/channel/fetch",
-            Fetch { channel, since: 0, wait_secs: 0 }.encode(),
+            Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode(),
         )
         .await
         .unwrap();
@@ -745,6 +746,7 @@ fn timeline_of(entries: &[sqex_proto::channel::Entry], key: &ChannelKey, channel
                 .ok()
                 .and_then(|plain| Body::decode(&plain).ok().flatten()),
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         })
         .collect();
     Timeline::fold(&received, admins)
@@ -813,7 +815,7 @@ async fn a_real_conversation_renders_end_to_end() {
     let a1 = send(&alice.signer, &mut alice_chain, Body::Post(SipPost::text("has anyone seen the report")), &mut alice_seq);
     let (code, body) = alice.client.post("/channel/post", a1).await.unwrap();
     assert_eq!(code, 200);
-    let question = Posted::decode(&body).unwrap().seq;
+    let question = Posted::decode(&body, false).unwrap().seq;
 
     let b1 = send(
         &bob.signer,
@@ -829,7 +831,7 @@ async fn a_real_conversation_renders_end_to_end() {
         &mut bob_seq,
     );
     let (_, body) = bob.client.post("/channel/post", b1).await.unwrap();
-    let reply = Posted::decode(&body).unwrap().seq;
+    let reply = Posted::decode(&body, false).unwrap().seq;
 
     let a2 = send(
         &alice.signer,
@@ -849,18 +851,18 @@ async fn a_real_conversation_renders_end_to_end() {
 
     let a3 = send(&alice.signer, &mut alice_chain, Body::Post(SipPost::text("ignore that")), &mut alice_seq);
     let (_, body) = alice.client.post("/channel/post", a3).await.unwrap();
-    let regretted = Posted::decode(&body).unwrap().seq;
+    let regretted = Posted::decode(&body, false).unwrap().seq;
     let a4 = send(&alice.signer, &mut alice_chain, Body::Redact { target: regretted }, &mut alice_seq);
     assert_eq!(alice.client.post("/channel/post", a4).await.unwrap().0, 200);
 
     // Bob fetches the lot and folds it.
     let (code, body) = bob
         .client
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
-    let entries = Entries::decode(&body).unwrap();
+    let entries = Entries::decode(&body, false).unwrap();
     assert_eq!(
         entries
             .entries
@@ -941,7 +943,7 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
     let a = seal(&alice.signer, &mut alice_chain, Body::Post(SipPost::text("what I actually said")), 0);
     let (code, body) = alice.client.post("/channel/post", a).await.unwrap();
     assert_eq!(code, 200);
-    let target = Posted::decode(&body).unwrap().seq;
+    let target = Posted::decode(&body, false).unwrap().seq;
 
     // Bob is a member, so he holds the channel key and can seal a well-formed
     // edit of somebody else's message. The exchange takes it.
@@ -959,10 +961,10 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
 
     let (_, body) = alice
         .client
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let entries = Entries::decode(&body).unwrap();
+    let entries = Entries::decode(&body, false).unwrap();
     assert_eq!(
         entries
             .entries
@@ -1016,10 +1018,10 @@ async fn a_removal_leaves_a_record_of_who_did_it() {
 
     let (_, body) = alice
         .client
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0, receipts: false }.encode())
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let events: Vec<System> = seen
         .entries
         .iter()

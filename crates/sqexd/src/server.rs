@@ -340,7 +340,16 @@ pub async fn bind(
         // entry lifts into another exchange's copy of the same direct message
         // — whose identifier is byte-identical, being derived from the two
         // accounts — and verifies there.
-        channels: Channels::open(channel_db.as_deref(), public_key)
+        channels: Channels::open(
+            channel_db.as_deref(),
+            public_key,
+            // SIP-34: the exchange signs receipts with the SIP-9 identity its
+            // clients already pin, and deliberately not with a second key. A
+            // separate signing key would need its own distribution, pinning and
+            // rotation, vouched for by this one — a longer chain with no
+            // shorter root.
+            Some(signing_key.to_bytes()),
+        )
             .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
         // Durable, and it was not always. The argument for keeping prekeys in
         // memory was that a key surviving a restart the device did not is a key
@@ -1756,7 +1765,7 @@ async fn fetch_waiting(
     req: &ChannelFetch,
 ) -> std::result::Result<sqex_proto::channel::Entries, ChannelError> {
     let notify = server.channels.notifier(&req.channel);
-    let first = server.channels.fetch(me, &req.channel, req.since)?;
+    let first = server.channels.fetch(me, &req.channel, req.since, req.receipts)?;
     if !first.entries.is_empty() || !first.signals.is_empty() || req.wait_secs == 0 {
         return Ok(first);
     }
@@ -1766,7 +1775,7 @@ async fn fetch_waiting(
         let waited = tokio::time::timeout_at(deadline, notify.notified()).await;
         // Re-check membership as well as entries: an answer is owed to whoever
         // the caller is *now*, not who they were when they parked.
-        let again = server.channels.fetch(me, &req.channel, req.since)?;
+        let again = server.channels.fetch(me, &req.channel, req.since, req.receipts)?;
         // A signal is as good a reason to answer as an entry: SIP-16 says a
         // held request returns as soon as either arrives for the caller.
         if !again.entries.is_empty() || !again.signals.is_empty() || waited.is_err() {

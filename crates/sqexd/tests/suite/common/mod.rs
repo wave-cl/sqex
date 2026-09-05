@@ -101,6 +101,7 @@ impl Signer {
             chain_seq: info.my_chain_seq,
             prev: info.my_chain_head,
             sig: sign_entry(&self.seed, &terms),
+            receipts: false,
             body,
         }
     }
@@ -365,6 +366,7 @@ impl Signer {
             chain_seq: chain.seq,
             prev: chain.head,
             sig,
+            receipts: false,
             body,
         };
         chain.seq += 1;

@@ -88,6 +88,8 @@ pub enum Code {
     LastAdmin,
     BrokenChain,
     UsedInstance,
+    /// SIP-34: a receipted request to an exchange that issues no receipts.
+    NoReceipts,
 
     // SIP-18 blobs.
     NoSuchUpload,
@@ -168,6 +170,7 @@ impl Code {
             Code::LastAdmin => 33,
             Code::BrokenChain => 34,
             Code::UsedInstance => 35,
+            Code::NoReceipts => 55,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -241,6 +244,7 @@ impl Code {
             33 => Code::LastAdmin,
             34 => Code::BrokenChain,
             35 => Code::UsedInstance,
+            55 => Code::NoReceipts,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -314,6 +318,7 @@ impl Code {
             Code::LastAdmin => "last_admin",
             Code::BrokenChain => "broken_chain",
             Code::UsedInstance => "used_instance",
+            Code::NoReceipts => "no_receipts",
 
             Code::NoSuchUpload => "no_such_upload",
             Code::NoSuchBlob => "no_such_blob",
@@ -383,6 +388,7 @@ impl Code {
         Code::LastAdmin,
         Code::BrokenChain,
         Code::UsedInstance,
+        Code::NoReceipts,
         Code::NoSuchUpload,
         Code::NoSuchBlob,
         Code::BadChunk,

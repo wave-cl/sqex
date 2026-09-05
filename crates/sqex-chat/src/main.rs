@@ -3306,7 +3306,7 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<([u8; 32], PubKey), String> 
 mod tests {
     use super::*;
     use sqex_proto::message::{Body, Post as SipPost};
-    use sqex_proto::timeline::{Received, Verdict};
+    use sqex_proto::timeline::{Received, Standing, Verdict};
 
     /// A credential is addressed to a device, so a client that has been linked
     /// — where the account is somebody else's key — must still recognise one
@@ -3364,6 +3364,7 @@ mod tests {
                 posted: 0,
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
+                standing: Standing::Unclaimed,
                 body: Some(Body::Post(SipPost::text(text))),
                 verdict: Verdict::Valid,
             },
@@ -3433,6 +3434,7 @@ mod tests {
                 posted: 10,
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
+                standing: Standing::Unclaimed,
                 body: Some(Body::Post(SipPost::text("hello"))),
                 verdict: Verdict::Valid,
             }],
@@ -3651,6 +3653,7 @@ mod tests {
                 posted: 10,
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
+                standing: Standing::Unclaimed,
                 body: Some(Body::Post(SipPost::text("did you see this?"))),
                 verdict: Verdict::Valid,
             }],
@@ -3725,6 +3728,7 @@ mod tests {
                     posted: 10,
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
+                    standing: Standing::Unclaimed,
                     body: Some(Body::Post(SipPost::text("theirs"))),
                     verdict: Verdict::Valid,
                 },
@@ -3734,6 +3738,7 @@ mod tests {
                     posted: 11,
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
+                    standing: Standing::Unclaimed,
                     body: Some(Body::Post(SipPost::text("mine"))),
                     verdict: Verdict::Valid,
                 },
@@ -3764,6 +3769,7 @@ mod tests {
             posted: 10 + seq,
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
+            standing: Standing::Unclaimed,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };
@@ -3807,6 +3813,7 @@ mod tests {
             posted: 10 + seq,
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
+            standing: Standing::Unclaimed,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };
