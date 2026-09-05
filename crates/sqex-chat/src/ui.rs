@@ -384,6 +384,17 @@ pub struct App {
     /// lines. Nought is the bottom, which is where a conversation opens and
     /// where it stays while somebody is reading the newest of it.
     pub scroll: usize,
+    /// Set when the pick has just moved, so the next frame brings it into
+    /// view.
+    ///
+    /// A flag rather than "always keep the pick visible", because the two are
+    /// different: somebody who scrolls with `^U` while a message is picked is
+    /// asking to look elsewhere, and snapping back to the pick would be the
+    /// client arguing with them. This only fires on the keystroke that moved
+    /// the pick, which is the moment the view is meant to follow.
+    ///
+    /// Cleared by the loop once the frame that honoured it has drawn.
+    pub follow_pick: bool,
     /// The bottom-most message actually on screen, as an index into `said`.
     ///
     /// `None` when the pane holds no message at all. Taken from the frame that
@@ -1394,7 +1405,38 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // The caller's number is a wish: it may be left over from a longer
     // conversation, or from before the window was resized.
     let furthest = total.saturating_sub(room);
-    let scroll = app.scroll.min(furthest);
+    // Following the pick. `owners` says which lines belong to the picked
+    // message, so the smallest move that puts the whole of it on screen is
+    // arithmetic rather than guesswork.
+    //
+    // Nudged only as far as it has to go — a pick moving off the top scrolls
+    // by the lines that message occupies, not by a page — so walking up
+    // through a conversation reads as walking rather than jumping.
+    let wish = match app
+        .follow_pick
+        .then_some(app.picked)
+        .flatten()
+        .and_then(|i| {
+            let first = owners.iter().position(|o| *o == Some(i))?;
+            let last = owners.iter().rposition(|o| *o == Some(i))?;
+            Some((first, last))
+        }) {
+        Some((first, last)) => {
+            let here = app.scroll.min(furthest);
+            let top = furthest - here;
+            if first < top {
+                // Above the pane: bring its first line to the top.
+                furthest.saturating_sub(first)
+            } else if last >= top + room {
+                // Below it: bring its last line to the bottom.
+                furthest.saturating_sub((last + 1).saturating_sub(room))
+            } else {
+                app.scroll
+            }
+        }
+        None => app.scroll,
+    };
+    let scroll = wish.min(furthest);
     let skip = furthest - scroll;
     // A short conversation sits at the bottom, against the input box, rather
     // than floating at the top of an empty pane — where the next message would
@@ -2607,6 +2649,51 @@ mod tests {
         assert!(
             last != Some(newest),
             "after paging back the newest message is still reported as on screen: {last:?}"
+        );
+    }
+
+    /// Walking the pick upwards takes the view with it.
+    ///
+    /// Without this the picker climbs off the top of the pane and keeps going
+    /// — the selection is somewhere in the conversation, invisible, and every
+    /// key that acts on it is aimed at a message nobody can see.
+    #[test]
+    fn the_view_follows_the_pick_off_the_top_of_the_pane() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| said("Alice", ALICE, false, &format!("message {n}"), 3600 + n as u64))
+            .collect();
+
+        // Start where Esc would put it: the newest, at the bottom.
+        app.picked = Some(app.said.len() - 1);
+        app.scroll = 0;
+        let at_bottom = drawn(&app, 130, 24);
+        assert_eq!(at_bottom.scroll, 0, "the newest message needs no scrolling");
+
+        // Now walk the pick well above the pane without asking to follow: the
+        // view stays put, which is the behaviour being fixed.
+        app.picked = Some(5);
+        let ignored = drawn(&app, 130, 24);
+        assert_eq!(
+            ignored.scroll, 0,
+            "without the request the view must not move on its own"
+        );
+        assert!(
+            !ignored.rows.iter().flatten().any(|o| *o == 5),
+            "message 5 should be off screen here"
+        );
+
+        // Ask, and it comes into view.
+        app.follow_pick = true;
+        let followed = drawn(&app, 130, 24);
+        assert!(
+            followed.scroll > 0,
+            "following the pick must scroll back: {}",
+            followed.scroll
+        );
+        assert!(
+            followed.rows.iter().flatten().any(|o| *o == 5),
+            "the picked message must be on screen after following"
         );
     }
 

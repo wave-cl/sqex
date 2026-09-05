@@ -797,6 +797,10 @@ async fn event_loop(
             // The last message the frame put on screen. `rows` is indexed by
             // screen row, so the last `Some` in it is the bottom-most one.
             app.last_visible = hover.rows.iter().rev().flatten().next().copied();
+            // The frame has been drawn with the pick in view, so the request is
+            // spent. Leaving it set would make every later frame drag the view
+            // back to the pick, including after somebody scrolled away.
+            app.follow_pick = false;
             // Somebody reading history stays where they are when a message
             // arrives. The lines all sit below them, so without this the text
             // would creep upward under their eyes at every poll.
@@ -1362,9 +1366,11 @@ async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: K
         KeyCode::Esc => app.picked = None,
         KeyCode::Up | KeyCode::Char('k') => {
             app.picked = Some(i.saturating_sub(1));
+            app.follow_pick = true;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.picked = Some((i + 1).min(app.said.len().saturating_sub(1)));
+            app.follow_pick = true;
         }
         // The keyboard's copy, so the one gesture that reaches a key is not a
         // click. Mouse capture is off until asked for, and somebody who never
