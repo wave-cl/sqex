@@ -779,7 +779,11 @@ async fn event_loop(
             // second copy of the layout could disagree with the first, and a
             // pointer that names the message above the one under it is worse than
             // no pointer at all.
-            let was = (hover.total, app.scroll);
+            // Lines, the scroll, and **how many messages** there were. The third
+        // is what separates a message arriving from the window being resized:
+        // both grow the line count, and only one of them should move a reader
+        // who is looking at history.
+        let was = (hover.total, app.scroll, app.said.len());
             terminal
                 .draw(|f| hover = ui::draw(f, app))
                 .map_err(|e| e.to_string())?;
@@ -801,10 +805,12 @@ async fn event_loop(
             // spent. Leaving it set would make every later frame drag the view
             // back to the pick, including after somebody scrolled away.
             app.follow_pick = false;
+            // Spent by the frame that honoured it, like the pick's follow.
+            app.anchor = None;
             // Somebody reading history stays where they are when a message
             // arrives. The lines all sit below them, so without this the text
             // would creep upward under their eyes at every poll.
-            if was.1 > 0 && hover.total > was.0 {
+            if was.1 > 0 && hover.total > was.0 && app.said.len() > was.2 {
                 app.scroll += hover.total - was.0;
             }
             needs_draw = false;
@@ -869,6 +875,11 @@ async fn event_loop(
                         }
                     }
                 }
+                // A resize rewraps every message, so the line the reader was
+                // parked on stops meaning anything. Anchor to the message that
+                // was at the bottom of the pane and the next frame puts it back
+                // there.
+                Event::Resize(_, _) => app.anchor = app.last_visible,
                 _ => {}
             }
             needs_draw = true;
