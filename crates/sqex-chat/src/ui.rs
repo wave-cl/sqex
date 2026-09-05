@@ -1455,7 +1455,16 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
         }
         None => app.scroll,
     };
-    let scroll = anchored.unwrap_or(wish).min(furthest);
+    // A followed pick wins over an anchor. Both fire on a resize when a
+    // message is picked, and they want different things: the anchor holds the
+    // bottom of the pane, the follow keeps the pick in view. Narrowing makes
+    // every message above the anchor taller, so holding the bottom is what
+    // pushes the pick off the top — the very fault the follow exists to stop.
+    let scroll = if app.follow_pick {
+        wish.min(furthest)
+    } else {
+        anchored.unwrap_or(wish).min(furthest)
+    };
     let skip = furthest - scroll;
     // A short conversation sits at the bottom, against the input box, rather
     // than floating at the top of an empty pane — where the next message would
@@ -2754,6 +2763,49 @@ mod tests {
                 "at {width} columns the anchored message did not land at the bottom"
             );
         }
+    }
+
+    /// A picked message must still be on screen after the window narrows.
+    ///
+    /// The anchor holds the *bottom* of the pane, and narrowing makes every
+    /// message above it taller — so a pick that was near the top gets pushed
+    /// off it, and the keys that act on a pick are aimed at something nobody
+    /// can see. Exactly the fault the pick's follow exists to prevent, arriving
+    /// by a different route.
+    #[test]
+    fn a_picked_message_is_still_on_screen_after_a_resize() {
+        let mut app = sample();
+        app.said = (0..60)
+            .map(|n| {
+                said(
+                    "Alice",
+                    ALICE,
+                    false,
+                    &format!("message {n} with enough words in it to wrap when the pane narrows"),
+                    3600 + n as u64,
+                )
+            })
+            .collect();
+
+        // Wide: anchor the bottom of the pane, and pick something near its top.
+        app.anchor = Some(40);
+        let wide = drawn(&app, 130, 24);
+        let top = wide.rows.iter().flatten().next().copied().unwrap();
+        app.picked = Some(top);
+        assert!(
+            wide.rows.iter().flatten().any(|o| *o == top),
+            "the pick starts on screen"
+        );
+
+        // Narrow, exactly as `Event::Resize` does it: anchor the bottom, and
+        // ask to follow the pick because there is one.
+        app.anchor = Some(40);
+        app.follow_pick = true;
+        let narrow = drawn(&app, 80, 24);
+        assert!(
+            narrow.rows.iter().flatten().any(|o| *o == top),
+            "the picked message ({top}) fell off the pane when the window narrowed"
+        );
     }
 
     #[test]
