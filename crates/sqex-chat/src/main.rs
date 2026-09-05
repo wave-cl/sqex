@@ -879,7 +879,14 @@ async fn event_loop(
                 // parked on stops meaning anything. Anchor to the message that
                 // was at the bottom of the pane and the next frame puts it back
                 // there.
-                Event::Resize(_, _) => app.anchor = app.last_visible,
+                Event::Resize(_, _) => {
+                    app.anchor = app.last_visible;
+                    // Picking is the reader working on one message, so that is
+                    // what a resize has to keep. The follow only moves the view
+                    // when the pick has actually left the pane, so this costs
+                    // nothing when it has not.
+                    app.follow_pick = app.picked.is_some();
+                }
                 _ => {}
             }
             needs_draw = true;
