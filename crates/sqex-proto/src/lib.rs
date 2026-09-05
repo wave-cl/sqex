@@ -10,6 +10,7 @@
 //! decoded payload and checks it matches — so the operator's displayed context
 //! provably corresponds to what executes.
 
+pub mod attest;
 pub mod beacon;
 pub mod blob;
 pub mod blob_store;
@@ -20,11 +21,16 @@ pub mod device;
 pub mod entry_sig;
 pub mod events;
 pub mod exchange;
+pub mod h3;
 pub mod mailbox;
 pub mod message;
+pub mod peer;
 pub mod prekey;
 pub mod profile;
+pub mod receipt;
 pub mod refusal;
+pub mod rendezvous;
+pub mod resolve;
 pub mod room;
 pub mod session;
 pub mod timeline;
@@ -62,7 +68,10 @@ pub enum Op {
     AdmissionList,
     /// Admit a device to the whitelist, with an optional label of the
     /// administrator's own.
-    AdmissionApprove { device: PubKey, label: Option<String> },
+    AdmissionApprove {
+        device: PubKey,
+        label: Option<String>,
+    },
     /// Decline one, and remember the decision so it does not requeue.
     AdmissionDeny(PubKey),
 }
@@ -259,13 +268,20 @@ fn decode_add(rest: &[u8]) -> Result<Op> {
             }
             let len = u32::from_be_bytes(tail[1..5].try_into().unwrap()) as usize;
             if len > MAX_LABEL {
-                return Err(Error::Malformed(format!("label of {len} bytes exceeds {MAX_LABEL}")));
+                return Err(Error::Malformed(format!(
+                    "label of {len} bytes exceeds {MAX_LABEL}"
+                )));
             }
             let body = &tail[5..];
             if body.len() != len {
-                return Err(Error::Malformed("whitelist-add: label length mismatch".into()));
+                return Err(Error::Malformed(
+                    "whitelist-add: label length mismatch".into(),
+                ));
             }
-            Some(String::from_utf8(body.to_vec()).map_err(|_| Error::Malformed("label is not utf-8".into()))?)
+            Some(
+                String::from_utf8(body.to_vec())
+                    .map_err(|_| Error::Malformed("label is not utf-8".into()))?,
+            )
         }
         _ => return Err(Error::Malformed("whitelist-add: bad label marker".into())),
     };

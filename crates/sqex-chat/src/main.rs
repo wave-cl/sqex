@@ -29,15 +29,15 @@ use std::collections::{HashMap, HashSet};
 /// sentence, short enough not to sit over the next thing that goes wrong.
 const NOTE_LINGER: Duration = Duration::from_secs(8);
 
-use sqex_proto::events::Event as ChatEvent;
-use sqex_proto::message::Post as SipPost;
-use sqex_proto::timeline::{Deletion, Timeline, Verdict};
-use sqnr::{Client, config::Config, identity};
-use sqnr_core::Signer;
 use sqex_proto::channel::{Role, Visibility};
 use sqex_proto::credential::Credential;
+use sqex_proto::events::Event as ChatEvent;
+use sqex_proto::message::Post as SipPost;
 use sqex_proto::refusal::Code as RefusalCode;
+use sqex_proto::timeline::{Deletion, Timeline, Verdict};
+use sqnr::{Client, config::Config, identity};
 use sqnr_core::PubKey;
+use sqnr_core::Signer;
 
 mod ui;
 
@@ -333,8 +333,8 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
             let raw = bs58::decode(credential.trim())
                 .into_vec()
                 .map_err(|e| format!("that is not base58: {e}"))?;
-            let credential = Credential::decode(&raw)
-                .map_err(|e| format!("bad credential: {e}"))?;
+            let credential =
+                Credential::decode(&raw).map_err(|e| format!("bad credential: {e}"))?;
             if !credential_is_for(&credential, &chat.device()) {
                 return Err(format!(
                     "that credential names {}, not this client ({}) — \
@@ -366,7 +366,11 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
             // SIP-17 says to check after any device registers.
             let mut waiting = 0;
             for m in chat.mine().await.map_err(|e| e.to_string())? {
-                waiting += chat.stranded(&m.channel).await.map(|a| a.devices.len()).unwrap_or(0);
+                waiting += chat
+                    .stranded(&m.channel)
+                    .await
+                    .map(|a| a.devices.len())
+                    .unwrap_or(0);
             }
             if waiting > 0 {
                 println!("{waiting} device(s) across your channels still hold no key");
@@ -390,7 +394,9 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
         }
         DeviceCmd::Revoke { key } => {
             let device: PubKey = key.trim().parse().map_err(|e| format!("bad key: {e}"))?;
-            chat.revoke_device(&device).await.map_err(|e| e.to_string())?;
+            chat.revoke_device(&device)
+                .await
+                .map_err(|e| e.to_string())?;
             println!("revoked {device}");
             println!("it keeps every key it already holds — rotate what matters");
             Ok(())
@@ -714,8 +720,7 @@ async fn event_loop(
         match chat.reseal_to_siblings(&conv.channel).await {
             Ok(0) => {}
             Ok(n) => {
-                conv.trouble.message =
-                    Some(format!("sent the key to {n} of your other device(s)"))
+                conv.trouble.message = Some(format!("sent the key to {n} of your other device(s)"))
             }
             // Discarded, this used to be, which meant the one operation that
             // makes a linked device work failed in silence.
@@ -780,10 +785,10 @@ async fn event_loop(
             // pointer that names the message above the one under it is worse than
             // no pointer at all.
             // Lines, the scroll, and **how many messages** there were. The third
-        // is what separates a message arriving from the window being resized:
-        // both grow the line count, and only one of them should move a reader
-        // who is looking at history.
-        let was = (hover.total, app.scroll, app.said.len());
+            // is what separates a message arriving from the window being resized:
+            // both grow the line count, and only one of them should move a reader
+            // who is looking at history.
+            let was = (hover.total, app.scroll, app.said.len());
             terminal
                 .draw(|f| hover = ui::draw(f, app))
                 .map_err(|e| e.to_string())?;
@@ -1053,6 +1058,15 @@ impl Dirty {
             ChatEvent::Cursor { channel } => {
                 self.receipts.insert(channel);
             }
+            // SIP-36. `sqex-chat` is a terminal client with no media: it can
+            // show that a call is ringing, and cannot answer one. Marking the
+            // channel is what puts the invitation in front of the reader, and
+            // is deliberately *not* a throttled signal fetch — the whole point
+            // of a distinct kind is that a client which has quietened its
+            // signal polling still hears a phone.
+            ChatEvent::Ringing { channel, .. } => {
+                self.channels.insert(channel);
+            }
             ChatEvent::Membership {
                 channel, account, ..
             } => {
@@ -1167,87 +1181,82 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
 /// Split out because they must work with nothing open: somebody being written
 /// to by a stranger should not have to open the conversation in order to stop
 /// it.
-async fn account_command(
-    chat: &mut Chat,
-    cmd: Command,
-) -> std::result::Result<String, ChatError> {
+async fn account_command(chat: &mut Chat, cmd: Command) -> std::result::Result<String, ChatError> {
     let note = match cmd {
-            Command::Profile(None) => {
-                let me = chat.me;
-                match chat.profile_of(&me).await {
-                    Ok(got) if got.found => Ok(Some(format!(
-                        "you are {:?}{} — /profile <name> | <title> changes it",
-                        got.profile().name,
-                        if got.profile().title.is_empty() {
-                            String::new()
-                        } else {
-                            format!(", {:?}", got.profile().title)
-                        }
-                    ))),
-                    Ok(_) => Ok(Some(
-                        "you have published no profile — /profile <name> | <title>".into(),
-                    )),
-                    Err(e) => Err(e),
-                }
-            }
-            Command::Profile(Some((name, title))) => {
-                let profile = sqex_proto::profile::Profile {
-                    flags: 0,
-                    name: name.clone(),
-                    title: title.clone(),
-                    avatar: Vec::new(),
-                };
-                chat.set_profile(profile).await.map(|()| {
-                    Some(if name.is_empty() {
-                        "your profile is empty again — readers see your key".to_string()
+        Command::Profile(None) => {
+            let me = chat.me;
+            match chat.profile_of(&me).await {
+                Ok(got) if got.found => Ok(Some(format!(
+                    "you are {:?}{} — /profile <name> | <title> changes it",
+                    got.profile().name,
+                    if got.profile().title.is_empty() {
+                        String::new()
                     } else {
-                        // Said back with a reminder of what it is. A display
-                        // name is a claim, not a credential, and a client that
-                        // reported "you are now X" would be agreeing with it.
-                        format!(
-                            "published {name:?} — a name is a claim, and readers see \
-                             your key beside it"
-                        )
-                    })
-                })
-            }
-            Command::Block(key) => match key.parse::<PubKey>() {
-                Ok(who) if who == chat.me => Err(ChatError::Protocol(
-                    "that is your own key".into(),
+                        format!(", {:?}", got.profile().title)
+                    }
+                ))),
+                Ok(_) => Ok(Some(
+                    "you have published no profile — /profile <name> | <title>".into(),
                 )),
-                Ok(who) => chat.set_block(&who, true).await.map(|()| {
-                    Some(format!(
-                        "blocked {} — what they send is dropped, and they are \
+                Err(e) => Err(e),
+            }
+        }
+        Command::Profile(Some((name, title))) => {
+            let profile = sqex_proto::profile::Profile {
+                flags: 0,
+                name: name.clone(),
+                title: title.clone(),
+                avatar: Vec::new(),
+            };
+            chat.set_profile(profile).await.map(|()| {
+                Some(if name.is_empty() {
+                    "your profile is empty again — readers see your key".to_string()
+                } else {
+                    // Said back with a reminder of what it is. A display
+                    // name is a claim, not a credential, and a client that
+                    // reported "you are now X" would be agreeing with it.
+                    format!(
+                        "published {name:?} — a name is a claim, and readers see \
+                             your key beside it"
+                    )
+                })
+            })
+        }
+        Command::Block(key) => match key.parse::<PubKey>() {
+            Ok(who) if who == chat.me => Err(ChatError::Protocol("that is your own key".into())),
+            Ok(who) => chat.set_block(&who, true).await.map(|()| {
+                Some(format!(
+                    "blocked {} — what they send is dropped, and they are \
                          answered as though it landed",
-                        short(&who)
-                    ))
-                }),
-                Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
-            },
-            Command::Unblock(key) => match key.parse::<PubKey>() {
-                Ok(who) => chat
-                    .set_block(&who, false)
-                    .await
-                    .map(|()| Some(format!("unblocked {}", short(&who)))),
-                Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
-            },
-            Command::Whoami => Ok(Some(format!(
-                "{} — your key in full. The header shows the first six, which \
+                    short(&who)
+                ))
+            }),
+            Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+        },
+        Command::Unblock(key) => match key.parse::<PubKey>() {
+            Ok(who) => chat
+                .set_block(&who, false)
+                .await
+                .map(|()| Some(format!("unblocked {}", short(&who)))),
+            Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+        },
+        Command::Whoami => Ok(Some(format!(
+            "{} — your key in full. The header shows the first six, which \
                  is for recognising yourself and not for comparing against \
                  anybody",
-                chat.me
-            ))),
-            Command::Reconnect => {
-                chat.reconnect_now();
-                Ok(Some("trying the exchange again now".to_string()))
-            }
-            Command::Blocked => chat.blocked().await.map(|who| {
-                Some(if who.is_empty() {
-                    "you have blocked nobody".to_string()
-                } else {
-                    who.iter().map(short).collect::<Vec<_>>().join(" ")
-                })
-            }),
+            chat.me
+        ))),
+        Command::Reconnect => {
+            chat.reconnect_now();
+            Ok(Some("trying the exchange again now".to_string()))
+        }
+        Command::Blocked => chat.blocked().await.map(|who| {
+            Some(if who.is_empty() {
+                "you have blocked nobody".to_string()
+            } else {
+                who.iter().map(short).collect::<Vec<_>>().join(" ")
+            })
+        }),
         _ => Ok(None),
     }?;
     Ok(note.unwrap_or_default())
@@ -1410,7 +1419,8 @@ async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: K
         // others teaches nothing about which.
         KeyCode::Char('m') => {
             if mine {
-                app.trouble.message = Some("that is you — there is no direct message with yourself".into());
+                app.trouble.message =
+                    Some("that is you — there is no direct message with yourself".into());
                 return;
             }
             match key.parse::<PubKey>() {
@@ -1422,8 +1432,7 @@ async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: K
                 // this is unreachable short of a bug — and says so rather than
                 // failing silently if it ever is not.
                 Err(_) => {
-                    app.trouble.message =
-                        Some(format!("the author's key did not parse: {key}"))
+                    app.trouble.message = Some(format!("the author's key did not parse: {key}"))
                 }
             }
         }
@@ -1441,8 +1450,7 @@ async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: K
             app.picked = None;
         }
         KeyCode::Char('e') if !mine => {
-            app.trouble.message =
-                Some("only the person who wrote a message can rewrite it".into());
+            app.trouble.message = Some("only the person who wrote a message can rewrite it".into());
         }
         KeyCode::Char('d') if !redacted => {
             let Some(at) = selected_index(open, app) else {
@@ -1640,7 +1648,9 @@ async fn handle_key(
             // "/save" typed into an edit is text somebody meant to keep, not
             // an instruction.
             if let Some(target) = app.editing.take() {
-                let Some(at) = selected_index(open, app) else { return };
+                let Some(at) = selected_index(open, app) else {
+                    return;
+                };
                 let channel = open[at].channel;
                 match chat.edit(&channel, target, SipPost::text(&text)).await {
                     Ok(_) => app.scroll = 0,
@@ -1650,7 +1660,9 @@ async fn handle_key(
                 return;
             }
             if let Some((target, _)) = app.replying.take() {
-                let Some(at) = selected_index(open, app) else { return };
+                let Some(at) = selected_index(open, app) else {
+                    return;
+                };
                 let channel = open[at].channel;
                 match chat.reply(&channel, target, &text).await {
                     Ok(_) => app.scroll = 0,
@@ -1703,8 +1715,7 @@ async fn handle_key(
                                 })
                                 .collect();
                             if app.found.is_empty() {
-                                app.trouble.message =
-                                    Some("no public channels match".into());
+                                app.trouble.message = Some("no public channels match".into());
                             }
                         }
                         Err(e) => app.trouble.message = Some(e.to_string()),
@@ -1713,8 +1724,7 @@ async fn handle_key(
                 }
                 Command::Join(n) => {
                     let Some(found) = app.found.get(*n) else {
-                        app.trouble.message =
-                            Some("no such number — /find first".into());
+                        app.trouble.message = Some("no such number — /find first".into());
                         return;
                     };
                     // The incarnation comes from the directory row we found it
@@ -1842,12 +1852,10 @@ async fn handle_key(
                     Ok(_) => Ok(Some(format!("topic set to {topic}"))),
                     Err(e) => Err(e),
                 },
-                Command::Avatar(path) => set_avatar(chat, &channel, path.as_deref())
-                    .await
-                    .map(Some),
-                Command::SaveAvatar(path) => {
-                    save_avatar(chat, &open[i], &path).await.map(Some)
+                Command::Avatar(path) => {
+                    set_avatar(chat, &channel, path.as_deref()).await.map(Some)
                 }
+                Command::SaveAvatar(path) => save_avatar(chat, &open[i], &path).await.map(Some),
                 Command::Invite(key) => match key.parse::<PubKey>() {
                     Ok(who) => match chat.invite(&channel, &who).await {
                         // SIP-17 says to check after inviting: this is the one
@@ -1881,6 +1889,30 @@ async fn handle_key(
                     }),
                     Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
                 },
+                // SIP-35 requires this to be presented as publication to
+                // another operator rather than as a setting, and the wording
+                // here is that requirement: a replica learns the whole shape of
+                // the conversation, and there is no undo.
+                Command::Replicate(key, on) => match key.parse::<PubKey>() {
+                    Ok(who) => chat.replicate(&channel, &who, on).await.map(|()| {
+                        Some(if on {
+                            format!(
+                                "{} may now hold a copy of this conversation. It learns who \
+                                 is here, when, and how much was said — not what. This cannot \
+                                 be taken back: /unreplicate stops it receiving more and \
+                                 recalls nothing",
+                                short(&who)
+                            )
+                        } else {
+                            format!(
+                                "{} will receive nothing further. What it already holds was \
+                                 lawfully obtained and stays where it is",
+                                short(&who)
+                            )
+                        })
+                    }),
+                    Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+                },
                 Command::Rotate => chat.rotate(&channel).await.map(|epoch| {
                     Some(format!(
                         "rotated to epoch {epoch} — everyone here has the new key, \
@@ -1911,9 +1943,10 @@ async fn handle_key(
                         Some(said)
                     })
                 }
-                Command::Leave => chat.leave(&channel).await.map(|()| {
-                    Some("left — it will be gone from the list next time".to_string())
-                }),
+                Command::Leave => chat
+                    .leave(&channel)
+                    .await
+                    .map(|()| Some("left — it will be gone from the list next time".to_string())),
                 Command::Op(ref key) | Command::Deop(ref key) => {
                     let admin = matches!(cmd, Command::Op(_));
                     match key.parse::<PubKey>() {
@@ -1925,7 +1958,9 @@ async fn handle_key(
                                      remove and set retention",
                                     short(&who)
                                 ))),
-                                Ok(()) => Ok(Some(format!("{} is an ordinary member again", short(&who)))),
+                                Ok(()) => {
+                                    Ok(Some(format!("{} is an ordinary member again", short(&who))))
+                                }
                                 // The exchange refuses this in a direct
                                 // message, where both parties are admins from
                                 // the start; say that rather than pass on a
@@ -1982,13 +2017,13 @@ async fn handle_key(
                     match open.get(to).map(|o| (o.channel, o.label.clone())) {
                         Some((target, label)) if target != channel => {
                             forward_file(chat, &open[i], seq, &target).await.map(|n| {
-                                Some(format!("forwarded {n} to {label} — the file was not \
-                                              uploaded again"))
+                                Some(format!(
+                                    "forwarded {n} to {label} — the file was not \
+                                              uploaded again"
+                                ))
                             })
                         }
-                        Some(_) => Err(ChatError::Protocol(
-                            "that is this conversation".into(),
-                        )),
+                        Some(_) => Err(ChatError::Protocol("that is this conversation".into())),
                         None => Err(ChatError::Protocol(format!(
                             "there is no conversation {}",
                             to + 1
@@ -2037,8 +2072,7 @@ async fn handle_key(
                         // one place a member who has never spoken is listed,
                         // and they are exactly who somebody runs it to
                         // identify.
-                        let members: Vec<PubKey> =
-                            info.members.iter().map(|m| m.account).collect();
+                        let members: Vec<PubKey> = info.members.iter().map(|m| m.account).collect();
                         // Asked for, not cached: somebody typing /who is
                         // putting the question, and answering it out of an
                         // hour-old note is refusing to answer it.
@@ -2047,9 +2081,7 @@ async fn handle_key(
                             info.members
                                 .iter()
                                 .map(|m| {
-                                    let name = chat
-                                        .display_name(&m.account)
-                                        .unwrap_or_default();
+                                    let name = chat.display_name(&m.account).unwrap_or_default();
                                     // The whole key, not a stub of it. Since
                                     // the transcript stopped showing keys this
                                     // is the list somebody runs to find one,
@@ -2108,9 +2140,7 @@ async fn handle_key(
                     None
                 }
             };
-            if restructured
-                && let Ok(fresh) = sync_channels(chat).await
-            {
+            if restructured && let Ok(fresh) = sync_channels(chat).await {
                 *open = fresh;
                 if let Some(n) = note
                     && let Some(last) = open.last_mut()
@@ -2145,6 +2175,10 @@ enum Command {
     Invite(String),
     /// `/kick <key>` — remove somebody, and rotate so what follows is not theirs.
     Kick(String),
+    /// `/replicate <exchange key>` — let another exchange hold a copy of this
+    /// channel. `bool` is false for `/unreplicate`, which ends the
+    /// subscription and recalls nothing.
+    Replicate(String, bool),
     /// `/name <name>` — rename, as a sealed entry the exchange cannot read.
     Name(String),
     /// `/topic <text>` — set what this channel is for, likewise sealed.
@@ -2242,9 +2276,7 @@ impl Command {
             "/find" => Command::Find(rest.to_string()),
             "/join" => match first.parse::<usize>() {
                 Ok(n) if n >= 1 => Command::Join(n - 1),
-                _ => Command::Unknown(
-                    "/join takes a number from the last /find".into(),
-                ),
+                _ => Command::Unknown("/join takes a number from the last /find".into()),
             },
             "/name" if !rest.is_empty() => Command::Name(rest.to_string()),
             "/name" => Command::Unknown("/name needs a name".into()),
@@ -2269,13 +2301,21 @@ impl Command {
             "/invite" => Command::Unknown("/invite needs a public key".into()),
             "/kick" if !first.is_empty() => Command::Kick(first.to_string()),
             "/kick" => Command::Unknown("/kick needs a public key".into()),
+            "/replicate" if !first.is_empty() => Command::Replicate(first.to_string(), true),
+            "/replicate" => Command::Unknown(
+                "/replicate needs an exchange's public key. It lets that exchange hold a \
+                 copy of this conversation, and cannot be undone"
+                    .into(),
+            ),
+            "/unreplicate" if !first.is_empty() => Command::Replicate(first.to_string(), false),
+            "/unreplicate" => {
+                Command::Unknown("/unreplicate needs an exchange's public key".into())
+            }
             "/rotate" => Command::Rotate,
             "/leave" => Command::Leave,
             "/redact" => match first.parse::<u64>() {
                 Ok(n) if n > 0 => Command::Redact(n),
-                _ => Command::Unknown(
-                    "/redact takes the number of a message you posted".into(),
-                ),
+                _ => Command::Unknown("/redact takes the number of a message you posted".into()),
             },
             "/who" => Command::Who,
             // The name and the title are both free text, so they are separated
@@ -2284,9 +2324,7 @@ impl Command {
             "/profile" if rest.is_empty() => Command::Profile(None),
             // Publishing an empty record, which is how a name is taken back.
             // Without this a name could be set and never unset.
-            "/profile" if first == "off" => {
-                Command::Profile(Some((String::new(), String::new())))
-            }
+            "/profile" if first == "off" => Command::Profile(Some((String::new(), String::new()))),
             "/profile" => {
                 let (name, title) = match rest.split_once('|') {
                     Some((n, t)) => (n.trim().to_string(), t.trim().to_string()),
@@ -2524,7 +2562,11 @@ async fn save_avatar(
     }
     std::fs::write(&target, &bytes)
         .map_err(|e| ChatError::Protocol(format!("{}: {e}", target.display())))?;
-    Ok(format!("saved {} bytes to {}", bytes.len(), target.display()))
+    Ok(format!(
+        "saved {} bytes to {}",
+        bytes.len(),
+        target.display()
+    ))
 }
 
 /// Fetch the attachment on message `seq` and write it out.
@@ -2567,7 +2609,11 @@ async fn save_file(
     }
     std::fs::write(&target, &bytes)
         .map_err(|e| ChatError::Protocol(format!("{}: {e}", target.display())))?;
-    Ok(format!("saved {} bytes to {}", bytes.len(), target.display()))
+    Ok(format!(
+        "saved {} bytes to {}",
+        bytes.len(),
+        target.display()
+    ))
 }
 
 /// Rebuild the conversation list and land on `channel`, carrying a note.
@@ -2624,7 +2670,11 @@ async fn message_account(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, a
         app.trouble.message = Some("that is your own key".into());
         return;
     }
-    if let Some(existing) = open.iter().find(|o| o.peer == Some(account)).map(|o| o.channel) {
+    if let Some(existing) = open
+        .iter()
+        .find(|o| o.peer == Some(account))
+        .map(|o| o.channel)
+    {
         app.selected = Some(existing);
         // The same three things Tab does, for the same reasons: a conversation
         // arrived at is read from its newest, and carrying a scroll offset
@@ -2866,8 +2916,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 // delivered may well have been read by somebody who declined
                 // to say, and claiming otherwise would be inventing a fact.
                 receipt: (m.account == *me).then(|| {
-                    let others: Vec<_> =
-                        conv.marks.iter().filter(|k| k.account != *me).collect();
+                    let others: Vec<_> = conv.marks.iter().filter(|k| k.account != *me).collect();
                     if others.is_empty() {
                         ui::Receipt::Sent
                     } else if others.iter().all(|k| k.read >= m.seq) {
@@ -2913,9 +2962,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 reactions: m
                     .reactions
                     .iter()
-                    .map(|(emoji, who)| {
-                        (emoji.clone(), who.len(), who.contains(me))
-                    })
+                    .map(|(emoji, who)| (emoji.clone(), who.len(), who.contains(me)))
                     .collect(),
                 mentions: m.post.mentions().map(short).collect(),
             }
@@ -3246,8 +3293,6 @@ fn resolve_one_sync(address: &str) -> Result<std::net::SocketAddr, String> {
         .ok_or_else(|| format!("{address:?} resolved to no addresses"))
 }
 
-
-
 /// Split a trailing `:port`, leaving an IPv6 literal alone.
 fn split_port(addr: &str) -> (&str, Option<u16>) {
     if addr.starts_with('[') {
@@ -3306,7 +3351,7 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<([u8; 32], PubKey), String> 
 mod tests {
     use super::*;
     use sqex_proto::message::{Body, Post as SipPost};
-    use sqex_proto::timeline::{Received, Verdict};
+    use sqex_proto::timeline::{Received, Standing, Verdict};
 
     /// A credential is addressed to a device, so a client that has been linked
     /// — where the account is somebody else's key — must still recognise one
@@ -3364,6 +3409,7 @@ mod tests {
                 posted: 0,
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
+                standing: Standing::Unclaimed,
                 body: Some(Body::Post(SipPost::text(text))),
                 verdict: Verdict::Valid,
             },
@@ -3433,6 +3479,7 @@ mod tests {
                 posted: 10,
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
+                standing: Standing::Unclaimed,
                 body: Some(Body::Post(SipPost::text("hello"))),
                 verdict: Verdict::Valid,
             }],
@@ -3495,7 +3542,10 @@ mod tests {
     fn a_copy_says_the_key_either_way() {
         let key = PubKey::new([9; 32]).to_string();
         let note = copied(&key, false);
-        assert!(note.contains(&key), "the note does not carry the key: {note}");
+        assert!(
+            note.contains(&key),
+            "the note does not carry the key: {note}"
+        );
         assert!(note.contains("their key"), "{note}");
         assert!(copied(&key, true).contains("your key"));
     }
@@ -3651,6 +3701,7 @@ mod tests {
                 posted: 10,
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
+                standing: Standing::Unclaimed,
                 body: Some(Body::Post(SipPost::text("did you see this?"))),
                 verdict: Verdict::Valid,
             }],
@@ -3671,7 +3722,11 @@ mod tests {
             app.said[0].receipt
         };
 
-        let mark = |a, d, r| Mark { account: a, delivered: d, read: r };
+        let mark = |a, d, r| Mark {
+            account: a,
+            delivered: d,
+            read: r,
+        };
 
         // Nobody has fetched it.
         assert_eq!(
@@ -3714,8 +3769,16 @@ mod tests {
         let bob = PubKey::new([2; 32]);
         let mut c = conv(2, "bob");
         c.marks = vec![
-            Mark { account: me, delivered: 9, read: 9 },
-            Mark { account: bob, delivered: 9, read: 9 },
+            Mark {
+                account: me,
+                delivered: 9,
+                read: 9,
+            },
+            Mark {
+                account: bob,
+                delivered: 9,
+                read: 9,
+            },
         ];
         c.timeline = Timeline::fold(
             &[
@@ -3725,6 +3788,7 @@ mod tests {
                     posted: 10,
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
+                    standing: Standing::Unclaimed,
                     body: Some(Body::Post(SipPost::text("theirs"))),
                     verdict: Verdict::Valid,
                 },
@@ -3734,6 +3798,7 @@ mod tests {
                     posted: 11,
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
+                    standing: Standing::Unclaimed,
                     body: Some(Body::Post(SipPost::text("mine"))),
                     verdict: Verdict::Valid,
                 },
@@ -3747,7 +3812,10 @@ mod tests {
         };
         refresh(&mut app, &open, &me, &HashMap::new());
         assert_eq!(app.said.len(), 2);
-        assert_eq!(app.said[0].receipt, None, "a receipt on somebody else's message");
+        assert_eq!(
+            app.said[0].receipt, None,
+            "a receipt on somebody else's message"
+        );
         assert_eq!(app.said[1].receipt, Some(ui::Receipt::Read));
     }
 
@@ -3764,6 +3832,7 @@ mod tests {
             posted: 10 + seq,
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
+            standing: Standing::Unclaimed,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };
@@ -3807,6 +3876,7 @@ mod tests {
             posted: 10 + seq,
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
+            standing: Standing::Unclaimed,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };
@@ -3845,7 +3915,10 @@ mod tests {
         let mut app = App::default();
         refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
         assert_eq!(
-            app.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+            app.rows
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>(),
             vec!["bob", "carol", "alice"]
         );
     }
@@ -3931,14 +4004,20 @@ mod tests {
 
     #[test]
     fn retention_takes_a_window_and_optionally_a_count() {
-        assert!(matches!(Command::parse("/retain 3600"), Command::Retain(3600, 0)));
+        assert!(matches!(
+            Command::parse("/retain 3600"),
+            Command::Retain(3600, 0)
+        ));
         assert!(matches!(
             Command::parse("/retain 3600 50"),
             Command::Retain(3600, 50)
         ));
         // Not a number is a mistake to report rather than a value to guess at:
         // narrowing a window deletes messages straight away.
-        assert!(matches!(Command::parse("/retain soon"), Command::Unknown(_)));
+        assert!(matches!(
+            Command::parse("/retain soon"),
+            Command::Unknown(_)
+        ));
         assert!(matches!(Command::parse("/retain"), Command::Unknown(_)));
     }
 
@@ -3971,7 +4050,9 @@ mod tests {
     #[test]
     fn a_path_with_spaces_does_not_need_quoting() {
         match Command::parse("/file /tmp/my holiday photo.png") {
-            Command::File(p) => assert_eq!(p, std::path::PathBuf::from("/tmp/my holiday photo.png")),
+            Command::File(p) => {
+                assert_eq!(p, std::path::PathBuf::from("/tmp/my holiday photo.png"))
+            }
             _ => panic!("not parsed as a file"),
         }
     }
@@ -3985,7 +4066,10 @@ mod tests {
             }
             _ => panic!("not parsed as a save"),
         }
-        assert!(matches!(Command::parse("/save notanumber /tmp/x"), Command::Unknown(_)));
+        assert!(matches!(
+            Command::parse("/save notanumber /tmp/x"),
+            Command::Unknown(_)
+        ));
         assert!(matches!(Command::parse("/save 12"), Command::Unknown(_)));
         assert!(matches!(Command::parse("/file"), Command::Unknown(_)));
     }
@@ -4079,7 +4163,10 @@ mod tests {
 
         assert!(dirty.arrivals);
         for c in [1u8, 2, 3] {
-            assert!(dirty.channels.contains(&[c; 32]), "channel {c} was left stale");
+            assert!(
+                dirty.channels.contains(&[c; 32]),
+                "channel {c} was left stale"
+            );
             assert!(dirty.receipts.contains(&[c; 32]));
         }
     }

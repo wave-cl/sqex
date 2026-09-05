@@ -65,6 +65,26 @@ pub const TYPE_MINE: u8 = 0x10;
 /// exchange — a membership graph with a name on it says considerably more than
 /// the graph — and this route refuses one rather than storing it.
 pub const TYPE_DIRECTORY: u8 = 0x11;
+/// SIP-34: a fetch whose answer carries receipts.
+///
+/// Carries exactly the fields of [`TYPE_FETCH`] and differs only in the shape
+/// of the response. A distinct byte rather than a flag because **a response's
+/// shape must follow from the request's type and never from its length** —
+/// there is nowhere to append a field to an `Entries`, whose entries have no
+/// per-entry length prefix, and both outer decoders refuse trailing bytes on
+/// purpose. This is the hazard SIP-31 met from the other direction when it
+/// moved `Post` off `0x06`.
+pub const TYPE_FETCH_RECEIPTED: u8 = 0x13;
+/// SIP-34: a post whose answer carries a receipt, so a poster learns its entry
+/// was numbered rather than accepted and discarded.
+pub const TYPE_POST_RECEIPTED: u8 = 0x14;
+/// SIP-35: authorise replication of this channel to a replica exchange.
+pub const TYPE_REPLICATE: u8 = 0x15;
+/// SIP-35: withdraw that authorisation. **Not a recall** — a replica stops
+/// accepting new entries, and what it holds was lawfully obtained.
+pub const TYPE_UNREPLICATE: u8 = 0x16;
+/// SIP-35: ask for the proof that this exchange's origin equivocated.
+pub const TYPE_EQUIVOCATION: u8 = 0x17;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.
@@ -91,6 +111,22 @@ pub const EVENT_CREATED: u8 = 0x09;
 /// This left no record whatsoever before, so a public room could be renamed
 /// with nothing to show for it — a gap that needs no second exchange to matter.
 pub const EVENT_RENAMED: u8 = 0x0a;
+/// SIP-35: `actor` authorised replication of this channel to `subject`, a
+/// replica exchange's Ed25519 identity.
+///
+/// **An entry, so the members can see it.** An out-of-band arrangement between
+/// two operators would have been simpler and would have made a channel's copies
+/// invisible to the people in it. It lands in the log they already read, signed
+/// by whoever did it, and replicates with the channel — so a reader at a replica
+/// can see the authority under which the replica holds what it is showing them.
+pub const EVENT_REPLICATE: u8 = 0x0b;
+/// SIP-35: `actor` withdrew that authorisation.
+///
+/// **Not a revocation of a copy.** A replica stops accepting new entries and
+/// should stop serving, but what it holds was lawfully obtained and no protocol
+/// can unsend it. An implementation MUST NOT describe this as recalling
+/// anything; it is the end of a subscription.
+pub const EVENT_UNREPLICATE: u8 = 0x0c;
 
 /// The body of an entry the exchange wrote itself.
 ///
@@ -139,7 +175,7 @@ impl System {
                 b.len()
             )));
         }
-        if b[0] == 0 || b[0] > EVENT_RENAMED {
+        if b[0] == 0 || b[0] > EVENT_UNREPLICATE {
             return Ok(None);
         }
         Ok(Some(System {
@@ -601,6 +637,12 @@ pub struct Post {
     pub prev: [u8; 32],
     /// SIP-31 signature by the posting device over everything it chose.
     pub sig: [u8; 64],
+    /// SIP-34: ask for a receipt in the answer.
+    ///
+    /// Carried as the type byte, not as a field — the request's length is
+    /// unchanged, and an exchange that does not implement SIP-34 refuses the
+    /// type cleanly rather than reading a flag it does not know.
+    pub receipts: bool,
     pub body: Vec<u8>,
 }
 
@@ -610,7 +652,11 @@ pub const POST_HEADER: usize = 1 + 32 + 4 + 8 + 4 + 8 + 32 + 64;
 impl Post {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(POST_HEADER + self.body.len());
-        out.push(TYPE_POST);
+        out.push(if self.receipts {
+            TYPE_POST_RECEIPTED
+        } else {
+            TYPE_POST
+        });
         out.extend_from_slice(&self.channel);
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.msg_seq.to_be_bytes());
@@ -629,7 +675,7 @@ impl Post {
                 "post predates SIP-31 and carries no signature".into(),
             ));
         }
-        if b[0] != TYPE_POST {
+        if b[0] != TYPE_POST && b[0] != TYPE_POST_RECEIPTED {
             return Err(Error::Malformed(format!("not a post (type {:#x})", b[0])));
         }
         let body = b[POST_HEADER..].to_vec();
@@ -647,6 +693,7 @@ impl Post {
             chain_seq: u64at(b, 49),
             prev: b[57..89].try_into().unwrap(),
             sig: b[89..153].try_into().unwrap(),
+            receipts: b[0] == TYPE_POST_RECEIPTED,
             body,
         })
     }
@@ -658,12 +705,18 @@ pub struct Fetch {
     pub channel: [u8; 32],
     pub since: u64,
     pub wait_secs: u16,
+    /// SIP-34: ask for receipts on the entries and a signed tip.
+    pub receipts: bool,
 }
 
 impl Fetch {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(43);
-        out.push(TYPE_FETCH);
+        out.push(if self.receipts {
+            TYPE_FETCH_RECEIPTED
+        } else {
+            TYPE_FETCH
+        });
         out.extend_from_slice(&self.channel);
         out.extend_from_slice(&self.since.to_be_bytes());
         out.extend_from_slice(&self.wait_secs.to_be_bytes());
@@ -677,7 +730,7 @@ impl Fetch {
                 b.len()
             )));
         }
-        if b[0] != TYPE_FETCH {
+        if b[0] != TYPE_FETCH && b[0] != TYPE_FETCH_RECEIPTED {
             return Err(Error::Malformed(format!("not a fetch (type {:#x})", b[0])));
         }
         Ok(Fetch {
@@ -687,6 +740,7 @@ impl Fetch {
             // the exchange will is not making an error, and answering early is
             // always permitted.
             wait_secs: u16at(b, 41).min(MAX_WAIT),
+            receipts: b[0] == TYPE_FETCH_RECEIPTED,
         })
     }
 }
@@ -709,8 +763,7 @@ pub struct Directory {
 
 impl Directory {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(36 + ACTION_LEN + self.name.len() + self.topic.len());
+        let mut out = Vec::with_capacity(36 + ACTION_LEN + self.name.len() + self.topic.len());
         out.push(TYPE_DIRECTORY);
         out.extend_from_slice(&self.channel);
         out.push(self.name.len() as u8);
@@ -742,8 +795,7 @@ impl Directory {
         }
         let name = String::from_utf8(b[34..after_name].to_vec())
             .map_err(|_| Error::Malformed("directory name is not utf-8".into()))?;
-        let topic_len =
-            u16::from_be_bytes([b[after_name], b[after_name + 1]]) as usize;
+        let topic_len = u16::from_be_bytes([b[after_name], b[after_name + 1]]) as usize;
         let start = after_name + 2;
         if b.len() != start + topic_len + ACTION_LEN {
             return Err(Error::Malformed("directory topic runs past the end".into()));
@@ -835,7 +887,10 @@ impl Invite {
             )));
         }
         if b[0] != TYPE_INVITE {
-            return Err(Error::Malformed(format!("not an invite (type {:#x})", b[0])));
+            return Err(Error::Malformed(format!(
+                "not an invite (type {:#x})",
+                b[0]
+            )));
         }
         Ok(Invite {
             channel: b[1..33].try_into().unwrap(),
@@ -968,7 +1023,10 @@ impl Ack {
 
     pub fn decode(b: &[u8]) -> Result<Ack> {
         if b.len() != 8 {
-            return Err(Error::Malformed(format!("ack is {} bytes, want 8", b.len())));
+            return Err(Error::Malformed(format!(
+                "ack is {} bytes, want 8",
+                b.len()
+            )));
         }
         Ok(Ack { now: u64at(b, 0) })
     }
@@ -1024,21 +1082,34 @@ pub struct Posted {
     pub seq: u64,
     pub posted: u64,
     pub now: u64,
+    /// SIP-34, present only on an answer to [`TYPE_POST_RECEIPTED`].
+    ///
+    /// **What it closes:** an exchange that accepted a post and quietly
+    /// discarded it had said nothing a poster could check. A receipt here is
+    /// the exchange stating that it numbered the entry. It does not close
+    /// withholding — an exchange that refuses a post outright, or never
+    /// advances its head, has issued no receipt and contradicted nothing.
+    pub stamp: Option<Receipted>,
 }
 
 impl Posted {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24);
+        let mut out = Vec::with_capacity(24 + RECEIPTED_LEN);
         out.extend_from_slice(&self.seq.to_be_bytes());
         out.extend_from_slice(&self.posted.to_be_bytes());
         out.extend_from_slice(&self.now.to_be_bytes());
+        if let Some(stamp) = &self.stamp {
+            stamp.write(&mut out);
+        }
         out
     }
 
-    pub fn decode(b: &[u8]) -> Result<Posted> {
-        if b.len() != 24 {
+    /// Read one in the shape the caller's request selected.
+    pub fn decode(b: &[u8], receipted: bool) -> Result<Posted> {
+        let want_len = 24 + if receipted { RECEIPTED_LEN } else { 0 };
+        if b.len() != want_len {
             return Err(Error::Malformed(format!(
-                "posted is {} bytes, want 24",
+                "posted is {} bytes, want {want_len}",
                 b.len()
             )));
         }
@@ -1046,6 +1117,7 @@ impl Posted {
             seq: u64at(b, 0),
             posted: u64at(b, 8),
             now: u64at(b, 16),
+            stamp: receipted.then(|| Receipted::read(b, 24)),
         })
     }
 }
@@ -1080,15 +1152,116 @@ pub struct Entry {
     /// SIP-31 signature by `device`. A system entry carries zeroes here and
     /// puts its actor's signature inside the body instead.
     pub sig: [u8; 64],
+    /// SIP-34, present only on a response to [`TYPE_FETCH_RECEIPTED`].
+    ///
+    /// `None` means the exchange was not asked, or does not implement SIP-34.
+    /// It never means the entry is suspect: absence is *unclaimed*, and a
+    /// receipt that is present and does not verify is *repudiated*. A client
+    /// that collapses those two has built a mechanism an exchange can switch
+    /// off by corrupting its own signatures.
+    pub stamp: Option<Receipted>,
     pub body: Vec<u8>,
 }
 
 /// Bytes of entry header before the body.
 pub const ENTRY_HEADER: usize = 8 + 1 + 32 + 32 + 8 + 4 + 4 + 8 + 8 + 32 + 32 + 64 + 4;
 
+/// SIP-34: where the exchange put this entry, and its signature saying so.
+///
+/// `head` is carried per entry rather than recomputed because a reader that
+/// begins mid-log — after a prune, or with `since` above `first` — holds
+/// nothing to recompute from, and the head is an input to the signature it must
+/// check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Receipted {
+    /// SHA-256 of the entry's SIP-31 signing input.
+    ///
+    /// **Carried rather than recomputed, and SIP-34 needs it that way.** A
+    /// member entry's signing input is recomputable from the entry's own
+    /// fields, so a verifier checks this against its own arithmetic and refuses
+    /// a receipt that names a different hash. A *system* entry's is not: its
+    /// input includes SIP-31's `arg`, which is deliberately never transmitted
+    /// — both parties to the action reconstruct it, and a third party reading
+    /// the log later is not one of them. Without this field a verifier could
+    /// not check the head linkage across any membership change, which is to
+    /// say across most of what a channel's history is made of.
+    pub entry_hash: [u8; 32],
+    pub head: [u8; 32],
+    pub receipt: [u8; 64],
+}
+
+/// Bytes a [`Receipted`] occupies.
+pub const RECEIPTED_LEN: usize = 32 + 32 + 64;
+
+impl Receipted {
+    /// SIP-35 writes these outside an `Entries`, so the reader and writer are
+    /// shared rather than reimplemented per response.
+    pub fn write_into(&self, out: &mut Vec<u8>) {
+        self.write(out);
+    }
+
+    /// The pair to [`Receipted::write_into`]. The caller has already checked
+    /// the buffer is long enough, as every fixed-layout reader here does.
+    pub fn read_from(b: &[u8], at: usize) -> Receipted {
+        Receipted::read(b, at)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.entry_hash);
+        out.extend_from_slice(&self.head);
+        out.extend_from_slice(&self.receipt);
+    }
+
+    fn read(b: &[u8], at: usize) -> Receipted {
+        Receipted {
+            entry_hash: b[at..at + 32].try_into().unwrap(),
+            head: b[at + 32..at + 64].try_into().unwrap(),
+            receipt: b[at + 64..at + 128].try_into().unwrap(),
+        }
+    }
+}
+
+/// The head and receipt of a channel's `last`, whether or not it is in the
+/// batch.
+///
+/// **This is what a reader who fetched nothing still learns.** A reader whose
+/// tip advances while its entries do not knows the exchange is carrying
+/// something it is not serving, which before SIP-34 was indistinguishable from
+/// an idle channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tip {
+    /// `0` where the channel has no entries and there is nothing to sign;
+    /// `posted` and `stamp` are then zeroes.
+    pub seq: u64,
+    /// **Carried because the tip's whole purpose is to be checkable when its
+    /// entry is not in the batch.** `posted` is bound into the receipt's
+    /// signing input, so a reader that fetched nothing — the case this field
+    /// exists for — could not verify the tip without it.
+    pub posted: u64,
+    pub stamp: Receipted,
+}
+
 impl Entry {
     pub fn wire_len(&self) -> usize {
-        ENTRY_HEADER + self.body.len()
+        ENTRY_HEADER
+            + if self.stamp.is_some() {
+                RECEIPTED_LEN
+            } else {
+                0
+            }
+            + self.body.len()
+    }
+
+    /// Write one in the receipted shape, for SIP-35's `Pulled` — where a
+    /// receipt is not optional, because a replica that stored an entry without
+    /// one would have taken the origin's word for its position.
+    pub fn write_receipted(&self, out: &mut Vec<u8>) {
+        self.write(out);
+    }
+
+    /// Read one written by [`Entry::write_receipted`].
+    pub fn read_receipted(b: &[u8], o: &mut usize) -> Result<Entry> {
+        Entry::read(b, o, true)
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -1104,21 +1277,31 @@ impl Entry {
         out.extend_from_slice(&self.prev);
         out.extend_from_slice(&self.body_hash);
         out.extend_from_slice(&self.sig);
+        if let Some(stamp) = &self.stamp {
+            stamp.write(out);
+        }
         out.extend_from_slice(&(self.body.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.body);
     }
 
-    fn read(b: &[u8], o: &mut usize) -> Result<Entry> {
-        want(b, *o + ENTRY_HEADER, "entry")?;
+    /// Read one at `o`, in the shape the caller's request selected.
+    ///
+    /// `receipted` is not guessed from the buffer and must not be: an entry
+    /// carries no length of its own, so a reader that guessed wrong would
+    /// misparse every entry after this one rather than fail.
+    fn read(b: &[u8], o: &mut usize, receipted: bool) -> Result<Entry> {
+        let extra = if receipted { RECEIPTED_LEN } else { 0 };
+        let header = ENTRY_HEADER + extra;
+        want(b, *o + header, "entry")?;
         let at = *o;
-        let len = u32at(b, at + 233) as usize;
+        let len = u32at(b, at + 233 + extra) as usize;
         if len > MAX_ENTRY_BODY {
             return Err(Error::Malformed(format!(
                 "entry body is {len} bytes, limit is {MAX_ENTRY_BODY}"
             )));
         }
-        want(b, at + ENTRY_HEADER + len, "entry")?;
-        *o = at + ENTRY_HEADER + len;
+        want(b, at + header + len, "entry")?;
+        *o = at + header + len;
         Ok(Entry {
             seq: u64at(b, at),
             kind: b[at + 8],
@@ -1132,7 +1315,8 @@ impl Entry {
             prev: b[at + 105..at + 137].try_into().unwrap(),
             body_hash: b[at + 137..at + 169].try_into().unwrap(),
             sig: b[at + 169..at + 233].try_into().unwrap(),
-            body: b[at + ENTRY_HEADER..at + ENTRY_HEADER + len].to_vec(),
+            stamp: receipted.then(|| Receipted::read(b, at + 233)),
+            body: b[at + header..at + header + len].to_vec(),
         })
     }
 }
@@ -1153,6 +1337,8 @@ pub struct Entries {
     /// dropped every one of these would still conform: signals are a courtesy
     /// and nothing may depend on one arriving.
     pub signals: Vec<Signalled>,
+    /// SIP-34, present only on an answer to [`TYPE_FETCH_RECEIPTED`].
+    pub tip: Option<Tip>,
 }
 
 /// One signal, as it reached us. The body is SIP-19's; nothing here reads it.
@@ -1188,10 +1374,16 @@ impl Entries {
             out.extend_from_slice(&(s.body.len() as u16).to_be_bytes());
             out.extend_from_slice(&s.body);
         }
+        if let Some(tip) = &self.tip {
+            out.extend_from_slice(&tip.seq.to_be_bytes());
+            out.extend_from_slice(&tip.posted.to_be_bytes());
+            tip.stamp.write(&mut out);
+        }
         out
     }
 
-    pub fn decode(b: &[u8]) -> Result<Entries> {
+    /// Read one in the shape the caller's request selected.
+    pub fn decode(b: &[u8], receipted: bool) -> Result<Entries> {
         want(b, 26, "entries")?;
         let count = u16at(b, 24) as usize;
         if count > MAX_BATCH {
@@ -1202,7 +1394,7 @@ impl Entries {
         let mut o = 26;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            entries.push(Entry::read(b, &mut o)?);
+            entries.push(Entry::read(b, &mut o, receipted)?);
         }
         want(b, o + 2, "entries")?;
         let count = u16at(b, o) as usize;
@@ -1229,6 +1421,18 @@ impl Entries {
             });
             o += 35 + len;
         }
+        let tip = if receipted {
+            want(b, o + 16 + RECEIPTED_LEN, "tip")?;
+            let tip = Tip {
+                seq: u64at(b, o),
+                posted: u64at(b, o + 8),
+                stamp: Receipted::read(b, o + 16),
+            };
+            o += 16 + RECEIPTED_LEN;
+            Some(tip)
+        } else {
+            None
+        };
         if o != b.len() {
             return Err(Error::Malformed(format!(
                 "entries has {} trailing bytes",
@@ -1241,6 +1445,7 @@ impl Entries {
             last: u64at(b, 16),
             entries,
             signals,
+            tip,
         })
     }
 }
@@ -1605,13 +1810,25 @@ mod tests {
         // `create()` has one invitee, so a fresh create signs twice.
         assert_eq!(Create::decode(&create().encode()).unwrap().actions.len(), 2);
 
-        let returning = Create { actions: vec![act(0)], ..create() };
-        assert_eq!(Create::decode(&returning.encode()).unwrap().actions.len(), 1);
+        let returning = Create {
+            actions: vec![act(0)],
+            ..create()
+        };
+        assert_eq!(
+            Create::decode(&returning.encode()).unwrap().actions.len(),
+            1
+        );
 
-        let none = Create { actions: vec![], ..create() };
+        let none = Create {
+            actions: vec![],
+            ..create()
+        };
         assert!(Create::decode(&none.encode()).is_err());
 
-        let too_many = Create { actions: vec![act(0), act(1), act(2)], ..create() };
+        let too_many = Create {
+            actions: vec![act(0), act(1), act(2)],
+            ..create()
+        };
         assert!(Create::decode(&too_many.encode()).is_err());
     }
 
@@ -1646,7 +1863,11 @@ mod tests {
     }
 
     fn act(n: u64) -> Action {
-        Action { chain_seq: n, prev: [n as u8; 32], sig: [n as u8; 64] }
+        Action {
+            chain_seq: n,
+            prev: [n as u8; 32],
+            sig: [n as u8; 64],
+        }
     }
 
     #[test]
@@ -1659,11 +1880,13 @@ mod tests {
             chain_seq: 0,
             prev: [0; 32],
             sig: [9; 64],
+            receipts: false,
             body: b"hello".to_vec(),
         };
         assert_eq!(Post::decode(&p.encode()).unwrap(), p);
 
         let big = Post {
+            receipts: false,
             body: vec![0; MAX_ENTRY_BODY + 1],
             ..p
         };
@@ -1683,6 +1906,7 @@ mod tests {
             chain_seq: 0,
             prev: [0; 32],
             sig: [9; 64],
+            receipts: false,
             body: b"a message long enough to have survived being eaten".to_vec(),
         };
         let mut old = p.encode();
@@ -1707,6 +1931,7 @@ mod tests {
             chain_seq: 0,
             prev: [0; 32],
             sig: [9; 64],
+            receipts: false,
             body: vec![],
         };
         assert_eq!(Post::decode(&p.encode()).unwrap(), p);
@@ -1718,6 +1943,7 @@ mod tests {
             channel: [1; 32],
             since: 0,
             wait_secs: 9_999,
+            receipts: false,
         };
         assert_eq!(Fetch::decode(&f.encode()).unwrap().wait_secs, MAX_WAIT);
     }
@@ -1737,6 +1963,7 @@ mod tests {
             prev: [0; 32],
             body_hash: [0; 32],
             sig: [0; 64],
+            stamp: None,
             body: body.to_vec(),
         };
         let got = Entries {
@@ -1745,8 +1972,9 @@ mod tests {
             last: 3,
             entries: vec![e(1, b"one"), e(2, b""), e(3, b"three")],
             signals: vec![],
+            tip: None,
         };
-        assert_eq!(Entries::decode(&got.encode()).unwrap(), got);
+        assert_eq!(Entries::decode(&got.encode(), false).unwrap(), got);
     }
 
     #[test]
@@ -1759,8 +1987,9 @@ mod tests {
             last: 91,
             entries: vec![],
             signals: vec![],
+            tip: None,
         };
-        let back = Entries::decode(&got.encode()).unwrap();
+        let back = Entries::decode(&got.encode(), false).unwrap();
         assert_eq!((back.first, back.last), (40, 91));
     }
 
@@ -1783,8 +2012,9 @@ mod tests {
                     body: vec![],
                 },
             ],
+            tip: None,
         };
-        assert_eq!(Entries::decode(&got.encode()).unwrap(), got);
+        assert_eq!(Entries::decode(&got.encode(), false).unwrap(), got);
     }
 
     #[test]
@@ -1828,7 +2058,10 @@ mod tests {
             channel: [5; 32],
             target: 12,
         };
-        assert_eq!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_REDACT).unwrap(), t);
+        assert_eq!(
+            ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_REDACT).unwrap(),
+            t
+        );
         assert!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_CURSOR).is_err());
     }
 
@@ -1847,9 +2080,16 @@ mod tests {
 
         let mut later = e.encode();
         later[0] = 0x7f;
-        assert_eq!(System::decode(&later).unwrap(), None, "a later event is ignored");
+        assert_eq!(
+            System::decode(&later).unwrap(),
+            None,
+            "a later event is ignored"
+        );
 
-        assert!(System::decode(&e.encode()[..64]).is_err(), "truncation is not");
+        assert!(
+            System::decode(&e.encode()[..64]).is_err(),
+            "truncation is not"
+        );
     }
 
     #[test]
@@ -1936,7 +2176,10 @@ mod tests {
             account: PubKey::new([4; 32]),
             action: act(3),
         };
-        assert_eq!(ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_REMOVE).unwrap(), r);
+        assert_eq!(
+            ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_REMOVE).unwrap(),
+            r
+        );
         // The type byte is checked, so a remove cannot be read as anything else.
         assert!(ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_INVITE).is_err());
     }

@@ -24,7 +24,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use sqex_proto::mailbox::{Entry, Listing, MAX_BYTES, MAX_MESSAGES, Sealed, State, Status, TTL_SECS};
+use sqex_proto::mailbox::{
+    Entry, Listing, MAX_BYTES, MAX_MESSAGES, Sealed, State, Status, TTL_SECS,
+};
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
@@ -224,7 +226,11 @@ impl Mailbox {
     /// How many messages are waiting to be collected, across all recipients.
     pub fn waiting(&self) -> usize {
         let inner = self.inner.lock().unwrap();
-        inner.messages.values().filter(|m| m.sealed.is_some()).count()
+        inner
+            .messages
+            .values()
+            .filter(|m| m.sealed.is_some())
+            .count()
     }
 }
 

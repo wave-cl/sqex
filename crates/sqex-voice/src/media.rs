@@ -140,7 +140,10 @@ pub struct Frame {
 
 impl Frame {
     pub fn audio(timestamp: u32, packet: Vec<u8>) -> Frame {
-        Frame { timestamp, body: Body::Audio(packet) }
+        Frame {
+            timestamp,
+            body: Body::Audio(packet),
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -187,7 +190,10 @@ impl Frame {
                 }
                 Ok(Some(Frame {
                     timestamp,
-                    body: Body::Comfort(Comfort { level: b[HEADER], tilt: b[HEADER + 1] }),
+                    body: Body::Comfort(Comfort {
+                        level: b[HEADER],
+                        tilt: b[HEADER + 1],
+                    }),
                 }))
             }
             _ => Ok(None),
@@ -279,7 +285,11 @@ impl Gate {
             self.seen = 0;
         }
 
-        let threshold = if self.hangover > 0 { Self::CLOSE } else { Self::OPEN };
+        let threshold = if self.hangover > 0 {
+            Self::CLOSE
+        } else {
+            Self::OPEN
+        };
         if level > self.floor * threshold {
             self.hangover = self.hangover_frames;
             return true;
@@ -320,7 +330,11 @@ impl Default for Noise {
 
 impl Noise {
     pub fn new() -> Noise {
-        Noise { seed: 0x2545_F491_4F6C_DD1D, lp: 0.0, at: None }
+        Noise {
+            seed: 0x2545_F491_4F6C_DD1D,
+            lp: 0.0,
+            at: None,
+        }
     }
 
     /// Fill `out` with one frame of the described room, gliding toward a new
@@ -434,7 +448,9 @@ impl Sender {
         }
         if opens_silence || keepalive_due {
             self.since_sent = 0;
-            let (level, tilt) = self.room.unwrap_or((rms(samples), f32::from(tilt(samples))));
+            let (level, tilt) = self
+                .room
+                .unwrap_or((rms(samples), f32::from(tilt(samples))));
             return Ok(Some(Frame {
                 timestamp,
                 body: Body::Comfort(Comfort::from_parts(level, tilt as u8)),
@@ -522,7 +538,10 @@ mod tests {
 
         let comfort = Frame {
             timestamp: 9,
-            body: Body::Comfort(Comfort { level: 120, tilt: 40 }),
+            body: Body::Comfort(Comfort {
+                level: 120,
+                tilt: 40,
+            }),
         };
         assert_eq!(Frame::decode(&comfort.encode()).unwrap(), Some(comfort));
     }
@@ -539,7 +558,10 @@ mod tests {
     #[test]
     fn a_frame_of_the_wrong_shape_is_refused() {
         assert!(Frame::decode(&[]).is_err());
-        assert!(Frame::decode(&[TYPE_AUDIO, 0, 0, 1]).is_err(), "short header");
+        assert!(
+            Frame::decode(&[TYPE_AUDIO, 0, 0, 1]).is_err(),
+            "short header"
+        );
         // A comfort frame is exactly two bytes of body, no more and no less.
         assert!(Frame::decode(&[TYPE_COMFORT, 0, 0, 0, 1, 60]).is_err());
         assert!(Frame::decode(&[TYPE_COMFORT, 0, 0, 0, 1, 60, 40, 0]).is_err());
@@ -578,7 +600,15 @@ mod tests {
                 c.amplitude()
             );
         }
-        assert_eq!(Comfort { level: 255, tilt: 0 }.amplitude(), 0.0, "digital silence");
+        assert_eq!(
+            Comfort {
+                level: 255,
+                tilt: 0
+            }
+            .amplitude(),
+            0.0,
+            "digital silence"
+        );
     }
 
     #[test]
@@ -607,14 +637,20 @@ mod tests {
     fn a_changed_description_is_glided_to_not_stepped_to() {
         let mut n = Noise::new();
         let mut pcm = vec![0f32; FRAME_SAMPLES];
-        let quiet = Comfort { level: 120, tilt: 60 };
+        let quiet = Comfort {
+            level: 120,
+            tilt: 60,
+        };
         for _ in 0..60 {
             n.fill(quiet, &mut pcm);
         }
         let before = rms(&pcm);
 
         // Now claim the room is four times louder.
-        let louder = Comfort { level: 96, tilt: 60 };
+        let louder = Comfort {
+            level: 96,
+            tilt: 60,
+        };
         n.fill(louder, &mut pcm);
         let first_step = rms(&pcm);
         assert!(
@@ -682,7 +718,10 @@ mod tests {
         for _ in 0..Gate::WINDOW {
             g.is_speech(&room(&mut seed, 0.006));
         }
-        assert!(!g.is_speech(&room(&mut seed, 0.006)), "room tone is not speech");
+        assert!(
+            !g.is_speech(&room(&mut seed, 0.006)),
+            "room tone is not speech"
+        );
         assert!(g.is_speech(&talking()), "a voice is");
         assert!(g.floor() < 0.02, "the floor should have settled low");
     }
@@ -698,7 +737,10 @@ mod tests {
         // The gap between two words must not close the gate, or word tails and
         // the start of the next one get clipped.
         for i in 0..15 {
-            assert!(g.is_speech(&room(&mut seed, 0.006)), "closed after {i} frames");
+            assert!(
+                g.is_speech(&room(&mut seed, 0.006)),
+                "closed after {i} frames"
+            );
         }
         assert!(!g.is_speech(&room(&mut seed, 0.006)), "and then it closes");
     }
@@ -745,7 +787,10 @@ mod tests {
             assert_eq!(f.timestamp, i);
             assert!(matches!(f.body, Body::Audio(_)));
         }
-        assert_eq!(ran, 10, "the encoder ran exactly for the frames that went out");
+        assert_eq!(
+            ran, 10,
+            "the encoder ran exactly for the frames that went out"
+        );
     }
 
     #[test]
@@ -804,10 +849,17 @@ mod tests {
                 quiet += 1;
             }
         }
-        assert!(quiet > 90, "most of a quiet stretch costs nothing, sent {}", 120 - quiet);
+        assert!(
+            quiet > 90,
+            "most of a quiet stretch costs nothing, sent {}",
+            120 - quiet
+        );
         let before = s.produced();
         let back = send(&mut s, &talking()).expect("speech again");
-        assert_eq!(back.timestamp, before, "time passed though nothing was sent");
+        assert_eq!(
+            back.timestamp, before,
+            "time passed though nothing was sent"
+        );
         assert_eq!(s.produced(), before + 1);
     }
 
@@ -836,19 +888,31 @@ mod tests {
     fn slots_skipped_with_no_packets_missing_are_silence() {
         assert_eq!(
             classify((5, 100), (6, 200)),
-            Gap { lost: 0, silent: 99 },
+            Gap {
+                lost: 0,
+                silent: 99
+            },
             "this is the case that must never be concealed"
         );
     }
 
     #[test]
     fn a_gap_can_be_both_and_loss_is_bounded_by_the_packets_missing() {
-        assert_eq!(classify((5, 100), (8, 150)), Gap { lost: 2, silent: 47 });
+        assert_eq!(
+            classify((5, 100), (8, 150)),
+            Gap {
+                lost: 2,
+                silent: 47
+            }
+        );
     }
 
     #[test]
     fn the_timestamp_wrapping_does_not_produce_a_two_year_gap() {
-        assert_eq!(classify((5, u32::MAX - 1), (6, 1)), Gap { lost: 0, silent: 2 });
+        assert_eq!(
+            classify((5, u32::MAX - 1), (6, 1)),
+            Gap { lost: 0, silent: 2 }
+        );
     }
 }
 
@@ -875,8 +939,7 @@ mod probe {
     #[ignore = "reports numbers; run explicitly"]
     fn chop_envelope() {
         let mut enc =
-            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-                .unwrap();
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
         enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
         enc.set_dtx(false).unwrap();
         let mut sender = Sender::new(50, true);
@@ -892,7 +955,11 @@ mod probe {
                 .map(|_| {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
-                    let s = if (150..250).contains(&i) { phase.sin() * 0.5 + noise } else { noise };
+                    let s = if (150..250).contains(&i) {
+                        phase.sin() * 0.5 + noise
+                    } else {
+                        noise
+                    };
                     phase = (phase + step) % std::f32::consts::TAU;
                     s
                 })
@@ -934,11 +1001,16 @@ mod probe {
         }
 
         println!("\n  what the sender did, slots 300-420:");
-        println!("    {}", kinds[300..420.min(kinds.len())].iter().collect::<String>());
+        println!(
+            "    {}",
+            kinds[300..420.min(kinds.len())].iter().collect::<String>()
+        );
         let pause = &levels[330..levels.len().saturating_sub(5)];
-        let (lo, hi) = pause.iter().fold((f32::MAX, 0.0f32), |(l, h), x| (l.min(*x), h.max(*x)));
-        let jump: f32 = pause.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>()
-            / (pause.len() - 1) as f32;
+        let (lo, hi) = pause
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(l, h), x| (l.min(*x), h.max(*x)));
+        let jump: f32 =
+            pause.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / (pause.len() - 1) as f32;
         println!(
             "  heard in the pause: mean {:.5} range {lo:.5}-{hi:.5} ({:.1}x), mean step {jump:.5}",
             pause.iter().sum::<f32>() / pause.len() as f32,
@@ -956,8 +1028,7 @@ mod probe {
     #[ignore = "reports numbers; run explicitly"]
     fn sip15_cost_and_envelope() {
         let mut enc =
-            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-                .unwrap();
+            opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
         enc.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
         enc.set_dtx(false).unwrap();
         let mut sender = Sender::new(50, true);
@@ -976,7 +1047,11 @@ mod probe {
                 .map(|_| {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                     let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
-                    let s = if i < 100 { phase.sin() * 0.5 + noise } else { noise };
+                    let s = if i < 100 {
+                        phase.sin() * 0.5 + noise
+                    } else {
+                        noise
+                    };
                     phase = (phase + step) % std::f32::consts::TAU;
                     s
                 })
@@ -1022,4 +1097,3 @@ mod probe {
         );
     }
 }
-

@@ -15,9 +15,7 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-async fn bare_server(
-    dir: &std::path::Path,
-) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn bare_server(dir: &std::path::Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();

@@ -70,6 +70,54 @@ pub struct FileConfig {
     /// happened to say when it was written.
     #[serde(default)]
     pub accepted_envelope_versions: Option<Vec<u8>>,
+
+    /// SIP-35: base58 Ed25519 identities of exchanges this one will serve
+    /// replication to.
+    ///
+    /// The **operational** half of the gate, and only that half. Being on this
+    /// list lets a peer speak the peering routes at all; it does not give it a
+    /// single channel, which takes a signed authorisation by one of that
+    /// channel's admins. Empty — the default — means this exchange serves
+    /// replication to nobody and its peering routes refuse everyone
+    /// identically.
+    #[serde(default)]
+    pub replication_peers: Vec<String>,
+
+    /// SIP-35: origins this exchange replicates *from*.
+    ///
+    /// The other direction from `replication_peers`, and both ends of a link
+    /// need their own entry: an origin lists the peer it will serve, and the
+    /// replica lists the origin it pulls from. Neither implies the other, and
+    /// neither is enough on its own — the origin's members must also have
+    /// signed a `0x0b` for each channel.
+    #[serde(default)]
+    pub replicate: Vec<FileOrigin>,
+}
+
+/// One origin to replicate from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileOrigin {
+    /// The origin's base58 Ed25519 identity — its SIP-9 key.
+    ///
+    /// **Pinned from here and never taken from the wire.** SIP-35 calls this
+    /// the trap in the whole document: a replica that accepted the signing key
+    /// from the party supplying the entries has been handed the forgery power
+    /// the design spends its length removing.
+    pub origin: String,
+    /// `host:port` to dial.
+    pub addr: String,
+    /// Base58 channel identifiers to pull. A channel the origin has not
+    /// authorised us for is refused, in the same words as everything else.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Seconds between pulls. Clamped up to SIP-35's `PEER_MIN_INTERVAL`.
+    #[serde(default = "default_pull_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_pull_interval() -> u64 {
+    30
 }
 
 /// Configuration with everything parsed and resolved.
@@ -84,6 +132,17 @@ pub struct Config {
     /// The channel every account joins on first sight. Empty is off.
     pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
+    pub replication_peers: Vec<PubKey>,
+    pub replicate: Vec<OriginConfig>,
+}
+
+/// One resolved origin to replicate from.
+#[derive(Debug, Clone)]
+pub struct OriginConfig {
+    pub origin: PubKey,
+    pub addr: SocketAddr,
+    pub channels: Vec<[u8; 32]>,
+    pub interval: std::time::Duration,
 }
 
 impl FileConfig {
@@ -92,6 +151,17 @@ impl FileConfig {
         let listen = parse_listen(&self.listen)?;
         let admins = parse_keys(&self.admins, "admins")?;
         let seed_whitelist = parse_keys(&self.seed_whitelist, "seed_whitelist")?;
+        let replication_peers = parse_keys(&self.replication_peers, "replication_peers")?;
+        // SIP-35 caps the peers an origin will serve, and an operator who set
+        // more should hear so at load rather than discover that some of them
+        // are silently ignored.
+        if replication_peers.len() > sqex_proto::peer::MAX_PEERS {
+            return Err(Error::Malformed(format!(
+                "replication_peers holds {}, limit is {}",
+                replication_peers.len(),
+                sqex_proto::peer::MAX_PEERS
+            )));
+        }
 
         // SIP-29 reserves version 0 and forbids emitting it, and an empty list
         // would refuse every caller in silence — both are configuration
@@ -105,6 +175,33 @@ impl FileConfig {
             ));
         }
 
+        let mut replicate = Vec::new();
+        for r in self.replicate {
+            let origin = r
+                .origin
+                .parse::<PubKey>()
+                .map_err(|e| Error::Key(format!("replicate.origin {}: {e}", r.origin)))?;
+            let addr = parse_listen(&r.addr)?;
+            let mut channels = Vec::new();
+            for c in &r.channels {
+                let key = c
+                    .parse::<PubKey>()
+                    .map_err(|e| Error::Key(format!("replicate.channels {c}: {e}")))?;
+                channels.push(*key.as_bytes());
+            }
+            replicate.push(OriginConfig {
+                origin,
+                addr,
+                channels,
+                // Clamped rather than refused: an operator asking to pull more
+                // often than SIP-35 permits is not making an error, and a
+                // replica that hammered an origin would be one.
+                interval: std::time::Duration::from_secs(
+                    r.interval_secs.max(sqex_proto::peer::PEER_MIN_INTERVAL),
+                ),
+            });
+        }
+
         Ok(Config {
             listen,
             key_file: self.key_file,
@@ -114,6 +211,8 @@ impl FileConfig {
             challenge_ttl: std::time::Duration::from_secs(self.challenge_ttl_secs.max(1)),
             welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
+            replication_peers,
+            replicate,
         })
     }
 }
@@ -225,5 +324,115 @@ mod tests {
                 toml::from_str(&format!("{base}accepted_envelope_versions = {bad}\n")).unwrap();
             assert!(cfg.resolve().is_err(), "{bad} should be refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod replication_tests {
+    use super::*;
+
+    /// SIP-35's two directions are two settings, and neither implies the other:
+    /// `replication_peers` is who this exchange will *serve*, `[[replicate]]`
+    /// is who it will *pull from*. An operator who set one and expected both
+    /// would get silence, so both are parsed and both are tested.
+    #[test]
+    fn both_directions_of_a_peering_link_are_parsed() {
+        let peer = PubKey::new([1u8; 32]).to_base58();
+        let origin = PubKey::new([2u8; 32]).to_base58();
+        let channel = PubKey::new([3u8; 32]).to_base58();
+        let text = format!(
+            r#"
+listen = "127.0.0.1:443"
+key_file = "/etc/sqex/host_key"
+replication_peers = ["{peer}"]
+
+[[replicate]]
+origin = "{origin}"
+addr = "198.51.100.7:443"
+channels = ["{channel}"]
+interval_secs = 120
+"#
+        );
+        let config: Config = toml::from_str::<FileConfig>(&text)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(config.replication_peers, vec![PubKey::new([1u8; 32])]);
+        assert_eq!(config.replicate.len(), 1);
+        assert_eq!(config.replicate[0].origin, PubKey::new([2u8; 32]));
+        assert_eq!(config.replicate[0].channels, vec![[3u8; 32]]);
+        assert_eq!(
+            config.replicate[0].interval,
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    /// Neither is on by default, and that is the SIP's own default: no
+    /// replication without a deliberate act, because every replica is another
+    /// operator holding the shape of a conversation.
+    #[test]
+    fn an_exchange_replicates_nothing_unless_told_to() {
+        let text = "listen = \"127.0.0.1:443\"\nkey_file = \"/etc/sqex/host_key\"\n";
+        let config: Config = toml::from_str::<FileConfig>(text)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert!(config.replication_peers.is_empty());
+        assert!(config.replicate.is_empty());
+    }
+
+    /// A pull interval below SIP-35's floor is clamped rather than refused: an
+    /// operator asking for it is not making an error, and a replica that
+    /// hammered an origin would be.
+    #[test]
+    fn a_pull_interval_is_floored_rather_than_refused() {
+        let origin = PubKey::new([2u8; 32]).to_base58();
+        let text = format!(
+            "listen = \"127.0.0.1:443\"\nkey_file = \"/k\"\n\n\
+             [[replicate]]\norigin = \"{origin}\"\naddr = \"198.51.100.7:443\"\n\
+             interval_secs = 0\n"
+        );
+        let config: Config = toml::from_str::<FileConfig>(&text)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(
+            config.replicate[0].interval,
+            std::time::Duration::from_secs(sqex_proto::peer::PEER_MIN_INTERVAL)
+        );
+    }
+
+    /// More peers than SIP-35 permits is caught at load, not by silently
+    /// ignoring some of them — an operator who set seventeen should hear so
+    /// rather than discover which one stopped working.
+    #[test]
+    fn too_many_peers_is_refused_at_load() {
+        let peers: Vec<String> = (0..=sqex_proto::peer::MAX_PEERS)
+            .map(|i| format!("\"{}\"", PubKey::new([i as u8; 32]).to_base58()))
+            .collect();
+        let text = format!(
+            "listen = \"127.0.0.1:443\"\nkey_file = \"/k\"\nreplication_peers = [{}]\n",
+            peers.join(", ")
+        );
+        let err = toml::from_str::<FileConfig>(&text)
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("replication_peers"),
+            "the refusal must name the field: {err}"
+        );
+    }
+
+    /// A key that is not a key is a configuration mistake, and it is named.
+    #[test]
+    fn an_unreadable_origin_key_names_itself() {
+        let text = "listen = \"127.0.0.1:443\"\nkey_file = \"/k\"\n\n\
+                    [[replicate]]\norigin = \"not-a-key\"\naddr = \"198.51.100.7:443\"\n";
+        let err = toml::from_str::<FileConfig>(text)
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(err.to_string().contains("not-a-key"), "{err}");
     }
 }

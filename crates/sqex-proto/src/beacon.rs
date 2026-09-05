@@ -43,7 +43,10 @@ impl Beat {
 
     pub fn decode(b: &[u8]) -> Result<Beat> {
         if b.len() != 6 {
-            return Err(Error::Malformed(format!("beat is {} bytes, want 6", b.len())));
+            return Err(Error::Malformed(format!(
+                "beat is {} bytes, want 6",
+                b.len()
+            )));
         }
         if b[0] != TYPE_BEAT {
             return Err(Error::Malformed(format!("not a beat (type {:#x})", b[0])));
@@ -52,7 +55,9 @@ impl Beat {
         let flags = b[5];
         // SIP-4: bits other than 0 are reserved and MUST be zero.
         if flags & !FLAG_WITHHOLD != 0 {
-            return Err(Error::Malformed(format!("reserved beat flags set: {flags:#010b}")));
+            return Err(Error::Malformed(format!(
+                "reserved beat flags set: {flags:#010b}"
+            )));
         }
         Ok(Beat {
             interval_secs,
@@ -77,7 +82,10 @@ impl BeatAck {
 
     pub fn decode(b: &[u8]) -> Result<BeatAck> {
         if b.len() != 8 {
-            return Err(Error::Malformed(format!("ack is {} bytes, want 8", b.len())));
+            return Err(Error::Malformed(format!(
+                "ack is {} bytes, want 8",
+                b.len()
+            )));
         }
         Ok(BeatAck {
             now: u64::from_be_bytes(b.try_into().unwrap()),
@@ -103,7 +111,10 @@ impl Read {
 
     pub fn decode(b: &[u8]) -> Result<Read> {
         if b.len() != 33 {
-            return Err(Error::Malformed(format!("read is {} bytes, want 33", b.len())));
+            return Err(Error::Malformed(format!(
+                "read is {} bytes, want 33",
+                b.len()
+            )));
         }
         if b[0] != TYPE_READ {
             return Err(Error::Malformed(format!("not a read (type {:#x})", b[0])));
@@ -152,7 +163,10 @@ impl Reply {
 
     pub fn decode(b: &[u8]) -> Result<Reply> {
         if b.len() != 21 {
-            return Err(Error::Malformed(format!("reply is {} bytes, want 21", b.len())));
+            return Err(Error::Malformed(format!(
+                "reply is {} bytes, want 21",
+                b.len()
+            )));
         }
         Ok(Reply {
             found: b[0] != 0,

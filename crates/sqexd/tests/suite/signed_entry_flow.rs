@@ -122,8 +122,11 @@ async fn an_entry_signed_by_one_device_and_claimed_by_another_is_refused() {
     let (code, _) = m
         .post(
             "/channel/join",
-            sqex_proto::channel::ByChannelSigned { channel, action: joining }
-                .encode(sqex_proto::channel::TYPE_JOIN),
+            sqex_proto::channel::ByChannelSigned {
+                channel,
+                action: joining,
+            }
+            .encode(sqex_proto::channel::TYPE_JOIN),
         )
         .await
         .unwrap();
@@ -137,7 +140,10 @@ async fn an_entry_signed_by_one_device_and_claimed_by_another_is_refused() {
         exchange: PubKey::new(server_pub),
     };
     let forged = as_alice.post_chained(
-        &mut Chain { seq: 1, head: [0; 32] },
+        &mut Chain {
+            seq: 1,
+            head: [0; 32],
+        },
         channel,
         instance_for(channel, 0),
         0,
@@ -146,7 +152,8 @@ async fn an_entry_signed_by_one_device_and_claimed_by_another_is_refused() {
     );
     let (code, body) = m.post("/channel/post", forged.encode()).await.unwrap();
     assert_eq!(
-        code, 401,
+        code,
+        401,
         "an entry claiming another account was stored: {}",
         common::said(&body)
     );
@@ -215,7 +222,8 @@ async fn an_entry_signed_against_one_exchange_is_refused_by_another() {
     // The same bytes, at exchange B.
     let (code, body) = a2.post("/channel/post", signed.encode()).await.unwrap();
     assert_eq!(
-        code, 401,
+        code,
+        401,
         "an entry lifted between exchanges verified: {}",
         common::said(&body)
     );
@@ -294,7 +302,8 @@ async fn an_entry_from_a_previous_incarnation_is_refused_by_the_next() {
     // The old entry, verbatim, into the new incarnation.
     let (code, body) = a.post("/channel/post", said.encode()).await.unwrap();
     assert_eq!(
-        code, 401,
+        code,
+        401,
         "an entry from a previous incarnation was accepted: {}",
         common::said(&body)
     );
@@ -320,7 +329,15 @@ async fn an_incarnation_cannot_be_used_twice_for_one_identifier() {
     // record of where this device stood in it with it.
     let build = |i: [u8; 32]| {
         signer(server_pub, 41)
-            .create_chained(&mut Chain::default(), channel, i, Visibility::Public, 3600, "", vec![])
+            .create_chained(
+                &mut Chain::default(),
+                channel,
+                i,
+                Visibility::Public,
+                3600,
+                "",
+                vec![],
+            )
             .encode()
     };
     assert_eq!(a.post("/channel/create", build(once)).await.unwrap().0, 200);
@@ -337,7 +354,8 @@ async fn an_incarnation_cannot_be_used_twice_for_one_identifier() {
 
     let (code, body) = a.post("/channel/create", build(once)).await.unwrap();
     assert_eq!(
-        code, 409,
+        code,
+        409,
         "an identifier reused an incarnation: {}",
         common::said(&body)
     );
@@ -370,8 +388,18 @@ async fn a_chain_position_is_neither_reused_nor_skipped() {
     let s = signer(server_pub, 51);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
-    let first = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 0, b"one".to_vec());
-    assert_eq!(a.post("/channel/post", first.encode()).await.unwrap().0, 200);
+    let first = s.post_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        0,
+        0,
+        b"one".to_vec(),
+    );
+    assert_eq!(
+        a.post("/channel/post", first.encode()).await.unwrap().0,
+        200
+    );
 
     // The same position again.
     let repeat = s.post_chained(
@@ -388,7 +416,10 @@ async fn a_chain_position_is_neither_reused_nor_skipped() {
 
     // A position skipped over.
     let ahead = s.post_chained(
-        &mut Chain { seq: chain.seq + 3, head: chain.head },
+        &mut Chain {
+            seq: chain.seq + 3,
+            head: chain.head,
+        },
         channel,
         instance_for(channel, 0),
         0,
@@ -399,8 +430,18 @@ async fn a_chain_position_is_neither_reused_nor_skipped() {
     assert_eq!(code, 409, "{}", common::said(&body));
 
     // And the next position, in order, still works.
-    let second = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 3, b"two".to_vec());
-    assert_eq!(a.post("/channel/post", second.encode()).await.unwrap().0, 200);
+    let second = s.post_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        0,
+        3,
+        b"two".to_vec(),
+    );
+    assert_eq!(
+        a.post("/channel/post", second.encode()).await.unwrap().0,
+        200
+    );
 }
 
 /// A redaction keeps the signature, and it still verifies.
@@ -419,28 +460,56 @@ async fn a_tombstone_keeps_a_signature_that_still_verifies() {
     let s = signer(server_pub, 61);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
-    let said = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 0, b"regret".to_vec());
+    let said = s.post_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        0,
+        0,
+        b"regret".to_vec(),
+    );
     let (_, body) = a.post("/channel/post", said.encode()).await.unwrap();
-    let seq = sqex_proto::channel::Posted::decode(&body).unwrap().seq;
+    let seq = sqex_proto::channel::Posted::decode(&body, false)
+        .unwrap()
+        .seq;
 
     let (code, _) = a
         .post(
             "/channel/redact",
-            sqex_proto::channel::ByTarget { channel, target: seq }
-                .encode(sqex_proto::channel::TYPE_REDACT),
+            sqex_proto::channel::ByTarget {
+                channel,
+                target: seq,
+            }
+            .encode(sqex_proto::channel::TYPE_REDACT),
         )
         .await
         .unwrap();
     assert_eq!(code, 200);
 
     let (_, body) = a
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
-    let tomb = seen.entries.iter().find(|e| e.seq == seq).expect("the tombstone is gone");
+    let seen = Entries::decode(&body, false).unwrap();
+    let tomb = seen
+        .entries
+        .iter()
+        .find(|e| e.seq == seq)
+        .expect("the tombstone is gone");
     assert!(tomb.body.is_empty(), "the body survived the redaction");
-    assert_ne!(tomb.sig, [0u8; 64], "the signature was cleared with the body");
+    assert_ne!(
+        tomb.sig, [0u8; 64],
+        "the signature was cleared with the body"
+    );
 
     let terms = sqex_proto::entry_sig::EntryTerms {
         place: sqex_proto::entry_sig::Place {
@@ -463,7 +532,14 @@ async fn a_tombstone_keeps_a_signature_that_still_verifies() {
     );
 
     // And the chain runs through it: the next entry follows on.
-    let next = s.post_chained(&mut chain, channel, instance_for(channel, 0), 0, 1, b"after".to_vec());
+    let next = s.post_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        0,
+        1,
+        b"after".to_vec(),
+    );
     assert_eq!(a.post("/channel/post", next.encode()).await.unwrap().0, 200);
 }
 
@@ -491,11 +567,13 @@ async fn an_unsigned_entry_is_refused() {
         chain_seq: 0,
         prev: [0; 32],
         sig: [0; 64],
+        receipts: false,
         body: b"nobody vouched for this".to_vec(),
     };
     let (code, body) = a.post("/channel/post", bare.encode()).await.unwrap();
     assert_eq!(
-        code, 401,
+        code,
+        401,
         "an unsigned entry was stored: {}",
         common::said(&body)
     );
@@ -535,13 +613,19 @@ async fn a_membership_event_needs_the_actors_signature() {
     let (code, body) = a
         .post(
             "/channel/invite",
-            sqex_proto::channel::Invite { channel, account: bob, role: Role::Member, action }
-                .encode(),
+            sqex_proto::channel::Invite {
+                channel,
+                account: bob,
+                role: Role::Member,
+                action,
+            }
+            .encode(),
         )
         .await
         .unwrap();
     assert_eq!(
-        code, 401,
+        code,
+        401,
         "a membership change went in under a signature nobody made: {}",
         common::said(&body)
     );
@@ -552,7 +636,10 @@ async fn a_membership_event_needs_the_actors_signature() {
         .await
         .unwrap();
     assert_eq!(
-        sqex_proto::channel::ChannelInfo::decode(&body).unwrap().members.len(),
+        sqex_proto::channel::ChannelInfo::decode(&body)
+            .unwrap()
+            .members
+            .len(),
         1
     );
 }
@@ -603,16 +690,45 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
     let mut dc = Chain::default();
     let mut hc = Chain::default();
     a_room(&mut desk, &d, &mut dc, channel).await;
-    let one = d.post_chained(&mut dc, channel, instance_for(channel, 0), 0, 0, b"desk".to_vec());
-    let two = h.post_chained(&mut hc, channel, instance_for(channel, 0), 0, 0, b"phone".to_vec());
-    assert_eq!(desk.post("/channel/post", one.encode()).await.unwrap().0, 200);
-    assert_eq!(hand.post("/channel/post", two.encode()).await.unwrap().0, 200);
+    let one = d.post_chained(
+        &mut dc,
+        channel,
+        instance_for(channel, 0),
+        0,
+        0,
+        b"desk".to_vec(),
+    );
+    let two = h.post_chained(
+        &mut hc,
+        channel,
+        instance_for(channel, 0),
+        0,
+        0,
+        b"phone".to_vec(),
+    );
+    assert_eq!(
+        desk.post("/channel/post", one.encode()).await.unwrap().0,
+        200
+    );
+    assert_eq!(
+        hand.post("/channel/post", two.encode()).await.unwrap().0,
+        200
+    );
 
     let (_, body) = desk
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let mine: Vec<_> = seen
         .entries
         .iter()
@@ -620,7 +736,10 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
         .collect();
     assert_eq!(mine.len(), 2);
     for e in &mine {
-        assert_eq!(e.account, account, "the account is the person, not the client");
+        assert_eq!(
+            e.account, account,
+            "the account is the person, not the client"
+        );
     }
     assert_ne!(mine[0].device, mine[1].device, "two clients, two devices");
     // The desktop created the channel, so its `created` took position 0 and its
@@ -630,10 +749,23 @@ async fn two_devices_of_one_account_sign_separately_and_chain_separately() {
     assert_eq!(mine[1].chain_seq, 0, "each device keeps its own chain");
 
     // And a device may not sign for the other's position.
-    let crossed = d.post_chained(&mut hc, channel, instance_for(channel, 0), 0, 1, b"no".to_vec());
+    let crossed = d.post_chained(
+        &mut hc,
+        channel,
+        instance_for(channel, 0),
+        0,
+        1,
+        b"no".to_vec(),
+    );
     let (code, _) = hand.post("/channel/post", crossed.encode()).await.unwrap();
-    assert_eq!(code, 401, "one device's signature stood for another's entry");
-    let _ = Invitee { account, role: Role::Member };
+    assert_eq!(
+        code, 401,
+        "one device's signature stood for another's entry"
+    );
+    let _ = Invitee {
+        account,
+        role: Role::Member,
+    };
 }
 
 /// **SIP-32: a channel's constitution cannot be restated.**
@@ -664,7 +796,8 @@ async fn a_channels_constitution_cannot_be_restated() {
     flipped.visibility = Visibility::Public;
     let (code, body) = a.post("/channel/create", flipped.encode()).await.unwrap();
     assert_eq!(
-        code, 401,
+        code,
+        401,
         "a channel was created as something other than what was signed: {}",
         common::said(&body)
     );
@@ -686,7 +819,10 @@ async fn a_channels_constitution_cannot_be_restated() {
     renamed.name = "team chat".into();
     assert_eq!(renamed.name.len(), 9);
     let (code, _) = a.post("/channel/create", renamed.encode()).await.unwrap();
-    assert_eq!(code, 401, "a public channel was named something it did not sign for");
+    assert_eq!(
+        code, 401,
+        "a public channel was named something it did not sign for"
+    );
 
     // And the honest case still works, or this proves nothing.
     let honest = s.create_chained(
@@ -718,10 +854,19 @@ async fn a_channel_always_opens_with_a_signed_event() {
     a_room(&mut a, &signer(server_pub, 111), &mut chain, channel).await;
 
     let (_, body) = a
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     assert_eq!(seen.entries.len(), 1, "an empty channel wrote no origin");
 
     let opening = sqex_proto::channel::System::decode(&seen.entries[0].body)
@@ -729,7 +874,10 @@ async fn a_channel_always_opens_with_a_signed_event() {
         .expect("the opening event is one nobody knows");
     assert_eq!(opening.event, sqex_proto::channel::EVENT_CREATED);
     assert_eq!(opening.actor, alice);
-    assert_ne!(opening.sig, [0u8; 64], "nobody signed for the channel existing");
+    assert_ne!(
+        opening.sig, [0u8; 64],
+        "nobody signed for the channel existing"
+    );
 }
 
 /// **SIP-32: renaming a public channel is recorded, and signed.**
@@ -758,7 +906,13 @@ async fn a_rename_is_recorded_and_signed() {
         "",
     );
     let me = s.account;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_RENAMED, &me, &arg);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_RENAMED,
+        &me,
+        &arg,
+    );
     let (code, body) = a
         .post(
             "/channel/directory",
@@ -775,10 +929,19 @@ async fn a_rename_is_recorded_and_signed() {
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let (_, body) = a
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let events: Vec<_> = seen
         .entries
         .iter()

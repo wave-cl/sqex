@@ -14,10 +14,10 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME, Open, OpenAck, OpenState, Session};
-use sqexd::config::FileConfig;
 use sqex_voice::audio::{TONE_HZ, dominant_hz, rms, tone};
 use sqex_voice::jitter::{FRAME_SAMPLES, Jitter, Playback, SAMPLE_RATE};
 use sqex_voice::media;
+use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
@@ -26,9 +26,7 @@ const FRAMES: usize = 50;
 
 // ---- harness (mirrors sqexd/tests/session_flow.rs) --------------------------
 
-async fn bare_server(
-    dir: &std::path::Path,
-) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn bare_server(dir: &std::path::Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
@@ -67,7 +65,14 @@ fn ephemeral() -> (x25519_dalek::StaticSecret, [u8; 32]) {
 
 async fn open_session(client: &mut Client, peer: PubKey, eph_pub: [u8; 32]) -> OpenAck {
     let (code, body) = client
-        .post("/session/open", Open { peer, ephemeral: eph_pub }.encode())
+        .post(
+            "/session/open",
+            Open {
+                peer,
+                ephemeral: eph_pub,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", String::from_utf8_lossy(&body));
@@ -93,8 +98,12 @@ async fn call() -> Call {
     let (b_seed, b_id) = identity(92);
     let (a_eph, a_eph_pub) = ephemeral();
     let (b_eph, b_eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
     assert!(
         a.max_datagram_size().is_some() && b.max_datagram_size().is_some(),
         "no datagrams means no call"
@@ -119,8 +128,8 @@ async fn call() -> Call {
 // ---- the call itself --------------------------------------------------------
 
 fn encoder() -> opus::Encoder {
-    let mut e = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-        .unwrap();
+    let mut e =
+        opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
     e.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
     e.set_inband_fec(true).unwrap();
     e.set_packet_loss_perc(10).unwrap();
@@ -148,7 +157,12 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
         let body = media::Frame::audio(seq as u32, packet).encode();
         let sealed = c.a_sess.seal_datagram(seq, &body).unwrap();
         c.a.send_datagram(
-            DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
+            DatagramFrame {
+                session_id: c.id,
+                seq,
+                ciphertext: sealed,
+            }
+            .encode(),
         )
         .unwrap();
         expected.insert(seq);
@@ -162,8 +176,7 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
     let mut buffer = Jitter::new(3);
     let mut arrived = BTreeSet::new();
     while arrived.len() < expected.len() {
-        let Ok(Ok(bytes)) =
-            tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
+        let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
         else {
             break;
         };
@@ -173,7 +186,9 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
             .b_sess
             .open(frame.seq, &frame.ciphertext)
             .expect("the peer's key opens it");
-        let m = media::Frame::decode(&plaintext).expect("a media frame").expect("a known type");
+        let m = media::Frame::decode(&plaintext)
+            .expect("a media frame")
+            .expect("a known type");
         arrived.insert(frame.seq);
         buffer.push(frame.seq, m.timestamp, m.body);
     }
@@ -266,7 +281,12 @@ async fn the_exchange_carrying_the_call_cannot_listen_to_it() {
         .encode_vec_float(&tone(1)[0], MAX_DATAGRAM_FRAME)
         .unwrap();
     let sealed = c.a_sess.seal_datagram(0, &packet).unwrap();
-    let on_the_wire = DatagramFrame { session_id: c.id, seq: 0, ciphertext: sealed }.encode();
+    let on_the_wire = DatagramFrame {
+        session_id: c.id,
+        seq: 0,
+        ciphertext: sealed,
+    }
+    .encode();
 
     let relayed = DatagramFrame::decode(&on_the_wire).unwrap();
     assert_ne!(
@@ -316,7 +336,12 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
         let body = media::Frame::audio(seq as u32, packet).encode();
         let sealed = c.a_sess.seal_datagram(seq, &body).unwrap();
         c.a.send_datagram(
-            DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
+            DatagramFrame {
+                session_id: c.id,
+                seq,
+                ciphertext: sealed,
+            }
+            .encode(),
         )
         .unwrap();
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -326,8 +351,7 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
     let mut buffer = Jitter::new(3);
     let mut arrived = 0;
     while arrived < FRAMES {
-        let Ok(Ok(bytes)) =
-            tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
+        let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
         else {
             break;
         };
@@ -395,7 +419,11 @@ async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
             .map(|_| {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let noise = ((seed >> 33) as f32 / (1u64 << 30) as f32 - 1.0) * 0.006;
-                let s = if (150..250).contains(&i) { phase.sin() * 0.5 + noise } else { noise };
+                let s = if (150..250).contains(&i) {
+                    phase.sin() * 0.5 + noise
+                } else {
+                    noise
+                };
                 phase = (phase + step) % std::f32::consts::TAU;
                 s
             })
@@ -409,7 +437,12 @@ async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
         if let Some(m) = framed {
             let sealed = c.a_sess.seal_datagram(seq, &m.encode()).unwrap();
             c.a.send_datagram(
-                DatagramFrame { session_id: c.id, seq, ciphertext: sealed }.encode(),
+                DatagramFrame {
+                    session_id: c.id,
+                    seq,
+                    ciphertext: sealed,
+                }
+                .encode(),
             )
             .unwrap();
             sent_slots.push(i);
@@ -478,7 +511,9 @@ async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
         "a pause must not contain digitally dead frames"
     );
     // Not pulsing: this is what killed the gate that replayed concealment.
-    let (lo, hi) = pause.iter().fold((f32::MAX, 0.0f32), |(l, h), x| (l.min(*x), h.max(*x)));
+    let (lo, hi) = pause
+        .iter()
+        .fold((f32::MAX, 0.0f32), |(l, h), x| (l.min(*x), h.max(*x)));
     assert!(
         hi / lo < 4.0,
         "a synthesised pause must be steady, swung {lo:.5} to {hi:.5}"

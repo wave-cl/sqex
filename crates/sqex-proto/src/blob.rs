@@ -86,12 +86,12 @@ impl Attachment {
     /// How long it runs, for video and voice.
     pub fn duration_ms(&self) -> Option<u32> {
         match (self.effective_kind(), self.meta.len()) {
-            (KIND_VIDEO, n) if n >= 8 => Some(u32::from_be_bytes(
-                self.meta[4..8].try_into().unwrap(),
-            )),
-            (KIND_VOICE, n) if n >= 4 => Some(u32::from_be_bytes(
-                self.meta[0..4].try_into().unwrap(),
-            )),
+            (KIND_VIDEO, n) if n >= 8 => {
+                Some(u32::from_be_bytes(self.meta[4..8].try_into().unwrap()))
+            }
+            (KIND_VOICE, n) if n >= 4 => {
+                Some(u32::from_be_bytes(self.meta[0..4].try_into().unwrap()))
+            }
             _ => None,
         }
     }

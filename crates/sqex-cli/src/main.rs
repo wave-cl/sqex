@@ -11,9 +11,19 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
-use sqex_proto::refusal::Refusal;
+use sqex_proto::attest::{
+    Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVIEWED, CLAIM_REVOKES, Held,
+    Query as AttestQuery,
+};
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
+use sqex_proto::h3::H3Client;
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
+use sqex_proto::refusal::Refusal;
+use sqex_proto::rendezvous::{Introduce, Introduced};
+use sqex_proto::resolve::{
+    Endpoint, KIND_DNS, KIND_IPV4, KIND_IPV6, MAX_HOST, Publish as ResolvePublish,
+    Resolve as ResolveGet, Resolved, Successor as ResolveSuccessor,
+};
 use sqex_proto::session::{
     BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
 };
@@ -21,7 +31,11 @@ use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
 #[derive(Parser)]
-#[command(name = "sqex", version, about = "Administer a sqex server with signed transactions")]
+#[command(
+    name = "sqex",
+    version,
+    about = "Administer a sqex server with signed transactions"
+)]
 struct Cli {
     /// A domain that publishes an exchange (SIP-33). Its key is discovered over
     /// DNSSEC, pinned on first contact, and refused if it later changes.
@@ -60,6 +74,40 @@ enum Cmd {
     Beacon {
         #[command(subcommand)]
         cmd: BeaconCmd,
+    },
+    /// Rendezvous: ask to be introduced to a peer, so the two of you can
+    /// connect directly.
+    ///
+    /// Both sides must ask — an introduction discloses an address, so either
+    /// both consent or neither learns anything. Once introduced, both punch
+    /// their NATs open and one dials the other on the ports the exchange
+    /// observed.
+    ///
+    /// **Endpoint-independent mapping is what this needs.** Symmetric NAT
+    /// allocates a fresh external port per destination, so the port the
+    /// exchange saw is not the port the peer will see, and nothing here works
+    /// around that. SIP-12 relays instead, and works behind it.
+    Meet {
+        /// The peer's identity, base58.
+        peer: String,
+        /// How long to wait for them, in seconds.
+        #[arg(short = 'w', long, default_value_t = 30)]
+        wait: u16,
+        /// Ask, print what both sides were told, and stop there.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Attestation: sign a statement about another identity, or read what has
+    /// been said about one.
+    Attest {
+        #[command(subcommand)]
+        cmd: AttestCmd,
+    },
+    /// Public key resolution: say where this identity can be reached, or ask
+    /// where another one is.
+    Resolve {
+        #[command(subcommand)]
+        cmd: ResolveCmd,
     },
     /// Store-and-forward mailbox: leave sealed messages, collect your own.
     Mail {
@@ -146,6 +194,95 @@ enum BeaconCmd {
 }
 
 #[derive(Subcommand)]
+enum AttestCmd {
+    /// Sign a statement about another identity and lodge it.
+    ///
+    /// **This is not retractable in practice.** A revocation is a signed
+    /// statement a reader may never see, and anything once read can be kept and
+    /// replayed by anybody. Expiry is the only guarantee, so `--days` is the
+    /// setting that matters.
+    Say {
+        /// What is being claimed: `operates`, `known-as`, or `reviewed`.
+        claim: String,
+        /// The identity the claim is about, base58.
+        subject: String,
+        /// The claim's own text — a service name, a nickname, what was
+        /// examined.
+        #[arg(default_value = "")]
+        detail: String,
+        /// How long the statement stands, in days.
+        #[arg(short = 'd', long, default_value_t = 30)]
+        days: u64,
+    },
+    /// Withdraw a statement you made, by its digest.
+    ///
+    /// A reader that never sees this keeps trusting the claim until it expires,
+    /// which is why it is a courtesy rather than a mechanism.
+    Withdraw {
+        /// The identity the withdrawn statement was about, base58.
+        subject: String,
+        /// The statement's digest, base58, as `attest read` prints it.
+        digest: String,
+    },
+    /// Read what has been said about an identity.
+    Read {
+        /// The identity to ask about, base58. Defaults to your own.
+        subject: Option<String>,
+        /// Only statements by this issuer. **The ordinary case**: a count of
+        /// attestations measures how many keys somebody made, and only issuers
+        /// you already trust carry weight.
+        #[arg(short = 'i', long)]
+        issuer: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResolveCmd {
+    /// Publish where this identity can be reached. Replaces the whole set:
+    /// SIP-28 has no partial update, because reconciling one against a
+    /// trusting store is where stale addresses live forever.
+    Publish {
+        /// `host:port` to advertise, repeatable. A bare IP or a DNS name.
+        #[arg(required = true)]
+        endpoint: Vec<String>,
+        /// What this identity speaks — an ALPN, a service name, a version.
+        /// Repeatable. Published alongside the addresses and expiring with
+        /// them, because it has the same provenance they do.
+        ///
+        /// **Advertising capability advertises attack surface.** A version
+        /// string tells an attacker which vulnerabilities apply, and an
+        /// exchange makes that queryable for every identity at once.
+        #[arg(short = 'c', long = "capability")]
+        capability: Vec<String>,
+        /// How long the exchange should believe it, in seconds.
+        #[arg(short = 't', long, default_value_t = 300)]
+        ttl: u32,
+    },
+    /// Ask where a key can be reached.
+    ///
+    /// **The answer is the exchange's word.** Connecting to it pins the key you
+    /// asked for, so a wrong address is a failed handshake rather than somebody
+    /// else answering — the exchange is trusted for availability, not for
+    /// authenticity.
+    Get {
+        /// The identity to ask about, base58. Defaults to your own.
+        key: Option<String>,
+    },
+    /// Say this identity has moved.
+    ///
+    /// **Not a retirement.** It is authenticated by the connection, so whoever
+    /// holds the key can set it — after a theft, that is the attacker. It says
+    /// "I am moving", and only while the mover is still in control.
+    Moved {
+        /// The identity that takes over, base58.
+        successor: String,
+        /// A line for a human, at most 128 bytes.
+        #[arg(default_value = "")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum AdminCmd {
     /// Manage the connection whitelist.
     Whitelist {
@@ -194,6 +331,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Status => status(&cli, &cfg).await,
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
+        Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
+        Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
+        Cmd::Meet {
+            peer,
+            wait,
+            dry_run,
+        } => meet(&cli, &cfg, peer, *wait, *dry_run).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
         Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
@@ -270,7 +414,10 @@ async fn discover(domain: Option<&str>, forget: Option<&str>) -> Result<(), Stri
         }
         Some(sqex_discovery::Decision::Changed { pinned, offered }) => {
             println!();
-            println!("{}", sqex_discovery::known::changed_message(domain, &pinned, &offered));
+            println!(
+                "{}",
+                sqex_discovery::known::changed_message(domain, &pinned, &offered)
+            );
             return Err("the published key is not the pinned one".into());
         }
         None => {}
@@ -308,10 +455,7 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
     let ack = loop {
         let (code, body) = client.post("/session/open", open.encode()).await?;
         if code != 200 {
-            return Err(format!(
-                "open failed ({code}): {}",
-                said(&body)
-            ));
+            return Err(format!("open failed ({code}): {}", said(&body)));
         }
         let ack = OpenAck::decode(&body).map_err(|e| e.to_string())?;
         if ack.state == OpenState::Established {
@@ -336,7 +480,10 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
         return talk_datagram(client, session, ack.session_id).await;
     }
 
-    eprintln!("session {} established — type to send, Ctrl-D to end", ack.session_id);
+    eprintln!(
+        "session {} established — type to send, Ctrl-D to end",
+        ack.session_id
+    );
     talk(client, session, ack.session_id).await
 }
 
@@ -413,7 +560,9 @@ async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), Strin
         if stdin_open {
             match lines_rx.try_recv() {
                 Ok(line) => {
-                    let ct = session.seal(out_seq, line.as_bytes()).map_err(|e| e.to_string())?;
+                    let ct = session
+                        .seal(out_seq, line.as_bytes())
+                        .map_err(|e| e.to_string())?;
                     let frame = SendFrame {
                         session_id: id,
                         seq: out_seq,
@@ -421,10 +570,7 @@ async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), Strin
                     };
                     let (code, body) = client.post("/session/send", frame.encode()).await?;
                     if code != 200 {
-                        return Err(format!(
-                            "send failed ({code}): {}",
-                            said(&body)
-                        ));
+                        return Err(format!("send failed ({code}): {}", said(&body)));
                     }
                     out_seq += 1;
                     continue; // drain stdin eagerly before polling
@@ -506,13 +652,17 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
             let sealed = mailbox::seal(&to, &plaintext).map_err(|e| e.to_string())?;
             let (mut client, _signer) = mail_client(cli, cfg).await?;
             let (code, body) = client
-                .post("/mailbox/send", MailSend { recipient: to, sealed }.encode())
+                .post(
+                    "/mailbox/send",
+                    MailSend {
+                        recipient: to,
+                        sealed,
+                    }
+                    .encode(),
+                )
                 .await?;
             if code != 200 {
-                return Err(format!(
-                    "send refused ({code}): {}",
-                    said(&body)
-                ));
+                return Err(format!("send refused ({code}): {}", said(&body)));
             }
             let ack = SendAck::decode(&body).map_err(|e| e.to_string())?;
             println!("sent to {to} as message {}", ack.id);
@@ -545,7 +695,9 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
                 Some((sender, text)) => {
                     println!("from {sender}:");
                     println!("{text}");
-                    println!("\n(still on the exchange — `sqex mail delete {id}` to complete collection)");
+                    println!(
+                        "\n(still on the exchange — `sqex mail delete {id}` to complete collection)"
+                    );
                     Ok(())
                 }
                 None => Err(format!("no message {id} for you")),
@@ -613,10 +765,7 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
 async fn list_mail(client: &mut Client) -> Result<Listing, String> {
     let (code, body) = client.post("/mailbox/list", Vec::new()).await?;
     if code != 200 {
-        return Err(format!(
-            "list failed ({code}): {}",
-            said(&body)
-        ));
+        return Err(format!("list failed ({code}): {}", said(&body)));
     }
     Listing::decode(&body).map_err(|e| e.to_string())
 }
@@ -627,7 +776,9 @@ async fn fetch_one(
     signer: &sqnr_core::SoftwareSigner,
     id: u64,
 ) -> Result<Option<(PubKey, String)>, String> {
-    let (code, body) = client.post("/mailbox/fetch", ById::fetch(id).encode()).await?;
+    let (code, body) = client
+        .post("/mailbox/fetch", ById::fetch(id).encode())
+        .await?;
     if code != 200 {
         return Err(format!("fetch failed ({code})"));
     }
@@ -636,7 +787,10 @@ async fn fetch_one(
         return Ok(None);
     }
     let plain = mailbox::open(&signer.seed(), &f.sealed).map_err(|e| e.to_string())?;
-    Ok(Some((f.sender, String::from_utf8_lossy(&plain).into_owned())))
+    Ok(Some((
+        f.sender,
+        String::from_utf8_lossy(&plain).into_owned(),
+    )))
 }
 
 async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
@@ -647,6 +801,481 @@ async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
         return Err(format!("delete failed ({code})"));
     }
     Ok(body.first().copied().unwrap_or(0) != 0)
+}
+
+// ---- rendezvous -------------------------------------------------------------
+
+/// A local port this process can hold and then hand to squic.
+///
+/// Bound, read back, released. Racy in principle, and the alternative — letting
+/// squic bind first and asking what it got — would mean the exchange connection
+/// and the peer connection could not share one, which is the whole point.
+fn pick_local_port() -> Result<SocketAddr, String> {
+    let probe = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let addr = probe.local_addr().map_err(|e| e.to_string())?;
+    drop(probe);
+    Ok(addr)
+}
+
+async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> Result<(), String> {
+    let signer = load_software_identity(cli, cfg)?;
+    let them = parse_key(peer)?;
+    let (addr, server) = endpoint(cli, cfg).await?;
+
+    // **One port for both connections, and that is the whole mechanism.** The
+    // address the exchange observes is the NAT mapping *this socket* made, and
+    // it is the address the peer will be given — so the connection that gets
+    // introduced and the connection that punches have to leave from the same
+    // place. `sqnr::Client` binds an ephemeral port with no way to choose, so
+    // this uses the small client in `sqex-proto::h3`, which can.
+    let ours = pick_local_port()?;
+    let mut client =
+        H3Client::connect_from(addr, server.as_bytes(), &signer.seed(), Some(ours)).await?;
+    let req = Introduce {
+        peer: them,
+        wait_secs: wait,
+    };
+    // The request is a long poll and may sit for `wait` seconds by design.
+    let (code, body) = client
+        .post("/rendezvous/introduce", req.encode())
+        .await
+        .map_err(|e| e.to_string())?;
+    if code != 200 {
+        return Err(format!("introduction refused ({code}): {}", said(&body)));
+    }
+    let got = Introduced::decode(&body).map_err(|e| e.to_string())?;
+    if !got.ready {
+        // Deliberately says nothing about whether they asked. That would be a
+        // signal about somebody who has not consented.
+        println!("no introduction: both sides must ask, and this one has not completed");
+        return Ok(());
+    }
+    let there = got.addr.ok_or("an introduction with no address")?;
+    println!("{them} was seen at {there}");
+    let lead = got.start_at.saturating_sub(got.now);
+    println!(
+        "  both sides were told to begin in {lead}s (exchange clock {})",
+        got.now
+    );
+    if dry_run {
+        return Ok(());
+    }
+
+    // Wait for the moment both sides were given. Measured as a delay from the
+    // exchange's own clock rather than as an absolute time on ours, because the
+    // three clocks do not agree and only one of them is shared.
+    tokio::time::sleep(std::time::Duration::from_secs(lead)).await;
+
+    // **The exchange connection is dropped here, and the port is reused.** A
+    // NAT keeps a mapping alive for tens of seconds after the last packet, so
+    // rebinding the same port lands in the same mapping — the one the peer was
+    // just told about. Holding the connection open instead would be better and
+    // is not possible: two QUIC endpoints cannot share a socket, and one that
+    // both dialled the exchange and accepted a peer is the dual-role endpoint
+    // SIP-25 still lacks.
+    drop(client);
+    // The OS does not release a port synchronously, and squic will refuse to
+    // bind one still held. Dropping the client aborts its driver, which is what
+    // actually lets go; this waits for the kernel to agree.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // **Lower key dials, higher key listens.** Somebody has to do each, and the
+    // tiebreak is on bytes both sides already hold — the same one SIP-12 uses
+    // to decide which peer is `first`, so there is one convention and not two.
+    let me = PubKey::new(signer.public());
+    let dialing = me.as_bytes() < them.as_bytes();
+    let punch = vec![there];
+    let unreachable = "no direct connection. This needs endpoint-independent mapping at \
+                       both ends: symmetric NAT allocates a fresh external port per \
+                       destination, so the port the exchange saw is not the one the peer \
+                       sees. SIP-12 relays instead, and works behind it";
+
+    if dialing {
+        println!("  dialling {there} from {ours}");
+        match squic::dial(
+            there,
+            them.as_bytes(),
+            squic::Config {
+                local_bind: Some(ours),
+                punch,
+                client_key: Some(hex_seed(&signer.seed())),
+                advertise_identity: true,
+                handshake_timeout: Some(std::time::Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(conn) => {
+                println!("  connected directly to {}", conn.remote_address());
+                conn.close(0u32.into(), b"done");
+                Ok(())
+            }
+            Err(e) => Err(format!("{unreachable} ({e})")),
+        }
+    } else {
+        println!("  listening on {ours} for {them}");
+        let listener = squic::listen(
+            ours,
+            &ed25519_dalek::SigningKey::from_bytes(&signer.seed()),
+            squic::Config {
+                punch,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| format!("cannot listen on {ours}: {e}"))?;
+        match tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await {
+            Ok(Some(incoming)) => match incoming.await {
+                Ok(conn) => {
+                    println!("  {} reached us directly", conn.remote_address());
+                    conn.close(0u32.into(), b"done");
+                    Ok(())
+                }
+                Err(e) => Err(format!("a peer arrived and the handshake failed: {e}")),
+            },
+            _ => Err(unreachable.to_string()),
+        }
+    }
+}
+
+/// squic takes a client key as hex, which is the one place this CLI has to
+/// speak that encoding.
+fn hex_seed(seed: &[u8; 32]) -> String {
+    seed.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---- attest -----------------------------------------------------------------
+
+fn claim_code(name: &str) -> Result<u8, String> {
+    match name {
+        "operates" => Ok(CLAIM_OPERATES),
+        "known-as" => Ok(CLAIM_KNOWN_AS),
+        "reviewed" => Ok(CLAIM_REVIEWED),
+        // Deliberately not a list with a gap in it: there is no negative claim
+        // to name, and SIP-27 settles that in the conservative direction
+        // because an unaccountable assertion that somebody misbehaved has no
+        // adjudicator.
+        other => Err(format!(
+            "unknown claim {other}: want operates, known-as or reviewed"
+        )),
+    }
+}
+
+fn claim_name(code: u8) -> &'static str {
+    match code {
+        CLAIM_OPERATES => "operates",
+        CLAIM_KNOWN_AS => "known as",
+        CLAIM_REVIEWED => "reviewed",
+        CLAIM_REVOKES => "withdrew a statement",
+        _ => "unreadable",
+    }
+}
+
+async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> {
+    match cmd {
+        AttestCmd::Say {
+            claim,
+            subject,
+            detail,
+            days,
+        } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let about = parse_key(subject)?;
+            let code = claim_code(claim)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let a = Attestation::sign(
+                &signer.seed(),
+                &about,
+                code,
+                detail.as_bytes().to_vec(),
+                now,
+                now + days * 86_400,
+            );
+            let (addr, server) = endpoint(cli, cfg).await?;
+            // Lodging as ourselves is not required — an attestation carries its
+            // own proof — but connecting anonymously would be an odd way to
+            // publish something with your name on it.
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code_out, body) = client.post("/attest/lodge", a.encode()).await?;
+            if code_out != 200 {
+                return Err(format!("lodge refused ({code_out}): {}", said(&body)));
+            }
+            println!(
+                "lodged: {} {} {about}, until {}",
+                PubKey::new(signer.public()),
+                claim_name(code),
+                a.expires_at
+            );
+            println!("  digest {}", bs58::encode(a.digest()).into_string());
+            println!(
+                "  this cannot be taken back — a withdrawal is a statement a reader \
+                 may never see, and anything once read can be kept"
+            );
+            Ok(())
+        }
+        AttestCmd::Withdraw { subject, digest } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let about = parse_key(subject)?;
+            let named = bs58::decode(digest)
+                .into_vec()
+                .map_err(|e| format!("bad digest: {e}"))?;
+            if named.len() != 32 {
+                return Err("a digest is 32 bytes".into());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs();
+            let a = Attestation::sign(
+                &signer.seed(),
+                &about,
+                CLAIM_REVOKES,
+                named,
+                now,
+                now + 30 * 86_400,
+            );
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code, body) = client.post("/attest/lodge", a.encode()).await?;
+            if code != 200 {
+                return Err(format!("withdrawal refused ({code}): {}", said(&body)));
+            }
+            println!("withdrawn at this exchange. Readers who already have it still have it");
+            Ok(())
+        }
+        AttestCmd::Read { subject, issuer } => {
+            let about = match subject {
+                Some(k) => parse_key(k)?,
+                None => own_identity(cli, cfg)?,
+            };
+            let from = match issuer {
+                Some(k) => Some(parse_key(k)?),
+                None => None,
+            };
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = match load_software_identity(cli, cfg) {
+                Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?,
+                Err(_) => Client::connect(addr, server.as_bytes()).await?,
+            };
+            let (code, body) = client
+                .post(
+                    "/attest/read",
+                    AttestQuery {
+                        subject: about,
+                        issuer: from,
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("read failed ({code}): {}", said(&body)));
+            }
+            let held = Held::decode(&body).map_err(|e| e.to_string())?;
+            if held.attestations.is_empty() {
+                println!("{about}: nothing said, by anyone this exchange holds");
+                return Ok(());
+            }
+            for a in &held.attestations {
+                // Each is verified here rather than taken from the exchange:
+                // the whole point of a signature is that the holder checks it.
+                if a.verify(held.now).is_err() {
+                    println!("{}: a statement that does not verify — ignored", a.issuer);
+                    continue;
+                }
+                // **An unreadable claim is not printed as text about a person.**
+                // The escape hatch lets anybody encode anything, and rendering
+                // it would be carrying it.
+                if !a.readable() {
+                    println!(
+                        "{}: a claim of type {:#x} this build does not know",
+                        a.issuer, a.claim
+                    );
+                    continue;
+                }
+                println!(
+                    "{} says {} {}",
+                    a.issuer,
+                    claim_name(a.claim),
+                    String::from_utf8_lossy(&a.body)
+                );
+                println!("  digest {}", bs58::encode(a.digest()).into_string());
+            }
+            println!(
+                "  {} statement(s). This is not a score: anyone can make identities \
+                 and have them vouch for each other, so only issuers you already \
+                 trust mean anything",
+                held.attestations.len()
+            );
+            Ok(())
+        }
+    }
+}
+
+// ---- resolve ----------------------------------------------------------------
+
+/// Parse a `host:port` an operator typed into the shape SIP-28 publishes.
+///
+/// A bare IPv4 or IPv6 literal becomes an address endpoint; anything else is
+/// taken as a DNS name, which is what an operator behind a changing address
+/// wants and is the only kind an exchange cannot check.
+fn parse_endpoint(text: &str) -> Result<Endpoint, String> {
+    let (host, port) = match text.rsplit_once(':') {
+        // A bracketed IPv6 literal, `[::1]:443`.
+        Some((h, p)) if h.starts_with('[') && h.ends_with(']') => (&h[1..h.len() - 1], p),
+        Some((h, p)) if !h.contains(':') => (h, p),
+        // No port, or an unbracketed IPv6 address, which is ambiguous either
+        // way and is refused rather than guessed at.
+        _ => return Err(format!("{text}: want host:port, and [addr]:port for IPv6")),
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{text}: {port} is not a port"))?;
+    let (kind, host) = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => (KIND_IPV4, a.octets().to_vec()),
+        Ok(std::net::IpAddr::V6(a)) => (KIND_IPV6, a.octets().to_vec()),
+        Err(_) => {
+            if host.is_empty() || host.len() > MAX_HOST {
+                return Err(format!("{text}: a name must be 1..={MAX_HOST} bytes"));
+            }
+            (KIND_DNS, host.as_bytes().to_vec())
+        }
+    };
+    Ok(Endpoint {
+        kind,
+        host,
+        port,
+        priority: 0,
+        weight: 0,
+    })
+}
+
+/// Render an endpoint the way it was typed.
+fn show_endpoint(e: &Endpoint) -> String {
+    match e.kind {
+        KIND_IPV4 if e.host.len() == 4 => {
+            let o: [u8; 4] = e.host[..].try_into().unwrap();
+            format!("{}:{}", std::net::Ipv4Addr::from(o), e.port)
+        }
+        KIND_IPV6 if e.host.len() == 16 => {
+            let o: [u8; 16] = e.host[..].try_into().unwrap();
+            format!("[{}]:{}", std::net::Ipv6Addr::from(o), e.port)
+        }
+        _ => format!("{}:{}", String::from_utf8_lossy(&e.host), e.port),
+    }
+}
+
+async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), String> {
+    match cmd {
+        ResolveCmd::Publish {
+            endpoint: addrs,
+            capability,
+            ttl,
+        } => {
+            // Publishing means connecting *as* the identity: the handshake is
+            // what establishes which key is speaking, which is why nothing here
+            // is signed and why a YubiKey cannot do it.
+            if cli.yubikey {
+                return Err(
+                    "a YubiKey cannot publish endpoints: it signs, but cannot be a transport \
+                     identity. Publish with a software identity (see SIP-11 on delegation)."
+                        .into(),
+                );
+            }
+            let signer = load_software_identity(cli, cfg)?;
+            let endpoints: Vec<Endpoint> = addrs
+                .iter()
+                .map(|e| parse_endpoint(e))
+                .collect::<Result<_, _>>()?;
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let req = ResolvePublish {
+                ttl_secs: *ttl,
+                endpoints,
+                capabilities: capability.clone(),
+            };
+            let (code, body) = client.post("/resolve/publish", req.encode()).await?;
+            if code != 200 {
+                return Err(format!("publish refused ({code}): {}", said(&body)));
+            }
+            println!(
+                "published {} endpoint(s) for {}, good for {}s",
+                req.endpoints.len(),
+                PubKey::new(signer.public()),
+                ttl
+            );
+            Ok(())
+        }
+        ResolveCmd::Get { key } => {
+            let target = match key {
+                Some(k) => parse_key(k)?,
+                None => own_identity(cli, cfg)?,
+            };
+            let (addr, server) = endpoint(cli, cfg).await?;
+            // As ourselves where we can: an identity's own withheld liveness is
+            // disclosed to it and to nobody else.
+            let mut client = match load_software_identity(cli, cfg) {
+                Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?,
+                Err(_) => Client::connect(addr, server.as_bytes()).await?,
+            };
+            let (code, body) = client
+                .post("/resolve/get", ResolveGet { key: target }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("resolve failed ({code}): {}", said(&body)));
+            }
+            let r = Resolved::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                println!("{target}: no endpoints published");
+                return Ok(());
+            }
+            for e in &r.endpoints {
+                println!("{}", show_endpoint(e));
+            }
+            if !r.capabilities.is_empty() {
+                println!("  speaks {}", r.capabilities.join(", "));
+            }
+            // The provenance, because an answer without it cannot be judged.
+            // Ages against the exchange's clock, not this machine's, for the
+            // reason SIP-4 gives.
+            println!(
+                "  published {}s ago, expires in {}s",
+                r.now.saturating_sub(r.published_at),
+                r.expires_at.saturating_sub(r.now)
+            );
+            match r.last_seen {
+                0 => println!("  never seen beating — this exchange has no evidence it is up"),
+                seen => println!("  last seen {}s ago", r.now.saturating_sub(seen)),
+            }
+            Ok(())
+        }
+        ResolveCmd::Moved { successor, reason } => {
+            if cli.yubikey {
+                return Err("a YubiKey cannot be a transport identity".into());
+            }
+            let signer = load_software_identity(cli, cfg)?;
+            let to = parse_key(successor)?;
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let req = ResolveSuccessor {
+                successor: to,
+                reason: reason.clone(),
+            };
+            let (code, body) = client.post("/resolve/successor", req.encode()).await?;
+            if code != 200 {
+                return Err(format!("successor refused ({code}): {}", said(&body)));
+            }
+            println!(
+                "{} now points at {to}. This says you are moving; it does not say \
+                 the old key was stolen, and cannot — whoever holds a key can set this",
+                PubKey::new(signer.public())
+            );
+            Ok(())
+        }
+    }
 }
 
 // ---- beacon -----------------------------------------------------------------
@@ -675,10 +1304,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             };
             let (code, body) = client.post("/beacon/beat", beat.encode()).await?;
             if code != 200 {
-                return Err(format!(
-                    "beat refused ({code}): {}",
-                    said(&body)
-                ));
+                return Err(format!("beat refused ({code}): {}", said(&body)));
             }
             let ack = BeatAck::decode(&body).map_err(|e| e.to_string())?;
             println!(
@@ -704,12 +1330,11 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
                 Err(_) => Client::connect(addr, server.as_bytes()).await?,
             };
 
-            let (code, body) = client.post("/beacon/read", Read { key: target }.encode()).await?;
+            let (code, body) = client
+                .post("/beacon/read", Read { key: target }.encode())
+                .await?;
             if code != 200 {
-                return Err(format!(
-                    "read failed ({code}): {}",
-                    said(&body)
-                ));
+                return Err(format!("read failed ({code}): {}", said(&body)));
             }
             let r = Reply::decode(&body).map_err(|e| e.to_string())?;
             if !r.found {
@@ -721,7 +1346,10 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             // verdict (SIP-4 forbids the exchange deciding this, and a CLI
             // deciding it silently would be the same mistake one layer up).
             let missed = if r.interval_secs > 0 {
-                format!(" ({} intervals)", r.staleness() / u64::from(r.interval_secs))
+                format!(
+                    " ({} intervals)",
+                    r.staleness() / u64::from(r.interval_secs)
+                )
             } else {
                 String::new()
             };
@@ -757,7 +1385,6 @@ fn load_software_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::Software
 fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
     identity::read_public(&identity_path(cli, cfg)?)
 }
-
 
 /// The layers a caller can speak through, most specific first. Resolution is
 /// shared with the other clients in `sqex_discovery::target`, because three
@@ -996,7 +1623,10 @@ fn said(body: &[u8]) -> String {
 
 /// The nth entry of the server's `results` array.
 fn result(v: &serde_json::Value, i: usize) -> serde_json::Value {
-    v["results"].get(i).cloned().unwrap_or(serde_json::Value::Null)
+    v["results"]
+        .get(i)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn print_list(v: &serde_json::Value) {
@@ -1030,7 +1660,10 @@ fn print_audit(v: &serde_json::Value) {
         let time = e["time"].as_u64().unwrap_or(0);
         let admin = e["admin"].as_str().unwrap_or("?");
         let action = e["action"].as_str().unwrap_or("?");
-        let target = e["target"].as_str().map(|t| format!(" {t}")).unwrap_or_default();
+        let target = e["target"]
+            .as_str()
+            .map(|t| format!(" {t}"))
+            .unwrap_or_default();
         let short: String = admin.chars().take(8).collect();
         println!("[{time}] {short}… {action}{target}");
     }

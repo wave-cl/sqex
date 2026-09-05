@@ -88,6 +88,21 @@ pub enum Code {
     LastAdmin,
     BrokenChain,
     UsedInstance,
+    /// SIP-34: a receipted request to an exchange that issues no receipts.
+    NoReceipts,
+    /// SIP-35: this channel already has as many replicas as it may.
+    TooManyReplicas,
+    /// SIP-35: a write to a channel this exchange only replicates. The detail
+    /// carries the origin's key, which is where the write belongs.
+    Replicated,
+    /// SIP-35: a read of a replicated channel whose membership the replica
+    /// cannot derive. The detail carries the origin's key.
+    Underived,
+    /// SIP-35: this exchange holds two receipts for one position from the
+    /// channel's origin, and will present neither branch as the conversation.
+    Equivocated,
+    /// SIP-28: more endpoints than an identity may publish.
+    TooManyEndpoints,
 
     // SIP-18 blobs.
     NoSuchUpload,
@@ -168,6 +183,12 @@ impl Code {
             Code::LastAdmin => 33,
             Code::BrokenChain => 34,
             Code::UsedInstance => 35,
+            Code::NoReceipts => 55,
+            Code::TooManyReplicas => 56,
+            Code::Replicated => 57,
+            Code::Underived => 58,
+            Code::Equivocated => 59,
+            Code::TooManyEndpoints => 60,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -241,6 +262,12 @@ impl Code {
             33 => Code::LastAdmin,
             34 => Code::BrokenChain,
             35 => Code::UsedInstance,
+            55 => Code::NoReceipts,
+            56 => Code::TooManyReplicas,
+            57 => Code::Replicated,
+            58 => Code::Underived,
+            59 => Code::Equivocated,
+            60 => Code::TooManyEndpoints,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -314,6 +341,12 @@ impl Code {
             Code::LastAdmin => "last_admin",
             Code::BrokenChain => "broken_chain",
             Code::UsedInstance => "used_instance",
+            Code::NoReceipts => "no_receipts",
+            Code::TooManyReplicas => "too_many_replicas",
+            Code::Replicated => "replicated",
+            Code::Underived => "underived",
+            Code::Equivocated => "equivocated",
+            Code::TooManyEndpoints => "too_many_endpoints",
 
             Code::NoSuchUpload => "no_such_upload",
             Code::NoSuchBlob => "no_such_blob",
@@ -383,6 +416,12 @@ impl Code {
         Code::LastAdmin,
         Code::BrokenChain,
         Code::UsedInstance,
+        Code::NoReceipts,
+        Code::TooManyReplicas,
+        Code::Replicated,
+        Code::Underived,
+        Code::Equivocated,
+        Code::TooManyEndpoints,
         Code::NoSuchUpload,
         Code::NoSuchBlob,
         Code::BadChunk,
@@ -571,7 +610,10 @@ mod tests {
 
     #[test]
     fn a_truncated_or_overlong_body_is_refused() {
-        assert!(Refusal::decode(&[0, 21, 0]).is_err(), "3 bytes is too short");
+        assert!(
+            Refusal::decode(&[0, 21, 0]).is_err(),
+            "3 bytes is too short"
+        );
         // Says 5 bytes of detail, carries 2.
         assert!(Refusal::decode(&[0, 21, 0, 5, b'h', b'i']).is_err());
         // Says 0, carries 2.

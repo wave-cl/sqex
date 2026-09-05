@@ -179,7 +179,10 @@ async fn a_direct_message_closed_and_reopened_recovers_rather_than_going_silent(
     // one again — which is exactly how a real conversation went silent.
     bob.close(&channel).await.unwrap();
     let reopened = alice.open_dm(&bob_key).await.unwrap();
-    assert_eq!(reopened, channel, "the identifier is derived, so it returns");
+    assert_eq!(
+        reopened, channel,
+        "the identifier is derived, so it returns"
+    );
     bob.open_dm(&alice_key).await.unwrap();
     // Alice polls before she writes, as a running client does every 700 ms.
     // She holds keys and a cursor for a channel that no longer exists, and the
@@ -280,12 +283,22 @@ async fn withholding_your_own_reading_withholds_everyone_elses() {
     // She opts out, and immediately cannot see his either — enforced at the
     // exchange rather than left to a client that might not honour it.
     alice
-        .post_cursor(&channel, Cursor { channel, read: last, receipts: false })
+        .post_cursor(
+            &channel,
+            Cursor {
+                channel,
+                read: last,
+                receipts: false,
+            },
+        )
         .await
         .unwrap();
     let withheld = alice.marks(&channel).await.unwrap();
     assert_eq!(
-        withheld.iter().find(|m| m.account == bob_key).map(|m| m.read),
+        withheld
+            .iter()
+            .find(|m| m.account == bob_key)
+            .map(|m| m.read),
         Some(0),
         "reading was still visible to somebody who stopped sharing their own"
     );
@@ -422,7 +435,10 @@ async fn a_member_who_is_not_an_admin_is_told_so_instead_of_being_humoured() {
     let said = err.to_string();
     assert!(said.contains("admin"), "unhelpful refusal: {said}");
     // And it names somebody who can, rather than leaving them stuck.
-    assert!(said.contains(&alice_key.to_string()), "no admin named: {said}");
+    assert!(
+        said.contains(&alice_key.to_string()),
+        "no admin named: {said}"
+    );
 
     // Nothing was sent, so nothing changed for anybody.
     let held = alice.history(&channel, &[alice_key]).unwrap();

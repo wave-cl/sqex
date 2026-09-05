@@ -556,7 +556,9 @@ mod tests {
                 .map(|i| Prekey::generate(&seed, KIND_ONE_TIME, i).0)
                 .collect();
             store.publish(&key, &batch).unwrap();
-            store.publish(&key, &[Prekey::generate(&seed, KIND_FALLBACK, 5).0]).unwrap();
+            store
+                .publish(&key, &[Prekey::generate(&seed, KIND_FALLBACK, 5).0])
+                .unwrap();
             assert_eq!(store.take(&key).prekey.unwrap().id, 1);
         }
         let store = Prekeys::open(Some(&path)).unwrap();
@@ -576,7 +578,9 @@ mod tests {
         let (seed, key) = device(21);
         {
             let store = Prekeys::open(Some(&path)).unwrap();
-            store.publish(&key, &[Prekey::generate(&seed, KIND_ONE_TIME, 1).0]).unwrap();
+            store
+                .publish(&key, &[Prekey::generate(&seed, KIND_ONE_TIME, 1).0])
+                .unwrap();
             store.take(&key);
         }
         let store = Prekeys::open(Some(&path)).unwrap();
@@ -590,9 +594,17 @@ mod tests {
     fn a_new_fallback_replaces_the_old_one() {
         let (seed, key) = device(22);
         let store = Prekeys::open(None).unwrap();
-        store.publish(&key, &[Prekey::generate(&seed, KIND_FALLBACK, 1).0]).unwrap();
-        store.publish(&key, &[Prekey::generate(&seed, KIND_FALLBACK, 2).0]).unwrap();
-        assert_eq!(store.count(&key).fallback_id, 2, "two fallbacks are held at once");
+        store
+            .publish(&key, &[Prekey::generate(&seed, KIND_FALLBACK, 1).0])
+            .unwrap();
+        store
+            .publish(&key, &[Prekey::generate(&seed, KIND_FALLBACK, 2).0])
+            .unwrap();
+        assert_eq!(
+            store.count(&key).fallback_id,
+            2,
+            "two fallbacks are held at once"
+        );
         assert_eq!(store.take(&key).prekey.unwrap().id, 2);
     }
 }

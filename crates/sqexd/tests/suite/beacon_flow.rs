@@ -33,9 +33,7 @@ async fn spawn_server(
 }
 
 /// A server with no admins and an empty whitelist — nothing is pre-registered.
-async fn bare_server(
-    dir: &std::path::Path,
-) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn bare_server(dir: &std::path::Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
@@ -111,7 +109,10 @@ async fn an_unregistered_identity_can_beat_and_be_read() {
 
     // Anyone may ask, including an anonymous caller.
     let r = read(addr, &server_pub, None, pk).await;
-    assert!(r.found, "the beat was recorded against the Ed25519 identity");
+    assert!(
+        r.found,
+        "the beat was recorded against the Ed25519 identity"
+    );
     assert_eq!(r.interval_secs, 60);
     assert!(r.now >= r.last_seen);
     assert!(r.staleness() < 5, "just beaten, so barely stale");
@@ -212,7 +213,10 @@ async fn a_malformed_beat_is_refused() {
     let mut c = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
 
     // A reserved flag bit set — SIP-4 says these MUST be zero.
-    let (code, _) = c.post("/beacon/beat", vec![0x01, 0, 0, 0, 60, 0b10]).await.unwrap();
+    let (code, _) = c
+        .post("/beacon/beat", vec![0x01, 0, 0, 0, 60, 0b10])
+        .await
+        .unwrap();
     assert_eq!(code, 400);
 
     // Wrong length.

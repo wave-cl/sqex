@@ -14,6 +14,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # None of the `test` job's setup is repeated here on purpose. rustfmt
+      # parses rather than compiles, and `cargo metadata --no-deps` resolves
+      # nothing, so this job needs no PC/SC, no ALSA, no cache and no
+      # dependency fetch — it answers in seconds while `test` is still
+      # installing packages.
+      #
+      # `--all` would work in this repository: squic is a git dependency and
+      # the only path deps (sqex-chat and sqex-voice on sqexd) are workspace
+      # members already. The scoped form is used regardless, because `--all`
+      # formats the workspace *and the path-based dependencies of its
+      # members*, and the day any dependency here is switched to a path
+      # outside the workspace, `--all` would start rewriting that checkout
+      # unannounced. That is not hypothetical: it is how this repository was
+      # accidentally reformatted once, from sigil, which consumes these
+      # crates by path.
+      #
+      # The list is derived rather than written out, so adding a crate cannot
+      # leave it silently unchecked, and is echoed so a green run shows what
+      # it covered rather than only that nothing failed.
+      - name: Format
+        run: |
+          args=()
+          while read -r n; do args+=(-p "$n"); done \
+            < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')
+          test ${#args[@]} -gt 0
+          echo "checking: ${args[*]}"
+          cargo fmt "${args[@]}" -- --check
+
   test:
     runs-on: ubuntu-latest
     steps:

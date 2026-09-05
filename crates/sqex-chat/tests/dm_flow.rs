@@ -60,12 +60,7 @@ fn identity(b: u8) -> ([u8; 32], PubKey) {
 
 /// Open a client, exactly as the binary does: connect as the identity, open the
 /// store at a real path, publish prekeys if the pool is low.
-async fn chat_at(
-    addr: SocketAddr,
-    server_pub: [u8; 32],
-    b: u8,
-    store_path: &Path,
-) -> Chat {
+async fn chat_at(addr: SocketAddr, server_pub: [u8; 32], b: u8, store_path: &Path) -> Chat {
     let (seed, me) = identity(b);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(store_path)).unwrap();
@@ -97,7 +92,11 @@ async fn two_people_hold_a_direct_message_the_exchange_cannot_read() {
     // Alice starts it. Nothing is asked of the exchange to find the channel —
     // its identifier is derived from the two accounts.
     let channel = alice.open_dm(&bob_key).await.unwrap();
-    assert_eq!(channel, bob.dm_with(&alice_key), "both ends derive the same id");
+    assert_eq!(
+        channel,
+        bob.dm_with(&alice_key),
+        "both ends derive the same id"
+    );
 
     alice.send(&channel, "are you there?").await.unwrap();
 
@@ -136,9 +135,7 @@ async fn the_exchange_stores_ciphertext_and_nothing_else() {
     let db = dir.path().join("channels.db");
     let bytes = std::fs::read(&db).unwrap();
     assert!(
-        !bytes
-            .windows(secret.len())
-            .any(|w| w == secret.as_bytes()),
+        !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
         "the plaintext reached the exchange's disk"
     );
 }
@@ -222,7 +219,11 @@ async fn a_restart_does_not_reuse_a_message_counter() {
     bob.poll(&channel, &mut bobs, 0).await.unwrap();
     // Five messages from Alice, five distinct counters, none of them lost to a
     // collision the reader would have shown as a missing message.
-    assert_eq!(said(&bobs).len(), 5, "a counter collided and an entry was lost");
+    assert_eq!(
+        said(&bobs).len(),
+        5,
+        "a counter collided and an entry was lost"
+    );
 }
 
 #[tokio::test]
@@ -390,7 +391,10 @@ async fn a_client_that_lost_its_store_can_still_publish_prekeys() {
     bob.open_dm(&alice_key).await.unwrap();
     let mut bobs = Timeline::new();
     let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
-    assert_eq!(said(&got.timeline), vec!["before the loss", "after the loss"]);
+    assert_eq!(
+        said(&got.timeline),
+        vec!["before the loss", "after the loss"]
+    );
 }
 
 #[tokio::test]
@@ -431,7 +435,10 @@ async fn a_lost_store_does_not_leave_stale_prekeys_for_peers_to_seal_to() {
     bob.send(&channel, "so did i").await.unwrap();
     let mut alices = Timeline::new();
     let got = alice.poll(&channel, &mut alices, 0).await.unwrap();
-    assert_eq!(said(&got.timeline), vec!["after we both lost it", "so did i"]);
+    assert_eq!(
+        said(&got.timeline),
+        vec!["after we both lost it", "so did i"]
+    );
 }
 
 #[tokio::test]
@@ -469,7 +476,11 @@ async fn a_file_travels_end_to_end_and_the_exchange_cannot_open_it() {
     let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
     let msg = got.timeline.messages().next().unwrap();
     assert_eq!(msg.post.body_text(), Some("the notes"));
-    let a = msg.post.attachments().next().expect("no attachment arrived");
+    let a = msg
+        .post
+        .attachments()
+        .next()
+        .expect("no attachment arrived");
     assert_eq!(a.size, secret.len() as u64);
     assert_eq!(sqex_chat::file_name(a).as_deref(), Some("notes.md"));
 
@@ -567,7 +578,11 @@ async fn a_conversation_from_a_stranger_can_be_found() {
         .find(|a| *a != bob.me)
         .expect("no other member");
     assert_eq!(other, alice_key);
-    assert_eq!(bob.dm_with(&other), channel, "the identifier does not hash back");
+    assert_eq!(
+        bob.dm_with(&other),
+        channel,
+        "the identifier does not hash back"
+    );
 
     // Which is what the client does next: adding the contact and opening the
     // conversation is what collects the epoch key Alice sealed to him.
@@ -802,7 +817,10 @@ async fn a_member_without_the_role_cannot_seize_an_epoch() {
     // Reported as gone rather than as late: those epochs are superseded, and
     // a rotation hands out the next one and never an old one.
     assert!(got.lost > 0, "the gap should be reported");
-    assert!(got.unreadable.is_empty(), "and not as something still coming");
+    assert!(
+        got.unreadable.is_empty(),
+        "and not as something still coming"
+    );
 }
 
 #[tokio::test]
@@ -823,11 +841,8 @@ async fn a_client_republishes_when_the_exchange_has_lost_its_prekeys() {
     let db = dir.path().join("prekeys.db");
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute(
-            "DELETE FROM prekey WHERE device = ?1",
-            [bob_key.as_bytes()],
-        )
-        .unwrap();
+        conn.execute("DELETE FROM prekey WHERE device = ?1", [bob_key.as_bytes()])
+            .unwrap();
     }
     let channel = alice.open_dm(&bob_key).await.unwrap();
     assert!(
@@ -921,7 +936,10 @@ async fn a_key_that_has_not_arrived_yet_is_not_called_lost() {
     let mut carol = chat_at(addr, server_pub, 3, &dir.path().join("carol.db")).await;
     let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
 
-    let channel = alice.create_group("waiting room", &[bob_key]).await.unwrap();
+    let channel = alice
+        .create_group("waiting room", &[bob_key])
+        .await
+        .unwrap();
     alice.send(&channel, "before carol").await.unwrap();
 
     // Carol is added to the channel but not given the key — the exchange lets
@@ -933,7 +951,10 @@ async fn a_key_that_has_not_arrived_yet_is_not_called_lost() {
     let mut t = Timeline::new();
     let got = carol.poll(&channel, &mut t, 0).await.unwrap();
     assert_eq!(got.lost, 0, "nothing is gone; the key simply has not come");
-    assert!(!got.unreadable.is_empty(), "and it should say something is waiting");
+    assert!(
+        !got.unreadable.is_empty(),
+        "and it should say something is waiting"
+    );
     let _ = &mut bob;
 }
 
@@ -1018,7 +1039,10 @@ async fn a_private_channel_refuses_a_join() {
     let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
     let mut stranger = chat_at(addr, server_pub, 9, &dir.path().join("stranger.db")).await;
 
-    let channel = alice.create_group("private club", &[bob_key]).await.unwrap();
+    let channel = alice
+        .create_group("private club", &[bob_key])
+        .await
+        .unwrap();
     alice.send(&channel, "members only").await.unwrap();
 
     // Not in the directory under any query.
@@ -1074,7 +1098,9 @@ async fn link_device(
         .iter()
         .any(|d| d.device == owner.me)
     {
-        let own = owner.issue_credential(&owner.me, 90 * 24 * 60 * 60).unwrap();
+        let own = owner
+            .issue_credential(&owner.me, 90 * 24 * 60 * 60)
+            .unwrap();
         owner.register_self(&own).await.unwrap();
     }
     let credential = owner
@@ -1087,9 +1113,17 @@ async fn link_device(
     // A device that has published nothing cannot be sealed to.
     second.top_up_prekeys().await.unwrap();
     // Rebuilt so it picks the account up, as a real client would on next start.
-    let client = Client::connect_as(addr, &server_pub, &identity(b).0).await.unwrap();
+    let client = Client::connect_as(addr, &server_pub, &identity(b).0)
+        .await
+        .unwrap();
     let store = Store::open(&identity(b).0, Some(store)).unwrap();
-    let mut second = Chat::new(client, identity(b).0, identity(b).1, PubKey::new(server_pub), store);
+    let mut second = Chat::new(
+        client,
+        identity(b).0,
+        identity(b).1,
+        PubKey::new(server_pub),
+        store,
+    );
     second.top_up_prekeys().await.unwrap();
     second
 }
@@ -1112,16 +1146,29 @@ async fn two_devices_of_one_account_never_share_a_counter() {
     phone.send(&channel, "from the phone").await.unwrap();
 
     // Link a laptop to the same account, and give it the epoch in force.
-    let mut laptop = link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    let mut laptop = link_device(
+        addr,
+        server_pub,
+        &mut phone,
+        7,
+        &dir.path().join("laptop.db"),
+    )
+    .await;
     phone.reseal_to_siblings(&channel).await.unwrap();
-    assert!(laptop.collect_keys(&channel).await.unwrap() > 0, "the laptop got no key");
+    assert!(
+        laptop.collect_keys(&channel).await.unwrap() > 0,
+        "the laptop got no key"
+    );
     laptop.send(&channel, "from the laptop").await.unwrap();
 
     // Both read the whole conversation.
     bob.open_dm(&alice_key).await.unwrap();
     let mut t = Timeline::new();
     let got = bob.poll(&channel, &mut t, 0).await.unwrap();
-    assert_eq!(said(&got.timeline), vec!["from the phone", "from the laptop"]);
+    assert_eq!(
+        said(&got.timeline),
+        vec!["from the phone", "from the laptop"]
+    );
 
     // And the exchange recorded them under different devices. That is the
     // property; equal device keys here would mean a shared subkey.
@@ -1134,7 +1181,10 @@ async fn two_devices_of_one_account_never_share_a_counter() {
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(devices.len(), 2);
-    assert_ne!(devices[0], devices[1], "both entries came from one device key");
+    assert_ne!(
+        devices[0], devices[1],
+        "both entries came from one device key"
+    );
     // And both are the *same account*, which is the other half of the property:
     // two devices, one person, as far as anybody reading is concerned.
     let accounts: Vec<Vec<u8>> = db
@@ -1205,8 +1255,14 @@ async fn revoking_a_device_stops_it_being_sealed_to() {
     let (_, bob_key) = identity(2);
     let _bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
     let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
-    let mut laptop =
-        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    let mut laptop = link_device(
+        addr,
+        server_pub,
+        &mut phone,
+        7,
+        &dir.path().join("laptop.db"),
+    )
+    .await;
 
     // Both are registered: the phone by linking, the laptop by claiming.
     assert_eq!(phone.my_devices().await.unwrap().len(), 2);
@@ -1244,10 +1300,19 @@ async fn a_late_key_opens_what_was_already_held() {
     let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
 
     let channel = phone.open_dm(&bob_key).await.unwrap();
-    phone.send(&channel, "said before you linked").await.unwrap();
+    phone
+        .send(&channel, "said before you linked")
+        .await
+        .unwrap();
 
-    let mut laptop =
-        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    let mut laptop = link_device(
+        addr,
+        server_pub,
+        &mut phone,
+        7,
+        &dir.path().join("laptop.db"),
+    )
+    .await;
 
     // The laptop reads first, with no key. It keeps what it cannot open.
     let mut t = Timeline::new();
@@ -1289,8 +1354,14 @@ async fn missing_names_devices_and_not_accounts() {
     );
 
     // Link a device and do *not* reseal to it.
-    let laptop =
-        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    let laptop = link_device(
+        addr,
+        server_pub,
+        &mut phone,
+        7,
+        &dir.path().join("laptop.db"),
+    )
+    .await;
     let absent = phone.stranded(&channel).await.unwrap();
     assert_eq!(absent.devices.len(), 1, "the new device should be reported");
     assert_eq!(absent.devices[0].device, laptop.device());
@@ -1329,7 +1400,10 @@ async fn a_member_may_rekey_after_revoking_one_of_its_own_devices() {
 
     // Bob has revoked nothing, so he may not rotate.
     assert!(
-        matches!(bob.rotate(&channel).await, Err(sqex_chat::ChatError::NotAnAdmin)),
+        matches!(
+            bob.rotate(&channel).await,
+            Err(sqex_chat::ChatError::NotAnAdmin)
+        ),
         "an ordinary member rotated without cause"
     );
 
@@ -1356,8 +1430,14 @@ async fn a_revoked_client_is_told_so_rather_than_refused_everywhere() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
     let mut phone = chat_at(addr, server_pub, 1, &dir.path().join("phone.db")).await;
-    let mut laptop =
-        link_device(addr, server_pub, &mut phone, 7, &dir.path().join("laptop.db")).await;
+    let mut laptop = link_device(
+        addr,
+        server_pub,
+        &mut phone,
+        7,
+        &dir.path().join("laptop.db"),
+    )
+    .await;
 
     assert_eq!(laptop.still_linked().await.unwrap(), Some(true));
     phone.revoke_device(&laptop.device()).await.unwrap();
@@ -1471,7 +1551,10 @@ async fn redacting_removes_the_words_from_the_exchange_and_tells_the_other_side(
     // record, and a client that discarded it would show a conversation that
     // silently does not follow.
     let tomb = got.timeline.get(regret).expect("the tombstone was dropped");
-    assert!(tomb.redacted, "the entry survived but was not marked redacted");
+    assert!(
+        tomb.redacted,
+        "the entry survived but was not marked redacted"
+    );
     assert!(
         tomb.post.body_text().is_none_or(|t| t.is_empty()),
         "the redacted body was kept in the timeline"
@@ -1590,9 +1673,15 @@ async fn renaming_a_channel_leaves_its_topic_alone() {
     );
 
     // And the other way round, since the same record carries both.
-    alice.set_topic(&channel, "what we ship in November").await.unwrap();
+    alice
+        .set_topic(&channel, "what we ship in November")
+        .await
+        .unwrap();
     let held = alice.history(&channel, &[me]).unwrap();
-    assert_eq!(held.name, "shipping", "setting the topic destroyed the name");
+    assert_eq!(
+        held.name, "shipping",
+        "setting the topic destroyed the name"
+    );
     assert_eq!(held.topic, "what we ship in November");
 }
 
@@ -1610,7 +1699,11 @@ async fn redacting_takes_the_words_off_both_disks() {
     let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
 
     let channel = alice.open_dm(&bob_key).await.unwrap();
-    let regret = alice.send(&channel, "the incriminating words").await.unwrap().seq;
+    let regret = alice
+        .send(&channel, "the incriminating words")
+        .await
+        .unwrap()
+        .seq;
 
     bob.open_dm(&alice_key).await.unwrap();
     let mut bobs = Timeline::new();
@@ -1655,7 +1748,11 @@ async fn redacting_takes_the_words_off_both_disks() {
         .into_iter()
         .find(|(seq, ..)| *seq == regret)
         .unwrap();
-    assert_eq!(row.4, Some(Vec::new()), "a tombstone came back as unopenable");
+    assert_eq!(
+        row.4,
+        Some(Vec::new()),
+        "a tombstone came back as unopenable"
+    );
 }
 
 /// Only the message's own account or an admin may delete it, and the store has
@@ -1741,14 +1838,26 @@ async fn words_deleted_before_we_learned_to_forget_them_are_cleared_on_reload() 
         store
             .put_message(
                 &channel,
-                Kept { seq: 1, account: them, posted: 10, kind: KIND_MEMBER, plain: Some(&post) },
+                Kept {
+                    seq: 1,
+                    account: them,
+                    posted: 10,
+                    kind: KIND_MEMBER,
+                    plain: Some(&post),
+                },
             )
             .unwrap();
         let notice = Body::Redact { target: 1 }.encode();
         store
             .put_message(
                 &channel,
-                Kept { seq: 2, account: them, posted: 20, kind: KIND_MEMBER, plain: Some(&notice) },
+                Kept {
+                    seq: 2,
+                    account: them,
+                    posted: 20,
+                    kind: KIND_MEMBER,
+                    plain: Some(&notice),
+                },
             )
             .unwrap();
         let words = store
@@ -1770,7 +1879,10 @@ async fn words_deleted_before_we_learned_to_forget_them_are_cleared_on_reload() 
         Store::open(&seed, Some(&path)).unwrap(),
     );
     let folded = chat.history(&channel, &[them]).unwrap();
-    assert!(folded.get(1).is_some_and(|m| m.redacted), "the fold missed it");
+    assert!(
+        folded.get(1).is_some_and(|m| m.redacted),
+        "the fold missed it"
+    );
 
     assert_eq!(
         chat.store()

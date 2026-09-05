@@ -112,11 +112,16 @@ async fn a_name_is_cached_and_not_asked_for_twice() {
     // Asked once. Asking the exchange who everybody is on every poll would
     // turn a display convenience into a stream of traffic about who this
     // client is reading.
-    assert_eq!(bob.refresh_profiles(&[alice_key], now + 60).await.unwrap(), 0);
+    assert_eq!(
+        bob.refresh_profiles(&[alice_key], now + 60).await.unwrap(),
+        0
+    );
     // And an hour later it is asked again, because SIP-21 lets a profile
     // change 32 times an hour.
     assert_eq!(
-        bob.refresh_profiles(&[alice_key], now + 3601).await.unwrap(),
+        bob.refresh_profiles(&[alice_key], now + 3601)
+            .await
+            .unwrap(),
         1
     );
 }
@@ -139,14 +144,20 @@ async fn an_account_that_publishes_nothing_is_not_asked_about_forever() {
     assert_eq!(bob.display_name(&alice_key), None, "a name was invented");
     // "Asked and told nothing" is remembered, or the client asks again on
     // every poll for the rest of the conversation.
-    assert_eq!(bob.refresh_profiles(&[alice_key], now + 60).await.unwrap(), 0);
+    assert_eq!(
+        bob.refresh_profiles(&[alice_key], now + 60).await.unwrap(),
+        0
+    );
 
     // But it is believed for minutes, not for an hour. Everybody starts with
     // no profile, so this entry is the thing standing between somebody
     // publishing a name and anybody seeing it — cached for an hour, a name
     // set now is invisible to everyone who has already looked.
     alice.set_profile(named("Alice Byrne", "")).await.unwrap();
-    assert_eq!(bob.refresh_profiles(&[alice_key], now + 200).await.unwrap(), 1);
+    assert_eq!(
+        bob.refresh_profiles(&[alice_key], now + 200).await.unwrap(),
+        1
+    );
     assert_eq!(bob.display_name(&alice_key).as_deref(), Some("Alice Byrne"));
 }
 
@@ -159,7 +170,10 @@ async fn we_learn_our_own_name_too() {
     let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
     let (_, alice_key) = identity(1);
 
-    alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
+    alice
+        .set_profile(named("Alice Byrne", "shipping"))
+        .await
+        .unwrap();
     // An hour and a second after the write-through `set_profile` does, so the
     // cached copy is stale and a fetch is actually made. The clock is what
     // makes the fetch happen; what is under test is *whose* profile is
@@ -191,7 +205,10 @@ async fn publishing_a_name_is_visible_to_the_publisher_without_asking() {
     let (_, alice_key) = identity(1);
 
     assert_eq!(alice.display_name(&alice_key), None);
-    alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
+    alice
+        .set_profile(named("Alice Byrne", "shipping"))
+        .await
+        .unwrap();
 
     // No refresh_profiles, no round trip, no cache to wait out.
     assert_eq!(
@@ -237,11 +254,17 @@ async fn asking_who_somebody_is_does_not_answer_from_a_cache() {
 
     // Alice names herself a second later. The cache says otherwise.
     alice.set_profile(named("Alice Byrne", "")).await.unwrap();
-    assert_eq!(bob.refresh_profiles(&[alice_key], now + 1).await.unwrap(), 0);
+    assert_eq!(
+        bob.refresh_profiles(&[alice_key], now + 1).await.unwrap(),
+        0
+    );
     assert_eq!(bob.display_name(&alice_key), None);
 
     // Asking outright looks anyway.
-    assert_eq!(bob.refetch_profiles(&[alice_key], now + 1).await.unwrap(), 1);
+    assert_eq!(
+        bob.refetch_profiles(&[alice_key], now + 1).await.unwrap(),
+        1
+    );
     assert_eq!(bob.display_name(&alice_key).as_deref(), Some("Alice Byrne"));
 }
 
@@ -367,7 +390,10 @@ async fn a_published_name_can_be_taken_back() {
     let (_, alice_key) = identity(1);
     let (_, bob_key) = identity(2);
 
-    alice.set_profile(named("Alice Byrne", "shipping")).await.unwrap();
+    alice
+        .set_profile(named("Alice Byrne", "shipping"))
+        .await
+        .unwrap();
     let channel = alice.open_dm(&bob_key).await.unwrap();
     alice.send(&channel, "hello").await.unwrap();
     bob.open_dm(&alice_key).await.unwrap();
@@ -408,7 +434,10 @@ async fn an_admission_request_is_sent_and_tells_us_nothing_about_the_answer() {
         .unwrap();
     assert_eq!(credential.account, identity(1).1);
 
-    alice.request_admission("alice, on the laptop").await.unwrap();
+    alice
+        .request_admission("alice, on the laptop")
+        .await
+        .unwrap();
 
     // Twice from one client, and from a second client, and from a client that
     // offers no label at all. Every one of them succeeds and every one of them

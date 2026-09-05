@@ -300,16 +300,79 @@ mod tests {
         let other_body = b"hellp".to_vec();
 
         let mutations: Vec<(&str, EntryTerms)> = vec![
-            ("exchange", EntryTerms { place: Place { exchange: other_key, ..base.place }, ..base }),
-            ("instance", EntryTerms { place: Place { instance: [5; 32], ..base.place }, ..base }),
-            ("channel", EntryTerms { place: Place { channel: [8; 32], ..base.place }, ..base }),
-            ("account", EntryTerms { account: other_key, ..base }),
+            (
+                "exchange",
+                EntryTerms {
+                    place: Place {
+                        exchange: other_key,
+                        ..base.place
+                    },
+                    ..base
+                },
+            ),
+            (
+                "instance",
+                EntryTerms {
+                    place: Place {
+                        instance: [5; 32],
+                        ..base.place
+                    },
+                    ..base
+                },
+            ),
+            (
+                "channel",
+                EntryTerms {
+                    place: Place {
+                        channel: [8; 32],
+                        ..base.place
+                    },
+                    ..base
+                },
+            ),
+            (
+                "account",
+                EntryTerms {
+                    account: other_key,
+                    ..base
+                },
+            ),
             ("epoch", EntryTerms { epoch: 4, ..base }),
-            ("msg_seq", EntryTerms { msg_seq: 12, ..base }),
-            ("expires_after", EntryTerms { expires_after: 61, ..base }),
-            ("chain_seq", EntryTerms { chain_seq: 6, ..base }),
-            ("prev", EntryTerms { prev: [2; 32], ..base }),
-            ("body", EntryTerms { body: &other_body, ..base }),
+            (
+                "msg_seq",
+                EntryTerms {
+                    msg_seq: 12,
+                    ..base
+                },
+            ),
+            (
+                "expires_after",
+                EntryTerms {
+                    expires_after: 61,
+                    ..base
+                },
+            ),
+            (
+                "chain_seq",
+                EntryTerms {
+                    chain_seq: 6,
+                    ..base
+                },
+            ),
+            (
+                "prev",
+                EntryTerms {
+                    prev: [2; 32],
+                    ..base
+                },
+            ),
+            (
+                "body",
+                EntryTerms {
+                    body: &other_body,
+                    ..base
+                },
+            ),
         ];
 
         for (what, terms) in mutations {
@@ -332,7 +395,10 @@ mod tests {
         let terms = entry_terms(&body, device, account);
         let sig = sign_entry(&seed, &terms);
 
-        let claimed = EntryTerms { device: impostor, ..terms };
+        let claimed = EntryTerms {
+            device: impostor,
+            ..terms
+        };
         assert!(!verify_entry(&claimed, &sig));
     }
 
@@ -379,15 +445,78 @@ mod tests {
         let other_arg = [2u8];
 
         let mutations: Vec<(&str, ActionTerms)> = vec![
-            ("exchange", ActionTerms { place: Place { exchange: other_key, ..base.place }, ..base }),
-            ("instance", ActionTerms { place: Place { instance: [5; 32], ..base.place }, ..base }),
-            ("channel", ActionTerms { place: Place { channel: [8; 32], ..base.place }, ..base }),
-            ("actor", ActionTerms { actor: other_key, ..base }),
-            ("event", ActionTerms { event: 0x03, ..base }),
-            ("subject", ActionTerms { subject: other_key, ..base }),
-            ("arg", ActionTerms { arg: &other_arg, ..base }),
-            ("chain_seq", ActionTerms { chain_seq: 6, ..base }),
-            ("prev", ActionTerms { prev: [2; 32], ..base }),
+            (
+                "exchange",
+                ActionTerms {
+                    place: Place {
+                        exchange: other_key,
+                        ..base.place
+                    },
+                    ..base
+                },
+            ),
+            (
+                "instance",
+                ActionTerms {
+                    place: Place {
+                        instance: [5; 32],
+                        ..base.place
+                    },
+                    ..base
+                },
+            ),
+            (
+                "channel",
+                ActionTerms {
+                    place: Place {
+                        channel: [8; 32],
+                        ..base.place
+                    },
+                    ..base
+                },
+            ),
+            (
+                "actor",
+                ActionTerms {
+                    actor: other_key,
+                    ..base
+                },
+            ),
+            (
+                "event",
+                ActionTerms {
+                    event: 0x03,
+                    ..base
+                },
+            ),
+            (
+                "subject",
+                ActionTerms {
+                    subject: other_key,
+                    ..base
+                },
+            ),
+            (
+                "arg",
+                ActionTerms {
+                    arg: &other_arg,
+                    ..base
+                },
+            ),
+            (
+                "chain_seq",
+                ActionTerms {
+                    chain_seq: 6,
+                    ..base
+                },
+            ),
+            (
+                "prev",
+                ActionTerms {
+                    prev: [2; 32],
+                    ..base
+                },
+            ),
         ];
 
         for (what, terms) in mutations {
@@ -468,6 +597,10 @@ mod tests {
 
         assert_eq!(link(&a.input()), link(&a.input()), "a link must be stable");
         assert_ne!(link(&a.input()), link(&b.input()));
-        assert_ne!(link(&a.input()), GENESIS, "a real link must not look like a genesis");
+        assert_ne!(
+            link(&a.input()),
+            GENESIS,
+            "a real link must not look like a genesis"
+        );
     }
 }

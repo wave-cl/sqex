@@ -9,25 +9,27 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_proto::channel::{
-    Ack, ByChannel, Create, Entries, Fetch, Invitee, Role, TYPE_INVITE, TYPE_REMOVE,
-    Visibility,
-};
 use sqex_proto::channel::Posted;
+use sqex_proto::channel::{
+    Ack, ByChannel, Create, Entries, Fetch, Invitee, Role, TYPE_INVITE, TYPE_REMOVE, Visibility,
+};
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
     open_envelope, seal_envelope, sign_envelope,
 };
 use sqex_proto::message::{Body, Part, Post as SipPost};
 use sqex_proto::prekey::{Pool, Prekey, Publish, Take, Taken};
-use sqex_proto::timeline::{Received, Timeline, Verdict};
+use sqex_proto::timeline::{Received, Standing, Timeline, Verdict};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
 use crate::common;
 use crate::common::{Chain, Signer, instance_for};
-use sqex_proto::channel::{Action, ByChannelSigned, EVENT_ADDED, EVENT_CREATED, EVENT_JOINED, EVENT_LEFT, EVENT_REMOVED, EVENT_ROTATED};
+use sqex_proto::channel::{
+    Action, ByChannelSigned, EVENT_ADDED, EVENT_CREATED, EVENT_JOINED, EVENT_LEFT, EVENT_REMOVED,
+    EVENT_ROTATED,
+};
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
@@ -106,7 +108,8 @@ impl Peer {
         let taken = Taken::decode(&body).unwrap();
         assert!(taken.found, "no prekey published, so nothing may be sealed");
         let p = taken.prekey.unwrap();
-        p.verify(&them).expect("prekey must verify under its device");
+        p.verify(&them)
+            .expect("prekey must verify under its device");
         p
     }
 
@@ -230,7 +233,14 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
     // and there is no window in which an entry could be stored unsealed.
     // Signed at the position Alice stands at, and not advancing past it: this
     // post is meant to be refused, and a refused post spends nothing.
-    let req = alice.signer.post_probe(&alice_chain, channel, instance_for(channel, 0), 0, 0, b"too early".to_vec());
+    let req = alice.signer.post_probe(
+        &alice_chain,
+        channel,
+        instance_for(channel, 0),
+        0,
+        0,
+        b"too early".to_vec(),
+    );
     let (code, _) = alice
         .client
         .post("/channel/post", req.encode())
@@ -243,7 +253,12 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
+        envelopes.push(published(
+            &alice.signer,
+            channel,
+            1,
+            seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap(),
+        ));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     let (code, body) = alice
@@ -268,7 +283,14 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
     // ciphertext. The exchange sees bytes it cannot open.
     let plaintext = b"the exchange cannot read this";
     let sealed = epoch1.seal(&channel, 1, &alice.key, 0, plaintext).unwrap();
-    let req = alice.signer.post_chained(&mut alice_chain, channel, instance_for(channel, 0), 1, 0, sealed.clone());
+    let req = alice.signer.post_chained(
+        &mut alice_chain,
+        channel,
+        instance_for(channel, 0),
+        1,
+        0,
+        sealed.clone(),
+    );
     let (code, body) = alice
         .client
         .post("/channel/post", req.encode())
@@ -290,12 +312,13 @@ async fn two_people_hold_a_private_conversation_the_exchange_cannot_read() {
                 channel,
                 since: 0,
                 wait_secs: 0,
+                receipts: false,
             }
             .encode(),
         )
         .await
         .unwrap();
-    let entries = Entries::decode(&body).unwrap();
+    let entries = Entries::decode(&body, false).unwrap();
     // Creating with an invitee and minting an epoch are both recorded, so the
     // log holds the exchange's entries as well as the one message.
     let mine: Vec<_> = entries
@@ -329,7 +352,17 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
 
     alice
         .client
-        .post("/channel/create", private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![]).encode())
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![],
+            )
+            .encode(),
+        )
         .await
         .unwrap();
     let invite = |c: [u8; 32], who: PubKey| {
@@ -342,13 +375,16 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
     let mut invited = invite(channel, bob.key);
     alice
         .signer
-        .action_chained(&mut alice_chain, channel, instance_for(channel, 0), EVENT_ADDED, &bob.key, &[Role::Member as u8])
+        .action_chained(
+            &mut alice_chain,
+            channel,
+            instance_for(channel, 0),
+            EVENT_ADDED,
+            &bob.key,
+            &[Role::Member as u8],
+        )
         .write(&mut invited);
-    let (code, _) = alice
-        .client
-        .post("/channel/invite", invited)
-        .await
-        .unwrap();
+    let (code, _) = alice.client.post("/channel/invite", invited).await.unwrap();
     assert_eq!(code, 200);
 
     // Epoch 1 to both.
@@ -356,14 +392,25 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
+        envelopes.push(published(
+            &alice.signer,
+            channel,
+            1,
+            seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap(),
+        ));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     alice
         .client
         .post(
             "/channel/key/put",
-            KeyPut { channel, epoch: 1, envelopes, action: Some(rot) }.encode(),
+            KeyPut {
+                channel,
+                epoch: 1,
+                envelopes,
+                action: Some(rot),
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -376,7 +423,14 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
     rm.extend_from_slice(bob.key.as_bytes());
     alice
         .signer
-        .action_chained(&mut alice_chain, channel, instance_for(channel, 0), EVENT_REMOVED, &bob.key, &[])
+        .action_chained(
+            &mut alice_chain,
+            channel,
+            instance_for(channel, 0),
+            EVENT_REMOVED,
+            &bob.key,
+            &[],
+        )
         .write(&mut rm);
     let (code, _) = alice.client.post("/channel/remove", rm).await.unwrap();
     assert_eq!(code, 200);
@@ -386,7 +440,13 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
         .client
         .post(
             "/channel/fetch",
-            Fetch { channel, since: 0, wait_secs: 0 }.encode(),
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -402,7 +462,12 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
             KeyPut {
                 channel,
                 epoch: 2,
-                envelopes: vec![published(&alice.signer, channel, 2, seal_envelope(&alice.key, p.id, &p.public, 2, &[epoch2]).unwrap())],
+                envelopes: vec![published(
+                    &alice.signer,
+                    channel,
+                    2,
+                    seal_envelope(&alice.key, p.id, &p.public, 2, &[epoch2]).unwrap(),
+                )],
                 action: Some(rot),
             }
             .encode(),
@@ -417,7 +482,11 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
         .client
         .post(
             "/channel/key/get",
-            KeyGet { channel, since_epoch: 0 }.encode(),
+            KeyGet {
+                channel,
+                since_epoch: 0,
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -440,7 +509,17 @@ async fn an_envelope_is_served_only_to_the_recipient_it_names() {
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Member,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
@@ -456,7 +535,12 @@ async fn an_envelope_is_served_only_to_the_recipient_it_names() {
             KeyPut {
                 channel,
                 epoch: 1,
-                envelopes: vec![published(&alice.signer, channel, 1, seal_envelope(&alice.key, p.id, &p.public, 1, &[epoch1]).unwrap())],
+                envelopes: vec![published(
+                    &alice.signer,
+                    channel,
+                    1,
+                    seal_envelope(&alice.key, p.id, &p.public, 1, &[epoch1]).unwrap(),
+                )],
                 action: Some(rot),
             }
             .encode(),
@@ -467,7 +551,14 @@ async fn an_envelope_is_served_only_to_the_recipient_it_names() {
     // Bob is a member and gets nothing, because nothing was addressed to him.
     let (code, body) = bob
         .client
-        .post("/channel/key/get", KeyGet { channel, since_epoch: 0 }.encode())
+        .post(
+            "/channel/key/get",
+            KeyGet {
+                channel,
+                since_epoch: 0,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -502,7 +593,17 @@ async fn a_private_channel_refuses_a_join_and_hides_from_a_stranger() {
 
     alice
         .client
-        .post("/channel/create", private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![]).encode())
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![],
+            )
+            .encode(),
+        )
         .await
         .unwrap();
 
@@ -515,7 +616,11 @@ async fn a_private_channel_refuses_a_join_and_hides_from_a_stranger() {
                 channel,
                 // Never verified: a private channel refuses the join outright,
                 // which is what stops an identifier being a way in.
-                action: Action { chain_seq: 0, prev: [0; 32], sig: [0; 64] },
+                action: Action {
+                    chain_seq: 0,
+                    prev: [0; 32],
+                    sig: [0; 64],
+                },
             }
             .encode(sqex_proto::channel::TYPE_JOIN),
         )
@@ -525,7 +630,14 @@ async fn a_private_channel_refuses_a_join_and_hides_from_a_stranger() {
 
     let (code, _) = mallory
         .client
-        .post("/channel/key/get", KeyGet { channel, since_epoch: 0 }.encode())
+        .post(
+            "/channel/key/get",
+            KeyGet {
+                channel,
+                since_epoch: 0,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 403);
@@ -547,7 +659,17 @@ async fn a_direct_message_cannot_gain_a_third_party() {
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, dm, instance_for(dm, 0), vec![Invitee { account: bob.key, role: Role::Admin }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                dm,
+                instance_for(dm, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Admin,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
@@ -561,10 +683,20 @@ async fn a_direct_message_cannot_gain_a_third_party() {
     b.push(Role::Member as u8);
     // Signed at Alice's current position without advancing it: the invite is
     // meant to be refused, and a refused request spends no chain position.
-    let mut probe = Chain { seq: alice_chain.seq, head: alice_chain.head };
+    let mut probe = Chain {
+        seq: alice_chain.seq,
+        head: alice_chain.head,
+    };
     alice
         .signer
-        .action_chained(&mut probe, dm, instance_for(dm, 0), EVENT_ADDED, &carol.key, &[Role::Member as u8])
+        .action_chained(
+            &mut probe,
+            dm,
+            instance_for(dm, 0),
+            EVENT_ADDED,
+            &carol.key,
+            &[Role::Member as u8],
+        )
         .write(&mut b);
     let (code, body) = alice.client.post("/channel/invite", b).await.unwrap();
     assert_eq!(code, 409, "{}", common::said(&body));
@@ -575,10 +707,20 @@ async fn a_direct_message_cannot_gain_a_third_party() {
     rm.extend_from_slice(bob.key.as_bytes());
     // Refused, so it spends nothing: signed at Alice's current position with a
     // scratch chain rather than her own.
-    let mut probe = Chain { seq: alice_chain.seq, head: alice_chain.head };
+    let mut probe = Chain {
+        seq: alice_chain.seq,
+        head: alice_chain.head,
+    };
     alice
         .signer
-        .action_chained(&mut probe, dm, instance_for(dm, 0), EVENT_REMOVED, &bob.key, &[])
+        .action_chained(
+            &mut probe,
+            dm,
+            instance_for(dm, 0),
+            EVENT_REMOVED,
+            &bob.key,
+            &[],
+        )
         .write(&mut rm);
     let (code, _) = alice.client.post("/channel/remove", rm).await.unwrap();
     assert_eq!(code, 409);
@@ -597,7 +739,17 @@ async fn an_envelope_cannot_be_published_twice_for_one_epoch() {
     alice.publish_prekeys(4).await;
     alice
         .client
-        .post("/channel/create", private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![]).encode())
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![],
+            )
+            .encode(),
+        )
         .await
         .unwrap();
 
@@ -605,7 +757,12 @@ async fn an_envelope_cannot_be_published_twice_for_one_epoch() {
     // the calls that need it mutably.
     let signer = alice.signer;
     let seal_one = move |p: &Prekey, k: ChannelKey, who: &PubKey| -> Envelope {
-        published(&signer, channel, 1, seal_envelope(who, p.id, &p.public, 1, &[k]).unwrap())
+        published(
+            &signer,
+            channel,
+            1,
+            seal_envelope(who, p.id, &p.public, 1, &[k]).unwrap(),
+        )
     };
     let p1 = alice.take_prekey_for(alice.key).await;
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
@@ -644,7 +801,10 @@ async fn an_envelope_cannot_be_published_twice_for_one_epoch() {
         .unwrap();
     assert_eq!(code, 200);
     let ack = PutAck::decode(&body).unwrap();
-    assert!(!ack.accepted, "a second envelope for one epoch must not land");
+    assert!(
+        !ack.accepted,
+        "a second envelope for one epoch must not land"
+    );
     assert_eq!(ack.epoch, 1, "and the caller is told which epoch stands");
 }
 
@@ -669,7 +829,11 @@ async fn a_public_channel_has_no_keys_to_distribute() {
         "open",
         vec![],
     );
-    let (code, body) = alice.client.post("/channel/create", req.encode()).await.unwrap();
+    let (code, body) = alice
+        .client
+        .post("/channel/create", req.encode())
+        .await
+        .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let p = alice.take_prekey_for(alice.key).await;
@@ -681,15 +845,13 @@ async fn a_public_channel_has_no_keys_to_distribute() {
             KeyPut {
                 channel,
                 epoch: 1,
-                envelopes: vec![
-                    published(
-                        &alice.signer,
-                        channel,
-                        1,
-                        seal_envelope(&alice.key, p.id, &p.public, 1, &[ChannelKey::generate()])
-                            .unwrap(),
-                    ),
-                ],
+                envelopes: vec![published(
+                    &alice.signer,
+                    channel,
+                    1,
+                    seal_envelope(&alice.key, p.id, &p.public, 1, &[ChannelKey::generate()])
+                        .unwrap(),
+                )],
                 action: Some(rot),
             }
             .encode(),
@@ -710,19 +872,39 @@ async fn an_ack_is_still_an_ack() {
     let channel = [7u8; 32];
     alice
         .client
-        .post("/channel/create", private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![]).encode())
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![],
+            )
+            .encode(),
+        )
         .await
         .unwrap();
     let leaving = {
         let acct = alice.signer.account;
-        alice.signer.action_chained(&mut alice_chain, channel, instance_for(channel, 0), EVENT_LEFT, &acct, &[])
+        alice.signer.action_chained(
+            &mut alice_chain,
+            channel,
+            instance_for(channel, 0),
+            EVENT_LEFT,
+            &acct,
+            &[],
+        )
     };
     let (code, body) = alice
         .client
         .post(
             "/channel/leave",
-            ByChannelSigned { channel, action: leaving }
-                .encode(sqex_proto::channel::TYPE_LEAVE),
+            ByChannelSigned {
+                channel,
+                action: leaving,
+            }
+            .encode(sqex_proto::channel::TYPE_LEAVE),
         )
         .await
         .unwrap();
@@ -731,7 +913,12 @@ async fn an_ack_is_still_an_ack() {
 }
 
 /// Fold a fetched, decrypted channel into what a person would see.
-fn timeline_of(entries: &[sqex_proto::channel::Entry], key: &ChannelKey, channel: [u8; 32], admins: &[PubKey]) -> Timeline {
+fn timeline_of(
+    entries: &[sqex_proto::channel::Entry],
+    key: &ChannelKey,
+    channel: [u8; 32],
+    admins: &[PubKey],
+) -> Timeline {
     let received: Vec<Received> = entries
         .iter()
         .map(|e| Received {
@@ -745,6 +932,7 @@ fn timeline_of(entries: &[sqex_proto::channel::Entry], key: &ChannelKey, channel
                 .ok()
                 .and_then(|plain| Body::decode(&plain).ok().flatten()),
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         })
         .collect();
     Timeline::fold(&received, admins)
@@ -768,7 +956,17 @@ async fn a_real_conversation_renders_end_to_end() {
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Member,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
@@ -777,12 +975,26 @@ async fn a_real_conversation_renders_end_to_end() {
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
+        envelopes.push(published(
+            &alice.signer,
+            channel,
+            1,
+            seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap(),
+        ));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     alice
         .client
-        .post("/channel/key/put", KeyPut { channel, epoch: 1, envelopes, action: Some(rot) }.encode())
+        .post(
+            "/channel/key/put",
+            KeyPut {
+                channel,
+                epoch: 1,
+                envelopes,
+                action: Some(rot),
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(bob.collect_keys(channel).await.len(), 1);
@@ -796,24 +1008,22 @@ async fn a_real_conversation_renders_end_to_end() {
         let sealed = epoch1
             .seal(&channel, 1, &signer.device, *seq, &body.encode())
             .unwrap();
-        let post = signer.post_chained(
-            chain,
-            channel,
-            instance_for(channel, 0),
-            1,
-            *seq,
-            sealed,
-        );
+        let post = signer.post_chained(chain, channel, instance_for(channel, 0), 1, *seq, sealed);
         *seq += 1;
         post.encode()
     };
 
     // Sequence numbers are the exchange's, and the exchange's own entries share
     // the space, so a client works from what it was told rather than counting.
-    let a1 = send(&alice.signer, &mut alice_chain, Body::Post(SipPost::text("has anyone seen the report")), &mut alice_seq);
+    let a1 = send(
+        &alice.signer,
+        &mut alice_chain,
+        Body::Post(SipPost::text("has anyone seen the report")),
+        &mut alice_seq,
+    );
     let (code, body) = alice.client.post("/channel/post", a1).await.unwrap();
     assert_eq!(code, 200);
-    let question = Posted::decode(&body).unwrap().seq;
+    let question = Posted::decode(&body, false).unwrap().seq;
 
     let b1 = send(
         &bob.signer,
@@ -829,12 +1039,16 @@ async fn a_real_conversation_renders_end_to_end() {
         &mut bob_seq,
     );
     let (_, body) = bob.client.post("/channel/post", b1).await.unwrap();
-    let reply = Posted::decode(&body).unwrap().seq;
+    let reply = Posted::decode(&body, false).unwrap().seq;
 
     let a2 = send(
         &alice.signer,
         &mut alice_chain,
-        Body::Reaction { target: reply, add: true, emoji: "🙏".into() },
+        Body::Reaction {
+            target: reply,
+            add: true,
+            emoji: "🙏".into(),
+        },
         &mut alice_seq,
     );
     assert_eq!(alice.client.post("/channel/post", a2).await.unwrap().0, 200);
@@ -842,25 +1056,47 @@ async fn a_real_conversation_renders_end_to_end() {
     let b2 = send(
         &bob.signer,
         &mut bob_chain,
-        Body::Edit { target: reply, post: SipPost::text("I have it here — sending now") },
+        Body::Edit {
+            target: reply,
+            post: SipPost::text("I have it here — sending now"),
+        },
         &mut bob_seq,
     );
     assert_eq!(bob.client.post("/channel/post", b2).await.unwrap().0, 200);
 
-    let a3 = send(&alice.signer, &mut alice_chain, Body::Post(SipPost::text("ignore that")), &mut alice_seq);
+    let a3 = send(
+        &alice.signer,
+        &mut alice_chain,
+        Body::Post(SipPost::text("ignore that")),
+        &mut alice_seq,
+    );
     let (_, body) = alice.client.post("/channel/post", a3).await.unwrap();
-    let regretted = Posted::decode(&body).unwrap().seq;
-    let a4 = send(&alice.signer, &mut alice_chain, Body::Redact { target: regretted }, &mut alice_seq);
+    let regretted = Posted::decode(&body, false).unwrap().seq;
+    let a4 = send(
+        &alice.signer,
+        &mut alice_chain,
+        Body::Redact { target: regretted },
+        &mut alice_seq,
+    );
     assert_eq!(alice.client.post("/channel/post", a4).await.unwrap().0, 200);
 
     // Bob fetches the lot and folds it.
     let (code, body) = bob
         .client
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
-    let entries = Entries::decode(&body).unwrap();
+    let entries = Entries::decode(&body, false).unwrap();
     assert_eq!(
         entries
             .entries
@@ -874,12 +1110,18 @@ async fn a_real_conversation_renders_end_to_end() {
     let shown: Vec<&sqex_proto::timeline::Message> = t.messages().collect();
     assert_eq!(shown.len(), 3, "three posts; the rest act on them");
 
-    assert_eq!(shown[0].post.body_text(), Some("has anyone seen the report"));
+    assert_eq!(
+        shown[0].post.body_text(),
+        Some("has anyone seen the report")
+    );
     assert!(shown[0].reactions.is_empty());
 
     // Alice thanked Bob's reply, and Bob then edited it. The reply target
     // survives the fold, so a client can still draw the thread.
-    assert_eq!(shown[1].post.body_text(), Some("I have it here — sending now"));
+    assert_eq!(
+        shown[1].post.body_text(),
+        Some("I have it here — sending now")
+    );
     assert_eq!(shown[1].reactions["🙏"], vec![alice.key]);
     assert!(shown[1].edited.is_some());
 
@@ -907,7 +1149,17 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Member,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
@@ -915,12 +1167,26 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
     let mut envelopes = Vec::new();
     for who in [alice.key, bob.key] {
         let p = alice.take_prekey_for(who).await;
-        envelopes.push(published(&alice.signer, channel, 1, seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap()));
+        envelopes.push(published(
+            &alice.signer,
+            channel,
+            1,
+            seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap(),
+        ));
     }
     let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
     alice
         .client
-        .post("/channel/key/put", KeyPut { channel, epoch: 1, envelopes, action: Some(rot) }.encode())
+        .post(
+            "/channel/key/put",
+            KeyPut {
+                channel,
+                epoch: 1,
+                envelopes,
+                action: Some(rot),
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     bob.collect_keys(channel).await;
@@ -938,17 +1204,25 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
             .encode()
     };
 
-    let a = seal(&alice.signer, &mut alice_chain, Body::Post(SipPost::text("what I actually said")), 0);
+    let a = seal(
+        &alice.signer,
+        &mut alice_chain,
+        Body::Post(SipPost::text("what I actually said")),
+        0,
+    );
     let (code, body) = alice.client.post("/channel/post", a).await.unwrap();
     assert_eq!(code, 200);
-    let target = Posted::decode(&body).unwrap().seq;
+    let target = Posted::decode(&body, false).unwrap().seq;
 
     // Bob is a member, so he holds the channel key and can seal a well-formed
     // edit of somebody else's message. The exchange takes it.
     let forged = seal(
         &bob.signer,
         &mut bob_chain,
-        Body::Edit { target, post: SipPost::text("what Bob wishes I had said") },
+        Body::Edit {
+            target,
+            post: SipPost::text("what Bob wishes I had said"),
+        },
         0,
     );
     assert_eq!(
@@ -959,10 +1233,19 @@ async fn a_forged_edit_is_ignored_by_the_reader_because_the_exchange_cannot_chec
 
     let (_, body) = alice
         .client
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let entries = Entries::decode(&body).unwrap();
+    let entries = Entries::decode(&body, false).unwrap();
     assert_eq!(
         entries
             .entries
@@ -1000,7 +1283,17 @@ async fn a_removal_leaves_a_record_of_who_did_it() {
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, channel, instance_for(channel, 0), vec![Invitee { account: bob.key, role: Role::Member }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Member,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
@@ -1010,16 +1303,35 @@ async fn a_removal_leaves_a_record_of_who_did_it() {
     rm.extend_from_slice(bob.key.as_bytes());
     alice
         .signer
-        .action_chained(&mut alice_chain, channel, instance_for(channel, 0), EVENT_REMOVED, &bob.key, &[])
+        .action_chained(
+            &mut alice_chain,
+            channel,
+            instance_for(channel, 0),
+            EVENT_REMOVED,
+            &bob.key,
+            &[],
+        )
         .write(&mut rm);
-    assert_eq!(alice.client.post("/channel/remove", rm).await.unwrap().0, 200);
+    assert_eq!(
+        alice.client.post("/channel/remove", rm).await.unwrap().0,
+        200
+    );
 
     let (_, body) = alice
         .client
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     let events: Vec<System> = seen
         .entries
         .iter()
@@ -1058,8 +1370,18 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
 
     // Mallory gets there first, knowing nothing but two public keys — and
     // signs its own create, because SIP-32's `created` names its actor.
-    let squat = private(&mallory.signer, &mut mallory_chain, dm, instance_for(dm, 0), vec![]);
-    let (code, body) = mallory.client.post("/channel/create", squat.encode()).await.unwrap();
+    let squat = private(
+        &mallory.signer,
+        &mut mallory_chain,
+        dm,
+        instance_for(dm, 0),
+        vec![],
+    );
+    let (code, body) = mallory
+        .client
+        .post("/channel/create", squat.encode())
+        .await
+        .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
 
     // Alice claims it by showing it is the derivation over herself and Bob,
@@ -1073,7 +1395,17 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, dm, instance_for(dm, 1), vec![Invitee { account: bob.key, role: Role::Admin }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                dm,
+                instance_for(dm, 1),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Admin,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
@@ -1081,7 +1413,10 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
 
     let (code, body) = alice
         .client
-        .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+        .post(
+            "/channel/info",
+            ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -1093,17 +1428,33 @@ async fn a_squatter_cannot_deny_two_people_a_direct_message() {
     // And Mallory cannot take it back, having none.
     let (code, _) = mallory
         .client
-        .post("/channel/create", private(&alice.signer, &mut alice_chain, dm, instance_for(dm, 0), vec![]).encode())
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                dm,
+                instance_for(dm, 0),
+                vec![],
+            )
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
     let (_, body) = alice
         .client
-        .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+        .post(
+            "/channel/info",
+            ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO),
+        )
         .await
         .unwrap();
     assert_eq!(
-        sqex_proto::channel::ChannelInfo::decode(&body).unwrap().members.len(),
+        sqex_proto::channel::ChannelInfo::decode(&body)
+            .unwrap()
+            .members
+            .len(),
         2
     );
 }
@@ -1121,21 +1472,41 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
         .client
         .post(
             "/channel/create",
-            private(&alice.signer, &mut alice_chain, dm, instance_for(dm, 0), vec![Invitee { account: bob.key, role: Role::Admin }]).encode(),
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                dm,
+                instance_for(dm, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Admin,
+                }],
+            )
+            .encode(),
         )
         .await
         .unwrap();
 
     let leaving = {
         let acct = alice.signer.account;
-        alice.signer.action_chained(&mut alice_chain, dm, instance_for(dm, 0), EVENT_LEFT, &acct, &[])
+        alice.signer.action_chained(
+            &mut alice_chain,
+            dm,
+            instance_for(dm, 0),
+            EVENT_LEFT,
+            &acct,
+            &[],
+        )
     };
     let (code, _) = alice
         .client
         .post(
             "/channel/leave",
-            ByChannelSigned { channel: dm, action: leaving }
-                .encode(sqex_proto::channel::TYPE_LEAVE),
+            ByChannelSigned {
+                channel: dm,
+                action: leaving,
+            }
+            .encode(sqex_proto::channel::TYPE_LEAVE),
         )
         .await
         .unwrap();
@@ -1145,7 +1516,10 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
     assert_eq!(
         alice
             .client
-            .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+            .post(
+                "/channel/info",
+                ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO)
+            )
             .await
             .unwrap()
             .0,
@@ -1160,10 +1534,16 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
     // signs a `joined` rather than an `added` — that is the event the exchange
     // writes for a return. A real client learns both from the first create,
     // which is answered `created: 0` with the incarnation and changes nothing.
-    let mut back = private(&alice.signer, &mut Chain::default(), dm, instance_for(dm, 0), vec![Invitee {
-        account: bob.key,
-        role: Role::Admin,
-    }]);
+    let mut back = private(
+        &alice.signer,
+        &mut Chain::default(),
+        dm,
+        instance_for(dm, 0),
+        vec![Invitee {
+            account: bob.key,
+            role: Role::Admin,
+        }],
+    );
     let me = alice.signer.account;
     back.actions = vec![alice.signer.action_chained(
         &mut alice_chain,
@@ -1181,12 +1561,18 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
     assert_eq!(code, 200, "{}", common::said(&body));
     let (code, body) = alice
         .client
-        .post("/channel/info", ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO))
+        .post(
+            "/channel/info",
+            ByChannel { channel: dm }.encode(sqex_proto::channel::TYPE_INFO),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
     assert_eq!(
-        sqex_proto::channel::ChannelInfo::decode(&body).unwrap().members.len(),
+        sqex_proto::channel::ChannelInfo::decode(&body)
+            .unwrap()
+            .members
+            .len(),
         2
     );
 }

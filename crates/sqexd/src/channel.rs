@@ -33,27 +33,31 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use sqex_proto::channel::{
-    ABANDON_SECS, Action, Invitee, ChannelInfo, Create, Directory, Entries, Entry, KIND_MEMBER,
-    KIND_SYSTEM, Listing,
-    EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
-    EVENT_CREATED, EVENT_RENAMED, EVENT_RETENTION, EVENT_ROTATED, MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled,
-    System, constitution, direct_message_id,
-    ENTRY_HEADER, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
-    MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_NAME, MAX_TOPIC,
-    MAX_MINE, MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Membership, Mines, Post,
-    Posted, Public, Retain, Role, Visibility,
-};
 use sqex_proto::blob_store::{
-    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS,
-    MAX_CHANNEL_BLOB_BYTES, MAX_UPLOADS,
-    PutChunk as BlobPut, UPLOAD_TTL, blob_id,
+    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS, MAX_CHANNEL_BLOB_BYTES,
+    MAX_UPLOADS, PutChunk as BlobPut, UPLOAD_TTL, blob_id,
+};
+use sqex_proto::channel::{
+    ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
+    EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED, EVENT_RENAMED,
+    EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_UNREPLICATE, Entries, Entry, Invitee,
+    KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES,
+    MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_MINE, MAX_NAME,
+    MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark, Marks, Member,
+    Membership, Mines, Post, Posted, Public, Receipted, Retain, Role, SIGNAL_TTL, Signalled,
+    System, Tip, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
-    verify_envelope,
-    Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
+    Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded, verify_envelope,
 };
-use sqex_proto::entry_sig::{ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry};
+use sqex_proto::entry_sig::{
+    ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry,
+};
+use sqex_proto::message::SIGNAL_CALL_STATE;
+use sqex_proto::peer::{
+    BLOB_LIST, MAX_PULL, MAX_PULL_BYTES, MAX_REPLICAS, Pulled, PulledBlob, PulledEnvelopes,
+};
+use sqex_proto::receipt::{self, HEAD_GENESIS, ReceiptTerms};
 use sqnr_core::PubKey;
 use tokio::sync::Notify;
 
@@ -113,6 +117,28 @@ pub enum ChannelError {
     /// SIP-31: a create reusing an instance this channel identifier has already
     /// used, which would re-admit the entries signed under it.
     UsedInstance,
+    /// SIP-35: a channel already has as many replicas as it may.
+    TooManyReplicas,
+    /// SIP-35: a write to a channel this exchange only replicates, naming the
+    /// origin so the caller can go and do it where it can be done.
+    Replicated(PubKey),
+    /// SIP-35: a read of a replicated channel whose membership this replica
+    /// cannot derive, because it does not hold the channel's constitution.
+    /// Names the origin, which does.
+    Underived(PubKey),
+    /// SIP-35: this replica holds two receipts for one position under the
+    /// origin's key, and **will not present either branch as the
+    /// conversation**. The proof is served on its own route; a client that
+    /// wants to know why asks for it.
+    Equivocated,
+    /// SIP-34: a receipted request to an exchange that cannot issue receipts.
+    ///
+    /// Refused rather than answered in the unreceipted shape, so a response's
+    /// shape always follows from the request's type byte. A client recovers by
+    /// asking again on the ordinary type and showing a channel it cannot
+    /// verify — which is the same recovery as from an exchange that has never
+    /// heard of SIP-34.
+    NoReceipts,
     Storage,
 }
 
@@ -136,6 +162,11 @@ impl ChannelError {
             ChannelError::BadSignature => "bad_signature",
             ChannelError::BrokenChain => "broken_chain",
             ChannelError::UsedInstance => "used_instance",
+            ChannelError::NoReceipts => "no_receipts",
+            ChannelError::TooManyReplicas => "too_many_replicas",
+            ChannelError::Replicated(_) => "replicated",
+            ChannelError::Underived(_) => "underived",
+            ChannelError::Equivocated => "equivocated",
             ChannelError::BadChunk => "bad_chunk",
             ChannelError::TooManyUploads => "too_many_uploads",
             ChannelError::BlobQuota => "blob_quota",
@@ -176,6 +207,11 @@ impl ChannelError {
             ChannelError::BadSignature => Code::BadSignature,
             ChannelError::BrokenChain => Code::BrokenChain,
             ChannelError::UsedInstance => Code::UsedInstance,
+            ChannelError::NoReceipts => Code::NoReceipts,
+            ChannelError::TooManyReplicas => Code::TooManyReplicas,
+            ChannelError::Replicated(_) => Code::Replicated,
+            ChannelError::Underived(_) => Code::Underived,
+            ChannelError::Equivocated => Code::Equivocated,
             ChannelError::Storage => Code::Storage,
         }
     }
@@ -194,7 +230,14 @@ impl ChannelError {
             | ChannelError::TooManyUploads
             | ChannelError::BlobQuota
             | ChannelError::BlobChannels
-            | ChannelError::InviteQuota => 507,
+            | ChannelError::InviteQuota
+            | ChannelError::TooManyReplicas => 507,
+            // Not a conflict and not a refusal of authority: the caller asked
+            // the wrong exchange, and the answer says which is the right one.
+            ChannelError::Replicated(_) | ChannelError::Underived(_) => 421,
+            // Not the caller's fault and not a conflict with state: the state
+            // itself is contradictory, and saying so is the whole point.
+            ChannelError::Equivocated => 409,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
@@ -208,6 +251,11 @@ impl ChannelError {
             // A forged or absent signature is a refusal to authenticate what
             // was sent, not a conflict with stored state.
             ChannelError::BadSignature => 401,
+            // Not an error in the request: the caller asked for something this
+            // exchange does not offer. 501 says so without implying the client
+            // got anything wrong, which matters because the correct client
+            // response is to ask again unreceipted rather than to retry.
+            ChannelError::NoReceipts => 501,
             ChannelError::Storage => 500,
         }
     }
@@ -258,6 +306,10 @@ pub struct Channels {
     /// than defaulted, because a default would be a fixed place that every
     /// deployment shared.
     exchange: PubKey,
+    /// The seed for the SIP-9 identity above, where this exchange issues SIP-34
+    /// receipts. `None` is an exchange that makes no claims about ordering: it
+    /// serves ordinary fetches and refuses receipted ones.
+    exchange_seed: Option<[u8; 32]>,
     /// Stored entry bytes one channel may hold before the oldest are pruned.
     ///
     /// SIP-16 calls its numbers recommended values, and this one is the only
@@ -275,8 +327,45 @@ pub struct Channels {
     /// indicator that survived a restart would be describing a keyboard nobody
     /// is at. SIP-16 forbids storing these at all, and an exchange that dropped
     /// every one of them would still conform.
-    #[allow(clippy::type_complexity)]
-    signals: Mutex<HashMap<([u8; 32], PubKey), Vec<(PubKey, u8, Vec<u8>, u64)>>>,
+    signals: Mutex<SignalQueues>,
+}
+
+/// What an exchange holds about one numbered position: `posted`, the entry
+/// hash, the head after it, and the receipt it signed over those.
+pub type StampAt = (u64, [u8; 32], [u8; 32], [u8; 64]);
+
+/// Signals waiting, by channel and recipient account.
+type SignalQueues = HashMap<([u8; 32], PubKey), Vec<Pending>>;
+
+/// One signal waiting for a recipient.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// The account the exchange observed sending it. SIP-31 is clear this is
+    /// the exchange's assertion and not a signature, which is why nothing
+    /// durable may be derived from a signal.
+    from: PubKey,
+    /// The device it was sent from, which never receives it back.
+    ///
+    /// **Taken from the connection, not from the signal's body.** SIP-36 words
+    /// its rule as excluding "the device named in `device`", and a client's
+    /// claim about which device it is is exactly the kind of assertion SIP-16
+    /// says is not a fact — a client naming somebody else's device could
+    /// silence their ring. The body's field is for the recipients; this is for
+    /// routing.
+    from_device: PubKey,
+    kind: u8,
+    body: Vec<u8>,
+    at: u64,
+    /// SIP-36 rule 1: which of the recipient's devices have already collected
+    /// this, for the one kind delivered per device rather than per account.
+    ///
+    /// `None` for every other kind, which is delivered once to whichever
+    /// connection asks first and then dropped — the behaviour SIP-16 defines
+    /// and this must not change. Recording takers lazily, rather than
+    /// enumerating a recipient's devices when the signal is sent, means the
+    /// exchange needs no view of the device registry here and a device that
+    /// never connects simply lets its copy expire.
+    taken_by: Option<Vec<PubKey>>,
 }
 
 const SCHEMA: &str = r#"
@@ -302,7 +391,16 @@ CREATE TABLE IF NOT EXISTS channel (
     -- every signature, the previous incarnation's entries verify against this
     -- one. Proposed by the creator, because it has to be signed over before the
     -- exchange has minted anything.
-    instance       BLOB    NOT NULL
+    instance       BLOB    NOT NULL,
+    -- SIP-34's running head: SHA-256(previous head || entry hash), advanced
+    -- exactly once per entry as it is numbered.
+    --
+    -- **Never recomputed from the entries held.** Pruning removes entries, so a
+    -- recomputed head is a different head, and every receipt issued before the
+    -- prune stops verifying against every receipt issued after. The head is a
+    -- property of the channel's history, not of its current contents — the same
+    -- rule, for the same reason, as `chain` and `high_water` below.
+    head           BLOB    NOT NULL DEFAULT x''
 );
 -- Instances this channel identifier has already used, so that a recreation
 -- cannot reuse one and re-admit the entries signed under it.
@@ -361,6 +459,26 @@ CREATE TABLE IF NOT EXISTS entry (
     body_hash     BLOB    NOT NULL,
     sig           BLOB    NOT NULL,
     body          BLOB    NOT NULL,
+    -- SIP-34: the entry hash the head was advanced over, the head *after* this
+    -- entry, and the exchange's signature over both — so a reader beginning
+    -- mid-log has everything the signature was made over.
+    --
+    -- **The receipt is stored, and an earlier version of this reasoned that it
+    -- need not be.** Ed25519 is deterministic, so an *origin* re-signing these
+    -- same fields reproduces the same 64 bytes. A **replica** cannot: it holds
+    -- no origin seed, so a receipt it did not keep is one it can never produce
+    -- again — and comparing two receipts for one position is exactly what
+    -- SIP-35 needs it to do. Deriving instead of storing made an origin's
+    -- equivocation undetectable at a replica, which is most of that document's
+    -- value.
+    --
+    -- `entry_hash` is stored rather than recomputed because a system entry's
+    -- signing input includes `arg`, which SIP-31 deliberately never transmits
+    -- and this table therefore never holds. It is recomputable for a member
+    -- entry and not for a system one, and one column is better than two paths.
+    entry_hash    BLOB    NOT NULL DEFAULT x'',
+    head          BLOB    NOT NULL DEFAULT x'',
+    receipt       BLOB    NOT NULL DEFAULT x'',
     PRIMARY KEY (channel, seq)
 );
 -- SIP-31 chain head per device per channel.
@@ -374,6 +492,40 @@ CREATE TABLE IF NOT EXISTS chain (
     chain_seq INTEGER NOT NULL,
     head      BLOB    NOT NULL,
     PRIMARY KEY (channel, device)
+);
+-- SIP-35: replicas a channel's admins have authorised, one row per surviving
+-- authorisation. Withdrawing deletes the row and nothing else: a copy already
+-- taken cannot be unsent, and this table must never be described as if it
+-- could.
+CREATE TABLE IF NOT EXISTS replica (
+    channel BLOB NOT NULL,
+    peer    BLOB NOT NULL,
+    PRIMARY KEY (channel, peer)
+);
+-- SIP-35: channels this exchange holds as a **replica** — pulled from an
+-- origin, read-only here forever. `origin` is the exchange whose receipts they
+-- verify under and whose key a write refusal names, so a client can go there.
+CREATE TABLE IF NOT EXISTS replicated (
+    channel BLOB PRIMARY KEY,
+    origin  BLOB NOT NULL,
+    -- The origin's own retention window, reported as the origin's and never as
+    -- this exchange's. A replica may hold more than the origin does — it
+    -- pulled entries the origin has since pruned, which is half the reason to
+    -- replicate — and must not claim those are still available there.
+    window_secs INTEGER NOT NULL,
+    -- Whether this replica holds the channel's constitution (SIP-32's
+    -- `created`), and therefore whether its roster is *derived* rather than
+    -- guessed at. **A replica whose history is too short to derive membership
+    -- refuses the channel rather than falling back on the origin's summary** —
+    -- serving a private channel on the strength of an unsigned roster is
+    -- exactly the trust SIP-35 exists to avoid, and the failure is safe in the
+    -- right direction.
+    derivable INTEGER NOT NULL DEFAULT 0,
+    -- Set when this replica holds two receipts for one position under the
+    -- origin's key. It stops accepting entries for the channel and **does not
+    -- choose** between the branches: picking one silently converts evidence
+    -- into a disagreement between two honest-looking servers.
+    equivocation BLOB
 );
 CREATE TABLE IF NOT EXISTS high_water (
     channel BLOB    NOT NULL,
@@ -458,7 +610,11 @@ CREATE INDEX IF NOT EXISTS entry_by_age ON entry (posted);
 impl Channels {
     /// Open the log. `None` gives an in-memory database, which is what a
     /// memory-only deployment and every test get.
-    pub fn open(path: Option<&Path>, exchange: PubKey) -> rusqlite::Result<Channels> {
+    pub fn open(
+        path: Option<&Path>,
+        exchange: PubKey,
+        exchange_seed: Option<[u8; 32]>,
+    ) -> rusqlite::Result<Channels> {
         let db = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -472,6 +628,26 @@ impl Channels {
         // A deployed exchange has a `channel` table without `epoch_at`, and
         // `CREATE TABLE IF NOT EXISTS` will not add it.
         add_column(&db, "channel", "epoch_at", "INTEGER NOT NULL DEFAULT 0")?;
+        // SIP-34, added the same way and for the same reason. A channel that
+        // predates receipts starts its head at genesis and advances from its
+        // next entry: the entries already in the log were never covered by one
+        // and are not retrospectively claimed. A reader sees that as a gap,
+        // which is ordinary, rather than as a divergence.
+        add_column(&db, "channel", "head", "BLOB NOT NULL DEFAULT x''")?;
+        add_column(&db, "entry", "entry_hash", "BLOB NOT NULL DEFAULT x''")?;
+        add_column(&db, "entry", "head", "BLOB NOT NULL DEFAULT x''")?;
+        add_column(&db, "entry", "receipt", "BLOB NOT NULL DEFAULT x''")?;
+        // SIP-35's `replicated` shipped in 0.31.0 without `derivable`, which
+        // was added to the `CREATE TABLE` body in 0.32.0 — where it did nothing
+        // for the exchanges that already had the table, because `CREATE TABLE
+        // IF NOT EXISTS` does not add a column. Every `fetch` and `info` reads
+        // it, so a deployed exchange answered `storage` to all of them.
+        //
+        // `0` is the safe default in both directions: a channel this exchange
+        // originated has no row here at all, and a replicated one that cannot
+        // be shown to be derivable is refused rather than served, which is
+        // where SIP-35 wants the failure to land.
+        add_column(&db, "replicated", "derivable", "INTEGER NOT NULL DEFAULT 0")?;
         // SIP-31's columns are deliberately *not* added this way, and carry no
         // defaults. A database predating them is wiped rather than migrated,
         // because a default would make an unsigned entry representable — and
@@ -479,9 +655,44 @@ impl Channels {
         Ok(Channels {
             db: Mutex::new(db),
             exchange,
+            exchange_seed,
             max_channel_bytes: MAX_CHANNEL_BYTES,
             waiters: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Sign a SIP-34 receipt for a position this exchange numbered.
+    ///
+    /// The receipt is derived rather than stored. Ed25519 is deterministic, so
+    /// signing the same fields again reproduces the same 64 bytes — a stored
+    /// copy could only ever disagree with the row it came from, and the head,
+    /// which is *not* derivable, is what is persisted instead.
+    ///
+    /// Refuses where this exchange holds no signing seed. **An exchange that
+    /// cannot issue a receipt refuses the receipted request rather than
+    /// answering it unreceipted**: a response whose shape does not follow from
+    /// the request it answers puts the reader back to guessing by length.
+    fn stamp(
+        &self,
+        place: &Place,
+        seq: u64,
+        posted: u64,
+        entry_hash: &[u8; 32],
+        head: &[u8; 32],
+    ) -> Result<Receipted, ChannelError> {
+        let seed = self.exchange_seed.ok_or(ChannelError::NoReceipts)?;
+        let terms = ReceiptTerms {
+            place: *place,
+            seq,
+            posted,
+            entry_hash: *entry_hash,
+            head: *head,
+        };
+        Ok(Receipted {
+            entry_hash: *entry_hash,
+            head: *head,
+            receipt: receipt::sign(&seed, &terms),
         })
     }
 
@@ -651,8 +862,17 @@ impl Channels {
                     }
                     let action = &req.actions[0];
                     write_system(
-                        &tx, &place, &req.channel, EVENT_JOINED, caller, caller, device, &[],
-                        action, now,
+                        &tx,
+                        &place,
+                        &req.channel,
+                        EVENT_JOINED,
+                        caller,
+                        caller,
+                        device,
+                        &[],
+                        action,
+                        now,
+                        self.exchange_seed.as_ref(),
                     )?;
                     tx.commit().map_err(storage("commit rejoin"))?;
                     return Ok((false, epoch, instance));
@@ -721,8 +941,16 @@ impl Channels {
                 // A private channel's name is carried as a sealed metadata
                 // entry (SIP-19); at the exchange it must be empty, because a
                 // membership graph plus a name says far more than the graph.
-                if req.visibility == Visibility::Public { &req.name } else { "" },
-                if req.visibility == Visibility::Public { &req.topic } else { "" },
+                if req.visibility == Visibility::Public {
+                    &req.name
+                } else {
+                    ""
+                },
+                if req.visibility == Visibility::Public {
+                    &req.topic
+                } else {
+                    ""
+                },
                 caller.as_bytes(),
                 now as i64,
                 &req.instance[..],
@@ -756,8 +984,16 @@ impl Channels {
             req.visibility,
             req.retention_secs,
             req.max_entries,
-            if req.visibility == Visibility::Public { &req.name } else { "" },
-            if req.visibility == Visibility::Public { &req.topic } else { "" },
+            if req.visibility == Visibility::Public {
+                &req.name
+            } else {
+                ""
+            },
+            if req.visibility == Visibility::Public {
+                &req.topic
+            } else {
+                ""
+            },
         );
         // A fresh create signs for `created` and for every invitee's `added`.
         if req.actions.len() != req.invites.len() + 1 {
@@ -765,8 +1001,17 @@ impl Channels {
         }
         let opening = &req.actions[0];
         write_system(
-            &tx, &place, &req.channel, EVENT_CREATED, caller, caller, device, &founding,
-            opening, now,
+            &tx,
+            &place,
+            &req.channel,
+            EVENT_CREATED,
+            caller,
+            caller,
+            device,
+            &founding,
+            opening,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
 
         for (n, i) in req.invites.iter().enumerate() {
@@ -791,8 +1036,17 @@ impl Channels {
             )
             .map_err(storage("insert invitee"))?;
             write_system(
-                &tx, &place, &req.channel, EVENT_ADDED, &i.account, caller, device,
-                &[i.role as u8], action, now,
+                &tx,
+                &place,
+                &req.channel,
+                EVENT_ADDED,
+                &i.account,
+                caller,
+                device,
+                &[i.role as u8],
+                action,
+                now,
+                self.exchange_seed.as_ref(),
             )?;
         }
         tx.commit().map_err(storage("commit create"))?;
@@ -953,6 +1207,8 @@ impl Channels {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin join"))?;
+        // SIP-35: writes go to the origin, always.
+        Channels::read_only(&tx, channel)?;
         let visibility = visibility_of(&tx, channel)?;
         if visibility != Visibility::Public {
             return Err(ChannelError::NotPublic);
@@ -973,7 +1229,17 @@ impl Channels {
         if !already {
             let place = self.place(&tx, channel)?;
             write_system(
-                &tx, &place, channel, EVENT_JOINED, caller, caller, device, &[], action, now,
+                &tx,
+                &place,
+                channel,
+                EVENT_JOINED,
+                caller,
+                caller,
+                device,
+                &[],
+                action,
+                now,
+                self.exchange_seed.as_ref(),
             )?;
         }
         tx.execute(
@@ -999,6 +1265,8 @@ impl Channels {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin leave"))?;
+        // SIP-35: writes go to the origin, always.
+        Channels::read_only(&tx, channel)?;
         let visibility = visibility_of(&tx, channel)?;
         let Some(role) = role_of(&tx, channel, caller) else {
             return Err(ChannelError::NotAMember);
@@ -1009,11 +1277,7 @@ impl Channels {
         // walking out would strand the others with a channel nobody can
         // administer. In a public one the role is durable and leaving does not
         // touch it.
-        if visibility == Visibility::Private
-            && role == Role::Admin
-            && admins == 1
-            && members > 1
-        {
+        if visibility == Visibility::Private && role == Role::Admin && admins == 1 && members > 1 {
             return Err(ChannelError::LastAdmin);
         }
 
@@ -1036,7 +1300,17 @@ impl Channels {
 
         let place = self.place(&tx, channel)?;
         write_system(
-            &tx, &place, channel, EVENT_LEFT, caller, caller, device, &[], action, now,
+            &tx,
+            &place,
+            channel,
+            EVENT_LEFT,
+            caller,
+            caller,
+            device,
+            &[],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         if members == 1 {
             if visibility == Visibility::Public {
@@ -1063,9 +1337,14 @@ impl Channels {
     ) -> Result<Posted, ChannelError> {
         let now = now_unix();
         let seq;
+        let head;
+        let place;
+        let entry_hash;
         {
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction().map_err(storage("begin post"))?;
+            // SIP-35: writes go to the origin, always.
+            Channels::read_only(&tx, &req.channel)?;
             let (visibility, epoch, retention, next) = channel_row(&tx, &req.channel)?;
             if role_of(&tx, &req.channel, account).is_none() {
                 return Err(ChannelError::NotAMember);
@@ -1073,7 +1352,11 @@ impl Channels {
             // Epoch 0 means unsealed. That is every entry in a public channel
             // and no member entry in a private one, which is why a private
             // channel refuses posts until its first epoch exists.
-            let wanted = if visibility == Visibility::Public { 0 } else { epoch };
+            let wanted = if visibility == Visibility::Public {
+                0
+            } else {
+                epoch
+            };
             if req.epoch != wanted || (visibility == Visibility::Private && wanted == 0) {
                 return Err(ChannelError::WrongEpoch);
             }
@@ -1087,7 +1370,7 @@ impl Channels {
             // exchange cannot check them*, and this one it can — the signature
             // and the device are both in the clear. Refusing here means no
             // entry is stored that every receiver would reject.
-            let place = self.place(&tx, &req.channel)?;
+            place = self.place(&tx, &req.channel)?;
             let terms = EntryTerms {
                 place,
                 account: *account,
@@ -1113,11 +1396,22 @@ impl Channels {
             let body_hash = Sha256::digest(&req.body);
 
             seq = next;
+            // SIP-34. The entry hash is SHA-256 of the signing input — the same
+            // value SIP-31's chain link is, computed by the same primitive.
+            entry_hash = link(&terms.input());
+            head = advance_head(&tx, &req.channel, &entry_hash)?;
+            // Signed once, here, and kept — see the `receipt` column on why a
+            // replica cannot re-derive one.
+            let receipt_bytes = self
+                .stamp(&place, seq, now, &entry_hash, &head)
+                .map(|st| st.receipt)
+                .unwrap_or([0u8; 64]);
             tx.execute(
                 "INSERT INTO entry (channel, seq, kind, account, device, posted,
                                     expires_after, epoch, msg_seq,
-                                    chain_seq, prev, body_hash, sig, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                    chain_seq, prev, body_hash, sig, body,
+                                    entry_hash, head, receipt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     &req.channel[..],
                     seq as i64,
@@ -1133,6 +1427,9 @@ impl Channels {
                     &body_hash[..],
                     &req.sig[..],
                     &req.body,
+                    &entry_hash[..],
+                    &head[..],
+                    &receipt_bytes[..],
                 ],
             )
             .map_err(storage("insert entry"))?;
@@ -1171,6 +1468,10 @@ impl Channels {
             seq,
             posted: now,
             now,
+            stamp: req
+                .receipts
+                .then(|| self.stamp(&place, seq, now, &entry_hash, &head))
+                .transpose()?,
         })
     }
 
@@ -1181,27 +1482,41 @@ impl Channels {
     pub fn fetch(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         since: u64,
+        receipts: bool,
     ) -> Result<Entries, ChannelError> {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
+        // SIP-35: a replica serves only what it can vouch for, and **will not
+        // choose** between two histories an origin signed for one position.
+        // Picking one silently would convert evidence into a disagreement
+        // between two honest-looking servers.
+        Channels::not_equivocated(&db, channel)?;
+        Channels::derivable(&db, channel)?;
         if role_of(&db, channel, caller).is_none() {
             return Err(ChannelError::NotAMember);
         }
+        // Before anything is read, so a caller asking an exchange that cannot
+        // answer in the shape it asked for is refused rather than served
+        // something it will misparse.
+        if receipts && self.exchange_seed.is_none() {
+            return Err(ChannelError::NoReceipts);
+        }
+        let place = receipts.then(|| self.place(&db, channel)).transpose()?;
         let (first, last) = window(&db, channel);
         let mut stmt = db
             .prepare(
                 "SELECT seq, kind, account, device, posted, expires_after, epoch, msg_seq,
-                        chain_seq, prev, body_hash, sig, body
+                        chain_seq, prev, body_hash, sig, body, entry_hash, head
                  FROM entry WHERE channel = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
             )
             .map_err(storage("prepare fetch"))?;
         let rows = stmt
-            .query_map(
-                params![&channel[..], since as i64, MAX_BATCH as i64],
-                |r| {
-                    Ok(Entry {
+            .query_map(params![&channel[..], since as i64, MAX_BATCH as i64], |r| {
+                Ok((
+                    Entry {
                         seq: r.get::<_, i64>(0)? as u64,
                         kind: r.get::<_, i64>(1)? as u8,
                         account: PubKey::new(r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32])),
@@ -1215,15 +1530,22 @@ impl Channels {
                         body_hash: r.get::<_, Vec<u8>>(10)?.try_into().unwrap_or([0; 32]),
                         sig: r.get::<_, Vec<u8>>(11)?.try_into().unwrap_or([0; 64]),
                         body: r.get(12)?,
-                    })
-                },
-            )
+                        // Stamped below, where the signing key is in scope.
+                        stamp: None,
+                    },
+                    r.get::<_, Vec<u8>>(13)?.try_into().unwrap_or([0u8; 32]),
+                    r.get::<_, Vec<u8>>(14)?.try_into().unwrap_or([0u8; 32]),
+                ))
+            })
             .map_err(storage("query fetch"))?;
 
         let mut entries = Vec::new();
         let mut bytes = 0usize;
         for row in rows {
-            let e = row.map_err(storage("read entry"))?;
+            let (mut e, entry_hash, head) = row.map_err(storage("read entry"))?;
+            if let Some(place) = &place {
+                e.stamp = Some(self.stamp(place, e.seq, e.posted, &entry_hash, &head)?);
+            }
             // Whichever binds first. An entry already counted is never dropped
             // to make room, so a client always makes progress.
             if !entries.is_empty() && bytes + e.wire_len() > MAX_BATCH_BYTES {
@@ -1253,12 +1575,59 @@ impl Channels {
             .map_err(storage("record delivery"))?;
         }
 
+        let tip = match &place {
+            None => None,
+            Some(place) => Some(self.tip(&db, place, last)?),
+        };
         Ok(Entries {
             now: now_unix(),
             first,
             last,
             entries,
-            signals: self.take_signals(channel, caller),
+            signals: self.take_signals(channel, caller, device),
+            tip,
+        })
+    }
+
+    /// The head and receipt of the channel's newest entry, whether or not it
+    /// was in the batch.
+    ///
+    /// **What a reader who fetched nothing still learns.** Without it, "nothing
+    /// happened" and "I am not being shown what happened" are the same
+    /// response; with it, a tip that advances while entries do not is the
+    /// exchange saying it is carrying something it did not serve.
+    fn tip(&self, db: &Connection, place: &Place, last: u64) -> Result<Tip, ChannelError> {
+        let row: Option<(u64, [u8; 32], [u8; 32])> = db
+            .query_row(
+                "SELECT posted, entry_hash, head FROM entry WHERE channel = ?1 AND seq = ?2",
+                params![&place.channel[..], last as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0u8; 32]),
+                        r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0u8; 32]),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage("read tip"))?;
+        // `seq` 0 means the channel has no entries and there is nothing to
+        // sign, so the stamp is zeroes rather than a signature over nothing.
+        let Some((posted, entry_hash, head)) = row else {
+            return Ok(Tip {
+                seq: 0,
+                posted: 0,
+                stamp: Receipted {
+                    entry_hash: [0u8; 32],
+                    head: HEAD_GENESIS,
+                    receipt: [0u8; 64],
+                },
+            });
+        };
+        Ok(Tip {
+            seq: last,
+            posted,
+            stamp: self.stamp(place, last, posted, &entry_hash, &head)?,
         })
     }
 }
@@ -1509,6 +1878,12 @@ impl Channels {
     ) -> Result<ChannelInfo, ChannelError> {
         let db = self.db.lock().unwrap();
         let (visibility, epoch, retention, _) = channel_row(&db, channel)?;
+        Channels::not_equivocated(&db, channel)?;
+        // SIP-35: the same rule as `fetch`. A replica that cannot derive the
+        // roster must not describe the channel either — a member list is the
+        // roster, and serving one it could not derive would be the origin's
+        // summary wearing this exchange's name.
+        Channels::derivable(&db, channel)?;
         if role_of(&db, channel, caller).is_none() && !is_admin(&db, channel, caller) {
             return Err(ChannelError::NotAMember);
         }
@@ -1635,8 +2010,17 @@ impl Channels {
         // which is a gap in-band and not only across exchanges.
         let place = self.place(&tx, &req.channel)?;
         write_system(
-            &tx, &place, &req.channel, EVENT_RENAMED, caller, caller, device, &arg,
-            &req.action, now,
+            &tx,
+            &place,
+            &req.channel,
+            EVENT_RENAMED,
+            caller,
+            caller,
+            device,
+            &arg,
+            &req.action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         tx.commit().map_err(storage("commit set_directory"))?;
         self.wake(&req.channel);
@@ -1655,6 +2039,8 @@ impl Channels {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin retain"))?;
+        // SIP-35: writes go to the origin, always.
+        Channels::read_only(&tx, &req.channel)?;
         visibility_of(&tx, &req.channel)?;
         if !is_admin(&tx, &req.channel, caller) {
             return Err(ChannelError::NotAnAdmin);
@@ -1676,8 +2062,17 @@ impl Channels {
         arg.extend_from_slice(&req.retention_secs.to_be_bytes());
         arg.extend_from_slice(&req.max_entries.to_be_bytes());
         write_system(
-            &tx, &place, &req.channel, EVENT_RETENTION, caller, caller, device, &arg,
-            &req.action, now,
+            &tx,
+            &place,
+            &req.channel,
+            EVENT_RETENTION,
+            caller,
+            caller,
+            device,
+            &arg,
+            &req.action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         prune(&tx, &req.channel, now, self.max_channel_bytes)?;
         tx.commit().map_err(storage("commit retain"))?;
@@ -1869,6 +2264,8 @@ impl Channels {
         }
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin invite"))?;
+        // SIP-35: writes go to the origin, always.
+        Channels::read_only(&tx, channel)?;
         visibility_of(&tx, channel)?;
         if !is_admin(&tx, channel, caller) {
             return Err(ChannelError::NotAnAdmin);
@@ -1914,7 +2311,17 @@ impl Channels {
         // The role travels in the signature, or a signed promotion could be
         // replayed as a demotion.
         write_system(
-            &tx, &place, channel, event, account, caller, device, &[role as u8], action, now,
+            &tx,
+            &place,
+            channel,
+            event,
+            account,
+            caller,
+            device,
+            &[role as u8],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
@@ -1923,6 +2330,737 @@ impl Channels {
         .map_err(storage("clear empty_since"))?;
         tx.commit().map_err(storage("commit invite"))?;
         self.wake(channel);
+        Ok(())
+    }
+
+    /// SIP-35: serve a peer the entries of a channel it is authorised to hold.
+    ///
+    /// Every entry carries its SIP-34 stamp — not optionally, as it is for a
+    /// member's fetch, because **a replica that stored an entry without one
+    /// would be taking the origin's word for its own ordering**, which is the
+    /// thing this whole document exists to stop it repeating.
+    ///
+    /// Membership is not checked and deliberately so: a peer is not a member,
+    /// and what makes it entitled to the channel is the signed `0x0b` in the
+    /// log, checked by the caller before this is reached.
+    pub fn pull(&self, channel: &[u8; 32], since: u64, max: u16) -> Result<Pulled, ChannelError> {
+        let db = self.db.lock().unwrap();
+        if self.exchange_seed.is_none() {
+            // An origin that cannot receipt cannot be replicated from: the
+            // replica would have nothing to verify and would be building the
+            // cache SIP-35 refuses.
+            return Err(ChannelError::NoReceipts);
+        }
+        let place = self.place(&db, channel)?;
+        let (first, last) = window(&db, channel);
+        let window_secs: u32 = db
+            .query_row(
+                "SELECT retention_secs FROM channel WHERE id = ?1",
+                params![&channel[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage("read retention"))? as u32;
+        let mut stmt = db
+            .prepare(
+                "SELECT seq, kind, account, device, posted, expires_after, epoch, msg_seq,
+                        chain_seq, prev, body_hash, sig, body,
+                        entry_hash, head, receipt
+                 FROM entry WHERE channel = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+            )
+            .map_err(storage("prepare pull"))?;
+        let rows = stmt
+            .query_map(
+                params![&channel[..], since as i64, max.min(MAX_PULL) as i64],
+                |r| {
+                    Ok((
+                        Entry {
+                            seq: r.get::<_, i64>(0)? as u64,
+                            kind: r.get::<_, i64>(1)? as u8,
+                            account: PubKey::new(
+                                r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32]),
+                            ),
+                            device: PubKey::new(
+                                r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 32]),
+                            ),
+                            posted: r.get::<_, i64>(4)? as u64,
+                            expires_after: r.get::<_, i64>(5)? as u32,
+                            epoch: r.get::<_, i64>(6)? as u32,
+                            msg_seq: r.get::<_, i64>(7)? as u64,
+                            chain_seq: r.get::<_, i64>(8)? as u64,
+                            prev: r.get::<_, Vec<u8>>(9)?.try_into().unwrap_or(GENESIS),
+                            body_hash: r.get::<_, Vec<u8>>(10)?.try_into().unwrap_or([0; 32]),
+                            sig: r.get::<_, Vec<u8>>(11)?.try_into().unwrap_or([0; 64]),
+                            body: r.get(12)?,
+                            stamp: None,
+                        },
+                        r.get::<_, Vec<u8>>(13)?.try_into().unwrap_or([0u8; 32]),
+                        r.get::<_, Vec<u8>>(14)?.try_into().unwrap_or([0u8; 32]),
+                        r.get::<_, Vec<u8>>(15)?.try_into().unwrap_or([0u8; 64]),
+                    ))
+                },
+            )
+            .map_err(storage("query pull"))?;
+
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let (mut e, entry_hash, head, receipt) = row.map_err(storage("read pulled entry"))?;
+            // An entry written before receipts were stored has none here. An
+            // *origin* can always produce one — Ed25519 is deterministic and it
+            // holds the seed — so it does, rather than serving zeroes a replica
+            // would rightly refuse. A replica has no such fallback, which is
+            // why the column exists.
+            let stamp = if receipt == [0u8; 64] {
+                self.stamp(&place, e.seq, e.posted, &entry_hash, &head)?
+            } else {
+                Receipted {
+                    entry_hash,
+                    head,
+                    receipt,
+                }
+            };
+            e.stamp = Some(stamp);
+            if !entries.is_empty() && bytes + e.wire_len() > MAX_PULL_BYTES {
+                break;
+            }
+            bytes += e.wire_len();
+            entries.push(e);
+        }
+        Ok(Pulled {
+            now: now_unix(),
+            instance: place.instance,
+            origin: self.exchange,
+            first,
+            last,
+            window_secs,
+            entries,
+            tip: self.tip(&db, &place, last)?,
+        })
+    }
+
+    /// SIP-35: every key envelope a channel holds, for a peer.
+    ///
+    /// Every recipient's, not one — a replica holds the channel on behalf of
+    /// its members and can open none of them. Each carries the epoch its `Put`
+    /// was made at, because that is bound into the SIP-32 signature and a peer
+    /// has no other way to know it.
+    pub fn pull_envelopes(
+        &self,
+        channel: &[u8; 32],
+        since_epoch: u32,
+    ) -> Result<PulledEnvelopes, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        let mut stmt = db
+            .prepare(
+                "SELECT epoch, recipient, publisher, sig, from_epoch, to_epoch,
+                        prekey_id, ephemeral, ciphertext FROM envelope
+                 WHERE channel = ?1 AND to_epoch >= ?2 ORDER BY epoch ASC LIMIT ?3",
+            )
+            .map_err(storage("prepare envelope pull"))?;
+        let rows = stmt
+            .query_map(
+                params![&channel[..], since_epoch as i64, MAX_PULL as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u32,
+                        Envelope {
+                            recipient: PubKey::new(
+                                r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32]),
+                            ),
+                            publisher: PubKey::new(
+                                r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32]),
+                            ),
+                            sig: r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 64]),
+                            from_epoch: r.get::<_, i64>(4)? as u32,
+                            to_epoch: r.get::<_, i64>(5)? as u32,
+                            prekey_id: r.get::<_, i64>(6)? as u32,
+                            ephemeral: r.get::<_, Vec<u8>>(7)?.try_into().unwrap_or([0; 32]),
+                            ciphertext: r.get(8)?,
+                        },
+                    ))
+                },
+            )
+            .map_err(storage("query envelope pull"))?;
+        Ok(PulledEnvelopes {
+            now: now_unix(),
+            envelopes: rows.filter_map(|r| r.ok()).collect(),
+        })
+    }
+
+    /// Store one envelope pulled from an origin, its signature already checked.
+    pub fn store_envelope(
+        &self,
+        channel: &[u8; 32],
+        epoch: u32,
+        e: &Envelope,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO envelope
+                (channel, recipient, publisher, sig, epoch, from_epoch, to_epoch,
+                 prekey_id, ephemeral, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                &channel[..],
+                e.recipient.as_bytes(),
+                e.publisher.as_bytes(),
+                &e.sig[..],
+                epoch as i64,
+                e.from_epoch as i64,
+                e.to_epoch as i64,
+                e.prekey_id as i64,
+                &e.ephemeral[..],
+                &e.ciphertext,
+            ],
+        )
+        .map_err(storage("store pulled envelope"))?;
+        Ok(())
+    }
+
+    /// SIP-35: the blobs attached to a channel, or one sealed chunk of one.
+    ///
+    /// **The origin lists them because a replica cannot.** Attachments are
+    /// named inside SIP-19 bodies, which are sealed in a private channel, so a
+    /// replica reading the log sees no blob identifiers at all. The exchange
+    /// registers every attachment against its channel for quota and collection
+    /// and therefore knows the set without reading anything.
+    pub fn pull_blob(
+        &self,
+        channel: &[u8; 32],
+        blob: &[u8; 32],
+        chunk: u32,
+    ) -> Result<PulledBlob, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if chunk == BLOB_LIST {
+            let mut stmt = db
+                .prepare(
+                    "SELECT b.id, b.size, b.chunks FROM blob b
+                     JOIN attachment a ON a.blob = b.id
+                     WHERE a.channel = ?1 ORDER BY b.id ASC LIMIT ?2",
+                )
+                .map_err(storage("prepare blob list"))?;
+            let rows = stmt
+                .query_map(params![&channel[..], MAX_PULL as i64], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]),
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u32,
+                    ))
+                })
+                .map_err(storage("query blob list"))?;
+            return Ok(PulledBlob {
+                blobs: rows.filter_map(|r| r.ok()).collect(),
+                sealed: Vec::new(),
+            });
+        }
+        // Attached to *this* channel, so a peer authorised for one channel
+        // cannot use the route to read blobs from another.
+        let attached: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM attachment WHERE channel = ?1 AND blob = ?2",
+                params![&channel[..], &blob[..]],
+                |r| r.get(0),
+            )
+            .map_err(storage("check attachment"))?;
+        if attached == 0 {
+            return Err(ChannelError::NoSuchBlob);
+        }
+        let sealed: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT sealed FROM blob_chunk WHERE blob = ?1 AND idx = ?2",
+                params![&blob[..], chunk as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read chunk"))?;
+        Ok(PulledBlob {
+            blobs: Vec::new(),
+            sealed: sealed.ok_or(ChannelError::NoSuchBlob)?,
+        })
+    }
+
+    /// Whether this exchange already holds a blob's bytes, so a replica does
+    /// not re-pull one it has.
+    pub fn holds_blob(&self, blob: &[u8; 32]) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM blob WHERE id = ?1",
+            params![&blob[..]],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// Store a blob a replica pulled, once its id has been checked against the
+    /// hash of the chunks — which is what makes a blob need no signature.
+    pub fn store_blob(
+        &self,
+        channel: &[u8; 32],
+        blob: &[u8; 32],
+        size: u64,
+        chunks: &[Vec<u8>],
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin store blob"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO blob (id, size, chunks) VALUES (?1, ?2, ?3)",
+            params![&blob[..], size as i64, chunks.len() as i64],
+        )
+        .map_err(storage("store blob"))?;
+        for (i, sealed) in chunks.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO blob_chunk (blob, idx, sealed) VALUES (?1, ?2, ?3)",
+                params![&blob[..], i as i64, sealed],
+            )
+            .map_err(storage("store chunk"))?;
+        }
+        // Attached with no uploader and no timer: a replica did not receive
+        // this from anybody and has no per-message timer to honour — the
+        // origin's `expires_after` follows the *entry*, and the entry came
+        // with its own.
+        tx.execute(
+            "INSERT OR IGNORE INTO attachment
+                (channel, blob, attached, expires_after, uploader)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![&channel[..], &blob[..], now_unix() as i64, &[0u8; 32][..]],
+        )
+        .map_err(storage("attach pulled blob"))?;
+        tx.commit().map_err(storage("commit store blob"))?;
+        Ok(())
+    }
+
+    /// SIP-35: authorise or withdraw replication of this channel to a replica.
+    ///
+    /// **The disclosure belongs to the members, not to the operator.** An
+    /// operational whitelist decides which peers this exchange will talk to at
+    /// all; it does not decide which channels replicate, because each
+    /// authorisation hands another operator the channel's whole shape — who is
+    /// a member, when each joined, who posted and when, and how large every
+    /// message was. So it is a signed act by an admin, written into the log the
+    /// members already read.
+    ///
+    /// Withdrawal deletes the row and nothing else. A replica stops being
+    /// served and stops accepting new entries; what it already holds was
+    /// lawfully obtained, and **no protocol can unsend it**. A caller must not
+    /// be told otherwise.
+    pub fn replicate(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        channel: &[u8; 32],
+        replica: &PubKey,
+        action: &Action,
+        authorise: bool,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin replicate"))?;
+        visibility_of(&tx, channel)?;
+        // The same authority as `added` and `removed`, and for the same
+        // reason: this changes who can see the channel.
+        if !is_admin(&tx, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        if authorise {
+            let held: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM replica WHERE channel = ?1",
+                    params![&channel[..]],
+                    |r| r.get(0),
+                )
+                .map_err(storage("count replicas"))?;
+            let already: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM replica WHERE channel = ?1 AND peer = ?2",
+                    params![&channel[..], replica.as_bytes()],
+                    |r| r.get(0),
+                )
+                .map_err(storage("check replica"))?;
+            // Bounds fan-out, and more to the point bounds the disclosure:
+            // each authorisation is another operator who learns the shape.
+            if already == 0 && held as usize >= MAX_REPLICAS {
+                return Err(ChannelError::TooManyReplicas);
+            }
+        }
+        let place = self.place(&tx, channel)?;
+        let event = if authorise {
+            EVENT_REPLICATE
+        } else {
+            EVENT_UNREPLICATE
+        };
+        write_system(
+            &tx,
+            &place,
+            channel,
+            event,
+            replica,
+            caller,
+            device,
+            &[],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
+        )?;
+        if authorise {
+            tx.execute(
+                "INSERT OR IGNORE INTO replica (channel, peer) VALUES (?1, ?2)",
+                params![&channel[..], replica.as_bytes()],
+            )
+            .map_err(storage("authorise replica"))?;
+        } else {
+            tx.execute(
+                "DELETE FROM replica WHERE channel = ?1 AND peer = ?2",
+                params![&channel[..], replica.as_bytes()],
+            )
+            .map_err(storage("withdraw replica"))?;
+        }
+        tx.commit().map_err(storage("commit replicate"))?;
+        self.wake(channel);
+        Ok(())
+    }
+
+    /// Whether `subject` is a present member of any channel replicated to
+    /// `peer`.
+    ///
+    /// The peering analogue of SIP-21's "shares a channel", and it decides
+    /// whether a withheld profile is served to a replica. A replica is not a
+    /// person and has no standing of its own; what it may hold is what the
+    /// members of the channels it carries could already see.
+    pub fn shares_replicated(&self, peer: &PubKey, subject: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM member m JOIN replica r ON r.channel = m.channel
+             WHERE m.account = ?1 AND m.present = 1 AND r.peer = ?2",
+            params![subject.as_bytes(), peer.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// Whether `peer` holds a surviving authorisation for this channel.
+    ///
+    /// **The only question the pull route asks about a channel**, and it is
+    /// asked without disclosing which of the possible answers was false: an
+    /// origin refuses an unauthorised peer, an absent channel and an
+    /// unreplicated one identically. These routes are reachable by strangers,
+    /// and a reply that varied would make them an existence oracle for private
+    /// channels — SIP-24's rule for its admission endpoint and SIP-4's for a
+    /// withheld beacon, applied here for the same reason.
+    pub fn replicates_to(&self, channel: &[u8; 32], peer: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM replica WHERE channel = ?1 AND peer = ?2",
+            params![&channel[..], peer.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// SIP-35: adopt a channel as a replica of `origin`.
+    ///
+    /// The channel row is created locally with the origin's `instance` served
+    /// unaltered. **A replica MUST NOT mint one:** SIP-31 binds it into every
+    /// signature, so a replica that generated its own would hold a channel
+    /// whose entries all fail to verify — and would have no way to notice,
+    /// because they would fail consistently.
+    pub fn adopt(
+        &self,
+        channel: &[u8; 32],
+        instance: &[u8; 32],
+        origin: &PubKey,
+        window_secs: u32,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin adopt"))?;
+        // **This exchange's own window, not the origin's.** SIP-35 lets a
+        // replica hold *more* than the origin does — it pulled entries the
+        // origin has since pruned, and outliving that window is half the reason
+        // to replicate — so the local row keeps this exchange's own policy and
+        // the origin's window is recorded separately, to be reported as the
+        // origin's and never as this one's. A per-entry `expires_after` still
+        // binds: that one follows the entry rather than the channel.
+        tx.execute(
+            "INSERT OR IGNORE INTO channel
+                (id, visibility, retention_secs, max_entries, name, topic, epoch,
+                 next_seq, creator, created, epoch_at, instance)
+             VALUES (?1, ?2, ?3, ?4, '', '', 0, 1, ?5, ?6, 0, ?7)",
+            params![
+                &channel[..],
+                Visibility::Private as i64,
+                MAX_RETENTION as i64,
+                MAX_ENTRIES as i64,
+                origin.as_bytes(),
+                now as i64,
+                &instance[..],
+            ],
+        )
+        .map_err(storage("adopt channel"))?;
+        tx.execute(
+            "INSERT INTO replicated (channel, origin, window_secs, equivocation)
+             VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT (channel) DO UPDATE SET origin = ?2, window_secs = ?3",
+            params![&channel[..], origin.as_bytes(), window_secs as i64],
+        )
+        .map_err(storage("mark replicated"))?;
+        tx.commit().map_err(storage("commit adopt"))?;
+        Ok(())
+    }
+
+    /// Refuse a write to a channel this exchange only replicates.
+    ///
+    /// **Writes go to the origin, always.** A replica accepting a post would be
+    /// a second origin, and every property SIP-35 rests on depends on there
+    /// being one. The refusal names the origin's key so a client can discover
+    /// where to go, which is the difference between "no" and "not here".
+    fn read_only(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+        let origin: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT origin FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read replica origin"))?;
+        match origin {
+            None => Ok(()),
+            Some(key) => Err(ChannelError::Replicated(PubKey::new(
+                key.try_into().unwrap_or([0; 32]),
+            ))),
+        }
+    }
+
+    /// Refuse to serve a channel whose origin has contradicted itself.
+    ///
+    /// SIP-35 requires a client receiving an `Equivocation` to surface it and
+    /// **MUST NOT present either branch as the conversation**. A replica that
+    /// went on serving one branch would be making that choice on the reader's
+    /// behalf, which is exactly what it has no basis to do.
+    fn not_equivocated(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+        let held: Option<Option<Vec<u8>>> = db
+            .query_row(
+                "SELECT equivocation FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read equivocation"))?;
+        match held.flatten() {
+            None => Ok(()),
+            Some(_) => Err(ChannelError::Equivocated),
+        }
+    }
+
+    /// Whether this exchange may serve a channel it replicates.
+    ///
+    /// `Ok(())` for a channel it originated, and for a replicated one whose
+    /// roster it derived from the constitution onward. `Err` where replication
+    /// began mid-channel or the origin had already pruned: **a replica that
+    /// cannot derive membership refuses the channel rather than falling back
+    /// on the origin's summary.**
+    fn derivable(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+        let row: Option<(Vec<u8>, i64)> = db
+            .query_row(
+                "SELECT origin, derivable FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage("read derivable"))?;
+        match row {
+            // Not replicated: this exchange wrote the roster itself.
+            None => Ok(()),
+            Some((_, 1)) => Ok(()),
+            Some((origin, _)) => Err(ChannelError::Underived(PubKey::new(
+                origin.try_into().unwrap_or([0; 32]),
+            ))),
+        }
+    }
+
+    /// The origin of a channel this exchange replicates, if it replicates it.
+    pub fn origin_of(&self, channel: &[u8; 32]) -> Option<PubKey> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT origin FROM replicated WHERE channel = ?1",
+            params![&channel[..]],
+            |r| {
+                Ok(PubKey::new(
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// The origin's own retention window for a channel this exchange
+    /// replicates.
+    ///
+    /// Reported as the origin's. A replica that presented it as its own would
+    /// be describing somebody else's policy, and one that presented *its* window
+    /// as the origin's would be claiming entries are still available there when
+    /// they may not be.
+    pub fn origin_window(&self, channel: &[u8; 32]) -> Option<u32> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT window_secs FROM replicated WHERE channel = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|w| w as u32)
+    }
+
+    /// The SIP-34 proof this replica holds for a channel, if it has caught the
+    /// origin saying two things about one position.
+    pub fn equivocation_for(&self, channel: &[u8; 32]) -> Option<Vec<u8>> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT equivocation FROM replicated WHERE channel = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    /// The stamp this exchange holds for one position: `posted`, the entry
+    /// hash, the head, and the receipt signed over them.
+    ///
+    /// What a replica compares a newly pulled entry against, and therefore what
+    /// makes an origin's equivocation findable at all.
+    pub fn stamp_at(&self, channel: &[u8; 32], seq: u64) -> Option<StampAt> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT posted, entry_hash, head, receipt
+             FROM entry WHERE channel = ?1 AND seq = ?2",
+            params![&channel[..], seq as i64],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0u8; 32]),
+                    r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0u8; 32]),
+                    r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0u8; 64]),
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// The highest sequence number this exchange holds for a channel.
+    pub fn highest(&self, channel: &[u8; 32]) -> u64 {
+        let db = self.db.lock().unwrap();
+        window(&db, channel).1
+    }
+
+    /// Store one verified entry pulled from an origin.
+    ///
+    /// The caller has already run SIP-31's and SIP-34's checks; this writes
+    /// what survived them. `seq`, `posted`, `entry_hash`, `head` and the
+    /// receipt are the origin's and are stored as given — a replica assigns
+    /// nothing and signs nothing.
+    pub fn store_pulled(
+        &self,
+        channel: &[u8; 32],
+        e: &Entry,
+        entry_hash: &[u8; 32],
+        head: &[u8; 32],
+        receipt: &[u8; 64],
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin store"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO entry (channel, seq, kind, account, device, posted,
+                                expires_after, epoch, msg_seq,
+                                chain_seq, prev, body_hash, sig, body,
+                                entry_hash, head, receipt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                &channel[..],
+                e.seq as i64,
+                e.kind as i64,
+                e.account.as_bytes(),
+                e.device.as_bytes(),
+                e.posted as i64,
+                e.expires_after as i64,
+                e.epoch as i64,
+                e.msg_seq as i64,
+                e.chain_seq as i64,
+                &e.prev[..],
+                &e.body_hash[..],
+                &e.sig[..],
+                &e.body,
+                &entry_hash[..],
+                &head[..],
+                &receipt[..],
+            ],
+        )
+        .map_err(storage("store pulled entry"))?;
+        // **Membership is derived here, from the signed action, and never from
+        // a roster the origin sent.** SIP-35 is explicit: a replica works out
+        // who may read a channel from the constitution event and the signed
+        // membership actions in the log it holds. Serving a private channel on
+        // the strength of an unsigned summary is precisely the trust the
+        // document exists to avoid.
+        if e.kind == KIND_SYSTEM
+            && let Ok(Some(sys)) = System::decode(&e.body)
+        {
+            derive_membership(&tx, channel, &sys, e.posted)?;
+            if sys.event == EVENT_CREATED {
+                tx.execute(
+                    "UPDATE replicated SET derivable = 1 WHERE channel = ?1",
+                    params![&channel[..]],
+                )
+                .map_err(storage("mark derivable"))?;
+            }
+        }
+        // The replica's head follows the origin's, because it *is* the
+        // origin's: a replica never advances a head of its own.
+        tx.execute(
+            "UPDATE channel SET head = ?2, next_seq = MAX(next_seq, ?3) WHERE id = ?1",
+            params![&channel[..], &head[..], (e.seq + 1) as i64],
+        )
+        .map_err(storage("advance replica head"))?;
+        tx.commit().map_err(storage("commit store"))?;
+        self.wake(channel);
+        Ok(())
+    }
+
+    /// Record that the origin said two different things about one position.
+    ///
+    /// **A replica does not choose.** It stops accepting entries for the
+    /// channel, keeps both branches and the proof, and serves the proof to
+    /// anybody who asks. Picking a branch would silently convert evidence into
+    /// a disagreement between two honest-looking servers.
+    pub fn record_equivocation(
+        &self,
+        channel: &[u8; 32],
+        proof: &[u8],
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE replicated SET equivocation = COALESCE(equivocation, ?2) WHERE channel = ?1",
+            params![&channel[..], proof],
+        )
+        .map_err(storage("record equivocation"))?;
         Ok(())
     }
 
@@ -1939,6 +3077,8 @@ impl Channels {
     ) -> Result<(), ChannelError> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin remove"))?;
+        // SIP-35: writes go to the origin, always.
+        Channels::read_only(&tx, channel)?;
         visibility_of(&tx, channel)?;
         if !is_admin(&tx, channel, caller) {
             return Err(ChannelError::NotAnAdmin);
@@ -1970,8 +3110,17 @@ impl Channels {
         // and is why an admin cannot redact one.
         let place = self.place(&tx, channel)?;
         write_system(
-            &tx, &place, channel, EVENT_REMOVED, account, caller, device, &[], action,
+            &tx,
+            &place,
+            channel,
+            EVENT_REMOVED,
+            account,
+            caller,
+            device,
+            &[],
+            action,
             now_unix(),
+            self.exchange_seed.as_ref(),
         )?;
         tx.commit().map_err(storage("commit remove"))?;
         self.wake(channel);
@@ -2135,8 +3284,17 @@ impl Channels {
             let place = self.place(&tx, &req.channel)?;
             let action = req.action.as_ref().ok_or(ChannelError::BadSignature)?;
             write_system(
-                &tx, &place, &req.channel, EVENT_ROTATED, caller, caller, device,
-                &req.epoch.to_be_bytes(), action, now,
+                &tx,
+                &place,
+                &req.channel,
+                EVENT_ROTATED,
+                caller,
+                caller,
+                device,
+                &req.epoch.to_be_bytes(),
+                action,
+                now,
+                self.exchange_seed.as_ref(),
             )?;
         }
         tx.commit().map_err(storage("commit put"))?;
@@ -2240,16 +3398,16 @@ impl Channels {
             .map_err(storage("prepare missing"))?;
         let accounts: Vec<PubKey> = stmt
             .query_map(params![&channel[..]], |r| {
-                Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+                Ok(PubKey::new(
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                ))
             })
             .map_err(storage("query missing"))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage("read missing"))?;
 
         let mut sealed = db
-            .prepare(
-                "SELECT 1 FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = ?3",
-            )
+            .prepare("SELECT 1 FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = ?3")
             .map_err(storage("prepare sealed"))?;
 
         let mut stranded = Vec::new();
@@ -2317,7 +3475,9 @@ fn dm_claim(
         .map_err(storage("prepare dm claim"))?;
     let present: Vec<PubKey> = stmt
         .query_map(params![&channel[..]], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .map_err(storage("query dm claim"))?
         .filter_map(|r| r.ok())
@@ -2391,7 +3551,9 @@ impl Channels {
             return Vec::new();
         };
         stmt.query_map(params![&channel[..]], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .unwrap_or_default()
@@ -2413,7 +3575,9 @@ impl Channels {
             return Vec::new();
         };
         stmt.query_map(params![account.as_bytes()], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .unwrap_or_default()
@@ -2432,7 +3596,9 @@ fn is_direct_message(db: &Connection, channel: &[u8; 32]) -> Result<bool, Channe
         .map_err(storage("prepare dm check"))?;
     let members: Vec<PubKey> = stmt
         .query_map(params![&channel[..]], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .map_err(storage("query dm check"))?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -2451,11 +3617,7 @@ fn is_direct_message(db: &Connection, channel: &[u8; 32]) -> Result<bool, Channe
 /// here than throughput, because the lifetime rules are the hard part.
 impl Channels {
     /// Reserve an upload against a channel's blob quota.
-    pub fn begin_upload(
-        &self,
-        uploader: &PubKey,
-        req: &BlobBegin,
-    ) -> Result<u64, ChannelError> {
+    pub fn begin_upload(&self, uploader: &PubKey, req: &BlobBegin) -> Result<u64, ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin upload"))?;
@@ -2499,11 +3661,7 @@ impl Channels {
 
     /// Write one chunk. Chunks may arrive in any order and a repeat overwrites,
     /// so a client that lost a response retries rather than starting again.
-    pub fn put_chunk(
-        &self,
-        uploader: &PubKey,
-        req: &BlobPut,
-    ) -> Result<(), ChannelError> {
+    pub fn put_chunk(&self, uploader: &PubKey, req: &BlobPut) -> Result<(), ChannelError> {
         let db = self.db.lock().unwrap();
         let (owner, chunks) = upload_row(&db, req.upload)?;
         if &owner != uploader {
@@ -2689,11 +3847,7 @@ impl Channels {
 
     /// Attach an existing blob to a second channel. This is what a forward
     /// does: it costs the reference, not the file.
-    pub fn attach_blob(
-        &self,
-        who: &PubKey,
-        req: &ByChannelBlob,
-    ) -> Result<(), ChannelError> {
+    pub fn attach_blob(&self, who: &PubKey, req: &ByChannelBlob) -> Result<(), ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin attach"))?;
@@ -2758,7 +3912,11 @@ impl Channels {
 ///
 /// Kept independently of the entries, so pruning cannot understate it — a
 /// device resuming from an understated mark would fork its own chain.
-fn chain_head(db: &Connection, channel: &[u8; 32], device: &PubKey) -> Result<(u64, [u8; 32]), ChannelError> {
+fn chain_head(
+    db: &Connection,
+    channel: &[u8; 32],
+    device: &PubKey,
+) -> Result<(u64, [u8; 32]), ChannelError> {
     let row: Option<(i64, Vec<u8>)> = db
         .query_row(
             "SELECT chain_seq, head FROM chain WHERE channel = ?1 AND device = ?2",
@@ -2795,10 +3953,110 @@ fn advance_chain(
     db.execute(
         "INSERT INTO chain (channel, device, chain_seq, head) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (channel, device) DO UPDATE SET chain_seq = ?3, head = ?4",
-        params![&channel[..], device.as_bytes(), chain_seq as i64, &link(input)[..]],
+        params![
+            &channel[..],
+            device.as_bytes(),
+            chain_seq as i64,
+            &link(input)[..]
+        ],
     )
     .map_err(storage("advance chain"))?;
     Ok(())
+}
+
+/// Apply one signed membership action to a replica's local roster.
+///
+/// The rules mirror the origin's own, because they are the same rules read from
+/// the same events — this is a *derivation*, not a second policy. Nothing here
+/// consults anything the origin asserted: every input is a field of an entry
+/// whose signature has already been checked.
+///
+/// An event this build does not know is ignored rather than refused, which is
+/// SIP-16's own rule for its system space and is what lets a replica hold a
+/// channel from an origin one version ahead of it.
+fn derive_membership(
+    db: &Connection,
+    channel: &[u8; 32],
+    sys: &System,
+    posted: u64,
+) -> Result<(), ChannelError> {
+    let present = |role: Role| -> Result<(), ChannelError> {
+        db.execute(
+            "INSERT INTO member (channel, account, role, joined, present)
+             VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT (channel, account) DO UPDATE SET present = 1",
+            params![
+                &channel[..],
+                sys.subject.as_bytes(),
+                role as i64,
+                posted as i64
+            ],
+        )
+        .map_err(storage("derive membership"))?;
+        Ok(())
+    };
+    match sys.event {
+        // The creator is the channel's first admin, and the constitution is
+        // what makes the whole derivation possible: without it a replica cannot
+        // know where the roster started.
+        EVENT_CREATED => {
+            db.execute(
+                "INSERT INTO member (channel, account, role, joined, present)
+                 VALUES (?1, ?2, ?3, ?4, 1)
+                 ON CONFLICT (channel, account) DO UPDATE SET role = ?3, present = 1",
+                params![
+                    &channel[..],
+                    sys.actor.as_bytes(),
+                    Role::Admin as i64,
+                    posted as i64
+                ],
+            )
+            .map_err(storage("derive creator"))?;
+        }
+        EVENT_ADDED | EVENT_JOINED => present(Role::Member)?,
+        EVENT_PROMOTED => present(Role::Admin)?,
+        EVENT_DEMOTED => present(Role::Member)?,
+        // Presence and authority are different things here exactly as they are
+        // at an origin: leaving a public channel does not surrender a role.
+        EVENT_LEFT | EVENT_REMOVED => {
+            db.execute(
+                "UPDATE member SET present = 0 WHERE channel = ?1 AND account = ?2",
+                params![&channel[..], sys.subject.as_bytes()],
+            )
+            .map_err(storage("derive departure"))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Advance the channel's SIP-34 running head over one entry, and return it.
+///
+/// Read-modify-write inside the caller's transaction, so the head advances
+/// exactly once per entry however the entry got there. A stored head that is
+/// not 32 bytes is a channel that predates receipts and starts at genesis.
+fn advance_head(
+    db: &Connection,
+    channel: &[u8; 32],
+    entry_hash: &[u8; 32],
+) -> Result<[u8; 32], ChannelError> {
+    let held: Vec<u8> = db
+        .query_row(
+            "SELECT head FROM channel WHERE id = ?1",
+            params![&channel[..]],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(storage("read head"))?
+        .ok_or(ChannelError::NoSuchChannel)?;
+    let prev: [u8; 32] = held.try_into().unwrap_or(HEAD_GENESIS);
+    let head = receipt::advance(&prev, entry_hash);
+    db.execute(
+        "UPDATE channel SET head = ?2 WHERE id = ?1",
+        params![&channel[..], &head[..]],
+    )
+    .map_err(storage("advance head"))?;
+    Ok(head)
 }
 
 /// Verify a signed membership action, then take its chain step.
@@ -2816,7 +4074,7 @@ fn check_action(
     subject: &PubKey,
     arg: &[u8],
     action: &Action,
-) -> Result<(), ChannelError> {
+) -> Result<Vec<u8>, ChannelError> {
     let terms = ActionTerms {
         place: *place,
         actor: *actor,
@@ -2831,7 +4089,15 @@ fn check_action(
         return Err(ChannelError::BadSignature);
     }
     let input = terms.input().map_err(|_| ChannelError::BadSignature)?;
-    advance_chain(db, &place.channel, actor_device, action.chain_seq, &action.prev, &input)
+    advance_chain(
+        db,
+        &place.channel,
+        actor_device,
+        action.chain_seq,
+        &action.prev,
+        &input,
+    )?;
+    Ok(input)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2846,8 +4112,9 @@ fn write_system(
     arg: &[u8],
     action: &Action,
     now: u64,
+    seed: Option<&[u8; 32]>,
 ) -> Result<(), ChannelError> {
-    check_action(db, place, actor, actor_device, event, subject, arg, action)?;
+    let action_input = check_action(db, place, actor, actor_device, event, subject, arg, action)?;
     let seq: u64 = db
         .query_row(
             "SELECT next_seq FROM channel WHERE id = ?1",
@@ -2868,14 +4135,37 @@ fn write_system(
         sig: action.sig,
     }
     .encode();
+    // SIP-34: a system entry is numbered like any other and so advances the
+    // head like any other. A head that skipped them would not be a commitment
+    // to the channel's history, and membership changes are exactly the history
+    // a reader most wants covered.
+    let entry_hash = link(&action_input);
+    let head = advance_head(db, channel, &entry_hash)?;
+    // A system entry is receipted like any other. The seed is threaded in
+    // rather than reached for, because this is a free function shared by every
+    // membership path.
+    let receipt_bytes = match seed {
+        Some(seed) => receipt::sign(
+            seed,
+            &ReceiptTerms {
+                place: *place,
+                seq,
+                posted: now,
+                entry_hash,
+                head,
+            },
+        ),
+        None => [0u8; 64],
+    };
     // The entry's own `sig` stays zero: the exchange wrote this row and did not
     // sign it. The actor's signature is inside the body, which is where a
     // verifier looks for a system entry — a different key in a different role.
     db.execute(
         "INSERT INTO entry (channel, seq, kind, account, device, posted,
                             expires_after, epoch, msg_seq,
-                            chain_seq, prev, body_hash, sig, body)
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, 0, ?6, ?6, ?7, ?8)",
+                            chain_seq, prev, body_hash, sig, body,
+                            entry_hash, head, receipt)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, 0, ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             &channel[..],
             seq as i64,
@@ -2885,6 +4175,9 @@ fn write_system(
             &GENESIS[..],
             &[0u8; 64][..],
             &body,
+            &entry_hash[..],
+            &head[..],
+            &receipt_bytes[..],
         ],
     )
     .map_err(storage("insert system entry"))?;
@@ -3203,10 +4496,17 @@ impl Channels {
     pub fn signal(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         kind: u8,
         body: &[u8],
     ) -> Result<(), ChannelError> {
+        // SIP-36's first delivery rule, and the only kind it applies to. An
+        // exchange MUST NOT apply it to typing: a signal that reached one
+        // connection has rung one of somebody's phones and left the rest
+        // silent, which is what rule 1 exists to fix and is exactly the
+        // behaviour typing wants.
+        let per_device = kind == SIGNAL_CALL_STATE;
         let recipients: Vec<PubKey> = {
             let db = self.db.lock().unwrap();
             visibility_of(&db, channel)?;
@@ -3218,21 +4518,39 @@ impl Channels {
                 .map_err(storage("prepare signal recipients"))?;
             let rows = stmt
                 .query_map(params![&channel[..]], |r| {
-                    Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+                    Ok(PubKey::new(
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    ))
                 })
                 .map_err(storage("query signal recipients"))?;
-            rows.filter_map(|r| r.ok()).filter(|a| a != caller).collect()
+            // SIP-36's second rule: a ring state also goes to the sender's
+            // **other** devices, and is excluded only from the one that sent
+            // it. That is a deliberate exception to the ordinary rule, and the
+            // ordinary rule's own justification is what shows it to be one — a
+            // client does not need telling that its own keyboard is in use, and
+            // a device very much does need telling that its user answered
+            // somewhere else.
+            rows.filter_map(|r| r.ok())
+                .filter(|a| per_device || a != caller)
+                .collect()
         };
 
         let now = now_unix();
         let mut pending = self.signals.lock().unwrap();
         for who in recipients {
             let q = pending.entry((*channel, who)).or_default();
-            q.retain(|(_, _, _, at)| now.saturating_sub(*at) < SIGNAL_TTL);
+            q.retain(|p| now.saturating_sub(p.at) < SIGNAL_TTL);
             while q.len() >= MAX_SIGNALS {
                 q.remove(0);
             }
-            q.push((*caller, kind, body.to_vec(), now));
+            q.push(Pending {
+                from: *caller,
+                from_device: *device,
+                kind,
+                body: body.to_vec(),
+                at: now,
+                taken_by: per_device.then(Vec::new),
+            });
         }
         drop(pending);
         self.wake(channel);
@@ -3240,20 +4558,44 @@ impl Channels {
     }
 
     /// Collect and discard whatever is waiting. Delivered at most once.
-    fn take_signals(&self, channel: &[u8; 32], who: &PubKey) -> Vec<Signalled> {
+    fn take_signals(&self, channel: &[u8; 32], who: &PubKey, device: &PubKey) -> Vec<Signalled> {
         let now = now_unix();
         let mut pending = self.signals.lock().unwrap();
-        let Some(q) = pending.remove(&(*channel, *who)) else {
+        let Some(q) = pending.get_mut(&(*channel, *who)) else {
             return Vec::new();
         };
-        q.into_iter()
-            .filter(|(_, _, _, at)| now.saturating_sub(*at) < SIGNAL_TTL)
-            .map(|(account, kind, body, _)| Signalled {
-                account,
-                kind,
-                body,
-            })
-            .collect()
+        q.retain(|p| now.saturating_sub(p.at) < SIGNAL_TTL);
+        let mut out = Vec::new();
+        for p in q.iter_mut() {
+            match &mut p.taken_by {
+                // SIP-16's ordinary rule: at most once per recipient, and gone.
+                None => out.push(Signalled {
+                    account: p.from,
+                    kind: p.kind,
+                    body: p.body.clone(),
+                }),
+                // SIP-36 rule 1, and rule 2's exclusion. Never back to the
+                // device that sent it — that one already knows — and at most
+                // once to each of the others.
+                Some(taken) => {
+                    if device != &p.from_device && !taken.contains(device) {
+                        taken.push(*device);
+                        out.push(Signalled {
+                            account: p.from,
+                            kind: p.kind,
+                            body: p.body.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // The per-account ones are spent; the per-device ones stay until their
+        // TTL, because another of this account's devices has not seen them yet.
+        q.retain(|p| p.taken_by.is_some());
+        if q.is_empty() {
+            pending.remove(&(*channel, *who));
+        }
+        out
     }
 }
 
@@ -3277,12 +4619,21 @@ mod tests {
     }
 
     /// The exchange every test in this module runs against.
+    /// The exchange's own seed, so SIP-34 receipts issued in these tests are
+    /// checkable rather than merely present. A store opened on an arbitrary
+    /// public key would sign under one identity and claim another.
+    const EXCHANGE_SEED: [u8; 32] = [200u8; 32];
+
     fn exchange() -> PubKey {
-        key(200)
+        PubKey::new(
+            ed25519_dalek::SigningKey::from_bytes(&EXCHANGE_SEED)
+                .verifying_key()
+                .to_bytes(),
+        )
     }
 
     fn open() -> Channels {
-        Channels::open(None, exchange()).unwrap()
+        Channels::open(None, exchange(), Some(EXCHANGE_SEED)).unwrap()
     }
 
     fn place_of(c: &Channels, channel: &[u8; 32]) -> Place {
@@ -3292,7 +4643,14 @@ mod tests {
 
     /// A post signed as `b`'s device, taking the chain step the exchange is
     /// expecting. Tests that want a *bad* signature build one by hand.
-    fn post_as(c: &Channels, b: u8, channel: &[u8; 32], epoch: u32, msg_seq: u64, body: Vec<u8>) -> Post {
+    fn post_as(
+        c: &Channels,
+        b: u8,
+        channel: &[u8; 32],
+        epoch: u32,
+        msg_seq: u64,
+        body: Vec<u8>,
+    ) -> Post {
         let who = key(b);
         let (place, chain_seq, prev) = {
             let db = c.db.lock().unwrap();
@@ -3319,12 +4677,20 @@ mod tests {
             chain_seq,
             prev,
             sig: sign_entry(&[b; 32], &terms),
+            receipts: false,
             body,
         }
     }
 
     /// An action signed as `b`'s device, at the chain position expected next.
-    fn action_as(c: &Channels, b: u8, place: &Place, event: u8, subject: &PubKey, arg: &[u8]) -> Action {
+    fn action_as(
+        c: &Channels,
+        b: u8,
+        place: &Place,
+        event: u8,
+        subject: &PubKey,
+        arg: &[u8],
+    ) -> Action {
         let who = key(b);
         let (chain_seq, prev) = {
             let db = c.db.lock().unwrap();
@@ -3340,15 +4706,31 @@ mod tests {
             chain_seq,
             prev,
         };
-        Action { chain_seq, prev, sig: sign_action(&[b; 32], &terms).unwrap() }
+        Action {
+            chain_seq,
+            prev,
+            sig: sign_action(&[b; 32], &terms).unwrap(),
+        }
     }
 
     /// An action for a channel that does not exist yet, signed against the
     /// instance the create proposes.
-    fn create_action(b: u8, channel: &[u8; 32], instance: [u8; 32], n: u64, prev: [u8; 32], subject: &PubKey, role: Role) -> (Action, [u8; 32]) {
+    fn create_action(
+        b: u8,
+        channel: &[u8; 32],
+        instance: [u8; 32],
+        n: u64,
+        prev: [u8; 32],
+        subject: &PubKey,
+        role: Role,
+    ) -> (Action, [u8; 32]) {
         let who = key(b);
         let terms = ActionTerms {
-            place: Place { exchange: key(200), instance, channel: *channel },
+            place: Place {
+                exchange: key(200),
+                instance,
+                channel: *channel,
+            },
             actor: who,
             actor_device: who,
             event: EVENT_ADDED,
@@ -3359,16 +4741,34 @@ mod tests {
         };
         let sig = sign_action(&[b; 32], &terms).unwrap();
         let head = link(&terms.input().unwrap());
-        (Action { chain_seq: n, prev, sig }, head)
+        (
+            Action {
+                chain_seq: n,
+                prev,
+                sig,
+            },
+            head,
+        )
     }
 
     /// A create by `b`: SIP-32's `created` first, then each invitee's `added`.
-    fn create_by(b: u8, channel: [u8; 32], instance: [u8; 32], visibility: Visibility, retention_secs: u32, invites: Vec<Invitee>) -> Create {
+    fn create_by(
+        b: u8,
+        channel: [u8; 32],
+        instance: [u8; 32],
+        visibility: Visibility,
+        retention_secs: u32,
+        invites: Vec<Invitee>,
+    ) -> Create {
         let who = key(b);
         let mut actions = Vec::new();
         let founding = constitution(visibility, retention_secs, 0, "", "");
         let opening = ActionTerms {
-            place: Place { exchange: key(200), instance, channel },
+            place: Place {
+                exchange: key(200),
+                instance,
+                channel,
+            },
             actor: who,
             actor_device: who,
             event: EVENT_CREATED,
@@ -3403,7 +4803,14 @@ mod tests {
     }
 
     fn public_channel(retention_secs: u32) -> Create {
-        create_by(1, [7; 32], [77; 32], Visibility::Public, retention_secs, Vec::new())
+        create_by(
+            1,
+            [7; 32],
+            [77; 32],
+            Visibility::Public,
+            retention_secs,
+            Vec::new(),
+        )
     }
 
     fn stored_bytes(c: &Channels) -> u64 {
@@ -3428,12 +4835,14 @@ mod tests {
     fn delivered_is_observed_and_a_caller_cannot_assert_it() {
         let c = open();
         let alice = key(ALICE);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
 
         // Nothing has ever been posted here, so nothing can have been
         // delivered to anybody.
-        c.fetch(&alice, &[7; 32], 9_999).unwrap();
+        c.fetch(&alice, &alice, &[7; 32], 9_999, false).unwrap();
 
         let marks = c.cursors(&alice, &[7; 32]).unwrap();
         let mine = marks
@@ -3453,8 +4862,10 @@ mod tests {
     fn a_read_mark_cannot_create_the_delivery_it_is_clamped_against() {
         let c = open();
         let alice = key(ALICE);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
 
         c.set_cursor(&alice, &[7; 32], 500, true).unwrap();
 
@@ -3475,8 +4886,10 @@ mod tests {
         let cap = 4 * (MAX_ENTRY_BODY + ENTRY_HEADER) as u64;
         let c = open().with_max_channel_bytes(cap);
         let alice = key(1);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
 
         for i in 0..10u8 {
             c.post(
@@ -3488,8 +4901,12 @@ mod tests {
         }
 
         assert!(stored_bytes(&c) <= cap, "the cap is not enforced");
-        let got = c.fetch(&alice, &[7; 32], 0).unwrap();
-        let member: Vec<&Entry> = got.entries.iter().filter(|e| e.kind == KIND_MEMBER).collect();
+        let got = c.fetch(&alice, &alice, &[7; 32], 0, false).unwrap();
+        let member: Vec<&Entry> = got
+            .entries
+            .iter()
+            .filter(|e| e.kind == KIND_MEMBER)
+            .collect();
         assert_eq!(member.len(), 4, "want the four newest kept");
         // Oldest first, exactly as the count prune does: what survives is the
         // tail, and the sequence numbers are not reissued.
@@ -3501,18 +4918,30 @@ mod tests {
     fn the_byte_cap_does_not_bite_a_small_channel() {
         let c = open();
         let alice = key(1);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
         for i in 0..20u8 {
             c.post(
                 &alice,
                 &alice,
-                &post_as(&c, ALICE, &[7; 32], 0, i as u64, b"a short message".to_vec()),
+                &post_as(
+                    &c,
+                    ALICE,
+                    &[7; 32],
+                    0,
+                    i as u64,
+                    b"a short message".to_vec(),
+                ),
             )
             .unwrap();
         }
-        let got = c.fetch(&alice, &[7; 32], 0).unwrap();
-        assert_eq!(got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(), 20);
+        let got = c.fetch(&alice, &alice, &[7; 32], 0, false).unwrap();
+        assert_eq!(
+            got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(),
+            20
+        );
     }
 
     fn channel_n(n: u8, visibility: Visibility) -> Create {
@@ -3540,14 +4969,45 @@ mod tests {
             id[31] = (n >> 8) as u8;
             let req = channel_at(ALICE, id, Visibility::Public);
             c.create(&spammer, &spammer, &req, &|_, _| false).unwrap();
-            c.invite(&spammer, &spammer, &req.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-                .unwrap();
+            c.invite(
+                &spammer,
+                &spammer,
+                &req.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &req.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8],
+                ),
+                &|_, _| false,
+            )
+            .unwrap();
         }
 
         let one_more = channel_n(200, Visibility::Public);
-        c.create(&spammer, &spammer, &one_more, &|_, _| false).unwrap();
+        c.create(&spammer, &spammer, &one_more, &|_, _| false)
+            .unwrap();
         assert!(matches!(
-            c.invite(&spammer, &spammer, &one_more.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &one_more.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false),
+            c.invite(
+                &spammer,
+                &spammer,
+                &one_more.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &one_more.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8]
+                ),
+                &|_, _| false
+            ),
             Err(ChannelError::InviteQuota)
         ));
         // Refused distinguishably, and not silently: 507, not a malformed
@@ -3577,14 +5037,45 @@ mod tests {
             id[31] = (n >> 8) as u8;
             let req = channel_at(ALICE, id, Visibility::Public);
             c.create(&spammer, &spammer, &req, &|_, _| false).unwrap();
-            c.invite(&spammer, &spammer, &req.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-                .unwrap();
+            c.invite(
+                &spammer,
+                &spammer,
+                &req.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &req.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8],
+                ),
+                &|_, _| false,
+            )
+            .unwrap();
         }
         let next = channel_n(200, Visibility::Public);
         c.create(&spammer, &spammer, &next, &|_, _| false).unwrap();
-        assert!(c
-            .invite(&spammer, &spammer, &next.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &next.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .is_err());
+        assert!(
+            c.invite(
+                &spammer,
+                &spammer,
+                &next.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &next.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8]
+                ),
+                &|_, _| false
+            )
+            .is_err()
+        );
 
         // Post in one of them.
         let mut spoken = [0u8; 32];
@@ -3595,20 +5086,73 @@ mod tests {
             &post_as(&c, VICTIM, &spoken, 0, 0, b"hello".to_vec()),
         )
         .unwrap();
-        c.invite(&spammer, &spammer, &next.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &next.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .expect("speaking in one frees the budget");
+        c.invite(
+            &spammer,
+            &spammer,
+            &next.channel,
+            &victim,
+            Role::Member,
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &next.channel),
+                EVENT_ADDED,
+                &victim,
+                &[Role::Member as u8],
+            ),
+            &|_, _| false,
+        )
+        .expect("speaking in one frees the budget");
 
         // And leaving frees it too.
         let another = channel_n(202, Visibility::Public);
-        c.create(&spammer, &spammer, &another, &|_, _| false).unwrap();
-        assert!(c
-            .invite(&spammer, &spammer, &another.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &another.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .is_err());
+        c.create(&spammer, &spammer, &another, &|_, _| false)
+            .unwrap();
+        assert!(
+            c.invite(
+                &spammer,
+                &spammer,
+                &another.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &another.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8]
+                ),
+                &|_, _| false
+            )
+            .is_err()
+        );
         let mut quiet = [1u8; 32];
         quiet[31] = 0;
-        c.leave(&victim, &victim, &quiet, &action_as(&c, VICTIM, &place_of(&c, &quiet), EVENT_LEFT, &victim, &[])).unwrap();
-        c.invite(&spammer, &spammer, &another.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &another.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .expect("leaving frees the budget");
+        c.leave(
+            &victim,
+            &victim,
+            &quiet,
+            &action_as(&c, VICTIM, &place_of(&c, &quiet), EVENT_LEFT, &victim, &[]),
+        )
+        .unwrap();
+        c.invite(
+            &spammer,
+            &spammer,
+            &another.channel,
+            &victim,
+            Role::Member,
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &another.channel),
+                EVENT_ADDED,
+                &victim,
+                &[Role::Member as u8],
+            ),
+            &|_, _| false,
+        )
+        .expect("leaving frees the budget");
     }
 
     #[test]
@@ -3618,8 +5162,23 @@ mod tests {
         let member = key(2);
         let home = channel_n(9, Visibility::Private);
         c.create(&admin, &admin, &home, &|_, _| false).unwrap();
-        c.invite(&admin, &admin, &home.channel, &member, Role::Member, &action_as(&c, ALICE, &place_of(&c, &home.channel), EVENT_ADDED, &member, &[Role::Member as u8]), &|_, _| false)
-            .unwrap();
+        c.invite(
+            &admin,
+            &admin,
+            &home.channel,
+            &member,
+            Role::Member,
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &home.channel),
+                EVENT_ADDED,
+                &member,
+                &[Role::Member as u8],
+            ),
+            &|_, _| false,
+        )
+        .unwrap();
         // Fill the rest of the budget elsewhere.
         for n in 0..(MAX_UNSPOKEN - 1) {
             // Built against the final identifier: SIP-32's `created` action
@@ -3630,8 +5189,23 @@ mod tests {
             id[30] = 0xaa;
             let req = channel_at(ALICE, id, Visibility::Public);
             c.create(&admin, &admin, &req, &|_, _| false).unwrap();
-            c.invite(&admin, &admin, &req.channel, &member, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &member, &[Role::Member as u8]), &|_, _| false)
-                .unwrap();
+            c.invite(
+                &admin,
+                &admin,
+                &req.channel,
+                &member,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &req.channel),
+                    EVENT_ADDED,
+                    &member,
+                    &[Role::Member as u8],
+                ),
+                &|_, _| false,
+            )
+            .unwrap();
         }
         // Promoting them where they already are must not be refused.
         // Signed as a *promotion*, because that is the event the exchange will
@@ -3644,7 +5218,14 @@ mod tests {
             &home.channel,
             &member,
             Role::Admin,
-            &action_as(&c, ALICE, &place_of(&c, &home.channel), EVENT_PROMOTED, &member, &[Role::Admin as u8]),
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &home.channel),
+                EVENT_PROMOTED,
+                &member,
+                &[Role::Admin as u8],
+            ),
             &|_, _| false,
         )
         .expect("a promotion is not an invitation");

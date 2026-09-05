@@ -442,11 +442,23 @@ mod tests {
 
         assert_eq!(s.counterpart(&a, id), Some(b));
         assert_eq!(s.counterpart(&b, id), Some(a));
-        assert_eq!(s.counterpart(&eve, id), None, "a stranger cannot aim a packet");
-        assert_eq!(s.counterpart(&a, 999), None, "nor can anyone at a phantom session");
+        assert_eq!(
+            s.counterpart(&eve, id),
+            None,
+            "a stranger cannot aim a packet"
+        );
+        assert_eq!(
+            s.counterpart(&a, 999),
+            None,
+            "nor can anyone at a phantom session"
+        );
 
         s.close(&a, id);
-        assert_eq!(s.counterpart(&a, id), None, "a closed session forwards nothing");
+        assert_eq!(
+            s.counterpart(&a, id),
+            None,
+            "a closed session forwards nothing"
+        );
     }
 
     #[test]

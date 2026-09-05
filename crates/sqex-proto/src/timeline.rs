@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 
 use sqnr_core::PubKey;
 
-use crate::channel::KIND_SYSTEM;
 use crate::blob::Attachment;
+use crate::channel::KIND_SYSTEM;
 use crate::message::{Body, EDIT_WINDOW, Post};
 
 /// What SIP-31 verification concluded about an entry.
@@ -65,6 +65,49 @@ pub enum Verdict {
     /// asserts and evidence somebody can check are different things and this is
     /// the only place a reader would find out which they hold.
     Unattributed,
+}
+
+/// What SIP-34 verification concluded about the exchange's claim on an entry.
+///
+/// **Deliberately separate from [`Verdict`], and both must be checked.** They
+/// answer different questions — who wrote this, and where the exchange says it
+/// put it. SIP-34 warns that a verifier which checks a receipt and skips
+/// SIP-31's steps has confirmed that an exchange carried something and learned
+/// nothing about who wrote it, and that the reverse omission is the more likely
+/// one.
+///
+/// The distinction that carries the most weight is between the first two.
+/// *Unclaimed* is an exchange that said nothing; *repudiated* is one that said
+/// something untrue. An implementation that collapses them — a single nullable
+/// field whose `None` means both — has built a mechanism the exchange can
+/// switch off by corrupting its own signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Standing {
+    /// No receipt. The exchange was not asked, or does not implement SIP-34.
+    /// It makes no claim, and this says nothing about the entry.
+    #[default]
+    Unclaimed,
+    /// A receipt that verifies under the key this client pinned, over a head
+    /// that follows the one held for the entry before it.
+    Vouched,
+    /// A receipt that verifies, with no predecessor held to link it to.
+    ///
+    /// Ordinary: pruning, retention, `expires_after` and joining a channel with
+    /// history all produce one. A reader SHOULD show that continuity across the
+    /// gap is unverified and MUST NOT present it as misconduct.
+    Unlinked,
+    /// A receipt that verifies and whose head does **not** follow the one held
+    /// for the entry before it.
+    ///
+    /// This cannot happen without the exchange having advanced its head over an
+    /// entry this reader was not shown. It is evidence, and unlike a gap it is
+    /// surfaced.
+    Diverged,
+    /// A receipt that is present and does not verify under the pinned key.
+    ///
+    /// Not absence. The exchange signed something it cannot stand behind, and a
+    /// client surfaces it exactly as it surfaces a forged entry.
+    Repudiated,
 }
 
 /// What a reader can say about a tombstone (SIP-32).
@@ -115,6 +158,9 @@ pub struct Received {
     /// wrote itself, which carries an actor's signature inside its body rather
     /// than one of its own.
     pub verdict: Verdict,
+    /// What SIP-34 verification concluded, which is a different question — see
+    /// [`Standing`].
+    pub standing: Standing,
 }
 
 /// A message as it should be shown.
@@ -164,11 +210,66 @@ pub struct Timeline {
     pub avatar: Option<Attachment>,
     /// Which entry set the metadata currently held, so a later one wins.
     metadata_seq: u64,
+    /// SIP-36 calls, by the `seq` of the invitation.
+    calls: BTreeMap<u64, CallRecord>,
+}
+
+/// A SIP-36 call, folded from the log.
+///
+/// Built only from entries — never from a `CallState` signal, which SIP-36
+/// forbids deriving anything durable from. A signal drives a ringing screen and
+/// nothing else; this is what happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRecord {
+    /// The `seq` of the invitation.
+    pub seq: u64,
+    /// Who called.
+    pub account: PubKey,
+    pub posted: u64,
+    pub media: u8,
+    pub ring_secs: u16,
+    /// A SIP-13 room secret. Held because joining needs it, and because a
+    /// reader that discarded it could not rejoin a call still in progress.
+    pub secret: [u8; 32],
+    /// The first `CallEnd` by sequence number, where one arrived: its outcome
+    /// and duration, and who posted it.
+    pub ended: Option<(u8, u32, PubKey)>,
+}
+
+impl CallRecord {
+    /// What to show for this call, given the time now.
+    ///
+    /// **A call with no `CallEnd` whose ring window has passed is missed, and a
+    /// reader derives that rather than waiting for an entry.** The party that
+    /// would have posted one is the party whose client crashed, lost its
+    /// connection or was closed — the common case, and it needs no protocol. A
+    /// client that waited would show a call ringing forever.
+    ///
+    /// `None` means still ringing: no end, and the window has not passed.
+    pub fn outcome(&self, now: u64) -> Option<u8> {
+        match self.ended {
+            Some((outcome, _, _)) => Some(outcome),
+            None if now > self.posted.saturating_add(u64::from(self.ring_secs)) => {
+                Some(crate::message::CALL_MISSED)
+            }
+            None => None,
+        }
+    }
 }
 
 impl Timeline {
     pub fn new() -> Timeline {
         Timeline::default()
+    }
+
+    /// Calls in the order the exchange assigned.
+    pub fn calls(&self) -> impl Iterator<Item = &CallRecord> {
+        self.calls.values()
+    }
+
+    /// One call by the `seq` of its invitation.
+    pub fn call(&self, seq: u64) -> Option<&CallRecord> {
+        self.calls.get(&seq)
     }
 
     /// Messages in the order the exchange assigned, which is the order
@@ -345,7 +446,168 @@ impl Timeline {
                 self.avatar = avatar.clone();
                 self.metadata_seq = e.seq;
             }
+            Body::Call {
+                media,
+                ring_secs,
+                secret,
+            } => {
+                self.calls.insert(
+                    e.seq,
+                    CallRecord {
+                        seq: e.seq,
+                        account: e.account,
+                        posted: e.posted,
+                        media: *media,
+                        ring_secs: *ring_secs,
+                        secret: *secret,
+                        ended: None,
+                    },
+                );
+            }
+            Body::CallEnd {
+                target,
+                outcome,
+                duration,
+            } => {
+                let Some(call) = self.calls.get_mut(target) else {
+                    // A call we do not hold — pruned, or from before we joined.
+                    return;
+                };
+                // Two `CallEnd`s targeting one call are ordinary: two parties
+                // observed the same call ending. The first by sequence number
+                // is shown, and the rest are kept out rather than overwriting
+                // it, so a late one cannot rewrite an answered call as missed.
+                if call.ended.is_none() {
+                    call.ended = Some((*outcome, *duration, e.account));
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+    use crate::channel::KIND_MEMBER;
+    use crate::message::{CALL_ANSWERED, CALL_DECLINED, CALL_MISSED, MEDIA_AUDIO};
+
+    fn key(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    fn entry(seq: u64, who: u8, posted: u64, body: Body) -> Received {
+        Received {
+            seq,
+            account: key(who),
+            posted,
+            kind: KIND_MEMBER,
+            body: Some(body),
+            tombstone: false,
+            verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
+        }
+    }
+
+    fn invitation(seq: u64, who: u8, posted: u64, ring_secs: u16) -> Received {
+        entry(
+            seq,
+            who,
+            posted,
+            Body::Call {
+                media: MEDIA_AUDIO,
+                ring_secs,
+                secret: [9; 32],
+            },
+        )
+    }
+
+    /// **A call with no ending and a ring window in the past is missed, and a
+    /// reader derives it.** The party that would have posted a `CallEnd` is the
+    /// party whose client crashed, lost its connection or was closed — the
+    /// common case, needing no protocol. Waiting for an entry shows a call
+    /// ringing forever.
+    #[test]
+    fn an_unanswered_call_becomes_missed_without_anybody_saying_so() {
+        let mut t = Timeline::new();
+        t.apply(&invitation(1, 1, 1_000, 30), &[]);
+        let call = t.call(1).unwrap();
+
+        // Inside the window it is still ringing, and saying anything else would
+        // be wrong in the other direction.
+        assert_eq!(call.outcome(1_000), None);
+        assert_eq!(call.outcome(1_030), None);
+        // Past it, missed — with no second entry involved.
+        assert_eq!(call.outcome(1_031), Some(CALL_MISSED));
+    }
+
+    #[test]
+    fn an_answered_call_keeps_its_outcome_however_long_ago_it_was() {
+        let mut t = Timeline::new();
+        t.apply(&invitation(1, 1, 1_000, 30), &[]);
+        t.apply(
+            &entry(
+                2,
+                1,
+                1_005,
+                Body::CallEnd {
+                    target: 1,
+                    outcome: CALL_ANSWERED,
+                    duration: 42,
+                },
+            ),
+            &[],
+        );
+        let call = t.call(1).unwrap();
+        assert_eq!(call.outcome(9_999_999), Some(CALL_ANSWERED));
+        assert_eq!(call.ended.unwrap().1, 42);
+    }
+
+    /// Two `CallEnd`s targeting one call are ordinary — two parties observed
+    /// the same call ending — and the first by sequence number is shown.
+    ///
+    /// The rule matters in one direction in particular: a late `declined` must
+    /// not rewrite a call that was answered.
+    #[test]
+    fn the_first_ending_by_sequence_wins_and_a_later_one_cannot_rewrite_it() {
+        let mut t = Timeline::new();
+        t.apply(&invitation(1, 1, 1_000, 30), &[]);
+        for (seq, outcome) in [(2, CALL_ANSWERED), (3, CALL_DECLINED)] {
+            t.apply(
+                &entry(
+                    seq,
+                    2,
+                    1_010,
+                    Body::CallEnd {
+                        target: 1,
+                        outcome,
+                        duration: 0,
+                    },
+                ),
+                &[],
+            );
+        }
+        assert_eq!(t.call(1).unwrap().outcome(2_000), Some(CALL_ANSWERED));
+    }
+
+    /// An ending naming a call this reader does not hold — pruned, or from
+    /// before it joined — changes nothing and is not an error.
+    #[test]
+    fn an_ending_for_a_call_we_never_saw_is_ignored() {
+        let mut t = Timeline::new();
+        t.apply(
+            &entry(
+                7,
+                1,
+                1_000,
+                Body::CallEnd {
+                    target: 4,
+                    outcome: CALL_ANSWERED,
+                    duration: 1,
+                },
+            ),
+            &[],
+        );
+        assert!(t.calls().next().is_none());
     }
 }
 
@@ -367,6 +629,7 @@ mod tests {
             tombstone: true,
             body: None,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -379,6 +642,7 @@ mod tests {
             tombstone: false,
             body: Some(Body::Post(Post::text(text))),
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -391,6 +655,7 @@ mod tests {
             tombstone: false,
             body: Some(b),
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -494,7 +759,10 @@ mod tests {
                 post: Post::text("third thoughts"),
             },
         );
-        let t = Timeline::fold(&[post(1, 1, 100, "first"), first.clone(), second.clone()], &[]);
+        let t = Timeline::fold(
+            &[post(1, 1, 100, "first"), first.clone(), second.clone()],
+            &[],
+        );
         assert_eq!(t.get(1).unwrap().post.body_text(), Some("third thoughts"));
 
         // And folding them the other way round reaches the same state, which
@@ -513,9 +781,19 @@ mod tests {
         };
         assert!(Timeline::fold(&entries(1), &[]).get(1).unwrap().redacted);
         // An admin, which is the moderation path.
-        assert!(Timeline::fold(&entries(9), &[key(9)]).get(1).unwrap().redacted);
+        assert!(
+            Timeline::fold(&entries(9), &[key(9)])
+                .get(1)
+                .unwrap()
+                .redacted
+        );
         // Anybody else.
-        assert!(!Timeline::fold(&entries(2), &[key(9)]).get(1).unwrap().redacted);
+        assert!(
+            !Timeline::fold(&entries(2), &[key(9)])
+                .get(1)
+                .unwrap()
+                .redacted
+        );
     }
 
     #[test]
@@ -647,6 +925,7 @@ mod tests {
                     tombstone: false,
                     body: None,
                     verdict: Verdict::Valid,
+                    standing: Standing::Unclaimed,
                 },
             ],
             &[],
@@ -671,6 +950,7 @@ mod tests {
                     tombstone: false,
                     body: None,
                     verdict: Verdict::Valid,
+                    standing: Standing::Unclaimed,
                 },
             ],
             &[],
@@ -738,6 +1018,7 @@ mod deletion_tests {
             body: Some(Body::Post(SipPost::text(text))),
             tombstone: false,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -750,6 +1031,7 @@ mod deletion_tests {
             body: None,
             tombstone: true,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 
@@ -762,6 +1044,7 @@ mod deletion_tests {
             body: Some(Body::Redact { target }),
             tombstone: false,
             verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
         }
     }
 

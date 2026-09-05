@@ -164,10 +164,7 @@ mod tests {
     #[test]
     fn an_explicit_address_does_not_fall_through_to_a_configured_domain() {
         let layers = [direct("127.0.0.1:5400", K), domain("squic.org")];
-        assert!(matches!(
-            resolve(&layers).unwrap(),
-            Target::Direct { .. }
-        ));
+        assert!(matches!(resolve(&layers).unwrap(), Target::Direct { .. }));
     }
 
     #[test]
@@ -201,7 +198,10 @@ mod tests {
         };
         let e = resolve(&[layer]).unwrap_err().to_string();
         assert!(e.contains("--server-key"), "{e}");
-        assert!(e.contains("--server squic.org"), "should point at discovery: {e}");
+        assert!(
+            e.contains("--server squic.org"),
+            "should point at discovery: {e}"
+        );
     }
 
     #[test]

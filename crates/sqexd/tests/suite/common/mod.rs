@@ -101,6 +101,7 @@ impl Signer {
             chain_seq: info.my_chain_seq,
             prev: info.my_chain_head,
             sig: sign_entry(&self.seed, &terms),
+            receipts: false,
             body,
         }
     }
@@ -231,8 +232,15 @@ impl Signer {
         max_entries: u32,
         name: &str,
     ) -> Create {
-        let mut req =
-            self.create_chained(&mut Chain::default(), channel, instance, visibility, retention_secs, name, vec![]);
+        let mut req = self.create_chained(
+            &mut Chain::default(),
+            channel,
+            instance,
+            visibility,
+            retention_secs,
+            name,
+            vec![],
+        );
         req.max_entries = max_entries;
         let public = visibility == Visibility::Public;
         let founding = sqex_proto::channel::constitution(
@@ -329,7 +337,10 @@ pub struct Chain {
 
 impl Default for Chain {
     fn default() -> Chain {
-        Chain { seq: 0, head: GENESIS }
+        Chain {
+            seq: 0,
+            head: GENESIS,
+        }
     }
 }
 
@@ -345,7 +356,11 @@ impl Signer {
         body: Vec<u8>,
     ) -> Post {
         let terms = EntryTerms {
-            place: Place { exchange: self.exchange, instance, channel },
+            place: Place {
+                exchange: self.exchange,
+                instance,
+                channel,
+            },
             account: self.account,
             device: self.device,
             epoch,
@@ -365,6 +380,7 @@ impl Signer {
             chain_seq: chain.seq,
             prev: chain.head,
             sig,
+            receipts: false,
             body,
         };
         chain.seq += 1;
@@ -387,7 +403,10 @@ impl Signer {
         msg_seq: u64,
         body: Vec<u8>,
     ) -> Post {
-        let mut scratch = Chain { seq: chain.seq, head: chain.head };
+        let mut scratch = Chain {
+            seq: chain.seq,
+            head: chain.head,
+        };
         self.post_chained(&mut scratch, channel, instance, epoch, msg_seq, body)
     }
 
@@ -402,7 +421,11 @@ impl Signer {
         arg: &[u8],
     ) -> Action {
         let terms = ActionTerms {
-            place: Place { exchange: self.exchange, instance, channel },
+            place: Place {
+                exchange: self.exchange,
+                instance,
+                channel,
+            },
             actor: self.account,
             actor_device: self.device,
             event,

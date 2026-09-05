@@ -19,3 +19,12 @@ sha2 = "0.10"
 hmac = "0.12"
 bs58 = { workspace = true }
 rand_core = { workspace = true }
+hex = { workspace = true }
+# The small HTTP/3 client in `h3`, for callers that cannot use `sqnr::Client` —
+# a server that must not link libpcsclite, and a hole punch that must choose its
+# own local port. See that module for why it exists rather than being reused.
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }

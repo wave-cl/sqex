@@ -102,14 +102,22 @@ pub enum Event {
     /// which is exactly why they get said out loud.
     StillWaiting { me: PubKey },
     /// A session is up and carrying media.
-    SessionUp { id: u64, bitrate: i32, buffer_ms: u64 },
+    SessionUp {
+        id: u64,
+        bitrate: i32,
+        buffer_ms: u64,
+    },
     /// A session is up and being reflected back. An echo responder neither
     /// encodes nor buffers, so it has no bitrate or jitter depth to report --
     /// which is why this is its own event rather than a `SessionUp` full of
     /// zeroes claiming otherwise.
     Reflecting { id: u64 },
     /// In a room, with a session to each peer as they appear.
-    RoomJoined { me: PubKey, bitrate: i32, buffer_ms: u64 },
+    RoomJoined {
+        me: PubKey,
+        bitrate: i32,
+        buffer_ms: u64,
+    },
     /// Somebody joined, left, was rejected, or had their session rebuilt.
     Roster(RoomEvent),
     /// Who is in the room right now, and who is talking.
@@ -168,14 +176,22 @@ impl Event {
                  use an identity at a time; a second one keeps discarding the \
                  first one's session, and neither ever connects."
             ),
-            Event::SessionUp { id, bitrate, buffer_ms } => format!(
+            Event::SessionUp {
+                id,
+                bitrate,
+                buffer_ms,
+            } => format!(
                 "session {id} up on datagrams — {} kbit/s, {buffer_ms} ms of jitter buffer.",
                 bitrate / 1000
             ),
             Event::Reflecting { id } => {
                 format!("session {id} up on datagrams — reflecting.")
             }
-            Event::RoomJoined { me, bitrate, buffer_ms } => format!(
+            Event::RoomJoined {
+                me,
+                bitrate,
+                buffer_ms,
+            } => format!(
                 "you are {me}\nin the room — {} kbit/s to each peer, {buffer_ms} ms of \
                  jitter buffer.",
                 bitrate / 1000
@@ -274,17 +290,24 @@ pub async fn resolve(
     report: &mut dyn Report,
 ) -> Result<Endpoint, String> {
     match sqex_discovery::target::resolve(layers).map_err(|e| e.to_string())? {
-        sqex_discovery::Target::Direct { address, key } => {
-            Ok(Endpoint { address: resolve_addr(&address)?, server: key })
-        }
+        sqex_discovery::Target::Direct { address, key } => Ok(Endpoint {
+            address: resolve_addr(&address)?,
+            server: key,
+        }),
         sqex_discovery::Target::Discover(domain) => {
             let found = sqex_discovery::discover(&domain)
                 .await
                 .map_err(|e| e.to_string())?;
             if found.newly_pinned {
-                report.event(Event::Pinned { domain, key: found.key });
+                report.event(Event::Pinned {
+                    domain,
+                    key: found.key,
+                });
             }
-            Ok(Endpoint { address: resolve_addr(&found.address)?, server: found.key })
+            Ok(Endpoint {
+                address: resolve_addr(&found.address)?,
+                server: found.key,
+            })
         }
     }
 }
@@ -296,7 +319,9 @@ pub fn resolve_addr(address: &str) -> Result<SocketAddr, String> {
         return Ok(socket);
     }
     let has_port = !address.starts_with('[')
-        && address.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok());
+        && address
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| p.parse::<u16>().is_ok());
     let with_port = if has_port {
         address.to_string()
     } else {
@@ -361,7 +386,10 @@ pub async fn rendezvous(
     // use it: completing the agreement needs a static private key from each of
     // us, and it holds neither.
     let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-    let open = Open { peer, ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes() };
+    let open = Open {
+        peer,
+        ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
+    };
 
     report.event(Event::Waiting { peer });
     let started = Instant::now();

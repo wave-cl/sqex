@@ -252,8 +252,7 @@ pub struct Contact {
 /// one machine cannot read each other's conversations by opening the wrong
 /// file — and because the store key is per identity anyway.
 pub fn store_path(account: &PubKey) -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| StoreError::Storage("no home directory".into()))?;
+    let home = dirs::home_dir().ok_or_else(|| StoreError::Storage("no home directory".into()))?;
     let dir = home.join(".sqex").join("chat");
     std::fs::create_dir_all(&dir).map_err(storage("create ~/.sqex/chat"))?;
     #[cfg(unix)]
@@ -262,7 +261,10 @@ pub fn store_path(account: &PubKey) -> Result<std::path::PathBuf> {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .map_err(storage("lock down ~/.sqex/chat"))?;
     }
-    Ok(dir.join(format!("{}.db", bs58::encode(account.as_bytes()).into_string())))
+    Ok(dir.join(format!(
+        "{}.db",
+        bs58::encode(account.as_bytes()).into_string()
+    )))
 }
 
 impl Store {
@@ -318,7 +320,9 @@ impl Store {
 
     fn unseal_bytes(&self, sealed: &[u8]) -> Result<Vec<u8>> {
         if sealed.len() < 12 {
-            return Err(StoreError::Sealed("row is too short to hold a nonce".into()));
+            return Err(StoreError::Sealed(
+                "row is too short to hold a nonce".into(),
+            ));
         }
         self.cipher
             .decrypt(Nonce::from_slice(&sealed[0..12]), &sealed[12..])
@@ -370,9 +374,7 @@ impl Store {
         let rows = stmt
             .query_map([], |r| {
                 Ok(Contact {
-                    account: PubKey::new(
-                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
-                    ),
+                    account: PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
                     label: r.get(1)?,
                     added: r.get::<_, i64>(2)? as u64,
                 })
@@ -588,7 +590,12 @@ impl Store {
             .execute(
                 "INSERT OR IGNORE INTO seen (channel, device, epoch, msg_seq)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![&channel[..], device.as_bytes(), epoch as i64, msg_seq as i64],
+                params![
+                    &channel[..],
+                    device.as_bytes(),
+                    epoch as i64,
+                    msg_seq as i64
+                ],
             )
             .map_err(storage("record seen"))?;
         Ok(())
@@ -735,11 +742,9 @@ impl Store {
     pub fn account(&self) -> Result<Option<PubKey>> {
         let v: Option<Vec<u8>> = self
             .db
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'account'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT value FROM meta WHERE key = 'account'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(storage("read account"))?;
         Ok(v.and_then(|b| b.try_into().ok()).map(PubKey::new))
@@ -800,7 +805,9 @@ impl Store {
     pub fn channels(&self) -> Result<Vec<([u8; 32], bool, String, Vec<PubKey>)>> {
         let mut stmt = self
             .db
-            .prepare("SELECT channel, kind, label, admins FROM channel_meta ORDER BY label, channel")
+            .prepare(
+                "SELECT channel, kind, label, admins FROM channel_meta ORDER BY label, channel",
+            )
             .map_err(storage("prepare channels"))?;
         let rows = stmt
             .query_map([], |r| {
@@ -986,10 +993,7 @@ impl Store {
             .map_err(storage("read chain"))?;
         Ok(match row {
             None => (0, GENESIS),
-            Some((seq, head)) => (
-                seq as u64 + 1,
-                head.try_into().unwrap_or(GENESIS),
-            ),
+            Some((seq, head)) => (seq as u64 + 1, head.try_into().unwrap_or(GENESIS)),
         })
     }
 
@@ -1180,7 +1184,8 @@ mod tests {
             pool.mint_fallback();
             s.save_pool(&pool).unwrap();
             // WAL: force everything into the main file before reading it.
-            s.db.pragma_update(None, "wal_checkpoint", "TRUNCATE").unwrap();
+            s.db.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                .unwrap();
 
             let bytes = std::fs::read(&path).unwrap();
             assert!(
@@ -1234,7 +1239,10 @@ mod tests {
         let next: Vec<u32> = pool.mint_one_time(4).iter().map(|p| p.id).collect();
         // Including past the spent one: its row is kept precisely so the
         // counter cannot walk back over it.
-        assert!(next.iter().all(|id| !first.contains(id)), "{first:?} vs {next:?}");
+        assert!(
+            next.iter().all(|id| !first.contains(id)),
+            "{first:?} vs {next:?}"
+        );
         s.save_pool(&pool).unwrap();
     }
 
@@ -1283,7 +1291,6 @@ mod tests {
         assert_eq!(s.contacts().unwrap().len(), 1);
     }
 
-
     #[test]
     fn a_conversation_survives_a_reopen() {
         // The bug this exists for: the fetch cursor was persisted and the
@@ -1293,10 +1300,40 @@ mod tests {
         let path = dir.path().join("chat.db");
         {
             let s = Store::open(&seed(1), Some(&path)).unwrap();
-            s.put_message(&[7; 32], Kept { seq: 3, account: key(2), posted: 100, kind: 1, plain: Some(b"hello") }).unwrap();
-            s.put_message(&[7; 32], Kept { seq: 4, account: key(1), posted: 101, kind: 1, plain: Some(b"hi back") }).unwrap();
+            s.put_message(
+                &[7; 32],
+                Kept {
+                    seq: 3,
+                    account: key(2),
+                    posted: 100,
+                    kind: 1,
+                    plain: Some(b"hello"),
+                },
+            )
+            .unwrap();
+            s.put_message(
+                &[7; 32],
+                Kept {
+                    seq: 4,
+                    account: key(1),
+                    posted: 101,
+                    kind: 1,
+                    plain: Some(b"hi back"),
+                },
+            )
+            .unwrap();
             // One we could not open: recorded, so the reader can be told.
-            s.put_message(&[7; 32], Kept { seq: 5, account: key(2), posted: 102, kind: 1, plain: None }).unwrap();
+            s.put_message(
+                &[7; 32],
+                Kept {
+                    seq: 5,
+                    account: key(2),
+                    posted: 102,
+                    kind: 1,
+                    plain: None,
+                },
+            )
+            .unwrap();
         }
         let s = Store::open(&seed(1), Some(&path)).unwrap();
         let got = s.messages(&[7; 32]).unwrap();
@@ -1304,16 +1341,37 @@ mod tests {
         assert_eq!(got[0].0, 3);
         assert_eq!(got[0].4.as_deref(), Some(&b"hello"[..]));
         assert_eq!(got[1].4.as_deref(), Some(&b"hi back"[..]));
-        assert!(got[2].4.is_none(), "an unopenable entry should stay unopenable");
+        assert!(
+            got[2].4.is_none(),
+            "an unopenable entry should stay unopenable"
+        );
     }
-
-
 
     #[test]
     fn a_message_is_not_stored_twice() {
         let s = Store::open(&seed(1), None).unwrap();
-        s.put_message(&[7; 32], Kept { seq: 3, account: key(2), posted: 100, kind: 1, plain: Some(b"once") }).unwrap();
-        s.put_message(&[7; 32], Kept { seq: 3, account: key(2), posted: 100, kind: 1, plain: Some(b"twice") }).unwrap();
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 3,
+                account: key(2),
+                posted: 100,
+                kind: 1,
+                plain: Some(b"once"),
+            },
+        )
+        .unwrap();
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 3,
+                account: key(2),
+                posted: 100,
+                kind: 1,
+                plain: Some(b"twice"),
+            },
+        )
+        .unwrap();
         let got = s.messages(&[7; 32]).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].4.as_deref(), Some(&b"once"[..]));
@@ -1328,8 +1386,19 @@ mod tests {
         let secret = b"meet me at the usual place";
         {
             let s = Store::open(&seed(1), Some(&path)).unwrap();
-            s.put_message(&[7; 32], Kept { seq: 1, account: key(2), posted: 100, kind: 1, plain: Some(secret) }).unwrap();
-            s.db.pragma_update(None, "wal_checkpoint", "TRUNCATE").unwrap();
+            s.put_message(
+                &[7; 32],
+                Kept {
+                    seq: 1,
+                    account: key(2),
+                    posted: 100,
+                    kind: 1,
+                    plain: Some(secret),
+                },
+            )
+            .unwrap();
+            s.db.pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                .unwrap();
         }
         let bytes = std::fs::read(&path).unwrap();
         assert!(
@@ -1392,8 +1461,10 @@ mod tests {
         let path = dir.path().join("chat.db");
         {
             let s = Store::open(&seed(1), Some(&path)).unwrap();
-            s.put_channel(&[7; 32], true, "the group", &[key(1), key(2)]).unwrap();
-            s.put_channel(&[8; 32], false, "bob", &[key(1), key(3)]).unwrap();
+            s.put_channel(&[7; 32], true, "the group", &[key(1), key(2)])
+                .unwrap();
+            s.put_channel(&[8; 32], false, "bob", &[key(1), key(3)])
+                .unwrap();
         }
         let s = Store::open(&seed(1), Some(&path)).unwrap();
         let got = s.channels().unwrap();

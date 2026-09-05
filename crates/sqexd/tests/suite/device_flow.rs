@@ -62,12 +62,7 @@ async fn connect(addr: SocketAddr, pubkey: [u8; 32], seed: [u8; 32]) -> Client {
 
 /// An account signs a credential for a device, and that device registers
 /// itself. The account never connects — it may be a key that cannot.
-async fn enrol(
-    c: &mut Client,
-    account_seed: &[u8; 32],
-    device: &PubKey,
-    lifetime: u64,
-) -> u16 {
+async fn enrol(c: &mut Client, account_seed: &[u8; 32], device: &PubKey, lifetime: u64) -> u16 {
     let n = now();
     let credential =
         Credential::issue(account_seed, device, SCOPE_CHAT, n - 1, n + lifetime).unwrap();
@@ -88,7 +83,14 @@ async fn devices_of(c: &mut Client, account: &PubKey) -> Devices {
 }
 
 fn public(signer: &Signer, channel: [u8; 32]) -> Create {
-    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, "shared", vec![])
+    signer.create(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "shared",
+        vec![],
+    )
 }
 
 /// Where a creator's chain stands after SIP-32's `created` event.
@@ -139,7 +141,10 @@ async fn one_person_two_devices_share_a_membership() {
     let desk = Signer::new(desktop_seed, desktop, pubkey).for_account(account);
     let hand = Signer::new(phone_seed, phone, pubkey).for_account(account);
 
-    let (code, body) = d.post("/channel/create", public(&desk, channel).encode()).await.unwrap();
+    let (code, body) = d
+        .post("/channel/create", public(&desk, channel).encode())
+        .await
+        .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
 
     // A chain each: the position is per device, so both start at zero and
@@ -147,27 +152,58 @@ async fn one_person_two_devices_share_a_membership() {
     // The desktop created the channel, so SIP-32's `created` already took its
     // position 0. The phone created nothing and starts at 0 — which is the
     // point: the chains are per device.
-    let mut desk_chain = Chain { seq: 1, head: created_head(&desk, channel) };
+    let mut desk_chain = Chain {
+        seq: 1,
+        head: created_head(&desk, channel),
+    };
     let mut hand_chain = Chain::default();
     let post = |signer: &Signer, chain: &mut Chain, body: &[u8], seq: u64| {
         signer
-            .post_chained(chain, channel, instance_for(channel, 0), 0, seq, body.to_vec())
+            .post_chained(
+                chain,
+                channel,
+                instance_for(channel, 0),
+                0,
+                seq,
+                body.to_vec(),
+            )
             .encode()
     };
     assert_eq!(
-        d.post("/channel/post", post(&desk, &mut desk_chain, b"from the desktop", 0)).await.unwrap().0,
+        d.post(
+            "/channel/post",
+            post(&desk, &mut desk_chain, b"from the desktop", 0)
+        )
+        .await
+        .unwrap()
+        .0,
         200
     );
     assert_eq!(
-        p.post("/channel/post", post(&hand, &mut hand_chain, b"from the phone", 0)).await.unwrap().0,
+        p.post(
+            "/channel/post",
+            post(&hand, &mut hand_chain, b"from the phone", 0)
+        )
+        .await
+        .unwrap()
+        .0,
         200
     );
 
     let (_, body) = p
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     // Three: SIP-32's `created`, then a message from each client.
     assert_eq!(seen.entries.len(), 3);
 
@@ -204,7 +240,14 @@ async fn a_revoked_device_cannot_re_register_with_the_credential_it_still_holds(
 
     // The phone is lost. The desktop, registered first, may revoke it.
     let (code, _) = d
-        .post("/device/revoke", Revoke { device: phone, revocation: None }.encode())
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: phone,
+                revocation: None,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -254,14 +297,28 @@ async fn a_junior_device_cannot_evict_its_senior() {
     assert_eq!(enrol(&mut a, &account_seed, &second, 3600).await, 200);
 
     let (code, _) = b
-        .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: first,
+                revocation: None,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 403, "the newer device may not evict the older");
 
     // It may always sign itself out.
     let (code, _) = b
-        .post("/device/revoke", Revoke { device: second, revocation: None }.encode())
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: second,
+                revocation: None,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -353,13 +410,22 @@ async fn an_account_with_no_registered_devices_is_its_own_device() {
 
     assert!(devices_of(&mut c, &alone).await.devices.is_empty());
     let solo = Signer::new(alone_seed, alone, pubkey);
-    assert_eq!(c.post("/channel/create", public(&solo, channel).encode()).await.unwrap().0, 200);
+    assert_eq!(
+        c.post("/channel/create", public(&solo, channel).encode())
+            .await
+            .unwrap()
+            .0,
+        200
+    );
     let (code, _) = c
         .post(
             "/channel/post",
             // Position 1: the create's `created` event took 0.
             solo.post_chained(
-                &mut Chain { seq: 1, head: created_head(&solo, channel) },
+                &mut Chain {
+                    seq: 1,
+                    head: created_head(&solo, channel),
+                },
                 channel,
                 instance_for(channel, 0),
                 0,
@@ -373,10 +439,19 @@ async fn an_account_with_no_registered_devices_is_its_own_device() {
     assert_eq!(code, 200);
 
     let (_, body) = c
-        .post("/channel/fetch", Fetch { channel, since: 0, wait_secs: 0 }.encode())
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
-    let seen = Entries::decode(&body).unwrap();
+    let seen = Entries::decode(&body, false).unwrap();
     // Entry 0 is SIP-32's `created`, which the exchange wrote and so carries
     // zeroes; the message is the member entry after it.
     let said = seen
@@ -480,7 +555,10 @@ async fn a_malformed_request_is_still_a_malformed_request() {
     let (device_seed, _) = keys(161);
     let mut c = connect(addr, pubkey, device_seed).await;
 
-    let (code, _) = c.post("/admission/request", vec![0x04, 0, 0]).await.unwrap();
+    let (code, _) = c
+        .post("/admission/request", vec![0x04, 0, 0])
+        .await
+        .unwrap();
     assert_eq!(code, 400);
 }
 
@@ -503,7 +581,14 @@ async fn the_account_may_revoke_a_device_it_never_registered_beside() {
     // The account has no device row of its own, and revokes anyway.
     let mut a = connect(addr, pubkey, account_seed).await;
     let (code, body) = a
-        .post("/device/revoke", Revoke { device: laptop, revocation: None }.encode())
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: laptop,
+                revocation: None,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
@@ -531,14 +616,28 @@ async fn the_account_is_exempt_from_seniority_and_nobody_else_is() {
     let mut s = connect(addr, pubkey, stranger_seed).await;
     assert_eq!(enrol(&mut s, &stranger_seed, &stranger, 3600).await, 200);
     let (code, _) = s
-        .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: first,
+                revocation: None,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 403, "a stranger revoked another account's device");
 
     // The account may, junior though it is.
     let (code, body) = a
-        .post("/device/revoke", Revoke { device: first, revocation: None }.encode())
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: first,
+                revocation: None,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
@@ -612,7 +711,8 @@ async fn an_attested_revocation_stands_on_the_account_alone() {
     };
     let (code, body) = d.post("/device/revoke", forged.encode()).await.unwrap();
     assert_ne!(
-        code, 200,
+        code,
+        200,
         "a stranger's signature withdrew somebody else's device: {}",
         common::said(&body)
     );
@@ -623,7 +723,11 @@ async fn an_attested_revocation_stands_on_the_account_alone() {
     let (code, body) = d
         .post(
             "/device/revoke",
-            Revoke { device: laptop, revocation: Some(attested) }.encode(),
+            Revoke {
+                device: laptop,
+                revocation: Some(attested),
+            }
+            .encode(),
         )
         .await
         .unwrap();

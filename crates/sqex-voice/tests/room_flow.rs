@@ -15,12 +15,12 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use sqex_proto::room::RoomId;
 use sqex_proto::session::{DatagramFrame, MAX_DATAGRAM_FRAME};
-use sqexd::config::FileConfig;
 use sqex_voice::audio::{Rate, amplitude_at, tone_at};
 use sqex_voice::jitter::{FRAME_SAMPLES, SAMPLE_RATE};
 use sqex_voice::media;
 use sqex_voice::mix::Mixer;
 use sqex_voice::room::{Event, Membership};
+use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
@@ -28,9 +28,7 @@ use sqnr_core::PubKey;
 const NOTES: [f32; 3] = [440.0, 660.0, 887.0];
 const FRAMES: usize = 50;
 
-async fn bare_server(
-    dir: &std::path::Path,
-) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn bare_server(dir: &std::path::Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
@@ -100,7 +98,10 @@ async fn mesh(members: &mut [Member]) -> Vec<Event> {
     }
     panic!(
         "mesh never completed: {:?}",
-        members.iter().map(|m| m.room.peers.len()).collect::<Vec<_>>()
+        members
+            .iter()
+            .map(|m| m.room.peers.len())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -110,8 +111,9 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
     let mut encoders: Vec<opus::Encoder> = members
         .iter()
         .map(|_| {
-            let mut e = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
-                .unwrap();
+            let mut e =
+                opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Voip)
+                    .unwrap();
             e.set_bitrate(opus::Bitrate::Bits(24_000)).unwrap();
             e
         })
@@ -121,7 +123,9 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
     for f in 0..FRAMES {
         for (i, m) in members.iter_mut().enumerate() {
             let frame = tone_at(m.note, FRAMES)[f].clone();
-            let packet = encoders[i].encode_vec_float(&frame, MAX_DATAGRAM_FRAME).unwrap();
+            let packet = encoders[i]
+                .encode_vec_float(&frame, MAX_DATAGRAM_FRAME)
+                .unwrap();
             assert!(packet.len() <= MAX_DATAGRAM_FRAME);
             let seq = m.seq;
             for peer in m.room.peers.values() {
@@ -161,7 +165,9 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
                 .session
                 .open(frame.seq, &frame.ciphertext)
                 .expect("a room peer's frames open");
-            let m = media::Frame::decode(&plaintext).expect("a media frame").expect("a known type");
+            let m = media::Frame::decode(&plaintext)
+                .expect("a media frame")
+                .expect("a known type");
             peer.jitter.push(frame.seq, m.timestamp, m.body);
             got += 1;
         }
@@ -194,7 +200,14 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
     heard
 }
 
-async fn room_of(n: u8) -> (Vec<Member>, RoomId, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+async fn room_of(
+    n: u8,
+) -> (
+    Vec<Member>,
+    RoomId,
+    tempfile::TempDir,
+    tokio::task::JoinHandle<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, handle) = bare_server(dir.path()).await;
     let room = RoomId::generate();
@@ -211,7 +224,10 @@ async fn three_people_in_a_room_each_hear_the_other_two() {
     let events = mesh(&mut members).await;
 
     assert_eq!(
-        events.iter().filter(|e| matches!(e, Event::Joined(_))).count(),
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Joined(_)))
+            .count(),
         6,
         "three people is six one-way arrivals"
     );
@@ -274,7 +290,10 @@ async fn each_pair_in_a_room_has_its_own_key() {
     // The other session in the same room, held by the same person, cannot open
     // it: three people in a room share a room, not a key.
     assert!(
-        a.room.peers[&sessions[1]].session.open(0, &to_first).is_err(),
+        a.room.peers[&sessions[1]]
+            .session
+            .open(0, &to_first)
+            .is_err(),
         "one member's two sessions must not share a key"
     );
 }

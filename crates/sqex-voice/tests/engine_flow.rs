@@ -35,7 +35,9 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
     let config = file.resolve().unwrap();
     let (signing_key, _pub) =
         squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
-    let bound = sqexd::bind(config, Some(config_path), signing_key).await.unwrap();
+    let bound = sqexd::bind(config, Some(config_path), signing_key)
+        .await
+        .unwrap();
     let addr = bound.local_addr;
     let server_pub = bound.public_key.to_bytes();
     let handle = tokio::spawn(async move {
@@ -90,7 +92,10 @@ fn tone_call(sink: &Path, seconds: u64) -> CallOpts {
 async fn a_call_driven_through_the_engine_carries_audio_both_ways() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
-    let endpoint = Endpoint { address: addr, server: PubKey::new(server_pub) };
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
 
     let (a_signer, a_id) = signer(1);
     let (b_signer, b_id) = signer(2);
@@ -139,7 +144,9 @@ async fn a_call_driven_through_the_engine_carries_audio_both_ways() {
     // caller could reach -- which is the other half of the lift.
     let events = a_events.events();
     assert!(
-        events.iter().any(|e| matches!(e, Event::Identity(id) if *id == a_id)),
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Identity(id) if *id == a_id)),
         "the engine says who you are: {events:?}"
     );
     assert!(
@@ -155,8 +162,10 @@ async fn a_call_driven_through_the_engine_carries_audio_both_ways() {
     // always printed it even under `--quiet`, and routing it through the
     // periodic `Stats` would have dropped it for anyone who asked for a quiet
     // call. That is a regression a move like this loses in silence.
-    let finals: Vec<&Event> =
-        events.iter().filter(|e| matches!(e, Event::FinalStats(_))).collect();
+    let finals: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::FinalStats(_)))
+        .collect();
     assert_eq!(
         finals.len(),
         1,
@@ -175,7 +184,10 @@ async fn a_call_driven_through_the_engine_carries_audio_both_ways() {
 async fn quiet_still_hears_the_closing_summary() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
-    let endpoint = Endpoint { address: addr, server: PubKey::new(server_pub) };
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
 
     let (a_signer, a_id) = signer(1);
     let (b_signer, b_id) = signer(2);
@@ -217,7 +229,10 @@ async fn quiet_still_hears_the_closing_summary() {
 async fn waiting_alone_times_out_and_names_the_causes() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
-    let endpoint = Endpoint { address: addr, server: PubKey::new(server_pub) };
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
 
     let (a_signer, _) = signer(1);
     let (_, b_id) = signer(2);
@@ -240,7 +255,8 @@ async fn waiting_alone_times_out_and_names_the_causes() {
 
     let got = events.events();
     assert!(
-        got.iter().any(|e| matches!(e, Event::Waiting { peer } if *peer == b_id)),
+        got.iter()
+            .any(|e| matches!(e, Event::Waiting { peer } if *peer == b_id)),
         "it says who it is waiting for: {got:?}"
     );
 }
@@ -252,7 +268,10 @@ async fn waiting_alone_times_out_and_names_the_causes() {
 async fn calling_yourself_is_refused_locally() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
-    let endpoint = Endpoint { address: addr, server: PubKey::new(server_pub) };
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
     let (a_signer, a_id) = signer(1);
 
     let err = match engine::dial(endpoint, &a_signer, a_id, &mut Silent).await {

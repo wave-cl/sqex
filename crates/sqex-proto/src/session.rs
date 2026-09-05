@@ -236,7 +236,10 @@ impl Open {
 
     pub fn decode(b: &[u8]) -> Result<Open> {
         if b.len() != 65 {
-            return Err(Error::Malformed(format!("open is {} bytes, want 65", b.len())));
+            return Err(Error::Malformed(format!(
+                "open is {} bytes, want 65",
+                b.len()
+            )));
         }
         if b[0] != TYPE_OPEN {
             return Err(Error::Malformed(format!("not an open (type {:#x})", b[0])));
@@ -289,7 +292,10 @@ impl OpenAck {
 
     pub fn decode(b: &[u8]) -> Result<OpenAck> {
         if b.len() != 49 {
-            return Err(Error::Malformed(format!("ack is {} bytes, want 49", b.len())));
+            return Err(Error::Malformed(format!(
+                "ack is {} bytes, want 49",
+                b.len()
+            )));
         }
         let state = match b[0] {
             0 => OpenState::Waiting,
@@ -326,7 +332,10 @@ impl SendFrame {
 
     pub fn decode(b: &[u8]) -> Result<SendFrame> {
         if b.len() < 17 {
-            return Err(Error::Malformed(format!("frame is {} bytes, want >= 17", b.len())));
+            return Err(Error::Malformed(format!(
+                "frame is {} bytes, want >= 17",
+                b.len()
+            )));
         }
         if b[0] != TYPE_SEND {
             return Err(Error::Malformed(format!("not a send (type {:#x})", b[0])));
@@ -378,7 +387,10 @@ impl BySession {
 
     pub fn decode(b: &[u8], expect: u8) -> Result<BySession> {
         if b.len() != 9 {
-            return Err(Error::Malformed(format!("request is {} bytes, want 9", b.len())));
+            return Err(Error::Malformed(format!(
+                "request is {} bytes, want 9",
+                b.len()
+            )));
         }
         if b[0] != expect {
             return Err(Error::Malformed(format!("unexpected type {:#x}", b[0])));
@@ -645,7 +657,9 @@ mod tests {
         };
         assert_eq!(OpenAck::decode(&a.encode()).unwrap(), a);
         assert_eq!(
-            OpenAck::decode(&OpenAck::waiting(5).encode()).unwrap().state,
+            OpenAck::decode(&OpenAck::waiting(5).encode())
+                .unwrap()
+                .state,
             OpenState::Waiting
         );
         let mut bad = a.encode();
@@ -714,7 +728,10 @@ mod tests {
     fn datagram_frames_are_bounded_to_the_path() {
         let (a, _b) = agree();
         assert!(a.seal_datagram(0, &vec![0u8; MAX_DATAGRAM_FRAME]).is_ok());
-        assert!(a.seal_datagram(0, &vec![0u8; MAX_DATAGRAM_FRAME + 1]).is_err());
+        assert!(
+            a.seal_datagram(0, &vec![0u8; MAX_DATAGRAM_FRAME + 1])
+                .is_err()
+        );
         let mut oversized = DatagramFrame {
             session_id: 1,
             seq: 0,

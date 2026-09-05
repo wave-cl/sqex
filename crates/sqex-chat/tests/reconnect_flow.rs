@@ -110,7 +110,10 @@ async fn the_client_comes_back_after_the_exchange_goes_away() {
     chat.dials(addr, server_pub);
 
     chat.top_up_prekeys().await.unwrap();
-    assert!(chat.mine().await.is_ok(), "the exchange should be answering");
+    assert!(
+        chat.mine().await.is_ok(),
+        "the exchange should be answering"
+    );
     assert_eq!(chat.link(), Link::Up);
 
     // The network goes away.

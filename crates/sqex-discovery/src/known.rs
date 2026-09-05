@@ -154,11 +154,17 @@ impl Known {
             };
             let mut parts = body.split_whitespace();
             let (Some(domain), Some(key)) = (parts.next(), parts.next()) else {
-                tracing::warn!(line = n + 1, "known_servers: skipping a line with too few fields");
+                tracing::warn!(
+                    line = n + 1,
+                    "known_servers: skipping a line with too few fields"
+                );
                 continue;
             };
             let Ok(key) = key.parse::<PubKey>() else {
-                tracing::warn!(line = n + 1, "known_servers: skipping a line whose key is not base58");
+                tracing::warn!(
+                    line = n + 1,
+                    "known_servers: skipping a line whose key is not base58"
+                );
                 continue;
             };
             // Everything after the key is cache: a host, then addresses. They
@@ -204,7 +210,8 @@ impl Known {
 
     /// Record a key for a domain, replacing any entry already there.
     pub fn add(&mut self, domain: &str, key: PubKey, comment: &str) {
-        self.entries.retain(|e| !e.domain.eq_ignore_ascii_case(domain));
+        self.entries
+            .retain(|e| !e.domain.eq_ignore_ascii_case(domain));
         self.entries.push(Entry {
             domain: domain.to_string(),
             key,
@@ -239,7 +246,8 @@ impl Known {
     /// Forget a domain. `true` if there was one.
     pub fn remove(&mut self, domain: &str) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|e| !e.domain.eq_ignore_ascii_case(domain));
+        self.entries
+            .retain(|e| !e.domain.eq_ignore_ascii_case(domain));
         self.entries.len() != before
     }
 
@@ -316,7 +324,10 @@ mod tests {
 
     #[test]
     fn a_matching_pin_is_used() {
-        assert_eq!(decide(&[key(1)], Some(key(1))), Some(Decision::Pinned(key(1))));
+        assert_eq!(
+            decide(&[key(1)], Some(key(1))),
+            Some(Decision::Pinned(key(1)))
+        );
     }
 
     /// A rotation in progress: both keys published, the pinned one still there.
@@ -338,7 +349,10 @@ mod tests {
     #[test]
     fn having_been_seen_beside_the_new_key_does_not_earn_it_the_pin() {
         // Overlap: both published, pin holds.
-        assert_eq!(decide(&[key(1), key(2)], Some(key(1))), Some(Decision::Pinned(key(1))));
+        assert_eq!(
+            decide(&[key(1), key(2)], Some(key(1))),
+            Some(Decision::Pinned(key(1)))
+        );
         // Old withdrawn: refused, despite key(2) having been published beside it.
         assert!(matches!(
             decide(&[key(2)], Some(key(1))),
@@ -366,7 +380,11 @@ mod tests {
         let back = Known::load(&p).unwrap();
         assert_eq!(back.lookup("example.com"), Some(key(7)));
         assert_eq!(back.lookup("other.example"), Some(key(8)));
-        assert_eq!(back.lookup("EXAMPLE.COM"), Some(key(7)), "domains are caseless");
+        assert_eq!(
+            back.lookup("EXAMPLE.COM"),
+            Some(key(7)),
+            "domains are caseless"
+        );
         assert_eq!(back.lookup("nobody.example"), None);
     }
 
@@ -420,7 +438,11 @@ mod tests {
         let p = dir.path().join("known_servers");
         let mut k = Known::default();
         k.add("squic.org", key(1), "discovered 2026-08-31");
-        k.remember("squic.org", Some("ex.squic.org"), addr("95.216.183.51:5400"));
+        k.remember(
+            "squic.org",
+            Some("ex.squic.org"),
+            addr("95.216.183.51:5400"),
+        );
         k.remember("squic.org", None, addr("[2a01:4f9:c01f:e09d::]:5400"));
         k.save(&p).unwrap();
 
@@ -430,7 +452,10 @@ mod tests {
         assert_eq!(e.host.as_deref(), Some("ex.squic.org"));
         assert_eq!(
             e.addrs,
-            vec![addr("[2a01:4f9:c01f:e09d::]:5400"), addr("95.216.183.51:5400")],
+            vec![
+                addr("[2a01:4f9:c01f:e09d::]:5400"),
+                addr("95.216.183.51:5400")
+            ],
             "the one that answered most recently comes first"
         );
         assert_eq!(e.comment, "discovered 2026-08-31");
@@ -467,7 +492,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("known_servers");
         fs::write(&p, format!("example.com  {}  # old\n", key(3))).unwrap();
-        let e = Known::load(&p).unwrap().get("example.com").cloned().unwrap();
+        let e = Known::load(&p)
+            .unwrap()
+            .get("example.com")
+            .cloned()
+            .unwrap();
         assert_eq!(e.key, key(3));
         assert_eq!(e.host, None);
         assert!(e.addrs.is_empty());
@@ -478,7 +507,11 @@ mod tests {
     fn remembering_does_not_change_the_key() {
         let mut k = Known::default();
         k.add("example.com", key(1), "");
-        k.remember("example.com", Some("elsewhere.example"), addr("10.0.0.9:5400"));
+        k.remember(
+            "example.com",
+            Some("elsewhere.example"),
+            addr("10.0.0.9:5400"),
+        );
         assert_eq!(k.lookup("example.com"), Some(key(1)));
     }
 
@@ -494,8 +527,14 @@ mod tests {
     #[test]
     fn the_refusal_names_both_keys_and_the_file() {
         let m = changed_message("example.com", &key(1), &[key(2)]);
-        assert!(m.contains(&key(1).to_string()), "the pinned key is not named");
-        assert!(m.contains(&key(2).to_string()), "the offered key is not named");
+        assert!(
+            m.contains(&key(1).to_string()),
+            "the pinned key is not named"
+        );
+        assert!(
+            m.contains(&key(2).to_string()),
+            "the offered key is not named"
+        );
         assert!(m.contains("known_servers"), "nothing says where to fix it");
     }
 }

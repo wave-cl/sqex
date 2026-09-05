@@ -28,6 +28,9 @@ enum By {
     Voice(&'static str),
     /// The sqnr admin CLI, over the signed-command protocol.
     Sqnr(&'static str),
+    /// Another exchange, over SIP-35 replication. Not a person's client at all,
+    /// which is why it is its own kind rather than filed under one.
+    Peer(&'static str),
     /// Liveness, answered to anything that connects. No client owns it.
     Probe,
     /// Served and reachable from nothing. Every one of these is a decision
@@ -50,6 +53,20 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/admin/command", Sqnr("signed transactions")),
     ("POST", "/beacon/beat", Cli("sqex beacon")),
     ("POST", "/beacon/read", Cli("sqex beacon read")),
+    // SIP-25 rendezvous. Coordination only: nothing punches yet, and the
+    // command says so rather than implying a connection was made.
+    ("POST", "/rendezvous/introduce", Cli("sqex meet")),
+    // SIP-27 attestation.
+    (
+        "POST",
+        "/attest/lodge",
+        Cli("sqex attest say, sqex attest withdraw"),
+    ),
+    ("POST", "/attest/read", Cli("sqex attest read")),
+    // SIP-28 resolution.
+    ("POST", "/resolve/publish", Cli("sqex resolve publish")),
+    ("POST", "/resolve/get", Cli("sqex resolve get")),
+    ("POST", "/resolve/successor", Cli("sqex resolve moved")),
     ("POST", "/admission/request", Chat("sqex-chat admit")),
     ("POST", "/profile/put", Chat("/profile")),
     ("POST", "/profile/get", Chat("Chat::refresh_profiles")),
@@ -66,11 +83,19 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/blob/head", Chat("Chat::fetch_file")),
     ("POST", "/blob/get", Chat("Chat::fetch_file")),
     ("POST", "/blob/attach", Chat("/forward")),
-    ("POST", "/blob/detach", Chat("Chat::redact, via Chat::detach")),
+    (
+        "POST",
+        "/blob/detach",
+        Chat("Chat::redact, via Chat::detach"),
+    ),
     ("POST", "/prekey/publish", Chat("Chat::top_up_prekeys")),
     ("POST", "/prekey/take", Chat("Chat::ensure_epoch")),
     ("POST", "/prekey/count", Chat("Chat::top_up_prekeys")),
-    ("POST", "/prekey/clear", Chat("Chat::top_up_prekeys, after a lost store")),
+    (
+        "POST",
+        "/prekey/clear",
+        Chat("Chat::top_up_prekeys, after a lost store"),
+    ),
     ("POST", "/channel/create", Chat("/new, /public, open_dm")),
     ("POST", "/channel/join", Chat("/join")),
     ("POST", "/channel/leave", Chat("/leave")),
@@ -85,6 +110,23 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/channel/list", Chat("/find")),
     ("POST", "/channel/invite", Chat("/invite")),
     ("POST", "/channel/remove", Chat("/kick")),
+    // SIP-35. The peering routes are called by another exchange rather than by
+    // a person, which is what `Peer` says: the caller is `sqexd::replica`,
+    // driven from `replicate` entries in the config.
+    ("POST", "/channel/replicate", Chat("/replicate")),
+    ("POST", "/channel/unreplicate", Chat("/unreplicate")),
+    ("POST", "/peer/hello", Peer("replica::pull_once")),
+    ("POST", "/peer/pull", Peer("replica::pull_once")),
+    ("POST", "/peer/envelopes", Peer("replica::pull_envelopes")),
+    ("POST", "/peer/blobs", Peer("replica::pull_blobs")),
+    ("POST", "/peer/records", Peer("replica::pull_profiles")),
+    // Reached when a fetch is refused with `equivocated`: the client asks for
+    // the evidence rather than reporting a bare refusal.
+    (
+        "POST",
+        "/channel/equivocation",
+        Chat("Chat::poll, on an equivocated refusal"),
+    ),
     ("POST", "/channel/key/put", Chat("Chat::ensure_epoch")),
     ("POST", "/channel/key/get", Chat("Chat::collect_keys")),
     ("POST", "/channel/key/missing", Chat("Chat::stranded")),

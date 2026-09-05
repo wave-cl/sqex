@@ -97,7 +97,11 @@ impl RoomId {
 /// which a caller has to ask for.
 impl std::fmt::Debug for RoomId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RoomId(<secret>, handle {})", bs58::encode(self.handle()).into_string())
+        write!(
+            f,
+            "RoomId(<secret>, handle {})",
+            bs58::encode(self.handle()).into_string()
+        )
     }
 }
 
@@ -220,7 +224,10 @@ impl Left {
 
     pub fn decode(b: &[u8]) -> Result<Left> {
         if b.len() != 2 {
-            return Err(Error::Malformed(format!("left is {} bytes, want 2", b.len())));
+            return Err(Error::Malformed(format!(
+                "left is {} bytes, want 2",
+                b.len()
+            )));
         }
         if b[0] != TYPE_LEFT {
             return Err(Error::Malformed(format!("not a left (type {:#x})", b[0])));
@@ -228,7 +235,9 @@ impl Left {
         match b[1] {
             0 => Ok(Left { was_there: false }),
             1 => Ok(Left { was_there: true }),
-            other => Err(Error::Malformed(format!("was_there is {other}, want 0 or 1"))),
+            other => Err(Error::Malformed(format!(
+                "was_there is {other}, want 0 or 1"
+            ))),
         }
     }
 }
@@ -319,8 +328,18 @@ mod tests {
     #[test]
     fn a_mistyped_room_id_is_refused_rather_than_truncated() {
         assert!("not base58 at all!".parse::<RoomId>().is_err());
-        assert!(bs58::encode([7u8; 31]).into_string().parse::<RoomId>().is_err());
-        assert!(bs58::encode([7u8; 33]).into_string().parse::<RoomId>().is_err());
+        assert!(
+            bs58::encode([7u8; 31])
+                .into_string()
+                .parse::<RoomId>()
+                .is_err()
+        );
+        assert!(
+            bs58::encode([7u8; 33])
+                .into_string()
+                .parse::<RoomId>()
+                .is_err()
+        );
     }
 
     #[test]
@@ -346,7 +365,10 @@ mod tests {
         let proof = room.proof(&me);
 
         assert!(room.verify(&me, &proof));
-        assert!(!room.verify(&them, &proof), "a proof is bound to an identity");
+        assert!(
+            !room.verify(&them, &proof),
+            "a proof is bound to an identity"
+        );
         assert!(!other.verify(&me, &proof), "and to a room");
 
         let mut tampered = proof;
@@ -365,7 +387,9 @@ mod tests {
         let join = Join::new(&room, &identity(3));
         assert_eq!(Join::decode(&join.encode()).unwrap(), join);
 
-        let leave = Leave { handle: room.handle() };
+        let leave = Leave {
+            handle: room.handle(),
+        };
         assert_eq!(Leave::decode(&leave.encode()).unwrap(), leave);
     }
 
@@ -375,7 +399,10 @@ mod tests {
         let good = Join::new(&room, &identity(3)).encode();
 
         assert!(Join::decode(&good[..64]).is_err(), "short");
-        assert!(Join::decode(&[good.as_slice(), &[0]].concat()).is_err(), "long");
+        assert!(
+            Join::decode(&[good.as_slice(), &[0]].concat()).is_err(),
+            "long"
+        );
         let mut wrong_type = good.clone();
         wrong_type[0] = TYPE_LEAVE;
         assert!(Join::decode(&wrong_type).is_err(), "a leave is not a join");
@@ -391,10 +418,16 @@ mod tests {
                 proof: room.proof(&identity(b)),
             })
             .collect();
-        let roster = Roster { now: 1_700_000_000, members };
+        let roster = Roster {
+            now: 1_700_000_000,
+            members,
+        };
         assert_eq!(Roster::decode(&roster.encode()).unwrap(), roster);
 
-        let empty = Roster { now: 1, members: vec![] };
+        let empty = Roster {
+            now: 1,
+            members: vec![],
+        };
         assert_eq!(Roster::decode(&empty.encode()).unwrap(), empty);
     }
 
@@ -402,7 +435,10 @@ mod tests {
     fn a_roster_whose_count_lies_is_refused() {
         let roster = Roster {
             now: 1,
-            members: vec![Member { identity: identity(1), proof: [0; 32] }],
+            members: vec![Member {
+                identity: identity(1),
+                proof: [0; 32],
+            }],
         };
         let mut bytes = roster.encode();
         bytes[9] = 2; // claim two members, carry one

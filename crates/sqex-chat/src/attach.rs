@@ -16,13 +16,10 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use sqex_proto::blob::{
-    Attachment, KIND_FILE, KIND_IMAGE, KIND_VIDEO, KIND_VOICE, MAX_MIME,
-};
+use sqex_proto::blob::{Attachment, KIND_FILE, KIND_IMAGE, KIND_VIDEO, KIND_VOICE, MAX_MIME};
 use sqex_proto::blob_store::{
     Begin, Begun, ByBlob, ByChannelBlob, Chunk, Commit, Committed, GetChunk, Headed, Limits,
-    MAX_BLOB, PutChunk, TYPE_ATTACH, TYPE_DETACH, TYPE_HEAD, TYPE_LIMITS, blob_id,
-    chunk_nonce,
+    MAX_BLOB, PutChunk, TYPE_ATTACH, TYPE_DETACH, TYPE_HEAD, TYPE_LIMITS, blob_id, chunk_nonce,
 };
 
 use crate::client::{Chat, ChatError};
@@ -48,11 +45,7 @@ impl Prepared {
 /// display — so sniffing content to make it more accurate would buy precision
 /// in a field nobody is allowed to trust.
 pub fn kind_of(name: &str) -> (u8, String) {
-    let ext = name
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "png" => (KIND_IMAGE, "image/png".into()),
         "jpg" | "jpeg" => (KIND_IMAGE, "image/jpeg".into()),
@@ -171,11 +164,7 @@ impl Chat {
     ///
     /// An upload that fails partway is aborted rather than left to expire, so
     /// the caller's next attempt is not refused for holding too many open.
-    pub async fn upload(
-        &mut self,
-        channel: &[u8; 32],
-        prepared: &Prepared,
-    ) -> Result<Attachment> {
+    pub async fn upload(&mut self, channel: &[u8; 32], prepared: &Prepared) -> Result<Attachment> {
         let body = self
             .post_raw(
                 "/blob/begin",
@@ -196,9 +185,8 @@ impl Chat {
             let _ = self
                 .post_raw(
                     "/blob/abort",
-                    sqex_proto::blob_store::ByUpload { upload }.encode(
-                        sqex_proto::blob_store::TYPE_ABORT,
-                    ),
+                    sqex_proto::blob_store::ByUpload { upload }
+                        .encode(sqex_proto::blob_store::TYPE_ABORT),
                 )
                 .await;
             return Err(e);
@@ -214,8 +202,7 @@ impl Chat {
                 .encode(),
             )
             .await?;
-        let committed =
-            Committed::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let committed = Committed::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         if !committed.stored {
             // The exchange hashed what arrived and it did not equal the name we
             // claimed. Refused rather than stored under the wrong name, which
@@ -315,7 +302,14 @@ impl Chat {
         let mut sealed = Vec::with_capacity(a.chunks as usize);
         for index in 0..a.chunks {
             let body = self
-                .post_raw("/blob/get", GetChunk { blob: a.blob, index }.encode())
+                .post_raw(
+                    "/blob/get",
+                    GetChunk {
+                        blob: a.blob,
+                        index,
+                    }
+                    .encode(),
+                )
                 .await?;
             let chunk = Chunk::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
             if !chunk.found {

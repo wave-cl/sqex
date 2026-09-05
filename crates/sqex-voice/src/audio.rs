@@ -334,7 +334,11 @@ fn microphone(want: Option<&str>) -> Result<(UnboundedReceiver<Vec<f32>>, Rate),
 
     match ready_rx.recv() {
         Ok(Ok((name, chosen))) => {
-            eprintln!("capturing from {name} at {}{}", chosen.rate, resampled(&chosen));
+            eprintln!(
+                "capturing from {name} at {}{}",
+                chosen.rate,
+                resampled(&chosen)
+            );
             // The cause of a narrowband capture is not guessable from the
             // number, and the remedy is one flag away.
             if chosen.rate.hz() <= 16_000 {
@@ -454,8 +458,8 @@ fn speaker(want: Option<&str>) -> Result<(Output, Rate), String> {
                         } else {
                             // Pull the working-rate samples this many device
                             // frames are worth, then stretch them.
-                            let want = (frames as f64 * rate_hz as f64 / device_hz as f64)
-                                .ceil() as usize;
+                            let want =
+                                (frames as f64 * rate_hz as f64 / device_hz as f64).ceil() as usize;
                             let src = take(&mut r, want);
                             let mut out = resample(&src, rate_hz, device_hz);
                             out.resize(frames, 0.0);
@@ -676,10 +680,7 @@ fn default_capture(host: &cpal::Host) -> Result<cpal::platform::Device, String> 
 }
 
 /// whole point of naming a device is that the default was wrong.
-fn pick_device(
-    want: Option<&str>,
-    input: bool,
-) -> Result<cpal::platform::Device, String> {
+fn pick_device(want: Option<&str>, input: bool) -> Result<cpal::platform::Device, String> {
     let host = cpal::default_host();
     let Some(want) = want else {
         return if input {
@@ -739,16 +740,20 @@ pub fn list_devices() -> Result<(), String> {
             }
             any = true;
             let name = describe(&device);
-            let default = if Some(&name) == (if input { &default_in } else { &default_out }).as_ref()
-            {
-                "  (default)"
-            } else {
-                ""
-            };
+            let default =
+                if Some(&name) == (if input { &default_in } else { &default_out }).as_ref() {
+                    "  (default)"
+                } else {
+                    ""
+                };
             let configs = if input {
-                device.supported_input_configs().map(|c| c.collect::<Vec<_>>())
+                device
+                    .supported_input_configs()
+                    .map(|c| c.collect::<Vec<_>>())
             } else {
-                device.supported_output_configs().map(|c| c.collect::<Vec<_>>())
+                device
+                    .supported_output_configs()
+                    .map(|c| c.collect::<Vec<_>>())
             };
             match configs {
                 Ok(cs) => {
@@ -767,7 +772,14 @@ pub fn list_devices() -> Result<(), String> {
                     rates.sort();
                     rates.dedup();
                     println!("  {name}{default}");
-                    println!("    offers: {}", if rates.is_empty() { "no f32 formats".into() } else { rates.join(", ") });
+                    println!(
+                        "    offers: {}",
+                        if rates.is_empty() {
+                            "no f32 formats".into()
+                        } else {
+                            rates.join(", ")
+                        }
+                    );
                     match chosen {
                         Ok(c) if c.resampling() => println!(
                             "    would run at: {} device, resampled to {}",
@@ -938,7 +950,11 @@ mod tests {
                 .collect();
             let packet = enc.encode_vec_float(&frame, 1024).unwrap();
             let n = dec.decode_float(&packet, &mut pcm, false).unwrap();
-            assert_eq!(n, high.frame(), "decoded at the playback rate, not the encoder's");
+            assert_eq!(
+                n,
+                high.frame(),
+                "decoded at the playback rate, not the encoder's"
+            );
             out.extend_from_slice(&pcm[..n]);
         }
 
@@ -981,7 +997,11 @@ mod tests {
             sizes.push((i, enc.encode_vec_float(&pcm, 1024).unwrap().len()));
         }
         let of = |r: std::ops::Range<usize>| -> Vec<usize> {
-            sizes.iter().filter(|(i, _)| r.contains(i)).map(|(_, l)| *l).collect()
+            sizes
+                .iter()
+                .filter(|(i, _)| r.contains(i))
+                .map(|(_, l)| *l)
+                .collect()
         };
         let speech = of(0..50);
         // Skip the first ten silent frames: the encoder takes a moment to decide.
@@ -1031,7 +1051,10 @@ mod tests {
         // to be refused outright.
         let c = choose([range(1, 16_000, 16_000)].into_iter(), "d", "capture").unwrap();
         assert_eq!(c.rate.hz(), 16_000);
-        assert!(!c.resampling(), "16 kHz is a rate Opus speaks; no resampler");
+        assert!(
+            !c.resampling(),
+            "16 kHz is a rate Opus speaks; no resampler"
+        );
 
         // A wide range takes the best of it.
         let c = choose([range(2, 8_000, 48_000)].into_iter(), "d", "capture").unwrap();

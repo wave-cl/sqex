@@ -22,9 +22,9 @@
 
 use std::collections::HashMap;
 
+use sqex_proto::refusal::{Code, Refusal};
 use sqex_proto::room::{Join, Leave, RoomId, Roster};
 use sqex_proto::session::{BySession, Open, OpenAck, OpenState, Session};
-use sqex_proto::refusal::{Code, Refusal};
 use sqnr::Client;
 use sqnr_core::PubKey;
 
@@ -192,9 +192,8 @@ impl Membership {
             events.push(Event::Left(id));
         }
         self.pending.retain(|id, _| still_here(id));
-        self.rejected.retain(|id| {
-            roster.members.iter().any(|m| m.identity == *id)
-        });
+        self.rejected
+            .retain(|id| roster.members.iter().any(|m| m.identity == *id));
 
         // 3. Throw away any session that has gone quiet, and let step 4 build
         //    it again with a fresh ephemeral.
@@ -216,9 +215,9 @@ impl Membership {
             if self.by_identity.contains_key(id) {
                 continue;
             }
-            self.pending.entry(*id).or_insert_with(|| {
-                x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng)
-            });
+            self.pending
+                .entry(*id)
+                .or_insert_with(|| x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng));
         }
         // Take the ephemeral out by value, so no borrow of `self` is alive
         // across the await inside. See the note on `Membership`.
@@ -339,7 +338,13 @@ impl Membership {
                 .await;
         }
         let _ = client
-            .post("/room/leave", Leave { handle: self.room.handle() }.encode())
+            .post(
+                "/room/leave",
+                Leave {
+                    handle: self.room.handle(),
+                }
+                .encode(),
+            )
             .await;
     }
 }

@@ -90,9 +90,7 @@ impl Playback {
     /// Render one slot into `pcm`. Returns false if there was nothing to play.
     pub fn render(&mut self, slot: &Playout, pcm: &mut [f32]) -> bool {
         match slot {
-            Playout::Frame(packet) => {
-                self.decoder.decode_float(packet, pcm, false).is_ok()
-            }
+            Playout::Frame(packet) => self.decoder.decode_float(packet, pcm, false).is_ok(),
             // Loss: the codec extrapolates from what it last heard.
             Playout::Conceal => self.decoder.decode_float(&[], pcm, false).is_ok(),
             // A described pause: make the room, rather than guessing at it.
@@ -429,7 +427,6 @@ mod tests {
         j
     }
 
-
     #[test]
     fn holds_until_the_buffer_has_filled() {
         let mut j = Jitter::new(3);
@@ -513,7 +510,10 @@ mod tests {
             j.push(i, (i) as u32, packet(i as u8));
         }
         assert!(matches!(j.pop(), Playout::Frame(_)), "starts playing");
-        assert!(j.overfull(), "36 frames is not a jitter buffer, it is a delay");
+        assert!(
+            j.overfull(),
+            "36 frames is not a jitter buffer, it is a delay"
+        );
 
         // Each tick sheds one frame and plays one, so the excess drains at
         // twice real time instead of never.
@@ -554,8 +554,15 @@ mod tests {
         j.push(2, 52, packet(2));
 
         assert_eq!(j.pop(), played(0));
-        let described = Comfort { level: 120, tilt: 40 };
-        assert_eq!(j.pop(), Playout::Comfort(described), "the descriptor's own slot");
+        let described = Comfort {
+            level: 120,
+            tilt: 40,
+        };
+        assert_eq!(
+            j.pop(),
+            Playout::Comfort(described),
+            "the descriptor's own slot"
+        );
         for slot in 2..52 {
             assert_eq!(
                 j.pop(),

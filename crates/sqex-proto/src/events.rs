@@ -66,6 +66,16 @@ pub const KIND_PROFILE: u8 = 0x05;
 pub const KIND_ADMISSION: u8 = 0x06;
 pub const KIND_HEARTBEAT: u8 = 0x07;
 pub const KIND_RESYNC: u8 = 0x08;
+/// SIP-36: a call is ringing in this channel.
+///
+/// `KIND_SIGNAL` already announces a waiting signal, so a dedicated kind needs
+/// justifying, and the justification is **priority, not information**. SIP-30
+/// exists because clients were polling nine times a second, and its whole
+/// purpose is to let an idle client be quiet — so a client that has throttled
+/// its signal fetching is behaving correctly, and must not throttle this. A
+/// distinguishable kind is what lets it tell somebody typing from a phone
+/// ringing.
+pub const KIND_RINGING: u8 = 0x09;
 
 /// What happened to a membership.
 pub const MEMBER_JOINED: u8 = 0x01;
@@ -137,6 +147,13 @@ pub enum Event {
     Heartbeat,
     /// The caller fell behind and events were dropped. Re-read everything.
     Resync,
+    /// SIP-36: a call is ringing in this channel, at this invitation.
+    ///
+    /// Names the channel and the invitation's `seq` and carries nothing else,
+    /// per SIP-30's central constraint — a client fetches to learn the rest.
+    /// Subject to SIP-21's blocking rules like every other event, which is what
+    /// stops this becoming a way to make a blocked person's phone ring.
+    Ringing { channel: [u8; 32], seq: u64 },
     /// A kind this build does not know. Carried rather than rejected so that
     /// ignoring it is deliberate; see the module docs.
     Unknown(u8),
@@ -150,6 +167,13 @@ impl Event {
                 out.push(KIND_CHANNEL);
                 out.extend_from_slice(channel);
                 out.extend_from_slice(&last_seq.to_be_bytes());
+                out
+            }
+            Event::Ringing { channel, seq } => {
+                let mut out = Vec::with_capacity(41);
+                out.push(KIND_RINGING);
+                out.extend_from_slice(channel);
+                out.extend_from_slice(&seq.to_be_bytes());
                 out
             }
             Event::Signal { channel } => one(KIND_SIGNAL, channel),
@@ -201,6 +225,13 @@ impl Event {
                 Event::Channel {
                     channel: body[0..32].try_into().unwrap(),
                     last_seq: u64::from_be_bytes(body[32..40].try_into().unwrap()),
+                }
+            }
+            KIND_RINGING => {
+                want(40)?;
+                Event::Ringing {
+                    channel: body[0..32].try_into().unwrap(),
+                    seq: u64::from_be_bytes(body[32..40].try_into().unwrap()),
                 }
             }
             KIND_SIGNAL => {

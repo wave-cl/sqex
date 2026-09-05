@@ -92,7 +92,12 @@ async fn pair() -> Pair {
 #[tokio::test]
 async fn a_reaction_reaches_the_other_side_and_counts_once() {
     let mut p = pair().await;
-    let seq = p.alice.send(&p.channel, "we ship on friday").await.unwrap().seq;
+    let seq = p
+        .alice
+        .send(&p.channel, "we ship on friday")
+        .await
+        .unwrap()
+        .seq;
 
     let mut bobs = Timeline::new();
     p.bob.poll(&p.channel, &mut bobs, 0).await.unwrap();
@@ -108,7 +113,11 @@ async fn a_reaction_reaches_the_other_side_and_counts_once() {
     let m = got.timeline.get(seq).expect("the message went missing");
     let (_, who) = m.reactions.iter().next().expect("no reaction arrived");
     assert_eq!(who.len(), 1, "the same reaction was counted twice");
-    assert_eq!(who[0], identity(2).1, "the reaction named the wrong account");
+    assert_eq!(
+        who[0],
+        identity(2).1,
+        "the reaction named the wrong account"
+    );
 
     // And taking it back empties it, rather than leaving a zero.
     p.bob.react(&p.channel, seq, "👍", false).await.unwrap();
@@ -148,7 +157,12 @@ async fn a_reaction_the_exchange_could_read_would_be_a_leak() {
 #[tokio::test]
 async fn an_edit_replaces_the_words_and_says_that_it_did() {
     let mut p = pair().await;
-    let seq = p.alice.send(&p.channel, "we ship on thursday").await.unwrap().seq;
+    let seq = p
+        .alice
+        .send(&p.channel, "we ship on thursday")
+        .await
+        .unwrap()
+        .seq;
 
     let mut bobs = Timeline::new();
     let got = p.bob.poll(&p.channel, &mut bobs, 0).await.unwrap();
@@ -179,7 +193,12 @@ async fn an_edit_replaces_the_words_and_says_that_it_did() {
 #[tokio::test]
 async fn nobody_can_edit_somebody_elses_message() {
     let mut p = pair().await;
-    let seq = p.alice.send(&p.channel, "what alice said").await.unwrap().seq;
+    let seq = p
+        .alice
+        .send(&p.channel, "what alice said")
+        .await
+        .unwrap()
+        .seq;
 
     let mut bobs = Timeline::new();
     p.bob.poll(&p.channel, &mut bobs, 0).await.unwrap();
@@ -202,7 +221,12 @@ async fn nobody_can_edit_somebody_elses_message() {
 #[tokio::test]
 async fn a_reply_carries_what_it_answers() {
     let mut p = pair().await;
-    let asked = p.alice.send(&p.channel, "thursday or friday?").await.unwrap().seq;
+    let asked = p
+        .alice
+        .send(&p.channel, "thursday or friday?")
+        .await
+        .unwrap()
+        .seq;
 
     let mut bobs = Timeline::new();
     p.bob.poll(&p.channel, &mut bobs, 0).await.unwrap();
@@ -305,7 +329,10 @@ async fn a_channel_picture_survives_the_name_changing_under_it() {
     let held = alice.history(&channel, &[me]).unwrap();
     assert_eq!(held.name, "shipping");
     assert_eq!(held.topic, "october");
-    let kept = held.avatar.as_ref().expect("the picture was lost on rename");
+    let kept = held
+        .avatar
+        .as_ref()
+        .expect("the picture was lost on rename");
     assert_eq!(kept.blob, attachment.blob);
 
     // And it opens: the reference survived intact, not merely a field with
