@@ -201,7 +201,10 @@ async fn main() {
     // the way out, so the exchange carries it until it times it out. That is a
     // better trade than a program you cannot stop.
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
     }
 
     let outcome = run(Cli::parse()).await;
@@ -248,7 +251,16 @@ async fn run(cli: Cli) -> Result<(), String> {
     let mut report = Printer { quiet: cli.quiet };
 
     // A room has no peer to name, and `--new` needs no connection at all.
-    if let Cmd::Room { room, new, source, sink, jitter, bitrate, seconds } = cmd {
+    if let Cmd::Room {
+        room,
+        new,
+        source,
+        sink,
+        jitter,
+        bitrate,
+        seconds,
+    } = cmd
+    {
         if *new {
             println!("{}", RoomId::generate().to_base58());
             eprintln!(
@@ -293,7 +305,15 @@ async fn run(cli: Cli) -> Result<(), String> {
     let (client, session, id) =
         engine::establish(endpoint, &signer, peer, cli.wait, &mut report).await?;
     match cmd {
-        Cmd::Call { source, sink, jitter, bitrate, seconds, rtt, .. } => {
+        Cmd::Call {
+            source,
+            sink,
+            jitter,
+            bitrate,
+            seconds,
+            rtt,
+            ..
+        } => {
             engine::call(
                 client,
                 session,

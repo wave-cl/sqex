@@ -610,7 +610,10 @@ mod tests {
 
     #[test]
     fn a_truncated_or_overlong_body_is_refused() {
-        assert!(Refusal::decode(&[0, 21, 0]).is_err(), "3 bytes is too short");
+        assert!(
+            Refusal::decode(&[0, 21, 0]).is_err(),
+            "3 bytes is too short"
+        );
         // Says 5 bytes of detail, carries 2.
         assert!(Refusal::decode(&[0, 21, 0, 5, b'h', b'i']).is_err());
         // Says 0, carries 2.

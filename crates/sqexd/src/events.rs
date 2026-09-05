@@ -20,9 +20,9 @@
 //! truth was. If events carried payloads this design would be data loss.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 use sqex_proto::events::Event;
 use sqnr_core::key::PubKey;
@@ -142,7 +142,12 @@ impl Subscribers {
 
     /// Streams open across every identity.
     pub fn total(&self) -> usize {
-        self.by_identity.lock().unwrap().values().map(|v| v.len()).sum()
+        self.by_identity
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| v.len())
+            .sum()
     }
 }
 
@@ -223,7 +228,10 @@ mod tests {
         subs.publish(&[key(1)], Event::Heartbeat);
 
         assert_eq!(a.rx.try_recv().ok(), Some(Event::Heartbeat));
-        assert!(b.rx.try_recv().is_err(), "published to an unaddressed identity");
+        assert!(
+            b.rx.try_recv().is_err(),
+            "published to an unaddressed identity"
+        );
     }
 
     #[tokio::test]
@@ -358,7 +366,10 @@ mod tests {
                 },
             );
         }
-        assert!(feed.behind.load(Ordering::Relaxed), "control: never overflowed");
+        assert!(
+            feed.behind.load(Ordering::Relaxed),
+            "control: never overflowed"
+        );
         drop(subs);
 
         let (mut rec, got) = recorder(2);
@@ -371,7 +382,10 @@ mod tests {
             "the backlog was delivered instead of replaced"
         );
         // And the backlog is gone rather than waiting behind the resync.
-        assert!(feed.rx.try_recv().is_err(), "stale hints survived the resync");
+        assert!(
+            feed.rx.try_recv().is_err(),
+            "stale hints survived the resync"
+        );
     }
 
     /// A stream with nothing to say still has to say so, or a client cannot

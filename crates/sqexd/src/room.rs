@@ -91,15 +91,27 @@ impl Rooms {
             }
             return Err(JoinError::Full);
         }
-        members.insert(identity, Presence { proof, last_seen: now });
+        members.insert(
+            identity,
+            Presence {
+                proof,
+                last_seen: now,
+            },
+        );
 
         let mut others: Vec<Member> = members
             .iter()
             .filter(|(id, _)| **id != identity)
-            .map(|(id, p)| Member { identity: *id, proof: p.proof })
+            .map(|(id, p)| Member {
+                identity: *id,
+                proof: p.proof,
+            })
             .collect();
         others.sort_by(|a, b| a.identity.as_bytes().cmp(b.identity.as_bytes()));
-        Ok(Roster { now, members: others })
+        Ok(Roster {
+            now,
+            members: others,
+        })
     }
 
     /// Remove `identity` from `handle`. Returns whether it was there.
@@ -171,7 +183,11 @@ mod tests {
             r.join(handle(1), key(id), [id; 32]).unwrap();
         }
         let roster = r.join(handle(1), key(1), [1; 32]).unwrap();
-        let names: Vec<u8> = roster.members.iter().map(|m| m.identity.as_bytes()[0]).collect();
+        let names: Vec<u8> = roster
+            .members
+            .iter()
+            .map(|m| m.identity.as_bytes()[0])
+            .collect();
         assert_eq!(names, vec![2, 3], "sorted, and without the caller");
         assert_eq!(roster.members[0].proof, [2; 32], "proofs relayed unaltered");
     }
@@ -181,7 +197,10 @@ mod tests {
         let r = Rooms::new();
         r.join(handle(1), key(1), [1; 32]).unwrap();
         let other = r.join(handle(2), key(2), [2; 32]).unwrap();
-        assert!(other.members.is_empty(), "a different handle is a different room");
+        assert!(
+            other.members.is_empty(),
+            "a different handle is a different room"
+        );
         assert_eq!(r.len(), 2);
     }
 
@@ -217,7 +236,12 @@ mod tests {
         r.join(handle(1), key(2), [2; 32]).unwrap();
 
         assert!(r.leave(&handle(1), &key(2)));
-        assert!(r.join(handle(1), key(1), [1; 32]).unwrap().members.is_empty());
+        assert!(
+            r.join(handle(1), key(1), [1; 32])
+                .unwrap()
+                .members
+                .is_empty()
+        );
 
         assert!(r.leave(&handle(1), &key(1)));
         assert!(r.is_empty(), "the room is gone with its last member");
@@ -246,8 +270,12 @@ mod tests {
         r.join(handle(1), key(1), [1; 32]).unwrap();
         {
             let mut rooms = r.rooms.lock().unwrap();
-            rooms.get_mut(&handle(1)).unwrap().get_mut(&key(1)).unwrap().last_seen =
-                now_unix() - TTL_SECS - 1;
+            rooms
+                .get_mut(&handle(1))
+                .unwrap()
+                .get_mut(&key(1))
+                .unwrap()
+                .last_seen = now_unix() - TTL_SECS - 1;
         }
         r.expire();
         assert!(r.is_empty());

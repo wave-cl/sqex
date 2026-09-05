@@ -15,9 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use sqex_proto::attest::{
-    Attestation, CLAIM_REVOKES, Held, Invalid, MAX_PER_SUBJECT,
-};
+use sqex_proto::attest::{Attestation, CLAIM_REVOKES, Held, Invalid, MAX_PER_SUBJECT};
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;

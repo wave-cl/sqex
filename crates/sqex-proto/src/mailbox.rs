@@ -75,7 +75,11 @@ pub struct Sealed {
 }
 
 /// Derive the message key and nonce from an ECDH result.
-fn kdf(ephemeral_pub: &[u8; 32], recipient_x: &[u8; 32], shared: &[u8; 32]) -> ([u8; 32], [u8; 12]) {
+fn kdf(
+    ephemeral_pub: &[u8; 32],
+    recipient_x: &[u8; 32],
+    shared: &[u8; 32],
+) -> ([u8; 32], [u8; 12]) {
     let mut h = Sha512::new();
     h.update(SEAL_CONTEXT);
     h.update(ephemeral_pub);
@@ -109,7 +113,11 @@ pub fn seal(recipient: &PubKey, plaintext: &[u8]) -> Result<Sealed> {
         return Err(Error::Key("recipient key is degenerate".into()));
     }
 
-    let (key, nonce) = kdf(&eph_pub.to_bytes(), &recipient_x.to_bytes(), shared.as_bytes());
+    let (key, nonce) = kdf(
+        &eph_pub.to_bytes(),
+        &recipient_x.to_bytes(),
+        shared.as_bytes(),
+    );
     let cipher =
         ChaCha20Poly1305::new_from_slice(&key).map_err(|e| Error::Key(format!("cipher: {e}")))?;
     let ciphertext = cipher
@@ -134,7 +142,11 @@ pub fn open(recipient_seed: &[u8; 32], sealed: &Sealed) -> Result<Vec<u8>> {
         return Err(Error::Key("ephemeral key is degenerate".into()));
     }
 
-    let (key, nonce) = kdf(&sealed.ephemeral, &recipient_x_pub.to_bytes(), shared.as_bytes());
+    let (key, nonce) = kdf(
+        &sealed.ephemeral,
+        &recipient_x_pub.to_bytes(),
+        shared.as_bytes(),
+    );
     let cipher =
         ChaCha20Poly1305::new_from_slice(&key).map_err(|e| Error::Key(format!("cipher: {e}")))?;
     cipher
@@ -163,7 +175,10 @@ impl Send {
 
     pub fn decode(b: &[u8]) -> Result<Send> {
         if b.len() < 65 {
-            return Err(Error::Malformed(format!("send is {} bytes, want >= 65", b.len())));
+            return Err(Error::Malformed(format!(
+                "send is {} bytes, want >= 65",
+                b.len()
+            )));
         }
         if b[0] != TYPE_SEND {
             return Err(Error::Malformed(format!("not a send (type {:#x})", b[0])));
@@ -205,7 +220,10 @@ impl SendAck {
 
     pub fn decode(b: &[u8]) -> Result<SendAck> {
         if b.len() != 16 {
-            return Err(Error::Malformed(format!("ack is {} bytes, want 16", b.len())));
+            return Err(Error::Malformed(format!(
+                "ack is {} bytes, want 16",
+                b.len()
+            )));
         }
         Ok(SendAck {
             id: u64::from_be_bytes(b[0..8].try_into().unwrap()),
@@ -255,7 +273,9 @@ impl Listing {
             return Err(Error::Malformed(format!("listing claims {count} entries")));
         }
         if b.len() != 12 + count * 52 {
-            return Err(Error::Malformed("listing length does not match its count".into()));
+            return Err(Error::Malformed(
+                "listing length does not match its count".into(),
+            ));
         }
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
@@ -308,7 +328,10 @@ impl ById {
 
     pub fn decode(b: &[u8], expect: u8) -> Result<ById> {
         if b.len() != 9 {
-            return Err(Error::Malformed(format!("request is {} bytes, want 9", b.len())));
+            return Err(Error::Malformed(format!(
+                "request is {} bytes, want 9",
+                b.len()
+            )));
         }
         if b[0] != expect {
             return Err(Error::Malformed(format!("unexpected type {:#x}", b[0])));
@@ -354,7 +377,10 @@ impl Fetched {
 
     pub fn decode(b: &[u8]) -> Result<Fetched> {
         if b.len() < 73 {
-            return Err(Error::Malformed(format!("fetched is {} bytes, want >= 73", b.len())));
+            return Err(Error::Malformed(format!(
+                "fetched is {} bytes, want >= 73",
+                b.len()
+            )));
         }
         Ok(Fetched {
             found: b[0] != 0,
@@ -410,7 +436,10 @@ impl Status {
 
     pub fn decode(b: &[u8]) -> Result<Status> {
         if b.len() != 25 {
-            return Err(Error::Malformed(format!("status is {} bytes, want 25", b.len())));
+            return Err(Error::Malformed(format!(
+                "status is {} bytes, want 25",
+                b.len()
+            )));
         }
         let state = match b[0] {
             0 => State::Unknown,
@@ -506,7 +535,10 @@ mod tests {
         }
         .encode();
         raw.extend(std::iter::repeat_n(0u8, MAX_PLAINTEXT + 17));
-        assert!(Send::decode(&raw).is_err(), "the exchange bounds ciphertext it cannot read");
+        assert!(
+            Send::decode(&raw).is_err(),
+            "the exchange bounds ciphertext it cannot read"
+        );
     }
 
     #[test]

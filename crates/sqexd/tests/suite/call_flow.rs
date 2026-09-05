@@ -17,9 +17,7 @@ use ed25519_dalek::SigningKey;
 use sqex_proto::channel::{Entries, Fetch, SignalOut, Visibility};
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
 use sqex_proto::device::Register;
-use sqex_proto::message::{
-    RING_ACCEPTED, RING_RINGING, SIGNAL_CALL_STATE, SIGNAL_TYPING, Signal,
-};
+use sqex_proto::message::{RING_ACCEPTED, RING_RINGING, SIGNAL_CALL_STATE, SIGNAL_TYPING, Signal};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -140,13 +138,19 @@ async fn a_ring_reaches_every_device_and_typing_still_reaches_one() {
     let channel = [61u8; 32];
 
     // Alice's two devices, both linked to her account.
-    let mut a1 = Client::connect_as(addr, &server_pub, &phone_seed).await.unwrap();
-    let mut a2 = Client::connect_as(addr, &server_pub, &laptop_seed).await.unwrap();
+    let mut a1 = Client::connect_as(addr, &server_pub, &phone_seed)
+        .await
+        .unwrap();
+    let mut a2 = Client::connect_as(addr, &server_pub, &laptop_seed)
+        .await
+        .unwrap();
     enrol(&mut a1, &alice_seed, &phone).await;
     enrol(&mut a2, &alice_seed, &laptop).await;
 
     // And somebody to call her.
-    let mut b = Client::connect_as(addr, &server_pub, &caller_seed).await.unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &caller_seed)
+        .await
+        .unwrap();
     let bs = Signer::new(caller_seed, caller_key, server_pub);
     let mut bchain = Chain::default();
     let req = bs.create_chained(
@@ -162,20 +166,25 @@ async fn a_ring_reaches_every_device_and_typing_still_reaches_one() {
     assert_eq!(code, 200, "{}", common::said(&body));
 
     // Alice joins from one device; the account is what is a member.
-    let joining = Signer::new(phone_seed, phone, server_pub).for_account(alice).action_outside(
-        channel,
-        instance_for(channel, 0),
-        sqex_proto::channel::EVENT_JOINED,
-        &alice,
-        &[],
-        0,
-        sqex_proto::entry_sig::GENESIS,
-    );
+    let joining = Signer::new(phone_seed, phone, server_pub)
+        .for_account(alice)
+        .action_outside(
+            channel,
+            instance_for(channel, 0),
+            sqex_proto::channel::EVENT_JOINED,
+            &alice,
+            &[],
+            0,
+            sqex_proto::entry_sig::GENESIS,
+        );
     let (code, body) = a1
         .post(
             "/channel/join",
-            sqex_proto::channel::ByChannelSigned { channel, action: joining }
-                .encode(sqex_proto::channel::TYPE_JOIN),
+            sqex_proto::channel::ByChannelSigned {
+                channel,
+                action: joining,
+            }
+            .encode(sqex_proto::channel::TYPE_JOIN),
         )
         .await
         .unwrap();
@@ -230,8 +239,12 @@ async fn accepting_on_one_device_reaches_the_others_and_not_itself() {
     let (laptop_seed, laptop) = identity(73);
     let channel = [71u8; 32];
 
-    let mut a1 = Client::connect_as(addr, &server_pub, &phone_seed).await.unwrap();
-    let mut a2 = Client::connect_as(addr, &server_pub, &laptop_seed).await.unwrap();
+    let mut a1 = Client::connect_as(addr, &server_pub, &phone_seed)
+        .await
+        .unwrap();
+    let mut a2 = Client::connect_as(addr, &server_pub, &laptop_seed)
+        .await
+        .unwrap();
     enrol(&mut a1, &alice_seed, &phone).await;
     enrol(&mut a2, &alice_seed, &laptop).await;
 
@@ -253,7 +266,11 @@ async fn accepting_on_one_device_reaches_the_others_and_not_itself() {
     ring(&mut a1, channel, phone, 1, RING_ACCEPTED).await;
 
     let on_laptop = collect(&mut a2, channel).await;
-    assert_eq!(on_laptop.len(), 1, "the sibling device was not told to stop");
+    assert_eq!(
+        on_laptop.len(),
+        1,
+        "the sibling device was not told to stop"
+    );
     assert_eq!(on_laptop[0].kind, SIGNAL_CALL_STATE);
     assert_eq!(
         on_laptop[0].account, alice,
@@ -284,8 +301,12 @@ async fn the_device_a_signal_names_does_not_decide_where_it_goes() {
     let (laptop_seed, laptop) = identity(83);
     let channel = [81u8; 32];
 
-    let mut a1 = Client::connect_as(addr, &server_pub, &phone_seed).await.unwrap();
-    let mut a2 = Client::connect_as(addr, &server_pub, &laptop_seed).await.unwrap();
+    let mut a1 = Client::connect_as(addr, &server_pub, &phone_seed)
+        .await
+        .unwrap();
+    let mut a2 = Client::connect_as(addr, &server_pub, &laptop_seed)
+        .await
+        .unwrap();
     enrol(&mut a1, &alice_seed, &phone).await;
     enrol(&mut a2, &alice_seed, &laptop).await;
 

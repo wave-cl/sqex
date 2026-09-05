@@ -281,7 +281,10 @@ mod tests {
         let (_, device) = identity(2);
 
         // Local: a client signing itself out, with nothing anybody can repeat.
-        let local = Revoke { device, revocation: None };
+        let local = Revoke {
+            device,
+            revocation: None,
+        };
         assert_eq!(Revoke::decode(&local.encode()).unwrap(), local);
 
         // Attested: the account's own withdrawal, verifiable anywhere.

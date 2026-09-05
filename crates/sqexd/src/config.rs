@@ -353,12 +353,18 @@ channels = ["{channel}"]
 interval_secs = 120
 "#
         );
-        let config: Config = toml::from_str::<FileConfig>(&text).unwrap().resolve().unwrap();
+        let config: Config = toml::from_str::<FileConfig>(&text)
+            .unwrap()
+            .resolve()
+            .unwrap();
         assert_eq!(config.replication_peers, vec![PubKey::new([1u8; 32])]);
         assert_eq!(config.replicate.len(), 1);
         assert_eq!(config.replicate[0].origin, PubKey::new([2u8; 32]));
         assert_eq!(config.replicate[0].channels, vec![[3u8; 32]]);
-        assert_eq!(config.replicate[0].interval, std::time::Duration::from_secs(120));
+        assert_eq!(
+            config.replicate[0].interval,
+            std::time::Duration::from_secs(120)
+        );
     }
 
     /// Neither is on by default, and that is the SIP's own default: no
@@ -367,7 +373,10 @@ interval_secs = 120
     #[test]
     fn an_exchange_replicates_nothing_unless_told_to() {
         let text = "listen = \"127.0.0.1:443\"\nkey_file = \"/etc/sqex/host_key\"\n";
-        let config: Config = toml::from_str::<FileConfig>(text).unwrap().resolve().unwrap();
+        let config: Config = toml::from_str::<FileConfig>(text)
+            .unwrap()
+            .resolve()
+            .unwrap();
         assert!(config.replication_peers.is_empty());
         assert!(config.replicate.is_empty());
     }
@@ -383,7 +392,10 @@ interval_secs = 120
              [[replicate]]\norigin = \"{origin}\"\naddr = \"198.51.100.7:443\"\n\
              interval_secs = 0\n"
         );
-        let config: Config = toml::from_str::<FileConfig>(&text).unwrap().resolve().unwrap();
+        let config: Config = toml::from_str::<FileConfig>(&text)
+            .unwrap()
+            .resolve()
+            .unwrap();
         assert_eq!(
             config.replicate[0].interval,
             std::time::Duration::from_secs(sqex_proto::peer::PEER_MIN_INTERVAL)
@@ -402,7 +414,10 @@ interval_secs = 120
             "listen = \"127.0.0.1:443\"\nkey_file = \"/k\"\nreplication_peers = [{}]\n",
             peers.join(", ")
         );
-        let err = toml::from_str::<FileConfig>(&text).unwrap().resolve().unwrap_err();
+        let err = toml::from_str::<FileConfig>(&text)
+            .unwrap()
+            .resolve()
+            .unwrap_err();
         assert!(
             err.to_string().contains("replication_peers"),
             "the refusal must name the field: {err}"
@@ -414,7 +429,10 @@ interval_secs = 120
     fn an_unreadable_origin_key_names_itself() {
         let text = "listen = \"127.0.0.1:443\"\nkey_file = \"/k\"\n\n\
                     [[replicate]]\norigin = \"not-a-key\"\naddr = \"198.51.100.7:443\"\n";
-        let err = toml::from_str::<FileConfig>(text).unwrap().resolve().unwrap_err();
+        let err = toml::from_str::<FileConfig>(text)
+            .unwrap()
+            .resolve()
+            .unwrap_err();
         assert!(err.to_string().contains("not-a-key"), "{err}");
     }
 }

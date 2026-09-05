@@ -128,7 +128,10 @@ impl Prekey {
             return Err(Error::Malformed("prekey id 0 is reserved".into()));
         }
         if self.kind != KIND_ONE_TIME && self.kind != KIND_FALLBACK {
-            return Err(Error::Malformed(format!("unknown prekey kind {}", self.kind)));
+            return Err(Error::Malformed(format!(
+                "unknown prekey kind {}",
+                self.kind
+            )));
         }
         let vk = VerifyingKey::from_bytes(device.as_bytes())
             .map_err(|e| Error::Key(format!("device key: {e}")))?;
@@ -200,7 +203,9 @@ impl Publish {
             )));
         }
         Ok(Publish {
-            prekeys: (0..count).map(|i| Prekey::read(b, 3 + i * PREKEY_LEN)).collect(),
+            prekeys: (0..count)
+                .map(|i| Prekey::read(b, 3 + i * PREKEY_LEN))
+                .collect(),
         })
     }
 }
@@ -585,7 +590,9 @@ mod tests {
     #[test]
     fn publish_round_trips() {
         let (seed, _) = device(1);
-        let prekeys = (1..=3).map(|i| Prekey::generate(&seed, KIND_ONE_TIME, i).0).collect();
+        let prekeys = (1..=3)
+            .map(|i| Prekey::generate(&seed, KIND_ONE_TIME, i).0)
+            .collect();
         let p = Publish { prekeys };
         assert_eq!(Publish::decode(&p.encode()).unwrap(), p);
     }

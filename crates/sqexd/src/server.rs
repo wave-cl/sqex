@@ -9,65 +9,64 @@ use std::time::Instant;
 use bytes::Buf;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
+use sqex_proto::Op;
 use sqex_proto::exchange::Pong;
 use sqex_proto::refusal::{Code, Refusal};
 use sqnr_core::key::PubKey;
 use sqnr_core::{Error, Result, SignedTransaction};
-use sqex_proto::Op;
 use squic::Config as SquicConfig;
 
-use crate::beacon::Beacons;
 use crate::admission::Admissions;
+use crate::attest::{Attestations, LodgeError};
+use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::{Config, OriginConfig};
-use crate::attest::{Attestations, LodgeError};
-use crate::rendezvous::Rendezvous;
-use crate::resolve::Endpoints;
 use crate::device::Registry;
 use crate::events::Subscribers;
-use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
 use crate::mailbox::Mailbox;
 use crate::prekey::Prekeys;
 use crate::profile::Profiles;
+use crate::rendezvous::Rendezvous;
+use crate::resolve::Endpoints;
 use crate::room::Rooms;
 use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
-use sqex_proto::beacon::{Beat, BeatAck, Read};
-use sqex_proto::channel::{
-    Ack as ChannelAck, ByChannel, ByChannelSigned, ByTarget, Cursor as ChannelCursor, Invitee,
-    SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
-    ByAccount as ChannelByAccount, Invite as ChannelInvite, List as ChannelList, Mine as ChannelMine,
-    Directory as ChannelDirectory, Post as ChannelPost, TYPE_REMOVE as CH_REMOVE,
-    TYPE_REPLICATE as CH_REPLICATE, TYPE_UNREPLICATE as CH_UNREPLICATE,
-    TYPE_EQUIVOCATION as CH_EQUIVOCATION,
-    Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
-    TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
-};
-use sqex_proto::mailbox::{ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS};
-use sqex_proto::blob_store::{
-    Begin as BlobBegin, ByBlob, ByChannelBlob, Begun, Commit as BlobCommit, Committed, GetChunk,
-    Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT, TYPE_DETACH as BL_DETACH,
-    TYPE_HEAD as BL_HEAD, ByUpload,
-};
-use sqex_proto::channel_key::{
-    Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
-};
-use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::attest::{Attestation, Query as AttestQuery};
-use sqex_proto::rendezvous::Introduce;
-use sqex_proto::resolve::{
-    Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
+use sqex_proto::beacon::{Beat, BeatAck, Read};
+use sqex_proto::blob_store::{
+    Begin as BlobBegin, Begun, ByBlob, ByChannelBlob, ByUpload, Commit as BlobCommit, Committed,
+    GetChunk, Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT, TYPE_DETACH as BL_DETACH,
+    TYPE_HEAD as BL_HEAD,
 };
-use sqex_proto::peer::{
-    Hello as PeerHello, Hi, PEER_VERSION, PullBlob, PullEnvelopes, PullRecord, Pull as PeerPull,
+use sqex_proto::channel::{
+    Ack as ChannelAck, ByAccount as ChannelByAccount, ByChannel, ByChannelSigned, ByTarget,
+    Create as ChannelCreate, Created, Cursor as ChannelCursor, Directory as ChannelDirectory,
+    Fetch as ChannelFetch, Invite as ChannelInvite, Invitee, List as ChannelList,
+    Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain, SignalOut,
+    TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_EQUIVOCATION as CH_EQUIVOCATION,
+    TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE, TYPE_REDACT as CH_REDACT,
+    TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE, TYPE_UNREPLICATE as CH_UNREPLICATE,
 };
+use sqex_proto::channel_key::{Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING};
 use sqex_proto::device::{
     AdmissionRequest, ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke,
+};
+use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
+use sqex_proto::mailbox::{
+    ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS,
+};
+use sqex_proto::message::{RING_RINGING, Signal};
+use sqex_proto::peer::{
+    Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull, PullBlob, PullEnvelopes, PullRecord,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
     Block as ProfileBlock, ByAccount, Put as ProfilePut, TYPE_GET as PR_GET,
+};
+use sqex_proto::rendezvous::Introduce;
+use sqex_proto::resolve::{
+    Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
 };
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave, Left};
 use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
@@ -143,7 +142,12 @@ struct Connections {
 
 impl Connections {
     fn add(&self, id: PubKey, conn: quinn::Connection) {
-        self.by_identity.lock().unwrap().entry(id).or_default().push(conn);
+        self.by_identity
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .push(conn);
     }
 
     /// Forget a connection, and the identity entirely once its last one goes.
@@ -419,7 +423,7 @@ pub async fn bind(
             // shorter root.
             Some(signing_key.to_bytes()),
         )
-            .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
+        .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
         // Durable, and it was not always. The argument for keeping prekeys in
         // memory was that a key surviving a restart the device did not is a key
         // whose secret is gone, so serving it produces an envelope nobody can
@@ -469,7 +473,10 @@ pub async fn bind(
     // room.
     let mut server = server;
     if !welcome_name.is_empty() {
-        match server.channels.ensure_public(&welcome_name, founder.as_ref()) {
+        match server
+            .channels
+            .ensure_public(&welcome_name, founder.as_ref())
+        {
             Ok(channel) => {
                 Arc::get_mut(&mut server)
                     .expect("nothing else holds this yet")
@@ -604,11 +611,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
 }
 
 /// Drive one HTTP/3 connection: accept request streams and answer each.
-async fn serve_h3(
-    server: Arc<Server>,
-    conn: quinn::Connection,
-    peer: Peer,
-) -> Result<()> {
+async fn serve_h3(server: Arc<Server>, conn: quinn::Connection, peer: Peer) -> Result<()> {
     // An identified connection can carry session datagrams, so register it and
     // pump them for as long as it lives. Anonymous connections cannot be a
     // party to a session, so they are never registered and never forwarded to.
@@ -716,8 +719,7 @@ async fn handle_stream(
         return serve_events(&server, &body, peer, &mut stream).await;
     }
 
-    let (status, content_type, out) =
-        route(&server, method.as_str(), &path, &body, peer).await;
+    let (status, content_type, out) = route(&server, method.as_str(), &path, &body, peer).await;
     respond(&mut stream, status, content_type, out).await
 }
 
@@ -816,7 +818,6 @@ impl crate::events::Sink for H3Sink<'_> {
     }
 }
 
-
 /// Pure-ish routing: all state access, no stream I/O.
 async fn route(
     server: &Arc<Server>,
@@ -895,9 +896,7 @@ async fn route(
             Ok(beat) => match peer.identity {
                 None => no_identity("beating"),
                 Some(id) => {
-                    let now = server
-                        .beacons
-                        .record(id, beat.interval_secs, beat.withhold);
+                    let now = server.beacons.record(id, beat.interval_secs, beat.withhold);
                     // SIP-28: a service proving it is alive should not have to
                     // separately prove its address is current. The window is
                     // extended by the interval it declared, so an identity that
@@ -958,7 +957,9 @@ async fn route(
                 Err(LodgeError::NoSuchAttestation) => refuse(
                     404,
                     Code::NoSuchEntry,
-                    Some("a revocation must name an attestation this exchange holds, by its own issuer"),
+                    Some(
+                        "a revocation must name an attestation this exchange holds, by its own issuer",
+                    ),
                 ),
             },
         },
@@ -990,18 +991,23 @@ async fn route(
             // Only for itself. The handshake established which key is speaking,
             // and a caller may publish for that identity and no other — which
             // is the whole reason no signature is needed.
-            (Some(id), Ok(req)) => match server.endpoints.publish(id, req.ttl_secs, req.endpoints, req.capabilities) {
-                Ok(_) => (
-                    200,
-                    "application/octet-stream",
-                    ChannelAck { now: now_unix() }.encode(),
-                ),
-                Err(_) => refuse(
-                    507,
-                    Code::TooManyEndpoints,
-                    Some("an identity may publish at most 8 endpoints"),
-                ),
-            },
+            (Some(id), Ok(req)) => {
+                match server
+                    .endpoints
+                    .publish(id, req.ttl_secs, req.endpoints, req.capabilities)
+                {
+                    Ok(_) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(_) => refuse(
+                        507,
+                        Code::TooManyEndpoints,
+                        Some("an identity may publish at most 8 endpoints"),
+                    ),
+                }
+            }
         },
         ("POST", "/resolve/get") => match (peer.identity, ResolveGet::decode(body)) {
             (None, _) => no_identity("resolving a key"),
@@ -1067,9 +1073,13 @@ async fn route(
                     .list(&req.credential.account)
                     .map(|d| d.devices.len())
                     .unwrap_or(0);
-                server
-                    .admissions
-                    .request(&me, peer.key.as_ref(), &req.credential, &req.label, siblings);
+                server.admissions.request(
+                    &me,
+                    peer.key.as_ref(),
+                    &req.credential,
+                    &req.label,
+                    siblings,
+                );
                 // Whoever can act on it. An admission request that waits for
                 // an admin to think of refreshing is the case this replaces.
                 let admins: Vec<PubKey> = server.admins.read().unwrap().clone();
@@ -1077,7 +1087,11 @@ async fn route(
                 // `now` is the only field, and it is here for the reason SIP-4
                 // gives: a client with a wrong clock has something to notice it
                 // against. It is identical for every caller.
-                (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
             }
         },
 
@@ -1103,8 +1117,14 @@ async fn route(
                                 && !server.profiles.has_blocked(&me, other)
                         })
                         .collect();
-                    server.events.publish(&to, EventKind::Profile { account: me });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                    server
+                        .events
+                        .publish(&to, EventKind::Profile { account: me });
+                    (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    )
                 }
                 Err(e) => refuse(e.status(), e.code(), None),
             },
@@ -1117,7 +1137,9 @@ async fn route(
                 // somebody: everybody is in it, so counting it would leave a
                 // withheld profile withheld from nobody.
                 let shares = |a: &PubKey, b: &PubKey| {
-                    server.channels.share_a_channel(a, b, server.welcome.as_ref())
+                    server
+                        .channels
+                        .share_a_channel(a, b, server.welcome.as_ref())
                 };
                 match server.profiles.get(&me, &req.account, &shares) {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
@@ -1129,7 +1151,11 @@ async fn route(
             (None, _) => no_identity("blocking"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.profiles.set_block(&me, &req.account, req.add) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refuse(e.status(), e.code(), None),
             },
         },
@@ -1154,20 +1180,30 @@ async fn route(
             // device of the same account. The account is never required to
             // connect, because a hardware-held one cannot.
             (Some(me), Ok(req)) => match server.devices.register(&me, &req.credential) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refuse(e.status(), e.code(), None),
             },
         },
         ("POST", "/device/revoke") => match (device, DeviceRevoke::decode(body)) {
             (None, _) => no_identity("revoking a device"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server
-                .devices
-                .revoke(&me, &req.device, req.revocation.as_ref())
-            {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
-                Err(e) => refuse(e.status(), e.code(), None),
-            },
+            (Some(me), Ok(req)) => {
+                match server
+                    .devices
+                    .revoke(&me, &req.device, req.revocation.as_ref())
+                {
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(e) => refuse(e.status(), e.code(), None),
+                }
+            }
         },
         // Answerable to anybody: the mapping is public by construction, since
         // every credential carries both keys in the clear to whoever verifies
@@ -1204,7 +1240,11 @@ async fn route(
                 Ok(upload) => (
                     200,
                     "application/octet-stream",
-                    Begun { upload, now: now_unix() }.encode(),
+                    Begun {
+                        upload,
+                        now: now_unix(),
+                    }
+                    .encode(),
                 ),
                 Err(e) => refused(e),
             },
@@ -1213,7 +1253,11 @@ async fn route(
             (None, _) => no_identity("uploading a chunk"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.put_chunk(&me, &req) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refused(e),
             },
         },
@@ -1225,7 +1269,12 @@ async fn route(
                     Ok(stored) => (
                         200,
                         "application/octet-stream",
-                        Committed { stored, blob: req.blob, now: now_unix() }.encode(),
+                        Committed {
+                            stored,
+                            blob: req.blob,
+                            now: now_unix(),
+                        }
+                        .encode(),
                     ),
                     Err(e) => refused(e),
                 }
@@ -1235,7 +1284,11 @@ async fn route(
             (None, _) => no_identity("aborting an upload"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.abort_upload(&me, req.upload) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refused(e),
             },
         },
@@ -1256,11 +1309,18 @@ async fn route(
             },
         },
         ("POST", "/blob/attach") => {
-            match (account, ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH)) {
+            match (
+                account,
+                ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH),
+            ) {
                 (None, _) => no_identity("attaching a blob"),
                 (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
                 (Some(me), Ok(req)) => match server.channels.attach_blob(&me, &req) {
-                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
                     Err(e) => refused(e),
                 },
             }
@@ -1270,7 +1330,11 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
                 match server.channels.detach_blob(&me, &req.channel, &req.blob) {
-                    Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
                     Err(e) => refused(e),
                 }
             }
@@ -1341,13 +1405,24 @@ async fn route(
                         // Everybody invited learns of a channel that did not
                         // exist when they last looked, which is the whole of
                         // how a conversation somebody else started arrives.
-                        server.tell(&req.channel, EventKind::Membership {
-                            channel: req.channel, account: me, what: MEMBER_JOINED,
-                        });
+                        server.tell(
+                            &req.channel,
+                            EventKind::Membership {
+                                channel: req.channel,
+                                account: me,
+                                what: MEMBER_JOINED,
+                            },
+                        );
                         (
                             200,
                             "application/octet-stream",
-                            Created { created, epoch, instance, now: now_unix() }.encode(),
+                            Created {
+                                created,
+                                epoch,
+                                instance,
+                                now: now_unix(),
+                            }
+                            .encode(),
                         )
                     }
                     Err(e) => refused(e),
@@ -1357,34 +1432,51 @@ async fn route(
         ("POST", "/channel/join") => match (who, ByChannelSigned::decode(body, CH_JOIN)) {
             (None, _) => no_identity("joining a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some((me, dev)), Ok(req)) => match server
-                .channels
-                .join(&me, &dev, &req.channel, &req.action)
-            {
-                Ok(()) => {
-                    server.tell(&req.channel, EventKind::Membership {
-                        channel: req.channel, account: me, what: MEMBER_JOINED,
-                    });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+            (Some((me, dev)), Ok(req)) => {
+                match server.channels.join(&me, &dev, &req.channel, &req.action) {
+                    Ok(()) => {
+                        server.tell(
+                            &req.channel,
+                            EventKind::Membership {
+                                channel: req.channel,
+                                account: me,
+                                what: MEMBER_JOINED,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(e) => refused(e),
                 }
-                Err(e) => refused(e),
-            },
+            }
         },
         ("POST", "/channel/leave") => match (who, ByChannelSigned::decode(body, CH_LEAVE)) {
             (None, _) => no_identity("leaving a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some((me, dev)), Ok(req)) => match server
-                .channels
-                .leave(&me, &dev, &req.channel, &req.action)
-            {
-                Ok(()) => {
-                    server.tell_including(&req.channel, &me, EventKind::Membership {
-                        channel: req.channel, account: me, what: MEMBER_LEFT,
-                    });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+            (Some((me, dev)), Ok(req)) => {
+                match server.channels.leave(&me, &dev, &req.channel, &req.action) {
+                    Ok(()) => {
+                        server.tell_including(
+                            &req.channel,
+                            &me,
+                            EventKind::Membership {
+                                channel: req.channel,
+                                account: me,
+                                what: MEMBER_LEFT,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(e) => refused(e),
                 }
-                Err(e) => refused(e),
-            },
+            }
         },
         ("POST", "/channel/post") => match (account, ChannelPost::decode(body)) {
             (None, _) => no_identity("posting to a channel"),
@@ -1399,7 +1491,10 @@ async fn route(
                 Ok(posted) => {
                     server.tell(
                         &req.channel,
-                        EventKind::Channel { channel: req.channel, last_seq: posted.seq },
+                        EventKind::Channel {
+                            channel: req.channel,
+                            last_seq: posted.seq,
+                        },
                     );
                     (200, "application/octet-stream", posted.encode())
                 }
@@ -1409,16 +1504,25 @@ async fn route(
         ("POST", "/channel/info") => match (account, ByChannel::decode(body, CH_INFO)) {
             (None, _) => no_identity("reading a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server.channels.info(&me, &device.unwrap_or(me), &req.channel) {
-                Ok(info) => (200, "application/octet-stream", info.encode()),
-                Err(e) => refused(e),
-            },
+            (Some(me), Ok(req)) => {
+                match server
+                    .channels
+                    .info(&me, &device.unwrap_or(me), &req.channel)
+                {
+                    Ok(info) => (200, "application/octet-stream", info.encode()),
+                    Err(e) => refused(e),
+                }
+            }
         },
         ("POST", "/channel/retain") => match (who, ChannelRetain::decode(body)) {
             (None, _) => no_identity("setting retention"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server.channels.retain(&me, &dev, &req) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refused(e),
             },
         },
@@ -1426,7 +1530,11 @@ async fn route(
             (None, _) => no_identity("naming a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server.channels.set_directory(&me, &dev, &req) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refused(e),
             },
         },
@@ -1434,7 +1542,11 @@ async fn route(
             (None, _) => no_identity("closing a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.close(&me, &req.channel) {
-                Ok(()) => (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode()),
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refused(e),
             },
         },
@@ -1462,17 +1574,37 @@ async fn route(
             (None, _) => no_identity("inviting to a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
-                let (channel, guest) = (req.channel, Invitee { account: req.account, role: req.role });
+                let (channel, guest) = (
+                    req.channel,
+                    Invitee {
+                        account: req.account,
+                        role: req.role,
+                    },
+                );
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
-                match server
-                    .channels
-                    .invite(&me, &dev, &channel, &guest.account, guest.role, &req.action, &blocked)
-                {
+                match server.channels.invite(
+                    &me,
+                    &dev,
+                    &channel,
+                    &guest.account,
+                    guest.role,
+                    &req.action,
+                    &blocked,
+                ) {
                     Ok(()) => {
-                        server.tell(&channel, EventKind::Membership {
-                            channel, account: guest.account, what: MEMBER_JOINED,
-                        });
-                        (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                        server.tell(
+                            &channel,
+                            EventKind::Membership {
+                                channel,
+                                account: guest.account,
+                                what: MEMBER_JOINED,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
                     }
                     Err(e) => refused(e),
                 }
@@ -1482,52 +1614,97 @@ async fn route(
         // written into the log the members read — never by an operator out of
         // band, which would make a channel's copies invisible to the people in
         // it.
-        ("POST", "/channel/replicate") => match (who, ChannelByAccount::decode(body, CH_REPLICATE)) {
+        ("POST", "/channel/replicate") => match (who, ChannelByAccount::decode(body, CH_REPLICATE))
+        {
             (None, _) => no_identity("authorising replication"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => match server.channels.replicate(
-                &me, &dev, &req.channel, &req.account, &req.action, true,
+                &me,
+                &dev,
+                &req.channel,
+                &req.account,
+                &req.action,
+                true,
             ) {
                 Ok(()) => {
-                    server.tell(&req.channel, EventKind::Channel { channel: req.channel, last_seq: 0 });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                    server.tell(
+                        &req.channel,
+                        EventKind::Channel {
+                            channel: req.channel,
+                            last_seq: 0,
+                        },
+                    );
+                    (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    )
                 }
                 Err(e) => refused(e),
             },
         },
         // **The end of a subscription, and not a recall.** What a replica
         // already holds was lawfully obtained and no protocol can unsend it.
-        ("POST", "/channel/unreplicate") => match (who, ChannelByAccount::decode(body, CH_UNREPLICATE)) {
-            (None, _) => no_identity("withdrawing replication"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some((me, dev)), Ok(req)) => match server.channels.replicate(
-                &me, &dev, &req.channel, &req.account, &req.action, false,
-            ) {
-                Ok(()) => {
-                    server.tell(&req.channel, EventKind::Channel { channel: req.channel, last_seq: 0 });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
-                }
-                Err(e) => refused(e),
-            },
-        },
+        ("POST", "/channel/unreplicate") => {
+            match (who, ChannelByAccount::decode(body, CH_UNREPLICATE)) {
+                (None, _) => no_identity("withdrawing replication"),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some((me, dev)), Ok(req)) => match server.channels.replicate(
+                    &me,
+                    &dev,
+                    &req.channel,
+                    &req.account,
+                    &req.action,
+                    false,
+                ) {
+                    Ok(()) => {
+                        server.tell(
+                            &req.channel,
+                            EventKind::Channel {
+                                channel: req.channel,
+                                last_seq: 0,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(e) => refused(e),
+                },
+            }
+        }
 
         ("POST", "/channel/remove") => match (who, ChannelByAccount::decode(body, CH_REMOVE)) {
             (None, _) => no_identity("removing from a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some((me, dev)), Ok(req)) => match server
-                .channels
-                .remove(&me, &dev, &req.channel, &req.account, &req.action)
-            {
-                Ok(()) => {
-                    // The removed account is told too. It is the one party to
-                    // this that cannot find out by asking again.
-                    server.tell_including(&req.channel, &req.account, EventKind::Membership {
-                        channel: req.channel, account: req.account, what: MEMBER_REMOVED,
-                    });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+            (Some((me, dev)), Ok(req)) => {
+                match server
+                    .channels
+                    .remove(&me, &dev, &req.channel, &req.account, &req.action)
+                {
+                    Ok(()) => {
+                        // The removed account is told too. It is the one party to
+                        // this that cannot find out by asking again.
+                        server.tell_including(
+                            &req.channel,
+                            &req.account,
+                            EventKind::Membership {
+                                channel: req.channel,
+                                account: req.account,
+                                what: MEMBER_REMOVED,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(e) => refused(e),
                 }
-                Err(e) => refused(e),
-            },
+            }
         },
 
         // SIP-17 channel keys. The exchange stores envelopes opaquely, serves
@@ -1558,7 +1735,10 @@ async fn route(
             (None, _, _) | (_, None, _) => no_identity("collecting channel keys"),
             (_, _, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Some(mine), Ok(req)) => {
-                match server.channels.get_keys(&me, &mine, &req.channel, req.since_epoch) {
+                match server
+                    .channels
+                    .get_keys(&me, &mine, &req.channel, req.since_epoch)
+                {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
                     Err(e) => refused(e),
                 }
@@ -1602,8 +1782,18 @@ async fn route(
                     .set_cursor(&me, &req.channel, req.read, req.receipts)
                 {
                     Ok(()) => {
-                        server.tell_others(&req.channel, &me, EventKind::Cursor { channel: req.channel });
-                        (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                        server.tell_others(
+                            &req.channel,
+                            &me,
+                            EventKind::Cursor {
+                                channel: req.channel,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
                     }
                     Err(e) => refused(e),
                 }
@@ -1625,8 +1815,18 @@ async fn route(
                     // No sequence number to name: a redaction changes an entry
                     // that is already numbered. Zero is the wire's word for
                     // "fetch and see".
-                    server.tell(&req.channel, EventKind::Channel { channel: req.channel, last_seq: 0 });
-                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                    server.tell(
+                        &req.channel,
+                        EventKind::Channel {
+                            channel: req.channel,
+                            last_seq: 0,
+                        },
+                    );
+                    (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    )
                 }
                 Err(e) => refused(e),
             },
@@ -1637,11 +1837,20 @@ async fn route(
             (None, _) => no_identity("signalling"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
-                match server.channels.signal(&me, &dev, &req.channel, req.kind, &req.body) {
+                match server
+                    .channels
+                    .signal(&me, &dev, &req.channel, req.kind, &req.body)
+                {
                     Ok(()) => {
                         // Not to the sender: a client does not need telling
                         // that its own keyboard is being used.
-                        server.tell_others(&req.channel, &me, EventKind::Signal { channel: req.channel });
+                        server.tell_others(
+                            &req.channel,
+                            &me,
+                            EventKind::Signal {
+                                channel: req.channel,
+                            },
+                        );
                         // SIP-36. A ringing phone is not a keyboard, and a
                         // client that has quietened its signal polling —
                         // which SIP-30 exists to let it do — would otherwise
@@ -1663,10 +1872,17 @@ async fn route(
                             server.tell_others(
                                 &req.channel,
                                 &me,
-                                EventKind::Ringing { channel: req.channel, seq: target },
+                                EventKind::Ringing {
+                                    channel: req.channel,
+                                    seq: target,
+                                },
                             );
                         }
-                        (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
                     }
                     Err(e) => refused(e),
                 }
@@ -1715,21 +1931,26 @@ async fn route(
         // honest-looking servers. Open to any member, because the artifact is
         // checkable by anybody holding the origin's public key and is worth
         // nothing kept private.
-        ("POST", "/channel/equivocation") => match (account, ByChannel::decode(body, CH_EQUIVOCATION)) {
-            (None, _) => no_identity("reading an equivocation"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(_), Ok(req)) => match server.channels.equivocation_for(&req.channel) {
-                Some(proof) => (200, "application/octet-stream", proof),
-                None => refuse(404, Code::NoSuchChannel, None),
-            },
-        },
+        ("POST", "/channel/equivocation") => {
+            match (account, ByChannel::decode(body, CH_EQUIVOCATION)) {
+                (None, _) => no_identity("reading an equivocation"),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some(_), Ok(req)) => match server.channels.equivocation_for(&req.channel) {
+                    Some(proof) => (200, "application/octet-stream", proof),
+                    None => refuse(404, Code::NoSuchChannel, None),
+                },
+            }
+        }
 
         ("POST", "/peer/envelopes") => match (peer.identity, PullEnvelopes::decode(body)) {
             (Some(who), Ok(req))
                 if server.replication_peers.contains(&who)
                     && server.channels.replicates_to(&req.channel, &who) =>
             {
-                match server.channels.pull_envelopes(&req.channel, req.since_epoch) {
+                match server
+                    .channels
+                    .pull_envelopes(&req.channel, req.since_epoch)
+                {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
                     Err(_) => peering_refused(),
                 }
@@ -1741,7 +1962,10 @@ async fn route(
                 if server.replication_peers.contains(&who)
                     && server.channels.replicates_to(&req.channel, &who) =>
             {
-                match server.channels.pull_blob(&req.channel, &req.blob, req.chunk) {
+                match server
+                    .channels
+                    .pull_blob(&req.channel, &req.blob, req.chunk)
+                {
                     Ok(got) => (200, "application/octet-stream", got.encode()),
                     Err(_) => peering_refused(),
                 }
@@ -1768,10 +1992,12 @@ async fn route(
         ("POST", "/channel/fetch") => match (account, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match fetch_waiting(server, &me, &device.unwrap_or(me), &req).await {
-                Ok(entries) => (200, "application/octet-stream", entries.encode()),
-                Err(e) => refused(e),
-            },
+            (Some(me), Ok(req)) => {
+                match fetch_waiting(server, &me, &device.unwrap_or(me), &req).await {
+                    Ok(entries) => (200, "application/octet-stream", entries.encode()),
+                    Err(e) => refused(e),
+                }
+            }
         },
 
         ("POST", "/room/join") => match (peer.identity, RoomJoin::decode(body)) {
@@ -1797,16 +2023,14 @@ async fn route(
         ("POST", "/mailbox/send") => match (peer.identity, MailSend::decode(body)) {
             (None, _) => no_identity("sending"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(from), Ok(msg)) => {
-                match server.mailbox.send(from, msg.recipient, msg.sealed) {
-                    Ok((id, now)) => (
-                        200,
-                        "application/octet-stream",
-                        SendAck { id, now }.encode(),
-                    ),
-                    Err(e) => refuse(507, e.code(), None),
-                }
-            }
+            (Some(from), Ok(msg)) => match server.mailbox.send(from, msg.recipient, msg.sealed) {
+                Ok((id, now)) => (
+                    200,
+                    "application/octet-stream",
+                    SendAck { id, now }.encode(),
+                ),
+                Err(e) => refuse(507, e.code(), None),
+            },
         },
         ("POST", "/mailbox/list") => match peer.identity {
             None => no_identity("listing"),
@@ -1895,7 +2119,11 @@ async fn route(
         // A protected exchange endpoint, to demonstrate whitelist enforcement.
         ("GET", "/exchange/ping") => {
             if server.state.lock().unwrap().peer_allowed(peer.key) {
-                (200, "application/octet-stream", Pong { now: now_unix() }.encode())
+                (
+                    200,
+                    "application/octet-stream",
+                    Pong { now: now_unix() }.encode(),
+                )
             } else {
                 refuse(403, Code::NotWhitelisted, None)
             }
@@ -2147,7 +2375,9 @@ async fn fetch_waiting(
     req: &ChannelFetch,
 ) -> std::result::Result<sqex_proto::channel::Entries, ChannelError> {
     let notify = server.channels.notifier(&req.channel);
-    let first = server.channels.fetch(me, device, &req.channel, req.since, req.receipts)?;
+    let first = server
+        .channels
+        .fetch(me, device, &req.channel, req.since, req.receipts)?;
     if !first.entries.is_empty() || !first.signals.is_empty() || req.wait_secs == 0 {
         return Ok(first);
     }
@@ -2157,7 +2387,9 @@ async fn fetch_waiting(
         let waited = tokio::time::timeout_at(deadline, notify.notified()).await;
         // Re-check membership as well as entries: an answer is owed to whoever
         // the caller is *now*, not who they were when they parked.
-        let again = server.channels.fetch(me, device, &req.channel, req.since, req.receipts)?;
+        let again = server
+            .channels
+            .fetch(me, device, &req.channel, req.since, req.receipts)?;
         // A signal is as good a reason to answer as an entry: SIP-16 says a
         // held request returns as soon as either arrives for the caller.
         if !again.entries.is_empty() || !again.signals.is_empty() || waited.is_err() {
@@ -2165,8 +2397,6 @@ async fn fetch_waiting(
         }
     }
 }
-
-
 
 fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
     refuse(

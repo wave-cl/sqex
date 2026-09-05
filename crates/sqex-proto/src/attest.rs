@@ -165,9 +165,7 @@ impl Attestation {
         if self.issuer == self.subject {
             return Err(Invalid::SelfIssued);
         }
-        if self.expires_at <= self.issued_at
-            || self.expires_at - self.issued_at > MAX_VALIDITY
-        {
+        if self.expires_at <= self.issued_at || self.expires_at - self.issued_at > MAX_VALIDITY {
             return Err(Invalid::BadWindow);
         }
         if now < self.issued_at {
@@ -176,8 +174,8 @@ impl Attestation {
         if now > self.expires_at {
             return Err(Invalid::Expired);
         }
-        let vk = VerifyingKey::from_bytes(self.issuer.as_bytes())
-            .map_err(|_| Invalid::BadSignature)?;
+        let vk =
+            VerifyingKey::from_bytes(self.issuer.as_bytes()).map_err(|_| Invalid::BadSignature)?;
         vk.verify(
             &signing_input(
                 &self.subject,
@@ -482,8 +480,14 @@ mod tests {
         assert_eq!(round_tripped, a);
         assert_eq!(round_tripped.digest(), a.digest());
         // A different statement is a different name.
-        assert_ne!(said(1, 2, CLAIM_KNOWN_AS, "ex.squic.org").digest(), a.digest());
-        assert_ne!(said(1, 4, CLAIM_OPERATES, "ex.squic.org").digest(), a.digest());
+        assert_ne!(
+            said(1, 2, CLAIM_KNOWN_AS, "ex.squic.org").digest(),
+            a.digest()
+        );
+        assert_ne!(
+            said(1, 4, CLAIM_OPERATES, "ex.squic.org").digest(),
+            a.digest()
+        );
     }
 
     #[test]
@@ -507,12 +511,21 @@ mod tests {
         );
         assert!(Attestation::decode(&big.encode()).is_err());
 
-        let q = Query { subject: about, issuer: Some(who(1).1) };
+        let q = Query {
+            subject: about,
+            issuer: Some(who(1).1),
+        };
         assert_eq!(Query::decode(&q.encode()).unwrap(), q);
-        let all = Query { subject: about, issuer: None };
+        let all = Query {
+            subject: about,
+            issuer: None,
+        };
         assert_eq!(Query::decode(&all.encode()).unwrap(), all);
 
-        let held = Held { now: 1500, attestations: vec![a.clone(), said(4, 2, CLAIM_KNOWN_AS, "A")] };
+        let held = Held {
+            now: 1500,
+            attestations: vec![a.clone(), said(4, 2, CLAIM_KNOWN_AS, "A")],
+        };
         assert_eq!(Held::decode(&held.encode()).unwrap(), held);
     }
 
@@ -521,13 +534,23 @@ mod tests {
     /// with a failing assertion in front of it, rather than a quiet extension.
     #[test]
     fn no_registered_claim_is_a_statement_against_somebody() {
-        for claim in [CLAIM_OPERATES, CLAIM_KNOWN_AS, CLAIM_REVIEWED, CLAIM_REVOKES] {
+        for claim in [
+            CLAIM_OPERATES,
+            CLAIM_KNOWN_AS,
+            CLAIM_REVIEWED,
+            CLAIM_REVOKES,
+        ] {
             let a = said(1, 2, claim, "x");
             assert!(a.readable());
         }
         // Four, and no more. A fifth registered type is a decision this
         // assertion asks somebody to make on purpose.
-        let registered = [CLAIM_OPERATES, CLAIM_KNOWN_AS, CLAIM_REVIEWED, CLAIM_REVOKES];
+        let registered = [
+            CLAIM_OPERATES,
+            CLAIM_KNOWN_AS,
+            CLAIM_REVIEWED,
+            CLAIM_REVOKES,
+        ];
         assert_eq!(registered.len(), 4);
         for code in 0u8..=255 {
             if !registered.contains(&code) {

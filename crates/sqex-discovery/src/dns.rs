@@ -32,8 +32,9 @@ static RESOLVER: OnceCell<TokioResolver> = OnceCell::const_new();
 async fn resolver() -> Result<&'static TokioResolver> {
     RESOLVER
         .get_or_try_init(|| async {
-            let mut builder = Resolver::builder_tokio()
-                .map_err(|e| Error::Resolve(format!("cannot read the system DNS configuration: {e}")))?;
+            let mut builder = Resolver::builder_tokio().map_err(|e| {
+                Error::Resolve(format!("cannot read the system DNS configuration: {e}"))
+            })?;
             // No trust anchor is set, so hickory's built-in root anchor is used:
             // the chain is checked here rather than taken on trust from whoever
             // answered.
@@ -102,28 +103,25 @@ pub async fn lookup(domain: &str) -> Result<Vec<Record>> {
 pub async fn lookup_txt(name: &str) -> Result<Vec<String>> {
     let resolver = resolver().await?;
 
-    let answer = resolver
-        .lookup(name, RecordType::TXT)
-        .await
-        .map_err(|e| {
-            if !e.is_no_records_found() {
-                return Error::Resolve(format!(
-                    "looking up {name} failed: {e}. A bogus signature means the answer was \
+    let answer = resolver.lookup(name, RecordType::TXT).await.map_err(|e| {
+        if !e.is_no_records_found() {
+            return Error::Resolve(format!(
+                "looking up {name} failed: {e}. A bogus signature means the answer was \
                      tampered with; a resolver that strips DNSSEC records looks the same from \
                      here."
-                ));
-            }
-            // The SOA that came back with the negative answer carries how long
-            // a resolver may go on serving it. That matters: a record published
-            // *after* something asked for it stays invisible for the rest of
-            // this window, and only to clients that validate. See `Error`.
-            let negative_ttl = e.into_soa().map(|soa| soa.ttl);
-            Error::NotPublished {
-                domain: name.to_string(),
-                name: name.to_string(),
-                negative_ttl,
-            }
-        })?;
+            ));
+        }
+        // The SOA that came back with the negative answer carries how long
+        // a resolver may go on serving it. That matters: a record published
+        // *after* something asked for it stays invisible for the rest of
+        // this window, and only to clients that validate. See `Error`.
+        let negative_ttl = e.into_soa().map(|soa| soa.ttl);
+        Error::NotPublished {
+            domain: name.to_string(),
+            name: name.to_string(),
+            negative_ttl,
+        }
+    })?;
 
     // An unsigned zone is a perfectly valid DNSSEC outcome — Insecure, not an
     // error — so it has to be refused explicitly rather than relied on to fail
@@ -158,8 +156,11 @@ pub async fn lookup_txt(name: &str) -> Result<Vec<String>> {
         });
     }
     if unproven > 0 {
-        tracing::warn!(name, unproven, "ignoring TXT answers without a DNSSEC proof");
+        tracing::warn!(
+            name,
+            unproven,
+            "ignoring TXT answers without a DNSSEC proof"
+        );
     }
     Ok(secure)
 }
-

@@ -18,8 +18,8 @@ pub mod target;
 
 pub use error::{Error, Result};
 pub use known::{Decision, Known};
-pub use target::{Layer, Target};
 pub use record::{DEFAULT_PORT, Invalid, LABEL, Parsed, Record, VERSION};
+pub use target::{Layer, Target};
 
 /// Where one rung of the ladder came from, so a caller can say what it did and
 /// decide how long to wait on it.
@@ -67,17 +67,13 @@ pub async fn discover(domain: &str) -> Result<Found> {
     let records = dns::lookup(domain).await?;
 
     let offered: Vec<_> = records.iter().map(|r| r.key).collect();
-    let decision = known::decide(&offered, store.lookup(domain))
-        .expect("lookup returns no empty set");
+    let decision =
+        known::decide(&offered, store.lookup(domain)).expect("lookup returns no empty set");
 
     let (key, newly_pinned) = match decision {
         Decision::Pinned(k) => (k, false),
         Decision::FirstContact(k) => {
-            store.add(
-                domain,
-                k,
-                &format!("discovered {}", today()),
-            );
+            store.add(domain, k, &format!("discovered {}", today()));
             store.save(&path).map_err(Error::Store)?;
             (k, true)
         }

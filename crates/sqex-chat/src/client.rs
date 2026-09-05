@@ -5,47 +5,43 @@
 //! it verifies prekey signatures itself, and it refuses a replayed counter,
 //! because the exchange is either unable or is the party being constrained.
 
+use sha2::{Digest, Sha256};
+use sqex_proto::blob::Attachment;
 use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
     EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
-    EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_UNREPLICATE, TYPE_EQUIVOCATION,
-    TYPE_REPLICATE,
-    TYPE_UNREPLICATE,
-    EVENT_RETENTION, EVENT_ROTATED,
-    Entries, Entry, Fetch, Invite, Invitee, constitution,
-    KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
-    Marks, Membership, Mine, Mines, Post, Posted, Retain, Role, TYPE_CLOSE, TYPE_CURSORS,
-    TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, Visibility, direct_message_id,
+    EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
+    EVENT_UNREPLICATE, Entries, Entry, Fetch, Invite, Invitee, KIND_MEMBER, KIND_SYSTEM, List,
+    Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark, Marks, Membership,
+    Mine, Mines, Post, Posted, Retain, Role, TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION,
+    TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_UNREPLICATE,
+    Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
-    Envelope, sign_envelope, verify_envelope,
-    Absent, ChannelKey, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING, open_envelope,
-    seal_envelope,
+    Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
+    open_envelope, seal_envelope, sign_envelope, verify_envelope,
 };
 use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
-use sqex_proto::refusal::{Code as RefusalCode, Refusal};
-use sqex_proto::receipt::{self, Equivocation, ReceiptTerms};
+use sqex_proto::device::{AdmissionRequest, Device, Devices, ListDevices, Register, Revoke};
 use sqex_proto::entry_sig::{
     ActionTerms, EntryTerms, GENESIS, Place, link, sign_action, sign_entry, verify_entry,
     verify_entry_hashed,
-};
-use sqex_proto::timeline::{Standing, Verdict};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use sqex_proto::device::{AdmissionRequest, Device, Devices, ListDevices, Register, Revoke};
-use sqex_proto::blob::Attachment;
-use sqex_proto::profile::{
-    self, Block, Blocks, ByAccount as ProfileByAccount, Got as GotProfile, Profile,
-    Record as ProfileRecord,
-    Put as ProfilePut,
 };
 use sqex_proto::message::{Body, MAX_EMOJI, Part, Post as SipPost};
 use sqex_proto::prekey::{
     Cleared, Counts, LOW_WATER, POOL, Pool, Prekey, Publish, TYPE_CLEAR, TYPE_COUNT, Take, Taken,
 };
+use sqex_proto::profile::{
+    self, Block, Blocks, ByAccount as ProfileByAccount, Got as GotProfile, Profile,
+    Put as ProfilePut, Record as ProfileRecord,
+};
+use sqex_proto::receipt::{self, Equivocation, ReceiptTerms};
+use sqex_proto::refusal::{Code as RefusalCode, Refusal};
 use sqex_proto::timeline::{Received, Timeline};
+use sqex_proto::timeline::{Standing, Verdict};
 use sqnr::Client;
 use sqnr_core::PubKey;
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -330,8 +326,7 @@ impl Chat {
             let body = self
                 .post("/device/list", ListDevices { account: *account }.encode())
                 .await?;
-            let listed =
-                Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            let listed = Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
             if listed.devices.is_empty() {
                 out.push(*account);
             } else {
@@ -527,7 +522,11 @@ impl Chat {
         let Some(stamp) = &e.stamp else {
             return Standing::Unclaimed;
         };
-        let place = Place { exchange, instance, channel: *channel };
+        let place = Place {
+            exchange,
+            instance,
+            channel: *channel,
+        };
         let terms = ReceiptTerms {
             place,
             seq: e.seq,
@@ -579,12 +578,23 @@ impl Chat {
     ///
     /// A system entry carries no signature of its own; its actor's is inside
     /// the body, and the exchange verified it before writing the row.
-    fn verdict_for(exchange: PubKey, channel: &[u8; 32], instance: [u8; 32], e: &Entry, chain: &mut HashMap<PubKey, (u64, [u8; 32])>, bound: &HashMap<PubKey, Option<PubKey>>) -> Verdict {
+    fn verdict_for(
+        exchange: PubKey,
+        channel: &[u8; 32],
+        instance: [u8; 32],
+        e: &Entry,
+        chain: &mut HashMap<PubKey, (u64, [u8; 32])>,
+        bound: &HashMap<PubKey, Option<PubKey>>,
+    ) -> Verdict {
         if e.kind == KIND_SYSTEM {
             return Verdict::Valid;
         }
         let terms = EntryTerms {
-            place: Place { exchange, instance, channel: *channel },
+            place: Place {
+                exchange,
+                instance,
+                channel: *channel,
+            },
             account: e.account,
             device: e.device,
             epoch: e.epoch,
@@ -597,7 +607,8 @@ impl Chat {
         // A tombstone's body is gone, so the hash it committed to is the only
         // thing left to check against — which is exactly why the commitment is
         // to the hash and not the bytes.
-        let signed = if e.body.is_empty() && e.body_hash != Sha256::digest(&[] as &[u8]).as_slice() {
+        let signed = if e.body.is_empty() && e.body_hash != Sha256::digest(&[] as &[u8]).as_slice()
+        {
             verify_entry_hashed(&terms, &e.body_hash, &e.sig)
         } else {
             verify_entry(&terms, &e.sig)
@@ -781,7 +792,8 @@ impl Chat {
             my_chain_head: GENESIS,
             ..Self::empty_info()
         };
-        let (action, _head) = self.sign_action_at(&req.channel, &info, EVENT_JOINED, &self.me, &[])?;
+        let (action, _head) =
+            self.sign_action_at(&req.channel, &info, EVENT_JOINED, &self.me, &[])?;
         req.instance = ack.instance;
         req.actions = vec![action];
         let out = self.post("/channel/create", req.encode()).await?;
@@ -822,7 +834,11 @@ impl Chat {
             if public { &req.name } else { "" },
             if public { &req.topic } else { "" },
         );
-        let sign = |event: u8, subject: PubKey, arg: &[u8], n: u64, prev_link: [u8; 32]|
+        let sign = |event: u8,
+                    subject: PubKey,
+                    arg: &[u8],
+                    n: u64,
+                    prev_link: [u8; 32]|
          -> Result<(Action, [u8; 32])> {
             let terms = ActionTerms {
                 place: Place {
@@ -840,8 +856,17 @@ impl Chat {
             };
             let sig =
                 sign_action(&self.seed, &terms).map_err(|e| ChatError::Protocol(e.to_string()))?;
-            let input = terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?;
-            Ok((Action { chain_seq: n, prev: prev_link, sig }, link(&input)))
+            let input = terms
+                .input()
+                .map_err(|e| ChatError::Protocol(e.to_string()))?;
+            Ok((
+                Action {
+                    chain_seq: n,
+                    prev: prev_link,
+                    sig,
+                },
+                link(&input),
+            ))
         };
 
         let (opening, head) = sign(EVENT_CREATED, self.me, &founding, start, prev)?;
@@ -878,10 +903,19 @@ impl Chat {
             chain_seq,
             prev,
         };
-        let sig = sign_action(&self.seed, &terms)
+        let sig =
+            sign_action(&self.seed, &terms).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let input = terms
+            .input()
             .map_err(|e| ChatError::Protocol(e.to_string()))?;
-        let input = terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?;
-        Ok((Action { chain_seq, prev, sig }, link(&input)))
+        Ok((
+            Action {
+                chain_seq,
+                prev,
+                sig,
+            },
+            link(&input),
+        ))
     }
 
     /// Where to dial when the connection is lost.
@@ -1021,7 +1055,9 @@ impl Chat {
             // must not be put into backoff. There is nothing to retry quickly
             // either: a client holding too many streams will still hold too
             // many a second later.
-            Err(crate::events::Refusal::Status(code, said)) => Err(classify("/events", code, &said)),
+            Err(crate::events::Refusal::Status(code, said)) => {
+                Err(classify("/events", code, &said))
+            }
             Err(crate::events::Refusal::Transport(e)) => {
                 self.down();
                 Err(ChatError::Transport(e))
@@ -1212,7 +1248,9 @@ impl Chat {
 
     /// Ask for a prekey for `them`, and check it ourselves.
     async fn take_prekey_for(&mut self, them: PubKey) -> Result<Prekey> {
-        let body = self.post("/prekey/take", Take { device: them }.encode()).await?;
+        let body = self
+            .post("/prekey/take", Take { device: them }.encode())
+            .await?;
         let taken = Taken::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         if !taken.found {
             // SIP-23 is deliberate about this: there is no static-only path, so
@@ -1268,25 +1306,25 @@ impl Chat {
     pub async fn open_dm(&mut self, them: &PubKey) -> Result<[u8; 32]> {
         let channel = self.dm_with(them);
         self.create_signed(Create {
-                channel,
-                // Both are filled in by `create_signed`, which proposes the
-                // incarnation and signs one action per invitee against it.
-                instance: [0u8; 32],
-                actions: Vec::new(),
-                visibility: Visibility::Private,
-                retention_secs: RETENTION_SECS,
-                max_entries: 0,
-                // A private channel's name is carried sealed (SIP-19); at the
-                // exchange it must be empty, because a membership graph plus a
-                // name says far more than the graph.
-                name: String::new(),
-                topic: String::new(),
-                invites: vec![Invitee {
-                    account: *them,
-                    role: Role::Admin,
-                }],
-            })
-            .await?;
+            channel,
+            // Both are filled in by `create_signed`, which proposes the
+            // incarnation and signs one action per invitee against it.
+            instance: [0u8; 32],
+            actions: Vec::new(),
+            visibility: Visibility::Private,
+            retention_secs: RETENTION_SECS,
+            max_entries: 0,
+            // A private channel's name is carried sealed (SIP-19); at the
+            // exchange it must be empty, because a membership graph plus a
+            // name says far more than the graph.
+            name: String::new(),
+            topic: String::new(),
+            invites: vec![Invitee {
+                account: *them,
+                role: Role::Admin,
+            }],
+        })
+        .await?;
 
         self.collect_keys(&channel).await?;
         Ok(channel)
@@ -1386,17 +1424,15 @@ impl Chat {
         let mut skipped = Vec::new();
         for who in members {
             match self.take_prekey_for(*who).await {
-                Ok(p) => envelopes.push(
-                    sign_envelope(
-                        &self.seed,
-                        &self.exchange,
-                        &instance,
-                        channel,
-                        epoch,
-                        seal_envelope(who, p.id, &p.public, epoch, &[key])
-                            .map_err(|e| ChatError::Protocol(e.to_string()))?,
-                    ),
-                ),
+                Ok(p) => envelopes.push(sign_envelope(
+                    &self.seed,
+                    &self.exchange,
+                    &instance,
+                    channel,
+                    epoch,
+                    seal_envelope(who, p.id, &p.public, epoch, &[key])
+                        .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                )),
                 Err(ChatError::NotReady(w)) if members.len() > 2 => skipped.push(w),
                 Err(e) => return Err(e),
             }
@@ -1504,7 +1540,13 @@ impl Chat {
                 recipient: self.device,
                 ..env.clone()
             };
-            if !verify_envelope(&self.exchange, &instance, channel, env.from_epoch, &addressed) {
+            if !verify_envelope(
+                &self.exchange,
+                &instance,
+                channel,
+                env.from_epoch,
+                &addressed,
+            ) {
                 unattested += 1;
                 continue;
             }
@@ -1810,25 +1852,25 @@ impl Chat {
             rand_core::OsRng.fill_bytes(&mut channel);
         }
         self.create_signed(Create {
-                channel,
-                // Both are filled in by `create_signed`, which proposes the
-                // incarnation and signs one action per invitee against it.
-                instance: [0u8; 32],
-                actions: Vec::new(),
-                visibility: Visibility::Private,
-                retention_secs: RETENTION_SECS,
-                max_entries: 0,
-                name: String::new(),
-                topic: String::new(),
-                invites: invite
-                    .iter()
-                    .map(|a| Invitee {
-                        account: *a,
-                        role: Role::Member,
-                    })
-                    .collect(),
-            })
-            .await?;
+            channel,
+            // Both are filled in by `create_signed`, which proposes the
+            // incarnation and signs one action per invitee against it.
+            instance: [0u8; 32],
+            actions: Vec::new(),
+            visibility: Visibility::Private,
+            retention_secs: RETENTION_SECS,
+            max_entries: 0,
+            name: String::new(),
+            topic: String::new(),
+            invites: invite
+                .iter()
+                .map(|a| Invitee {
+                    account: *a,
+                    role: Role::Member,
+                })
+                .collect(),
+        })
+        .await?;
         self.ensure_epoch(&channel).await?;
         if !name.is_empty() {
             self.set_name(&channel, name).await?;
@@ -1849,19 +1891,19 @@ impl Chat {
             rand_core::OsRng.fill_bytes(&mut channel);
         }
         self.create_signed(Create {
-                channel,
-                // Both are filled in by `create_signed`, which proposes the
-                // incarnation and signs one action per invitee against it.
-                instance: [0u8; 32],
-                actions: Vec::new(),
-                visibility: Visibility::Public,
-                retention_secs: RETENTION_SECS,
-                max_entries: 0,
-                name: name.chars().take(MAX_NAME).collect(),
-                topic: topic.chars().take(MAX_TOPIC).collect(),
-                invites: Vec::new(),
-            })
-            .await?;
+            channel,
+            // Both are filled in by `create_signed`, which proposes the
+            // incarnation and signs one action per invitee against it.
+            instance: [0u8; 32],
+            actions: Vec::new(),
+            visibility: Visibility::Public,
+            retention_secs: RETENTION_SECS,
+            max_entries: 0,
+            name: name.chars().take(MAX_NAME).collect(),
+            topic: topic.chars().take(MAX_TOPIC).collect(),
+            invites: Vec::new(),
+        })
+        .await?;
         Ok(channel)
     }
 
@@ -1891,7 +1933,11 @@ impl Chat {
         // the only party that could be harmed by a lower answer.
         let (chain_seq, prev) = self.store.chain(channel)?;
         let terms = ActionTerms {
-            place: Place { exchange: self.exchange, instance, channel: *channel },
+            place: Place {
+                exchange: self.exchange,
+                instance,
+                channel: *channel,
+            },
             actor: self.me,
             actor_device: self.device,
             event: EVENT_JOINED,
@@ -1900,14 +1946,22 @@ impl Chat {
             chain_seq,
             prev,
         };
-        let sig = sign_action(&self.seed, &terms)
-            .map_err(|e| ChatError::Protocol(e.to_string()))?;
-        let head = link(&terms.input().map_err(|e| ChatError::Protocol(e.to_string()))?);
+        let sig =
+            sign_action(&self.seed, &terms).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let head = link(
+            &terms
+                .input()
+                .map_err(|e| ChatError::Protocol(e.to_string()))?,
+        );
         self.post(
             "/channel/join",
             ByChannelSigned {
                 channel: *channel,
-                action: Action { chain_seq, prev, sig },
+                action: Action {
+                    chain_seq,
+                    prev,
+                    sig,
+                },
             }
             .encode(TYPE_JOIN),
         )
@@ -1938,7 +1992,11 @@ impl Chat {
         // The role is in the signature: without it a signed promotion could be
         // replayed as a demotion, which is the same request with one byte
         // changed.
-        let event = if role == Role::Admin { EVENT_PROMOTED } else { EVENT_DEMOTED };
+        let event = if role == Role::Admin {
+            EVENT_PROMOTED
+        } else {
+            EVENT_DEMOTED
+        };
         let (action, head) = self.sign_action_at(channel, &info, event, who, &[role as u8])?;
         self.post(
             "/channel/invite",
@@ -1961,7 +2019,8 @@ impl Chat {
         channel: &[u8; 32],
         avatar: Option<Attachment>,
     ) -> Result<Posted> {
-        self.publish_metadata(channel, None, None, Some(avatar)).await
+        self.publish_metadata(channel, None, None, Some(avatar))
+            .await
     }
 
     /// Change a channel's name, its topic, or both.
@@ -2076,8 +2135,7 @@ impl Chat {
                 &topic,
             );
             let me = self.me;
-            let (action, head) =
-                self.sign_action_at(channel, &info, EVENT_RENAMED, &me, &arg)?;
+            let (action, head) = self.sign_action_at(channel, &info, EVENT_RENAMED, &me, &arg)?;
             self.post(
                 "/channel/directory",
                 sqex_proto::channel::Directory {
@@ -2123,17 +2181,15 @@ impl Chat {
         let mut envelopes = Vec::new();
         for device in self.devices_of(&[*who]).await? {
             let p = self.take_prekey_for(device).await?;
-            envelopes.push(
-                sign_envelope(
-                    &self.seed,
-                    &self.exchange,
-                    &info.instance,
-                    channel,
-                    info.epoch,
-                    seal_envelope(&device, p.id, &p.public, info.epoch, &[key])
-                        .map_err(|e| ChatError::Protocol(e.to_string()))?,
-                ),
-            );
+            envelopes.push(sign_envelope(
+                &self.seed,
+                &self.exchange,
+                &info.instance,
+                channel,
+                info.epoch,
+                seal_envelope(&device, p.id, &p.public, info.epoch, &[key])
+                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
+            ));
         }
         let body = self
             .post(
@@ -2612,7 +2668,9 @@ impl Chat {
     /// wants to avoid is more sensitive than the membership it protects them
     /// from — which is why it takes no argument.
     pub async fn blocked(&mut self) -> Result<Vec<PubKey>> {
-        let body = self.post("/block/list", vec![profile::TYPE_BLOCKED]).await?;
+        let body = self
+            .post("/block/list", vec![profile::TYPE_BLOCKED])
+            .await?;
         Ok(Blocks::decode(&body)
             .map_err(|e| ChatError::Protocol(e.to_string()))?
             .accounts)
@@ -2668,9 +2726,7 @@ impl Chat {
                     PROFILE_TTL
                 }
             };
-            if !force
-                && held.is_some_and(|(name, _, at)| now.saturating_sub(at) < age(&name))
-            {
+            if !force && held.is_some_and(|(name, _, at)| now.saturating_sub(at) < age(&name)) {
                 continue;
             }
             let got = match self.profile_of(account).await {
@@ -2758,23 +2814,14 @@ impl Chat {
     /// entry. Checking here as well is a courtesy, so that a client tells
     /// somebody their edit will be ignored rather than sending one that
     /// silently is.
-    pub async fn edit(
-        &mut self,
-        channel: &[u8; 32],
-        target: u64,
-        post: SipPost,
-    ) -> Result<Posted> {
-        post.validate().map_err(|e| ChatError::Protocol(e.to_string()))?;
+    pub async fn edit(&mut self, channel: &[u8; 32], target: u64, post: SipPost) -> Result<Posted> {
+        post.validate()
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
         self.send_body(channel, Body::Edit { target, post }).await
     }
 
     /// Reply to a message: an ordinary post carrying [`Part::Reply`].
-    pub async fn reply(
-        &mut self,
-        channel: &[u8; 32],
-        target: u64,
-        text: &str,
-    ) -> Result<Posted> {
+    pub async fn reply(&mut self, channel: &[u8; 32], target: u64, text: &str) -> Result<Posted> {
         let mut post = SipPost::text(text);
         post.parts.push(Part::Reply(target));
         self.send_post(channel, post).await
@@ -2783,7 +2830,8 @@ impl Chat {
     /// Send a message built by the caller — text, attachments, a reply, or a
     /// combination. `send` is this with one text part.
     pub async fn send_post(&mut self, channel: &[u8; 32], post: SipPost) -> Result<Posted> {
-        post.validate().map_err(|e| ChatError::Protocol(e.to_string()))?;
+        post.validate()
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
         self.send_body(channel, Body::Post(post)).await
     }
 
@@ -3039,12 +3087,16 @@ impl Chat {
             receipts: self.receipts.load(Ordering::Relaxed),
         };
         let patience = PATIENCE + Duration::from_secs(u64::from(wait_secs));
-        let body = match self.post_within("/channel/fetch", req.encode(), patience).await {
+        let body = match self
+            .post_within("/channel/fetch", req.encode(), patience)
+            .await
+        {
             Ok(body) => body,
             Err(e) if req.receipts && declines_receipts(&e) => {
                 self.receipts.store(false, Ordering::Relaxed);
                 req.receipts = false;
-                self.post_within("/channel/fetch", req.encode(), patience).await?
+                self.post_within("/channel/fetch", req.encode(), patience)
+                    .await?
             }
             // SIP-35: the exchange is refusing to choose between two histories
             // its origin signed for one position. Fetch what it has instead of
@@ -3058,8 +3110,8 @@ impl Chat {
             }
             Err(e) => return Err(e),
         };
-        let mut entries = Entries::decode(&body, req.receipts)
-            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let mut entries =
+            Entries::decode(&body, req.receipts).map_err(|e| ChatError::Protocol(e.to_string()))?;
 
         // Being *above* the newest retained entry is not being ahead of the
         // conversation: it is holding the cursor of a channel that no longer
@@ -3176,7 +3228,8 @@ impl Chat {
             // before its key arrives, and every message it could not read then
             // stays unreadable forever.
             if plain.is_some() && e.kind == KIND_MEMBER {
-                self.store.record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
+                self.store
+                    .record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
             }
             // SIP-16 redaction leaves the entry with no body at all. That is
             // a deleted message, not one this client could not open, and the
@@ -3187,16 +3240,21 @@ impl Chat {
             // SIP-31, before anything is stored or shown: an entry nobody
             // signed for is not a message, and folding it first would put it in
             // front of a reader while the check was still pending.
-            let verdict =
-                Self::verdict_for(self.exchange, channel, info.instance, e, &mut seen_chains, &bound);
+            let verdict = Self::verdict_for(
+                self.exchange,
+                channel,
+                info.instance,
+                e,
+                &mut seen_chains,
+                &bound,
+            );
             // SIP-34, and separately: a receipt says where the exchange put the
             // entry and nothing about who wrote it. Both are checked; a
             // verifier doing only one has learned half of what it thinks.
             let held = last_head
                 .filter(|(seq, _)| seq + 1 == e.seq)
                 .map(|(_, head)| head);
-            let standing =
-                Self::standing_for(self.exchange, channel, info.instance, e, held);
+            let standing = Self::standing_for(self.exchange, channel, info.instance, e, held);
             if let Some(stamp) = &e.stamp {
                 last_head = Some((e.seq, stamp.head));
             }
@@ -3381,7 +3439,10 @@ mod tests {
 
     fn dev(n: u8) -> ([u8; 32], PubKey) {
         let seed = [n; 32];
-        (seed, PubKey::new(SigningKey::from_bytes(&seed).verifying_key().to_bytes()))
+        (
+            seed,
+            PubKey::new(SigningKey::from_bytes(&seed).verifying_key().to_bytes()),
+        )
     }
 
     /// One entry, honestly signed, at whatever chain position it is given.
@@ -3389,7 +3450,11 @@ mod tests {
         let (seed, device) = dev(1);
         let (_, exchange) = dev(9);
         let terms = EntryTerms {
-            place: Place { exchange, instance: [4; 32], channel: [7; 32] },
+            place: Place {
+                exchange,
+                instance: [4; 32],
+                channel: [7; 32],
+            },
             account: device,
             device,
             epoch: 0,
@@ -3421,7 +3486,11 @@ mod tests {
     fn stamped(mut e: Entry, prev_head: [u8; 32]) -> Entry {
         let (seed, exchange) = dev(9);
         let terms = EntryTerms {
-            place: Place { exchange, instance: [4; 32], channel: [7; 32] },
+            place: Place {
+                exchange,
+                instance: [4; 32],
+                channel: [7; 32],
+            },
             account: e.account,
             device: e.device,
             epoch: e.epoch,
@@ -3436,14 +3505,22 @@ mod tests {
         let sig = receipt::sign(
             &seed,
             &ReceiptTerms {
-                place: Place { exchange, instance: [4; 32], channel: [7; 32] },
+                place: Place {
+                    exchange,
+                    instance: [4; 32],
+                    channel: [7; 32],
+                },
                 seq: e.seq,
                 posted: e.posted,
                 entry_hash,
                 head,
             },
         );
-        e.stamp = Some(sqex_proto::channel::Receipted { entry_hash, head, receipt: sig });
+        e.stamp = Some(sqex_proto::channel::Receipted {
+            entry_hash,
+            head,
+            receipt: sig,
+        });
         e
     }
 
@@ -3482,10 +3559,7 @@ mod tests {
     fn a_gap_is_reported_differently_from_a_divergence() {
         let first = stamped(entry_at(1, 0, GENESIS, b"one"), HEAD_GENESIS);
         let head_1 = first.stamp.unwrap().head;
-        let second = stamped(
-            entry_at(2, 1, link_of(0, GENESIS, b"one"), b"two"),
-            head_1,
-        );
+        let second = stamped(entry_at(2, 1, link_of(0, GENESIS, b"one"), b"two"), head_1);
 
         // Holding the entry before it: the linkage is checkable and holds.
         assert_eq!(standing(&second, Some(head_1)), Standing::Vouched);
@@ -3526,7 +3600,11 @@ mod tests {
         let (_, device) = dev(1);
         let (_, exchange) = dev(9);
         let terms = EntryTerms {
-            place: Place { exchange, instance: [4; 32], channel: [7; 32] },
+            place: Place {
+                exchange,
+                instance: [4; 32],
+                channel: [7; 32],
+            },
             account: device,
             device,
             epoch: 0,
@@ -3599,7 +3677,12 @@ mod tests {
             entry_at(1, 0, GENESIS, b"first"),
             entry_at(2, 1, link_of(0, GENESIS, b"first"), b"second"),
             entry_at(3, 0, GENESIS, b"first"),
-            entry_at(4, 2, link_of(1, link_of(0, GENESIS, b"first"), b"second"), b"third"),
+            entry_at(
+                4,
+                2,
+                link_of(1, link_of(0, GENESIS, b"first"), b"second"),
+                b"third",
+            ),
         ]);
         assert_eq!(v[0], Verdict::Valid);
         assert_eq!(v[1], Verdict::Valid);

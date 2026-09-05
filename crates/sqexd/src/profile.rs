@@ -21,9 +21,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use sqex_proto::profile::{
-    Blocks, Got, MAX_BLOCKED, MAX_UPDATES_PER_HOUR, Record, FLAG_WITHHOLD,
-};
+use sqex_proto::profile::{Blocks, FLAG_WITHHOLD, Got, MAX_BLOCKED, MAX_UPDATES_PER_HOUR, Record};
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
@@ -321,7 +319,9 @@ impl Profiles {
             .map_err(storage("prepare blocks"))?;
         let accounts = stmt
             .query_map(params![account.as_bytes()], |r| {
-                Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+                Ok(PubKey::new(
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                ))
             })
             .map_err(storage("query blocks"))?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -340,11 +340,7 @@ impl Profiles {
     }
 }
 
-fn blocked_by(
-    db: &Connection,
-    account: &PubKey,
-    other: &PubKey,
-) -> Result<bool, ProfileError> {
+fn blocked_by(db: &Connection, account: &PubKey, other: &PubKey) -> Result<bool, ProfileError> {
     db.query_row(
         "SELECT 1 FROM block WHERE account = ?1 AND blocked = ?2",
         params![account.as_bytes(), other.as_bytes()],

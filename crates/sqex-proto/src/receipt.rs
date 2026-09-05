@@ -281,7 +281,10 @@ mod tests {
         for spoil in spoils {
             let mut bad = t;
             spoil(&mut bad);
-            assert!(!verify(&bad, &sig), "a changed field must break the receipt");
+            assert!(
+                !verify(&bad, &sig),
+                "a changed field must break the receipt"
+            );
         }
     }
 

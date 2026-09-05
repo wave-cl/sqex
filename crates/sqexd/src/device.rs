@@ -203,11 +203,7 @@ impl Registry {
     /// key may be held in hardware and a hardware key cannot be a transport key
     /// at all, so requiring the account to connect would make the first device
     /// of every hardware-held account impossible to register.
-    pub fn register(
-        &self,
-        caller: &PubKey,
-        credential: &Credential,
-    ) -> Result<(), DeviceError> {
+    pub fn register(&self, caller: &PubKey, credential: &Credential) -> Result<(), DeviceError> {
         let now = now_unix();
         credential
             .verify(&credential.account, SCOPE_CHAT, now)
@@ -364,8 +360,11 @@ impl Registry {
             }
         }
 
-        tx.execute("DELETE FROM device WHERE device = ?1", params![device.as_bytes()])
-            .map_err(storage("delete device"))?;
+        tx.execute(
+            "DELETE FROM device WHERE device = ?1",
+            params![device.as_bytes()],
+        )
+        .map_err(storage("delete device"))?;
         tx.execute(
             "INSERT INTO revoked (device, at, not_after, account, revocation)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -433,11 +432,7 @@ impl Registry {
     }
 }
 
-fn account_of(
-    db: &Connection,
-    device: &PubKey,
-    now: u64,
-) -> Result<Option<PubKey>, DeviceError> {
+fn account_of(db: &Connection, device: &PubKey, now: u64) -> Result<Option<PubKey>, DeviceError> {
     // A registration expires when its credential does. There is no second TTL:
     // two disagreeing lifetimes would let a peer verifying offline and an
     // exchange resolving online reach different conclusions about one device.
@@ -477,8 +472,11 @@ fn row(
 /// credentials would have expired anyway — after which the record protects
 /// nothing and can go.
 fn expire(db: &Connection, now: u64) -> Result<(), DeviceError> {
-    db.execute("DELETE FROM device WHERE not_after < ?1", params![now as i64])
-        .map_err(storage("expire devices"))?;
+    db.execute(
+        "DELETE FROM device WHERE not_after < ?1",
+        params![now as i64],
+    )
+    .map_err(storage("expire devices"))?;
     db.execute(
         "DELETE FROM revoked WHERE not_after < ?1",
         params![now as i64],

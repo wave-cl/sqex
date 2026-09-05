@@ -652,7 +652,11 @@ pub const POST_HEADER: usize = 1 + 32 + 4 + 8 + 4 + 8 + 32 + 64;
 impl Post {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(POST_HEADER + self.body.len());
-        out.push(if self.receipts { TYPE_POST_RECEIPTED } else { TYPE_POST });
+        out.push(if self.receipts {
+            TYPE_POST_RECEIPTED
+        } else {
+            TYPE_POST
+        });
         out.extend_from_slice(&self.channel);
         out.extend_from_slice(&self.epoch.to_be_bytes());
         out.extend_from_slice(&self.msg_seq.to_be_bytes());
@@ -708,7 +712,11 @@ pub struct Fetch {
 impl Fetch {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(43);
-        out.push(if self.receipts { TYPE_FETCH_RECEIPTED } else { TYPE_FETCH });
+        out.push(if self.receipts {
+            TYPE_FETCH_RECEIPTED
+        } else {
+            TYPE_FETCH
+        });
         out.extend_from_slice(&self.channel);
         out.extend_from_slice(&self.since.to_be_bytes());
         out.extend_from_slice(&self.wait_secs.to_be_bytes());
@@ -755,8 +763,7 @@ pub struct Directory {
 
 impl Directory {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(36 + ACTION_LEN + self.name.len() + self.topic.len());
+        let mut out = Vec::with_capacity(36 + ACTION_LEN + self.name.len() + self.topic.len());
         out.push(TYPE_DIRECTORY);
         out.extend_from_slice(&self.channel);
         out.push(self.name.len() as u8);
@@ -788,8 +795,7 @@ impl Directory {
         }
         let name = String::from_utf8(b[34..after_name].to_vec())
             .map_err(|_| Error::Malformed("directory name is not utf-8".into()))?;
-        let topic_len =
-            u16::from_be_bytes([b[after_name], b[after_name + 1]]) as usize;
+        let topic_len = u16::from_be_bytes([b[after_name], b[after_name + 1]]) as usize;
         let start = after_name + 2;
         if b.len() != start + topic_len + ACTION_LEN {
             return Err(Error::Malformed("directory topic runs past the end".into()));
@@ -881,7 +887,10 @@ impl Invite {
             )));
         }
         if b[0] != TYPE_INVITE {
-            return Err(Error::Malformed(format!("not an invite (type {:#x})", b[0])));
+            return Err(Error::Malformed(format!(
+                "not an invite (type {:#x})",
+                b[0]
+            )));
         }
         Ok(Invite {
             channel: b[1..33].try_into().unwrap(),
@@ -1014,7 +1023,10 @@ impl Ack {
 
     pub fn decode(b: &[u8]) -> Result<Ack> {
         if b.len() != 8 {
-            return Err(Error::Malformed(format!("ack is {} bytes, want 8", b.len())));
+            return Err(Error::Malformed(format!(
+                "ack is {} bytes, want 8",
+                b.len()
+            )));
         }
         Ok(Ack { now: u64at(b, 0) })
     }
@@ -1232,7 +1244,11 @@ pub struct Tip {
 impl Entry {
     pub fn wire_len(&self) -> usize {
         ENTRY_HEADER
-            + if self.stamp.is_some() { RECEIPTED_LEN } else { 0 }
+            + if self.stamp.is_some() {
+                RECEIPTED_LEN
+            } else {
+                0
+            }
             + self.body.len()
     }
 
@@ -1794,13 +1810,25 @@ mod tests {
         // `create()` has one invitee, so a fresh create signs twice.
         assert_eq!(Create::decode(&create().encode()).unwrap().actions.len(), 2);
 
-        let returning = Create { actions: vec![act(0)], ..create() };
-        assert_eq!(Create::decode(&returning.encode()).unwrap().actions.len(), 1);
+        let returning = Create {
+            actions: vec![act(0)],
+            ..create()
+        };
+        assert_eq!(
+            Create::decode(&returning.encode()).unwrap().actions.len(),
+            1
+        );
 
-        let none = Create { actions: vec![], ..create() };
+        let none = Create {
+            actions: vec![],
+            ..create()
+        };
         assert!(Create::decode(&none.encode()).is_err());
 
-        let too_many = Create { actions: vec![act(0), act(1), act(2)], ..create() };
+        let too_many = Create {
+            actions: vec![act(0), act(1), act(2)],
+            ..create()
+        };
         assert!(Create::decode(&too_many.encode()).is_err());
     }
 
@@ -1835,7 +1863,11 @@ mod tests {
     }
 
     fn act(n: u64) -> Action {
-        Action { chain_seq: n, prev: [n as u8; 32], sig: [n as u8; 64] }
+        Action {
+            chain_seq: n,
+            prev: [n as u8; 32],
+            sig: [n as u8; 64],
+        }
     }
 
     #[test]
@@ -2026,7 +2058,10 @@ mod tests {
             channel: [5; 32],
             target: 12,
         };
-        assert_eq!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_REDACT).unwrap(), t);
+        assert_eq!(
+            ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_REDACT).unwrap(),
+            t
+        );
         assert!(ByTarget::decode(&t.encode(TYPE_REDACT), TYPE_CURSOR).is_err());
     }
 
@@ -2045,9 +2080,16 @@ mod tests {
 
         let mut later = e.encode();
         later[0] = 0x7f;
-        assert_eq!(System::decode(&later).unwrap(), None, "a later event is ignored");
+        assert_eq!(
+            System::decode(&later).unwrap(),
+            None,
+            "a later event is ignored"
+        );
 
-        assert!(System::decode(&e.encode()[..64]).is_err(), "truncation is not");
+        assert!(
+            System::decode(&e.encode()[..64]).is_err(),
+            "truncation is not"
+        );
     }
 
     #[test]
@@ -2134,7 +2176,10 @@ mod tests {
             account: PubKey::new([4; 32]),
             action: act(3),
         };
-        assert_eq!(ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_REMOVE).unwrap(), r);
+        assert_eq!(
+            ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_REMOVE).unwrap(),
+            r
+        );
         // The type byte is checked, so a remove cannot be read as anything else.
         assert!(ByAccount::decode(&r.encode(TYPE_REMOVE), TYPE_INVITE).is_err());
     }

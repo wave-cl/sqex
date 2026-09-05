@@ -33,27 +33,26 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use sqex_proto::channel::{
-    ABANDON_SECS, Action, Invitee, ChannelInfo, Create, Directory, Entries, Entry, KIND_MEMBER,
-    KIND_SYSTEM, Listing,
-    EVENT_ADDED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED,
-    EVENT_CREATED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_UNREPLICATE, EVENT_ROTATED, MAX_BATCH, MAX_SIGNALS, Mark, Marks, SIGNAL_TTL, Signalled,
-    System, constitution, direct_message_id,
-    ENTRY_HEADER, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
-    MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_NAME, MAX_TOPIC,
-    MAX_MINE, MAX_RETENTION, MAX_UNSPOKEN, MIN_RETENTION, Member, Membership, Mines, Post,
-    Posted, Public, Receipted, Retain, Role, Tip, Visibility,
-};
 use sqex_proto::blob_store::{
-    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS,
-    MAX_CHANNEL_BLOB_BYTES, MAX_UPLOADS,
-    PutChunk as BlobPut, UPLOAD_TTL, blob_id,
+    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS, MAX_CHANNEL_BLOB_BYTES,
+    MAX_UPLOADS, PutChunk as BlobPut, UPLOAD_TTL, blob_id,
+};
+use sqex_proto::channel::{
+    ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
+    EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED, EVENT_RENAMED,
+    EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_UNREPLICATE, Entries, Entry, Invitee,
+    KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES,
+    MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_MINE, MAX_NAME,
+    MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark, Marks, Member,
+    Membership, Mines, Post, Posted, Public, Receipted, Retain, Role, SIGNAL_TTL, Signalled,
+    System, Tip, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
-    verify_envelope,
-    Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
+    Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded, verify_envelope,
 };
-use sqex_proto::entry_sig::{ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry};
+use sqex_proto::entry_sig::{
+    ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry,
+};
 use sqex_proto::message::SIGNAL_CALL_STATE;
 use sqex_proto::peer::{
     BLOB_LIST, MAX_PULL, MAX_PULL_BYTES, MAX_REPLICAS, Pulled, PulledBlob, PulledEnvelopes,
@@ -863,8 +862,17 @@ impl Channels {
                     }
                     let action = &req.actions[0];
                     write_system(
-                        &tx, &place, &req.channel, EVENT_JOINED, caller, caller, device, &[],
-                        action, now, self.exchange_seed.as_ref(),
+                        &tx,
+                        &place,
+                        &req.channel,
+                        EVENT_JOINED,
+                        caller,
+                        caller,
+                        device,
+                        &[],
+                        action,
+                        now,
+                        self.exchange_seed.as_ref(),
                     )?;
                     tx.commit().map_err(storage("commit rejoin"))?;
                     return Ok((false, epoch, instance));
@@ -933,8 +941,16 @@ impl Channels {
                 // A private channel's name is carried as a sealed metadata
                 // entry (SIP-19); at the exchange it must be empty, because a
                 // membership graph plus a name says far more than the graph.
-                if req.visibility == Visibility::Public { &req.name } else { "" },
-                if req.visibility == Visibility::Public { &req.topic } else { "" },
+                if req.visibility == Visibility::Public {
+                    &req.name
+                } else {
+                    ""
+                },
+                if req.visibility == Visibility::Public {
+                    &req.topic
+                } else {
+                    ""
+                },
                 caller.as_bytes(),
                 now as i64,
                 &req.instance[..],
@@ -968,8 +984,16 @@ impl Channels {
             req.visibility,
             req.retention_secs,
             req.max_entries,
-            if req.visibility == Visibility::Public { &req.name } else { "" },
-            if req.visibility == Visibility::Public { &req.topic } else { "" },
+            if req.visibility == Visibility::Public {
+                &req.name
+            } else {
+                ""
+            },
+            if req.visibility == Visibility::Public {
+                &req.topic
+            } else {
+                ""
+            },
         );
         // A fresh create signs for `created` and for every invitee's `added`.
         if req.actions.len() != req.invites.len() + 1 {
@@ -977,8 +1001,17 @@ impl Channels {
         }
         let opening = &req.actions[0];
         write_system(
-            &tx, &place, &req.channel, EVENT_CREATED, caller, caller, device, &founding,
-            opening, now, self.exchange_seed.as_ref(),
+            &tx,
+            &place,
+            &req.channel,
+            EVENT_CREATED,
+            caller,
+            caller,
+            device,
+            &founding,
+            opening,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
 
         for (n, i) in req.invites.iter().enumerate() {
@@ -1003,8 +1036,17 @@ impl Channels {
             )
             .map_err(storage("insert invitee"))?;
             write_system(
-                &tx, &place, &req.channel, EVENT_ADDED, &i.account, caller, device,
-                &[i.role as u8], action, now, self.exchange_seed.as_ref(),
+                &tx,
+                &place,
+                &req.channel,
+                EVENT_ADDED,
+                &i.account,
+                caller,
+                device,
+                &[i.role as u8],
+                action,
+                now,
+                self.exchange_seed.as_ref(),
             )?;
         }
         tx.commit().map_err(storage("commit create"))?;
@@ -1187,7 +1229,17 @@ impl Channels {
         if !already {
             let place = self.place(&tx, channel)?;
             write_system(
-                &tx, &place, channel, EVENT_JOINED, caller, caller, device, &[], action, now, self.exchange_seed.as_ref(),
+                &tx,
+                &place,
+                channel,
+                EVENT_JOINED,
+                caller,
+                caller,
+                device,
+                &[],
+                action,
+                now,
+                self.exchange_seed.as_ref(),
             )?;
         }
         tx.execute(
@@ -1225,11 +1277,7 @@ impl Channels {
         // walking out would strand the others with a channel nobody can
         // administer. In a public one the role is durable and leaving does not
         // touch it.
-        if visibility == Visibility::Private
-            && role == Role::Admin
-            && admins == 1
-            && members > 1
-        {
+        if visibility == Visibility::Private && role == Role::Admin && admins == 1 && members > 1 {
             return Err(ChannelError::LastAdmin);
         }
 
@@ -1252,7 +1300,17 @@ impl Channels {
 
         let place = self.place(&tx, channel)?;
         write_system(
-            &tx, &place, channel, EVENT_LEFT, caller, caller, device, &[], action, now, self.exchange_seed.as_ref(),
+            &tx,
+            &place,
+            channel,
+            EVENT_LEFT,
+            caller,
+            caller,
+            device,
+            &[],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         if members == 1 {
             if visibility == Visibility::Public {
@@ -1294,7 +1352,11 @@ impl Channels {
             // Epoch 0 means unsealed. That is every entry in a public channel
             // and no member entry in a private one, which is why a private
             // channel refuses posts until its first epoch exists.
-            let wanted = if visibility == Visibility::Public { 0 } else { epoch };
+            let wanted = if visibility == Visibility::Public {
+                0
+            } else {
+                epoch
+            };
             if req.epoch != wanted || (visibility == Visibility::Private && wanted == 0) {
                 return Err(ChannelError::WrongEpoch);
             }
@@ -1452,10 +1514,8 @@ impl Channels {
             )
             .map_err(storage("prepare fetch"))?;
         let rows = stmt
-            .query_map(
-                params![&channel[..], since as i64, MAX_BATCH as i64],
-                |r| {
-                    Ok((
+            .query_map(params![&channel[..], since as i64, MAX_BATCH as i64], |r| {
+                Ok((
                     Entry {
                         seq: r.get::<_, i64>(0)? as u64,
                         kind: r.get::<_, i64>(1)? as u8,
@@ -1476,8 +1536,7 @@ impl Channels {
                     r.get::<_, Vec<u8>>(13)?.try_into().unwrap_or([0u8; 32]),
                     r.get::<_, Vec<u8>>(14)?.try_into().unwrap_or([0u8; 32]),
                 ))
-                },
-            )
+            })
             .map_err(storage("query fetch"))?;
 
         let mut entries = Vec::new();
@@ -1537,12 +1596,7 @@ impl Channels {
     /// happened" and "I am not being shown what happened" are the same
     /// response; with it, a tip that advances while entries do not is the
     /// exchange saying it is carrying something it did not serve.
-    fn tip(
-        &self,
-        db: &Connection,
-        place: &Place,
-        last: u64,
-    ) -> Result<Tip, ChannelError> {
+    fn tip(&self, db: &Connection, place: &Place, last: u64) -> Result<Tip, ChannelError> {
         let row: Option<(u64, [u8; 32], [u8; 32])> = db
             .query_row(
                 "SELECT posted, entry_hash, head FROM entry WHERE channel = ?1 AND seq = ?2",
@@ -1956,8 +2010,17 @@ impl Channels {
         // which is a gap in-band and not only across exchanges.
         let place = self.place(&tx, &req.channel)?;
         write_system(
-            &tx, &place, &req.channel, EVENT_RENAMED, caller, caller, device, &arg,
-            &req.action, now, self.exchange_seed.as_ref(),
+            &tx,
+            &place,
+            &req.channel,
+            EVENT_RENAMED,
+            caller,
+            caller,
+            device,
+            &arg,
+            &req.action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         tx.commit().map_err(storage("commit set_directory"))?;
         self.wake(&req.channel);
@@ -1999,8 +2062,17 @@ impl Channels {
         arg.extend_from_slice(&req.retention_secs.to_be_bytes());
         arg.extend_from_slice(&req.max_entries.to_be_bytes());
         write_system(
-            &tx, &place, &req.channel, EVENT_RETENTION, caller, caller, device, &arg,
-            &req.action, now, self.exchange_seed.as_ref(),
+            &tx,
+            &place,
+            &req.channel,
+            EVENT_RETENTION,
+            caller,
+            caller,
+            device,
+            &arg,
+            &req.action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         prune(&tx, &req.channel, now, self.max_channel_bytes)?;
         tx.commit().map_err(storage("commit retain"))?;
@@ -2239,7 +2311,17 @@ impl Channels {
         // The role travels in the signature, or a signed promotion could be
         // replayed as a demotion.
         write_system(
-            &tx, &place, channel, event, account, caller, device, &[role as u8], action, now, self.exchange_seed.as_ref(),
+            &tx,
+            &place,
+            channel,
+            event,
+            account,
+            caller,
+            device,
+            &[role as u8],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
         )?;
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
@@ -2331,7 +2413,11 @@ impl Channels {
             let stamp = if receipt == [0u8; 64] {
                 self.stamp(&place, e.seq, e.posted, &entry_hash, &head)?
             } else {
-                Receipted { entry_hash, head, receipt }
+                Receipted {
+                    entry_hash,
+                    head,
+                    receipt,
+                }
             };
             e.stamp = Some(stamp);
             if !entries.is_empty() && bytes + e.wire_len() > MAX_PULL_BYTES {
@@ -2602,9 +2688,22 @@ impl Channels {
             }
         }
         let place = self.place(&tx, channel)?;
-        let event = if authorise { EVENT_REPLICATE } else { EVENT_UNREPLICATE };
+        let event = if authorise {
+            EVENT_REPLICATE
+        } else {
+            EVENT_UNREPLICATE
+        };
         write_system(
-            &tx, &place, channel, event, replica, caller, device, &[], action, now,
+            &tx,
+            &place,
+            channel,
+            event,
+            replica,
+            caller,
+            device,
+            &[],
+            action,
+            now,
             self.exchange_seed.as_ref(),
         )?;
         if authorise {
@@ -2795,7 +2894,11 @@ impl Channels {
         db.query_row(
             "SELECT origin FROM replicated WHERE channel = ?1",
             params![&channel[..]],
-            |r| Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]))),
+            |r| {
+                Ok(PubKey::new(
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                ))
+            },
         )
         .optional()
         .ok()
@@ -2947,7 +3050,11 @@ impl Channels {
     /// channel, keeps both branches and the proof, and serves the proof to
     /// anybody who asks. Picking a branch would silently convert evidence into
     /// a disagreement between two honest-looking servers.
-    pub fn record_equivocation(&self, channel: &[u8; 32], proof: &[u8]) -> Result<(), ChannelError> {
+    pub fn record_equivocation(
+        &self,
+        channel: &[u8; 32],
+        proof: &[u8],
+    ) -> Result<(), ChannelError> {
         let db = self.db.lock().unwrap();
         db.execute(
             "UPDATE replicated SET equivocation = COALESCE(equivocation, ?2) WHERE channel = ?1",
@@ -3003,8 +3110,17 @@ impl Channels {
         // and is why an admin cannot redact one.
         let place = self.place(&tx, channel)?;
         write_system(
-            &tx, &place, channel, EVENT_REMOVED, account, caller, device, &[], action,
-            now_unix(), self.exchange_seed.as_ref(),
+            &tx,
+            &place,
+            channel,
+            EVENT_REMOVED,
+            account,
+            caller,
+            device,
+            &[],
+            action,
+            now_unix(),
+            self.exchange_seed.as_ref(),
         )?;
         tx.commit().map_err(storage("commit remove"))?;
         self.wake(channel);
@@ -3168,8 +3284,17 @@ impl Channels {
             let place = self.place(&tx, &req.channel)?;
             let action = req.action.as_ref().ok_or(ChannelError::BadSignature)?;
             write_system(
-                &tx, &place, &req.channel, EVENT_ROTATED, caller, caller, device,
-                &req.epoch.to_be_bytes(), action, now, self.exchange_seed.as_ref(),
+                &tx,
+                &place,
+                &req.channel,
+                EVENT_ROTATED,
+                caller,
+                caller,
+                device,
+                &req.epoch.to_be_bytes(),
+                action,
+                now,
+                self.exchange_seed.as_ref(),
             )?;
         }
         tx.commit().map_err(storage("commit put"))?;
@@ -3273,16 +3398,16 @@ impl Channels {
             .map_err(storage("prepare missing"))?;
         let accounts: Vec<PubKey> = stmt
             .query_map(params![&channel[..]], |r| {
-                Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+                Ok(PubKey::new(
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                ))
             })
             .map_err(storage("query missing"))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage("read missing"))?;
 
         let mut sealed = db
-            .prepare(
-                "SELECT 1 FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = ?3",
-            )
+            .prepare("SELECT 1 FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = ?3")
             .map_err(storage("prepare sealed"))?;
 
         let mut stranded = Vec::new();
@@ -3350,7 +3475,9 @@ fn dm_claim(
         .map_err(storage("prepare dm claim"))?;
     let present: Vec<PubKey> = stmt
         .query_map(params![&channel[..]], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .map_err(storage("query dm claim"))?
         .filter_map(|r| r.ok())
@@ -3424,7 +3551,9 @@ impl Channels {
             return Vec::new();
         };
         stmt.query_map(params![&channel[..]], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .unwrap_or_default()
@@ -3446,7 +3575,9 @@ impl Channels {
             return Vec::new();
         };
         stmt.query_map(params![account.as_bytes()], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
         .unwrap_or_default()
@@ -3465,7 +3596,9 @@ fn is_direct_message(db: &Connection, channel: &[u8; 32]) -> Result<bool, Channe
         .map_err(storage("prepare dm check"))?;
     let members: Vec<PubKey> = stmt
         .query_map(params![&channel[..]], |r| {
-            Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
         })
         .map_err(storage("query dm check"))?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -3484,11 +3617,7 @@ fn is_direct_message(db: &Connection, channel: &[u8; 32]) -> Result<bool, Channe
 /// here than throughput, because the lifetime rules are the hard part.
 impl Channels {
     /// Reserve an upload against a channel's blob quota.
-    pub fn begin_upload(
-        &self,
-        uploader: &PubKey,
-        req: &BlobBegin,
-    ) -> Result<u64, ChannelError> {
+    pub fn begin_upload(&self, uploader: &PubKey, req: &BlobBegin) -> Result<u64, ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin upload"))?;
@@ -3532,11 +3661,7 @@ impl Channels {
 
     /// Write one chunk. Chunks may arrive in any order and a repeat overwrites,
     /// so a client that lost a response retries rather than starting again.
-    pub fn put_chunk(
-        &self,
-        uploader: &PubKey,
-        req: &BlobPut,
-    ) -> Result<(), ChannelError> {
+    pub fn put_chunk(&self, uploader: &PubKey, req: &BlobPut) -> Result<(), ChannelError> {
         let db = self.db.lock().unwrap();
         let (owner, chunks) = upload_row(&db, req.upload)?;
         if &owner != uploader {
@@ -3722,11 +3847,7 @@ impl Channels {
 
     /// Attach an existing blob to a second channel. This is what a forward
     /// does: it costs the reference, not the file.
-    pub fn attach_blob(
-        &self,
-        who: &PubKey,
-        req: &ByChannelBlob,
-    ) -> Result<(), ChannelError> {
+    pub fn attach_blob(&self, who: &PubKey, req: &ByChannelBlob) -> Result<(), ChannelError> {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin attach"))?;
@@ -3791,7 +3912,11 @@ impl Channels {
 ///
 /// Kept independently of the entries, so pruning cannot understate it — a
 /// device resuming from an understated mark would fork its own chain.
-fn chain_head(db: &Connection, channel: &[u8; 32], device: &PubKey) -> Result<(u64, [u8; 32]), ChannelError> {
+fn chain_head(
+    db: &Connection,
+    channel: &[u8; 32],
+    device: &PubKey,
+) -> Result<(u64, [u8; 32]), ChannelError> {
     let row: Option<(i64, Vec<u8>)> = db
         .query_row(
             "SELECT chain_seq, head FROM chain WHERE channel = ?1 AND device = ?2",
@@ -3828,7 +3953,12 @@ fn advance_chain(
     db.execute(
         "INSERT INTO chain (channel, device, chain_seq, head) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (channel, device) DO UPDATE SET chain_seq = ?3, head = ?4",
-        params![&channel[..], device.as_bytes(), chain_seq as i64, &link(input)[..]],
+        params![
+            &channel[..],
+            device.as_bytes(),
+            chain_seq as i64,
+            &link(input)[..]
+        ],
     )
     .map_err(storage("advance chain"))?;
     Ok(())
@@ -3855,7 +3985,12 @@ fn derive_membership(
             "INSERT INTO member (channel, account, role, joined, present)
              VALUES (?1, ?2, ?3, ?4, 1)
              ON CONFLICT (channel, account) DO UPDATE SET present = 1",
-            params![&channel[..], sys.subject.as_bytes(), role as i64, posted as i64],
+            params![
+                &channel[..],
+                sys.subject.as_bytes(),
+                role as i64,
+                posted as i64
+            ],
         )
         .map_err(storage("derive membership"))?;
         Ok(())
@@ -3954,7 +4089,14 @@ fn check_action(
         return Err(ChannelError::BadSignature);
     }
     let input = terms.input().map_err(|_| ChannelError::BadSignature)?;
-    advance_chain(db, &place.channel, actor_device, action.chain_seq, &action.prev, &input)?;
+    advance_chain(
+        db,
+        &place.channel,
+        actor_device,
+        action.chain_seq,
+        &action.prev,
+        &input,
+    )?;
     Ok(input)
 }
 
@@ -4376,7 +4518,9 @@ impl Channels {
                 .map_err(storage("prepare signal recipients"))?;
             let rows = stmt
                 .query_map(params![&channel[..]], |r| {
-                    Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
+                    Ok(PubKey::new(
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    ))
                 })
                 .map_err(storage("query signal recipients"))?;
             // SIP-36's second rule: a ring state also goes to the sender's
@@ -4499,7 +4643,14 @@ mod tests {
 
     /// A post signed as `b`'s device, taking the chain step the exchange is
     /// expecting. Tests that want a *bad* signature build one by hand.
-    fn post_as(c: &Channels, b: u8, channel: &[u8; 32], epoch: u32, msg_seq: u64, body: Vec<u8>) -> Post {
+    fn post_as(
+        c: &Channels,
+        b: u8,
+        channel: &[u8; 32],
+        epoch: u32,
+        msg_seq: u64,
+        body: Vec<u8>,
+    ) -> Post {
         let who = key(b);
         let (place, chain_seq, prev) = {
             let db = c.db.lock().unwrap();
@@ -4532,7 +4683,14 @@ mod tests {
     }
 
     /// An action signed as `b`'s device, at the chain position expected next.
-    fn action_as(c: &Channels, b: u8, place: &Place, event: u8, subject: &PubKey, arg: &[u8]) -> Action {
+    fn action_as(
+        c: &Channels,
+        b: u8,
+        place: &Place,
+        event: u8,
+        subject: &PubKey,
+        arg: &[u8],
+    ) -> Action {
         let who = key(b);
         let (chain_seq, prev) = {
             let db = c.db.lock().unwrap();
@@ -4548,15 +4706,31 @@ mod tests {
             chain_seq,
             prev,
         };
-        Action { chain_seq, prev, sig: sign_action(&[b; 32], &terms).unwrap() }
+        Action {
+            chain_seq,
+            prev,
+            sig: sign_action(&[b; 32], &terms).unwrap(),
+        }
     }
 
     /// An action for a channel that does not exist yet, signed against the
     /// instance the create proposes.
-    fn create_action(b: u8, channel: &[u8; 32], instance: [u8; 32], n: u64, prev: [u8; 32], subject: &PubKey, role: Role) -> (Action, [u8; 32]) {
+    fn create_action(
+        b: u8,
+        channel: &[u8; 32],
+        instance: [u8; 32],
+        n: u64,
+        prev: [u8; 32],
+        subject: &PubKey,
+        role: Role,
+    ) -> (Action, [u8; 32]) {
         let who = key(b);
         let terms = ActionTerms {
-            place: Place { exchange: key(200), instance, channel: *channel },
+            place: Place {
+                exchange: key(200),
+                instance,
+                channel: *channel,
+            },
             actor: who,
             actor_device: who,
             event: EVENT_ADDED,
@@ -4567,16 +4741,34 @@ mod tests {
         };
         let sig = sign_action(&[b; 32], &terms).unwrap();
         let head = link(&terms.input().unwrap());
-        (Action { chain_seq: n, prev, sig }, head)
+        (
+            Action {
+                chain_seq: n,
+                prev,
+                sig,
+            },
+            head,
+        )
     }
 
     /// A create by `b`: SIP-32's `created` first, then each invitee's `added`.
-    fn create_by(b: u8, channel: [u8; 32], instance: [u8; 32], visibility: Visibility, retention_secs: u32, invites: Vec<Invitee>) -> Create {
+    fn create_by(
+        b: u8,
+        channel: [u8; 32],
+        instance: [u8; 32],
+        visibility: Visibility,
+        retention_secs: u32,
+        invites: Vec<Invitee>,
+    ) -> Create {
         let who = key(b);
         let mut actions = Vec::new();
         let founding = constitution(visibility, retention_secs, 0, "", "");
         let opening = ActionTerms {
-            place: Place { exchange: key(200), instance, channel },
+            place: Place {
+                exchange: key(200),
+                instance,
+                channel,
+            },
             actor: who,
             actor_device: who,
             event: EVENT_CREATED,
@@ -4611,7 +4803,14 @@ mod tests {
     }
 
     fn public_channel(retention_secs: u32) -> Create {
-        create_by(1, [7; 32], [77; 32], Visibility::Public, retention_secs, Vec::new())
+        create_by(
+            1,
+            [7; 32],
+            [77; 32],
+            Visibility::Public,
+            retention_secs,
+            Vec::new(),
+        )
     }
 
     fn stored_bytes(c: &Channels) -> u64 {
@@ -4636,8 +4835,10 @@ mod tests {
     fn delivered_is_observed_and_a_caller_cannot_assert_it() {
         let c = open();
         let alice = key(ALICE);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
 
         // Nothing has ever been posted here, so nothing can have been
         // delivered to anybody.
@@ -4661,8 +4862,10 @@ mod tests {
     fn a_read_mark_cannot_create_the_delivery_it_is_clamped_against() {
         let c = open();
         let alice = key(ALICE);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
 
         c.set_cursor(&alice, &[7; 32], 500, true).unwrap();
 
@@ -4683,8 +4886,10 @@ mod tests {
         let cap = 4 * (MAX_ENTRY_BODY + ENTRY_HEADER) as u64;
         let c = open().with_max_channel_bytes(cap);
         let alice = key(1);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
 
         for i in 0..10u8 {
             c.post(
@@ -4697,7 +4902,11 @@ mod tests {
 
         assert!(stored_bytes(&c) <= cap, "the cap is not enforced");
         let got = c.fetch(&alice, &alice, &[7; 32], 0, false).unwrap();
-        let member: Vec<&Entry> = got.entries.iter().filter(|e| e.kind == KIND_MEMBER).collect();
+        let member: Vec<&Entry> = got
+            .entries
+            .iter()
+            .filter(|e| e.kind == KIND_MEMBER)
+            .collect();
         assert_eq!(member.len(), 4, "want the four newest kept");
         // Oldest first, exactly as the count prune does: what survives is the
         // tail, and the sequence numbers are not reissued.
@@ -4709,18 +4918,30 @@ mod tests {
     fn the_byte_cap_does_not_bite_a_small_channel() {
         let c = open();
         let alice = key(1);
-        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| false)
-            .unwrap();
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
         for i in 0..20u8 {
             c.post(
                 &alice,
                 &alice,
-                &post_as(&c, ALICE, &[7; 32], 0, i as u64, b"a short message".to_vec()),
+                &post_as(
+                    &c,
+                    ALICE,
+                    &[7; 32],
+                    0,
+                    i as u64,
+                    b"a short message".to_vec(),
+                ),
             )
             .unwrap();
         }
         let got = c.fetch(&alice, &alice, &[7; 32], 0, false).unwrap();
-        assert_eq!(got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(), 20);
+        assert_eq!(
+            got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(),
+            20
+        );
     }
 
     fn channel_n(n: u8, visibility: Visibility) -> Create {
@@ -4748,14 +4969,45 @@ mod tests {
             id[31] = (n >> 8) as u8;
             let req = channel_at(ALICE, id, Visibility::Public);
             c.create(&spammer, &spammer, &req, &|_, _| false).unwrap();
-            c.invite(&spammer, &spammer, &req.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-                .unwrap();
+            c.invite(
+                &spammer,
+                &spammer,
+                &req.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &req.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8],
+                ),
+                &|_, _| false,
+            )
+            .unwrap();
         }
 
         let one_more = channel_n(200, Visibility::Public);
-        c.create(&spammer, &spammer, &one_more, &|_, _| false).unwrap();
+        c.create(&spammer, &spammer, &one_more, &|_, _| false)
+            .unwrap();
         assert!(matches!(
-            c.invite(&spammer, &spammer, &one_more.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &one_more.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false),
+            c.invite(
+                &spammer,
+                &spammer,
+                &one_more.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &one_more.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8]
+                ),
+                &|_, _| false
+            ),
             Err(ChannelError::InviteQuota)
         ));
         // Refused distinguishably, and not silently: 507, not a malformed
@@ -4785,14 +5037,45 @@ mod tests {
             id[31] = (n >> 8) as u8;
             let req = channel_at(ALICE, id, Visibility::Public);
             c.create(&spammer, &spammer, &req, &|_, _| false).unwrap();
-            c.invite(&spammer, &spammer, &req.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-                .unwrap();
+            c.invite(
+                &spammer,
+                &spammer,
+                &req.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &req.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8],
+                ),
+                &|_, _| false,
+            )
+            .unwrap();
         }
         let next = channel_n(200, Visibility::Public);
         c.create(&spammer, &spammer, &next, &|_, _| false).unwrap();
-        assert!(c
-            .invite(&spammer, &spammer, &next.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &next.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .is_err());
+        assert!(
+            c.invite(
+                &spammer,
+                &spammer,
+                &next.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &next.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8]
+                ),
+                &|_, _| false
+            )
+            .is_err()
+        );
 
         // Post in one of them.
         let mut spoken = [0u8; 32];
@@ -4803,20 +5086,73 @@ mod tests {
             &post_as(&c, VICTIM, &spoken, 0, 0, b"hello".to_vec()),
         )
         .unwrap();
-        c.invite(&spammer, &spammer, &next.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &next.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .expect("speaking in one frees the budget");
+        c.invite(
+            &spammer,
+            &spammer,
+            &next.channel,
+            &victim,
+            Role::Member,
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &next.channel),
+                EVENT_ADDED,
+                &victim,
+                &[Role::Member as u8],
+            ),
+            &|_, _| false,
+        )
+        .expect("speaking in one frees the budget");
 
         // And leaving frees it too.
         let another = channel_n(202, Visibility::Public);
-        c.create(&spammer, &spammer, &another, &|_, _| false).unwrap();
-        assert!(c
-            .invite(&spammer, &spammer, &another.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &another.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .is_err());
+        c.create(&spammer, &spammer, &another, &|_, _| false)
+            .unwrap();
+        assert!(
+            c.invite(
+                &spammer,
+                &spammer,
+                &another.channel,
+                &victim,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &another.channel),
+                    EVENT_ADDED,
+                    &victim,
+                    &[Role::Member as u8]
+                ),
+                &|_, _| false
+            )
+            .is_err()
+        );
         let mut quiet = [1u8; 32];
         quiet[31] = 0;
-        c.leave(&victim, &victim, &quiet, &action_as(&c, VICTIM, &place_of(&c, &quiet), EVENT_LEFT, &victim, &[])).unwrap();
-        c.invite(&spammer, &spammer, &another.channel, &victim, Role::Member, &action_as(&c, ALICE, &place_of(&c, &another.channel), EVENT_ADDED, &victim, &[Role::Member as u8]), &|_, _| false)
-            .expect("leaving frees the budget");
+        c.leave(
+            &victim,
+            &victim,
+            &quiet,
+            &action_as(&c, VICTIM, &place_of(&c, &quiet), EVENT_LEFT, &victim, &[]),
+        )
+        .unwrap();
+        c.invite(
+            &spammer,
+            &spammer,
+            &another.channel,
+            &victim,
+            Role::Member,
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &another.channel),
+                EVENT_ADDED,
+                &victim,
+                &[Role::Member as u8],
+            ),
+            &|_, _| false,
+        )
+        .expect("leaving frees the budget");
     }
 
     #[test]
@@ -4826,8 +5162,23 @@ mod tests {
         let member = key(2);
         let home = channel_n(9, Visibility::Private);
         c.create(&admin, &admin, &home, &|_, _| false).unwrap();
-        c.invite(&admin, &admin, &home.channel, &member, Role::Member, &action_as(&c, ALICE, &place_of(&c, &home.channel), EVENT_ADDED, &member, &[Role::Member as u8]), &|_, _| false)
-            .unwrap();
+        c.invite(
+            &admin,
+            &admin,
+            &home.channel,
+            &member,
+            Role::Member,
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &home.channel),
+                EVENT_ADDED,
+                &member,
+                &[Role::Member as u8],
+            ),
+            &|_, _| false,
+        )
+        .unwrap();
         // Fill the rest of the budget elsewhere.
         for n in 0..(MAX_UNSPOKEN - 1) {
             // Built against the final identifier: SIP-32's `created` action
@@ -4838,8 +5189,23 @@ mod tests {
             id[30] = 0xaa;
             let req = channel_at(ALICE, id, Visibility::Public);
             c.create(&admin, &admin, &req, &|_, _| false).unwrap();
-            c.invite(&admin, &admin, &req.channel, &member, Role::Member, &action_as(&c, ALICE, &place_of(&c, &req.channel), EVENT_ADDED, &member, &[Role::Member as u8]), &|_, _| false)
-                .unwrap();
+            c.invite(
+                &admin,
+                &admin,
+                &req.channel,
+                &member,
+                Role::Member,
+                &action_as(
+                    &c,
+                    ALICE,
+                    &place_of(&c, &req.channel),
+                    EVENT_ADDED,
+                    &member,
+                    &[Role::Member as u8],
+                ),
+                &|_, _| false,
+            )
+            .unwrap();
         }
         // Promoting them where they already are must not be refused.
         // Signed as a *promotion*, because that is the event the exchange will
@@ -4852,7 +5218,14 @@ mod tests {
             &home.channel,
             &member,
             Role::Admin,
-            &action_as(&c, ALICE, &place_of(&c, &home.channel), EVENT_PROMOTED, &member, &[Role::Admin as u8]),
+            &action_as(
+                &c,
+                ALICE,
+                &place_of(&c, &home.channel),
+                EVENT_PROMOTED,
+                &member,
+                &[Role::Admin as u8],
+            ),
             &|_, _| false,
         )
         .expect("a promotion is not an invitation");

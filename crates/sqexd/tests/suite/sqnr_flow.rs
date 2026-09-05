@@ -61,7 +61,11 @@ async fn cli_flow_signs_a_batch() {
     let no_touch = || {};
 
     // One signed transaction that enables the whitelist AND adds a peer.
-    let peer = PubKey::new(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+    let peer = PubKey::new(
+        SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
     let v = flow::sign_and_submit(
         &mut client,
         &admin,
@@ -104,7 +108,9 @@ async fn cli_flow_signs_a_batch() {
     assert_eq!(entry["label"].as_str(), Some("device-1"), "label recorded");
 
     // A non-admin backend is refused.
-    let outsider = Backend::software(sqnr_core::SoftwareSigner::new(SigningKey::from_bytes(&[8u8; 32])));
+    let outsider = Backend::software(sqnr_core::SoftwareSigner::new(SigningKey::from_bytes(
+        &[8u8; 32],
+    )));
     let err = flow::sign_and_submit(
         &mut client,
         &outsider,

@@ -9,9 +9,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_proto::attest::{
-    Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVOKES, Held, Query,
-};
+use sqex_proto::attest::{Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVOKES, Held, Query};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -88,7 +86,9 @@ async fn a_signed_statement_can_be_lodged_by_anyone_and_read_by_anyone() {
 
     // Carol lodges Alice's statement about Bob. Neither the subject nor the
     // issuer is on the connection.
-    let mut c = Client::connect_as(addr, &server_pub, &carol_seed).await.unwrap();
+    let mut c = Client::connect_as(addr, &server_pub, &carol_seed)
+        .await
+        .unwrap();
     let (code, body) = c.post("/attest/lodge", a.encode()).await.unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
 
@@ -110,7 +110,9 @@ async fn a_statement_nobody_signed_is_refused() {
     let (addr, server_pub, _h) = server_in(dir.path()).await;
     let (alice_seed, _) = who(41);
     let (_, bob) = who(42);
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
 
     let mut forged = Attestation::sign(
         &alice_seed,
@@ -172,7 +174,11 @@ async fn a_reader_can_ask_about_one_issuer_and_ignore_the_rest() {
     let trusted = trusted.unwrap();
 
     let all = read(&mut c, bob, None).await;
-    assert_eq!(all.attestations.len(), 5, "the exchange holds what it was given");
+    assert_eq!(
+        all.attestations.len(),
+        5,
+        "the exchange holds what it was given"
+    );
 
     let filtered = read(&mut c, bob, Some(trusted)).await;
     assert_eq!(filtered.attestations.len(), 1);
@@ -215,7 +221,10 @@ async fn only_the_issuer_can_withdraw_and_the_withdrawal_is_visible() {
         now() + 3600,
     );
     let (code, _) = c.post("/attest/lodge", theirs.encode()).await.unwrap();
-    assert_eq!(code, 404, "somebody else withdrew a statement they did not make");
+    assert_eq!(
+        code, 404,
+        "somebody else withdrew a statement they did not make"
+    );
     assert_eq!(
         read(&mut c, bob, Some(alice)).await.attestations.len(),
         1,

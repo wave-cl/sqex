@@ -13,7 +13,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use ed25519_dalek::SigningKey;
 use sqex_proto::blob::{Attachment, KIND_IMAGE};
 use sqex_proto::blob_store::{
-    Begin, ByBlob, ByChannelBlob, ByUpload, Begun, Chunk, Commit, Committed, GetChunk, Headed,
+    Begin, Begun, ByBlob, ByChannelBlob, ByUpload, Chunk, Commit, Committed, GetChunk, Headed,
     Limits, PutChunk, TYPE_ABORT, TYPE_ATTACH, TYPE_DETACH, TYPE_HEAD, blob_id, chunk_nonce,
 };
 use sqex_proto::channel::{ByChannel, Create, TYPE_CLOSE, TYPE_JOIN, Visibility};
@@ -55,7 +55,11 @@ async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle
 /// What signs for identity `b` against this exchange (SIP-31).
 fn signer(pubkey: [u8; 32], b: u8) -> Signer {
     let sk = SigningKey::from_bytes(&[b; 32]);
-    Signer::new(sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()), pubkey)
+    Signer::new(
+        sk.to_bytes(),
+        PubKey::new(sk.verifying_key().to_bytes()),
+        pubkey,
+    )
 }
 
 async fn client_for(addr: SocketAddr, pubkey: [u8; 32], b: u8) -> (Client, PubKey) {
@@ -68,7 +72,14 @@ async fn client_for(addr: SocketAddr, pubkey: [u8; 32], b: u8) -> (Client, PubKe
 }
 
 fn public(signer: &Signer, channel: [u8; 32], name: &str) -> Create {
-    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, name, vec![])
+    signer.create(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        name,
+        vec![],
+    )
 }
 
 /// Seal a file the way a client must: one key, one nonce per chunk, and the
@@ -143,7 +154,14 @@ async fn upload(
         assert_eq!(code, 200);
     }
     let (code, body) = c
-        .post("/blob/commit", Commit { upload: up, blob: id }.encode())
+        .post(
+            "/blob/commit",
+            Commit {
+                upload: up,
+                blob: id,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
@@ -174,7 +192,10 @@ async fn a_file_survives_the_round_trip_and_the_exchange_never_sees_it() {
     let channel = [1u8; 32];
 
     let (code, body) = alice
-        .post("/channel/create", public(&signer(pubkey, 21), channel, "pictures").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 21), channel, "pictures").encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "create: {}", common::said(&body));
@@ -189,10 +210,14 @@ async fn a_file_survives_the_round_trip_and_the_exchange_never_sees_it() {
     );
     bob.post(
         "/channel/join",
-        ByChannelSigned { channel, action: joining }.encode(TYPE_JOIN),
+        ByChannelSigned {
+            channel,
+            action: joining,
+        }
+        .encode(TYPE_JOIN),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     // Something big enough to be several chunks, at a chunk size the exchange
     // told us it would take.
@@ -234,7 +259,10 @@ async fn a_commit_that_does_not_hash_to_its_name_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 31).await;
     let channel = [2u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 31), channel, "pictures").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 31), channel, "pictures").encode(),
+        )
         .await
         .unwrap();
 
@@ -258,7 +286,10 @@ async fn an_upload_missing_a_chunk_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 41).await;
     let channel = [3u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 41), channel, "pictures").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 41), channel, "pictures").encode(),
+        )
         .await
         .unwrap();
 
@@ -283,13 +314,25 @@ async fn an_upload_missing_a_chunk_is_refused() {
         alice
             .post(
                 "/blob/put",
-                PutChunk { upload: up, index: i as u32, sealed: s.clone() }.encode(),
+                PutChunk {
+                    upload: up,
+                    index: i as u32,
+                    sealed: s.clone(),
+                }
+                .encode(),
             )
             .await
             .unwrap();
     }
     let (_, body) = alice
-        .post("/blob/commit", Commit { upload: up, blob: id }.encode())
+        .post(
+            "/blob/commit",
+            Commit {
+                upload: up,
+                blob: id,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert!(!Committed::decode(&body).unwrap().stored);
@@ -328,7 +371,10 @@ async fn a_stranger_cannot_fetch_a_blob_and_absence_looks_the_same() {
         .unwrap();
     assert_eq!(code, 200);
     let c = Chunk::decode(&body).unwrap();
-    assert!(!c.found, "a stranger is told the same thing as about nothing");
+    assert!(
+        !c.found,
+        "a stranger is told the same thing as about nothing"
+    );
 
     let (_, body) = mallory
         .post("/blob/head", ByBlob { blob: id }.encode(TYPE_HEAD))
@@ -345,11 +391,17 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
     let first = [5u8; 32];
     let second = [6u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 61), first, "one").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 61), first, "one").encode(),
+        )
         .await
         .unwrap();
     alice
-        .post("/channel/create", public(&signer(pubkey, 61), second, "two").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 61), second, "two").encode(),
+        )
         .await
         .unwrap();
 
@@ -359,7 +411,12 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
     let (code, _) = alice
         .post(
             "/blob/attach",
-            ByChannelBlob { channel: second, blob: id, expires_after: 0 }.encode(TYPE_ATTACH),
+            ByChannelBlob {
+                channel: second,
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(TYPE_ATTACH),
         )
         .await
         .unwrap();
@@ -368,7 +425,10 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
     // Closing the first channel must not take the photograph out of the
     // second: a blob dies with its last attachment, not with one channel.
     let (code, _) = alice
-        .post("/channel/close", ByChannel { channel: first }.encode(TYPE_CLOSE))
+        .post(
+            "/channel/close",
+            ByChannel { channel: first }.encode(TYPE_CLOSE),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -377,13 +437,21 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
         .post("/blob/head", ByBlob { blob: id }.encode(TYPE_HEAD))
         .await
         .unwrap();
-    assert!(Headed::decode(&body).unwrap().found, "still attached elsewhere");
+    assert!(
+        Headed::decode(&body).unwrap().found,
+        "still attached elsewhere"
+    );
 
     // Detaching the last one deletes it.
     let (code, _) = alice
         .post(
             "/blob/detach",
-            ByChannelBlob { channel: second, blob: id, expires_after: 0 }.encode(TYPE_DETACH),
+            ByChannelBlob {
+                channel: second,
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(TYPE_DETACH),
         )
         .await
         .unwrap();
@@ -392,7 +460,10 @@ async fn forwarding_costs_the_reference_and_not_the_file() {
         .post("/blob/head", ByBlob { blob: id }.encode(TYPE_HEAD))
         .await
         .unwrap();
-    assert!(!Headed::decode(&body).unwrap().found, "the last attachment took it");
+    assert!(
+        !Headed::decode(&body).unwrap().found,
+        "the last attachment took it"
+    );
 }
 
 #[tokio::test]
@@ -402,7 +473,10 @@ async fn an_aborted_upload_leaves_nothing_behind() {
     let (mut alice, _) = client_for(addr, pubkey, 71).await;
     let channel = [7u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 71), channel, "x").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 71), channel, "x").encode(),
+        )
         .await
         .unwrap();
 
@@ -410,7 +484,13 @@ async fn an_aborted_upload_leaves_nothing_behind() {
     let (_, body) = alice
         .post(
             "/blob/begin",
-            Begin { channel, size: 9, chunks: 1, expires_after: 0 }.encode(),
+            Begin {
+                channel,
+                size: 9,
+                chunks: 1,
+                expires_after: 0,
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -418,7 +498,12 @@ async fn an_aborted_upload_leaves_nothing_behind() {
     alice
         .post(
             "/blob/put",
-            PutChunk { upload: up, index: 0, sealed: sealed[0].clone() }.encode(),
+            PutChunk {
+                upload: up,
+                index: 0,
+                sealed: sealed[0].clone(),
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -431,7 +516,14 @@ async fn an_aborted_upload_leaves_nothing_behind() {
 
     // The upload is gone, so committing it is not a thing that can happen.
     let (code, _) = alice
-        .post("/blob/commit", Commit { upload: up, blob: id }.encode())
+        .post(
+            "/blob/commit",
+            Commit {
+                upload: up,
+                blob: id,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 404);
@@ -444,14 +536,23 @@ async fn a_chunk_outside_the_reservation_is_refused() {
     let (mut alice, _) = client_for(addr, pubkey, 81).await;
     let channel = [8u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 81), channel, "x").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 81), channel, "x").encode(),
+        )
         .await
         .unwrap();
 
     let (_, body) = alice
         .post(
             "/blob/begin",
-            Begin { channel, size: 10, chunks: 2, expires_after: 0 }.encode(),
+            Begin {
+                channel,
+                size: 10,
+                chunks: 2,
+                expires_after: 0,
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -459,7 +560,12 @@ async fn a_chunk_outside_the_reservation_is_refused() {
     let (code, _) = alice
         .post(
             "/blob/put",
-            PutChunk { upload: up, index: 5, sealed: vec![0; 32] }.encode(),
+            PutChunk {
+                upload: up,
+                index: 5,
+                sealed: vec![0; 32],
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -474,7 +580,10 @@ async fn an_attachment_reference_describes_what_was_uploaded() {
     let (mut alice, _) = client_for(addr, pubkey, 91).await;
     let channel = [9u8; 32];
     alice
-        .post("/channel/create", public(&signer(pubkey, 91), channel, "x").encode())
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 91), channel, "x").encode(),
+        )
         .await
         .unwrap();
 
@@ -541,7 +650,10 @@ async fn the_last_member_leaving_takes_the_blobs_with_them() {
         .unwrap();
     assert_eq!(code, 200);
 
-    let (_, sealed, id) = seal_file(b"a file nobody will want afterwards", sqex_proto::blob_store::CHUNK);
+    let (_, sealed, id) = seal_file(
+        b"a file nobody will want afterwards",
+        sqex_proto::blob_store::CHUNK,
+    );
     assert!(upload(&mut alice, channel, &sealed, id, 34, 0).await);
 
     let held = |label: &str| {
@@ -599,7 +711,10 @@ async fn a_blob_attached_twice_survives_one_channel_ending() {
     let second = [0x82; 32];
     for c in [first, second] {
         let (code, _) = alice
-            .post("/channel/create", public(&signer(server_pub, 1), c, "room").encode())
+            .post(
+                "/channel/create",
+                public(&signer(server_pub, 1), c, "room").encode(),
+            )
             .await
             .unwrap();
         assert_eq!(code, 200);
@@ -622,7 +737,10 @@ async fn a_blob_attached_twice_survives_one_channel_ending() {
 
     // The first channel ends. The blob is still in the second.
     alice
-        .post("/channel/leave", ByChannel { channel: first }.encode(TYPE_LEAVE))
+        .post(
+            "/channel/leave",
+            ByChannel { channel: first }.encode(TYPE_LEAVE),
+        )
         .await
         .unwrap();
     let db = rusqlite::Connection::open(dir.path().join("channels.db")).unwrap();

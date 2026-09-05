@@ -11,19 +11,19 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
-use sqex_proto::refusal::Refusal;
 use sqex_proto::attest::{
     Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVIEWED, CLAIM_REVOKES, Held,
     Query as AttestQuery,
 };
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::h3::H3Client;
+use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
+use sqex_proto::refusal::Refusal;
 use sqex_proto::rendezvous::{Introduce, Introduced};
 use sqex_proto::resolve::{
     Endpoint, KIND_DNS, KIND_IPV4, KIND_IPV6, MAX_HOST, Publish as ResolvePublish,
     Resolve as ResolveGet, Resolved, Successor as ResolveSuccessor,
 };
-use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
 use sqex_proto::session::{
     BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
 };
@@ -31,7 +31,11 @@ use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
 #[derive(Parser)]
-#[command(name = "sqex", version, about = "Administer a sqex server with signed transactions")]
+#[command(
+    name = "sqex",
+    version,
+    about = "Administer a sqex server with signed transactions"
+)]
 struct Cli {
     /// A domain that publishes an exchange (SIP-33). Its key is discovered over
     /// DNSSEC, pinned on first contact, and refused if it later changes.
@@ -329,7 +333,11 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
-        Cmd::Meet { peer, wait, dry_run } => meet(&cli, &cfg, peer, *wait, *dry_run).await,
+        Cmd::Meet {
+            peer,
+            wait,
+            dry_run,
+        } => meet(&cli, &cfg, peer, *wait, *dry_run).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
         Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
@@ -406,7 +414,10 @@ async fn discover(domain: Option<&str>, forget: Option<&str>) -> Result<(), Stri
         }
         Some(sqex_discovery::Decision::Changed { pinned, offered }) => {
             println!();
-            println!("{}", sqex_discovery::known::changed_message(domain, &pinned, &offered));
+            println!(
+                "{}",
+                sqex_discovery::known::changed_message(domain, &pinned, &offered)
+            );
             return Err("the published key is not the pinned one".into());
         }
         None => {}
@@ -444,10 +455,7 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
     let ack = loop {
         let (code, body) = client.post("/session/open", open.encode()).await?;
         if code != 200 {
-            return Err(format!(
-                "open failed ({code}): {}",
-                said(&body)
-            ));
+            return Err(format!("open failed ({code}): {}", said(&body)));
         }
         let ack = OpenAck::decode(&body).map_err(|e| e.to_string())?;
         if ack.state == OpenState::Established {
@@ -472,7 +480,10 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
         return talk_datagram(client, session, ack.session_id).await;
     }
 
-    eprintln!("session {} established — type to send, Ctrl-D to end", ack.session_id);
+    eprintln!(
+        "session {} established — type to send, Ctrl-D to end",
+        ack.session_id
+    );
     talk(client, session, ack.session_id).await
 }
 
@@ -549,7 +560,9 @@ async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), Strin
         if stdin_open {
             match lines_rx.try_recv() {
                 Ok(line) => {
-                    let ct = session.seal(out_seq, line.as_bytes()).map_err(|e| e.to_string())?;
+                    let ct = session
+                        .seal(out_seq, line.as_bytes())
+                        .map_err(|e| e.to_string())?;
                     let frame = SendFrame {
                         session_id: id,
                         seq: out_seq,
@@ -557,10 +570,7 @@ async fn talk(mut client: Client, session: Session, id: u64) -> Result<(), Strin
                     };
                     let (code, body) = client.post("/session/send", frame.encode()).await?;
                     if code != 200 {
-                        return Err(format!(
-                            "send failed ({code}): {}",
-                            said(&body)
-                        ));
+                        return Err(format!("send failed ({code}): {}", said(&body)));
                     }
                     out_seq += 1;
                     continue; // drain stdin eagerly before polling
@@ -642,13 +652,17 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
             let sealed = mailbox::seal(&to, &plaintext).map_err(|e| e.to_string())?;
             let (mut client, _signer) = mail_client(cli, cfg).await?;
             let (code, body) = client
-                .post("/mailbox/send", MailSend { recipient: to, sealed }.encode())
+                .post(
+                    "/mailbox/send",
+                    MailSend {
+                        recipient: to,
+                        sealed,
+                    }
+                    .encode(),
+                )
                 .await?;
             if code != 200 {
-                return Err(format!(
-                    "send refused ({code}): {}",
-                    said(&body)
-                ));
+                return Err(format!("send refused ({code}): {}", said(&body)));
             }
             let ack = SendAck::decode(&body).map_err(|e| e.to_string())?;
             println!("sent to {to} as message {}", ack.id);
@@ -681,7 +695,9 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
                 Some((sender, text)) => {
                     println!("from {sender}:");
                     println!("{text}");
-                    println!("\n(still on the exchange — `sqex mail delete {id}` to complete collection)");
+                    println!(
+                        "\n(still on the exchange — `sqex mail delete {id}` to complete collection)"
+                    );
                     Ok(())
                 }
                 None => Err(format!("no message {id} for you")),
@@ -749,10 +765,7 @@ async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
 async fn list_mail(client: &mut Client) -> Result<Listing, String> {
     let (code, body) = client.post("/mailbox/list", Vec::new()).await?;
     if code != 200 {
-        return Err(format!(
-            "list failed ({code}): {}",
-            said(&body)
-        ));
+        return Err(format!("list failed ({code}): {}", said(&body)));
     }
     Listing::decode(&body).map_err(|e| e.to_string())
 }
@@ -763,7 +776,9 @@ async fn fetch_one(
     signer: &sqnr_core::SoftwareSigner,
     id: u64,
 ) -> Result<Option<(PubKey, String)>, String> {
-    let (code, body) = client.post("/mailbox/fetch", ById::fetch(id).encode()).await?;
+    let (code, body) = client
+        .post("/mailbox/fetch", ById::fetch(id).encode())
+        .await?;
     if code != 200 {
         return Err(format!("fetch failed ({code})"));
     }
@@ -772,7 +787,10 @@ async fn fetch_one(
         return Ok(None);
     }
     let plain = mailbox::open(&signer.seed(), &f.sealed).map_err(|e| e.to_string())?;
-    Ok(Some((f.sender, String::from_utf8_lossy(&plain).into_owned())))
+    Ok(Some((
+        f.sender,
+        String::from_utf8_lossy(&plain).into_owned(),
+    )))
 }
 
 async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
@@ -799,13 +817,7 @@ fn pick_local_port() -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
-async fn meet(
-    cli: &Cli,
-    cfg: &Config,
-    peer: &str,
-    wait: u16,
-    dry_run: bool,
-) -> Result<(), String> {
+async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> Result<(), String> {
     let signer = load_software_identity(cli, cfg)?;
     let them = parse_key(peer)?;
     let (addr, server) = endpoint(cli, cfg).await?;
@@ -819,7 +831,10 @@ async fn meet(
     let ours = pick_local_port()?;
     let mut client =
         H3Client::connect_from(addr, server.as_bytes(), &signer.seed(), Some(ours)).await?;
-    let req = Introduce { peer: them, wait_secs: wait };
+    let req = Introduce {
+        peer: them,
+        wait_secs: wait,
+    };
     // The request is a long poll and may sit for `wait` seconds by design.
     let (code, body) = client
         .post("/rendezvous/introduce", req.encode())
@@ -838,7 +853,10 @@ async fn meet(
     let there = got.addr.ok_or("an introduction with no address")?;
     println!("{them} was seen at {there}");
     let lead = got.start_at.saturating_sub(got.now);
-    println!("  both sides were told to begin in {lead}s (exchange clock {})", got.now);
+    println!(
+        "  both sides were told to begin in {lead}s (exchange clock {})",
+        got.now
+    );
     if dry_run {
         return Ok(());
     }
@@ -900,7 +918,10 @@ async fn meet(
         let listener = squic::listen(
             ours,
             &ed25519_dalek::SigningKey::from_bytes(&signer.seed()),
-            squic::Config { punch, ..Default::default() },
+            squic::Config {
+                punch,
+                ..Default::default()
+            },
         )
         .await
         .map_err(|e| format!("cannot listen on {ours}: {e}"))?;
@@ -953,7 +974,12 @@ fn claim_name(code: u8) -> &'static str {
 
 async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> {
     match cmd {
-        AttestCmd::Say { claim, subject, detail, days } => {
+        AttestCmd::Say {
+            claim,
+            subject,
+            detail,
+            days,
+        } => {
             let signer = load_software_identity(cli, cfg)?;
             let about = parse_key(subject)?;
             let code = claim_code(claim)?;
@@ -1036,7 +1062,14 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
                 Err(_) => Client::connect(addr, server.as_bytes()).await?,
             };
             let (code, body) = client
-                .post("/attest/read", AttestQuery { subject: about, issuer: from }.encode())
+                .post(
+                    "/attest/read",
+                    AttestQuery {
+                        subject: about,
+                        issuer: from,
+                    }
+                    .encode(),
+                )
                 .await?;
             if code != 200 {
                 return Err(format!("read failed ({code}): {}", said(&body)));
@@ -1137,7 +1170,11 @@ fn show_endpoint(e: &Endpoint) -> String {
 
 async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), String> {
     match cmd {
-        ResolveCmd::Publish { endpoint: addrs, capability, ttl } => {
+        ResolveCmd::Publish {
+            endpoint: addrs,
+            capability,
+            ttl,
+        } => {
             // Publishing means connecting *as* the identity: the handshake is
             // what establishes which key is speaking, which is why nothing here
             // is signed and why a YubiKey cannot do it.
@@ -1267,10 +1304,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             };
             let (code, body) = client.post("/beacon/beat", beat.encode()).await?;
             if code != 200 {
-                return Err(format!(
-                    "beat refused ({code}): {}",
-                    said(&body)
-                ));
+                return Err(format!("beat refused ({code}): {}", said(&body)));
             }
             let ack = BeatAck::decode(&body).map_err(|e| e.to_string())?;
             println!(
@@ -1296,12 +1330,11 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
                 Err(_) => Client::connect(addr, server.as_bytes()).await?,
             };
 
-            let (code, body) = client.post("/beacon/read", Read { key: target }.encode()).await?;
+            let (code, body) = client
+                .post("/beacon/read", Read { key: target }.encode())
+                .await?;
             if code != 200 {
-                return Err(format!(
-                    "read failed ({code}): {}",
-                    said(&body)
-                ));
+                return Err(format!("read failed ({code}): {}", said(&body)));
             }
             let r = Reply::decode(&body).map_err(|e| e.to_string())?;
             if !r.found {
@@ -1313,7 +1346,10 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             // verdict (SIP-4 forbids the exchange deciding this, and a CLI
             // deciding it silently would be the same mistake one layer up).
             let missed = if r.interval_secs > 0 {
-                format!(" ({} intervals)", r.staleness() / u64::from(r.interval_secs))
+                format!(
+                    " ({} intervals)",
+                    r.staleness() / u64::from(r.interval_secs)
+                )
             } else {
                 String::new()
             };
@@ -1349,7 +1385,6 @@ fn load_software_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::Software
 fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
     identity::read_public(&identity_path(cli, cfg)?)
 }
-
 
 /// The layers a caller can speak through, most specific first. Resolution is
 /// shared with the other clients in `sqex_discovery::target`, because three
@@ -1588,7 +1623,10 @@ fn said(body: &[u8]) -> String {
 
 /// The nth entry of the server's `results` array.
 fn result(v: &serde_json::Value, i: usize) -> serde_json::Value {
-    v["results"].get(i).cloned().unwrap_or(serde_json::Value::Null)
+    v["results"]
+        .get(i)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn print_list(v: &serde_json::Value) {
@@ -1622,7 +1660,10 @@ fn print_audit(v: &serde_json::Value) {
         let time = e["time"].as_u64().unwrap_or(0);
         let admin = e["admin"].as_str().unwrap_or("?");
         let action = e["action"].as_str().unwrap_or("?");
-        let target = e["target"].as_str().map(|t| format!(" {t}")).unwrap_or_default();
+        let target = e["target"]
+            .as_str()
+            .map(|t| format!(" {t}"))
+            .unwrap_or_default();
         let short: String = admin.chars().take(8).collect();
         println!("[{time}] {short}… {action}{target}");
     }

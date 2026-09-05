@@ -189,9 +189,10 @@ impl Rendezvous {
         let mut asked = self.asked.lock().unwrap();
         asked.retain(|_, a| now.saturating_sub(a.at) < PENDING_TTL);
         let live: Vec<(PubKey, PubKey)> = asked.keys().copied().collect();
-        self.waiters.lock().unwrap().retain(|(a, b), _| {
-            live.contains(&(*a, *b)) || live.contains(&(*b, *a))
-        });
+        self.waiters
+            .lock()
+            .unwrap()
+            .retain(|(a, b), _| live.contains(&(*a, *b)) || live.contains(&(*b, *a)));
     }
 
     /// How many requests are outstanding. For `/status`.

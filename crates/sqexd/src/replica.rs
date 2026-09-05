@@ -49,19 +49,19 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+use sqex_proto::blob_store::blob_id;
 use sqex_proto::channel::{Entry, KIND_MEMBER};
+use sqex_proto::channel_key::{Envelope, verify_envelope};
 use sqex_proto::credential::SCOPE_CHAT;
 use sqex_proto::device::{Devices, ListDevices};
 use sqex_proto::entry_sig::{EntryTerms, Place, link, verify_entry, verify_entry_hashed};
-use sqex_proto::blob_store::blob_id;
-use sqex_proto::channel_key::{Envelope, verify_envelope};
 use sqex_proto::peer::{
     BLOB_LIST, Hello, Hi, MAX_PULL, PEER_VERSION, Pull, PullBlob, PullEnvelopes, PullRecord,
     Pulled, PulledBlob, PulledEnvelopes,
 };
 use sqex_proto::profile::Got as ProfileGot;
 use sqex_proto::receipt::{self, Branch, Equivocation, ReceiptTerms};
-use sha2::{Digest, Sha256};
 use sqnr_core::PubKey;
 
 use crate::channel::Channels;
@@ -270,7 +270,9 @@ fn last_head(store: &Channels, channel: &[u8; 32]) -> Option<(u64, [u8; 32])> {
     if seq == 0 {
         return None;
     }
-    store.stamp_at(channel, seq).map(|(_, _, head, _)| (seq, head))
+    store
+        .stamp_at(channel, seq)
+        .map(|(_, _, head, _)| (seq, head))
 }
 
 /// The link an entry produces, exposed so a caller can rebuild a chain.
@@ -303,7 +305,11 @@ pub async fn pull_once(
     let (code, body) = client
         .post(
             "/peer/hello",
-            Hello { version: PEER_VERSION, since: 0 }.encode(),
+            Hello {
+                version: PEER_VERSION,
+                since: 0,
+            }
+            .encode(),
         )
         .await?;
     if code != 200 {
@@ -332,7 +338,12 @@ pub async fn pull_once(
         let (code, body) = client
             .post(
                 "/peer/pull",
-                Pull { channel: *channel, since, max: MAX_PULL }.encode(),
+                Pull {
+                    channel: *channel,
+                    since,
+                    max: MAX_PULL,
+                }
+                .encode(),
             )
             .await?;
         if code != 200 {
@@ -388,7 +399,11 @@ async fn pull_envelopes(
     let Ok((200, body)) = client
         .post(
             "/peer/envelopes",
-            PullEnvelopes { channel: *channel, since_epoch: 0 }.encode(),
+            PullEnvelopes {
+                channel: *channel,
+                since_epoch: 0,
+            }
+            .encode(),
         )
         .await
     else {
@@ -445,7 +460,12 @@ async fn pull_blobs(client: &mut H3Client, store: &Channels, channel: &[u8; 32])
     let Ok((200, body)) = client
         .post(
             "/peer/blobs",
-            PullBlob { channel: *channel, blob: [0; 32], chunk: BLOB_LIST }.encode(),
+            PullBlob {
+                channel: *channel,
+                blob: [0; 32],
+                chunk: BLOB_LIST,
+            }
+            .encode(),
         )
         .await
     else {
@@ -463,7 +483,12 @@ async fn pull_blobs(client: &mut H3Client, store: &Channels, channel: &[u8; 32])
             let Ok((200, body)) = client
                 .post(
                     "/peer/blobs",
-                    PullBlob { channel: *channel, blob: id, chunk: idx }.encode(),
+                    PullBlob {
+                        channel: *channel,
+                        blob: id,
+                        chunk: idx,
+                    }
+                    .encode(),
                 )
                 .await
             else {
@@ -626,9 +651,16 @@ mod tests {
     #[test]
     fn an_envelope_the_publisher_did_not_sign_is_not_acceptable() {
         let seed = [3u8; 32];
-        let recipient =
-            PubKey::new(SigningKey::from_bytes(&[4u8; 32]).verifying_key().to_bytes());
-        let origin = PubKey::new(SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes());
+        let recipient = PubKey::new(
+            SigningKey::from_bytes(&[4u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let origin = PubKey::new(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let instance = [5u8; 32];
         let channel = [6u8; 32];
         let secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
@@ -648,10 +680,16 @@ mod tests {
         // another, which is the whole reason those terms are in the input.
         let mut tampered = good.clone();
         tampered.ciphertext[0] ^= 1;
-        assert!(!acceptable_envelope(&origin, &instance, &channel, 1, &tampered));
+        assert!(!acceptable_envelope(
+            &origin, &instance, &channel, 1, &tampered
+        ));
         assert!(!acceptable_envelope(&origin, &instance, &channel, 2, &good));
-        assert!(!acceptable_envelope(&origin, &instance, &[7u8; 32], 1, &good));
-        assert!(!acceptable_envelope(&origin, &[8u8; 32], &channel, 1, &good));
+        assert!(!acceptable_envelope(
+            &origin, &instance, &[7u8; 32], 1, &good
+        ));
+        assert!(!acceptable_envelope(
+            &origin, &[8u8; 32], &channel, 1, &good
+        ));
         assert!(!acceptable_envelope(
             &PubKey::new([1u8; 32]),
             &instance,
@@ -674,7 +712,10 @@ mod tests {
         assert!(!acceptable_blob(&id, &altered));
         // Order is part of the name: two chunks swapped are a different blob,
         // and a replica that accepted them would hold a file nobody uploaded.
-        assert!(!acceptable_blob(&id, &[chunks[1].clone(), chunks[0].clone()]));
+        assert!(!acceptable_blob(
+            &id,
+            &[chunks[1].clone(), chunks[0].clone()]
+        ));
         assert!(!acceptable_blob(&id, &chunks[..1]));
     }
 }

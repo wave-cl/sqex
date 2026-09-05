@@ -181,7 +181,10 @@ impl Publish {
             return Err(Error::Malformed("publish is truncated".into()));
         }
         if b[0] != TYPE_PUBLISH {
-            return Err(Error::Malformed(format!("not a publish (type {:#x})", b[0])));
+            return Err(Error::Malformed(format!(
+                "not a publish (type {:#x})",
+                b[0]
+            )));
         }
         let count = b[5] as usize;
         if count > MAX_ENDPOINTS {
@@ -274,7 +277,10 @@ impl Resolve {
             )));
         }
         if b[0] != TYPE_RESOLVE {
-            return Err(Error::Malformed(format!("not a resolve (type {:#x})", b[0])));
+            return Err(Error::Malformed(format!(
+                "not a resolve (type {:#x})",
+                b[0]
+            )));
         }
         Ok(Resolve {
             key: PubKey::new(b[1..33].try_into().unwrap()),
@@ -647,9 +653,21 @@ mod tests {
     /// else's address by accident.
     #[test]
     fn each_type_refuses_the_others() {
-        let p = Publish { ttl_secs: 60, endpoints: vec![v4(443)], capabilities: vec![] }.encode();
-        let r = Resolve { key: PubKey::new([1; 32]) }.encode();
-        let s = Successor { successor: PubKey::new([2; 32]), reason: String::new() }.encode();
+        let p = Publish {
+            ttl_secs: 60,
+            endpoints: vec![v4(443)],
+            capabilities: vec![],
+        }
+        .encode();
+        let r = Resolve {
+            key: PubKey::new([1; 32]),
+        }
+        .encode();
+        let s = Successor {
+            successor: PubKey::new([2; 32]),
+            reason: String::new(),
+        }
+        .encode();
         assert!(Resolve::decode(&p).is_err());
         assert!(Publish::decode(&r).is_err());
         assert!(Successor::decode(&r).is_err());

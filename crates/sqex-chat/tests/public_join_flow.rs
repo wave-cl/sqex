@@ -18,7 +18,10 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-async fn server_with(dir: &Path, extra: &str) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn server_with(
+    dir: &Path,
+    extra: &str,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
@@ -79,7 +82,11 @@ async fn joining_a_public_channel_leaves_the_joiner_able_to_read_it() {
     join_public(&mut joiner, channel).await.unwrap();
 
     let info = joiner.info(&channel).await.unwrap();
-    println!("epoch in force: {} | members: {}", info.epoch, info.members.len());
+    println!(
+        "epoch in force: {} | members: {}",
+        info.epoch,
+        info.members.len()
+    );
     let mut timeline = Timeline::new();
     let got = joiner.poll(&channel, &mut timeline, 0).await;
     match got {
@@ -199,7 +206,12 @@ async fn the_welcome_channel_does_not_make_everybody_acquainted() {
     let mut stranger = chat_at(addr, server_pub, 47, &dir.path().join("h.db")).await;
     let lobby = stranger.mine().await.unwrap()[0].channel;
     assert!(
-        hidden.mine().await.unwrap().iter().any(|m| m.channel == lobby),
+        hidden
+            .mine()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.channel == lobby),
         "they are not both in it, so this proves nothing"
     );
     let got = stranger.profile_of(&hidden.me).await.unwrap();
@@ -260,7 +272,10 @@ async fn the_directory_route_refuses_a_private_channel() {
 
     // Whatever the exchange holds for it, it is not the name.
     let info = admin.info(&channel).await.unwrap();
-    assert_eq!(info.name, "", "the exchange learned a private channel's name");
+    assert_eq!(
+        info.name, "",
+        "the exchange learned a private channel's name"
+    );
 }
 
 /// Join a public channel the way the client does: find it in the directory,

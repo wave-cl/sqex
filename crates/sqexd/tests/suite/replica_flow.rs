@@ -104,7 +104,13 @@ async fn say(c: &mut Client, s: &Signer, chain: &mut Chain, channel: [u8; 32], t
     let info = s.info(c, channel).await;
     let req = s.post_chained(chain, channel, info.instance, 0, 0, text.to_vec());
     let (code, body) = c.post("/channel/post", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "saying {:?}: {}", String::from_utf8_lossy(text), common::said(&body));
+    assert_eq!(
+        code,
+        200,
+        "saying {:?}: {}",
+        String::from_utf8_lossy(text),
+        common::said(&body)
+    );
 }
 
 /// **Every peering refusal is the same refusal**, whatever the reason.
@@ -123,35 +129,68 @@ async fn a_stranger_and_an_absent_channel_get_the_same_answer() {
     let (addr, server_pub, _h) = server_in(dir.path(), &[peer_key]).await;
     let channel = [91u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, server_pub);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
     say(&mut a, &s, &mut chain, channel, b"not for you").await;
 
     // A stranger, on a channel that exists.
-    let mut stranger = Client::connect_as(addr, &server_pub, &stranger_seed).await.unwrap();
+    let mut stranger = Client::connect_as(addr, &server_pub, &stranger_seed)
+        .await
+        .unwrap();
     let existing = stranger
-        .post("/peer/pull", Pull { channel, since: 0, max: 16 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 16,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     // The same stranger, on a channel that does not.
     let absent = stranger
-        .post("/peer/pull", Pull { channel: [0xAB; 32], since: 0, max: 16 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel: [0xAB; 32],
+                since: 0,
+                max: 16,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     // And a whitelisted peer, on a channel nobody authorised it for.
     let (peer_seed, _) = identity(91);
-    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed).await.unwrap();
+    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed)
+        .await
+        .unwrap();
     let unauthorised = peer
-        .post("/peer/pull", Pull { channel, since: 0, max: 16 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 16,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
 
     assert_eq!(existing.0, absent.0);
     assert_eq!(existing.0, unauthorised.0);
     assert_eq!(existing.1, absent.1, "the reply must not vary by cause");
-    assert_eq!(existing.1, unauthorised.1, "the reply must not vary by cause");
+    assert_eq!(
+        existing.1, unauthorised.1,
+        "the reply must not vary by cause"
+    );
     // And it carries no detail, because a detail string is a reply that varies.
     let r = Refusal::decode(&existing.1).unwrap();
     assert_eq!(r.code, Code::NoSuchChannel);
@@ -160,7 +199,14 @@ async fn a_stranger_and_an_absent_channel_get_the_same_answer() {
     // The whitelist alone is not entitlement either: being allowed to speak the
     // routes gave this peer no channel.
     let hello = peer
-        .post("/peer/hello", Hello { version: PEER_VERSION, since: 0 }.encode())
+        .post(
+            "/peer/hello",
+            Hello {
+                version: PEER_VERSION,
+                since: 0,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(hello.0, 200, "a whitelisted peer may still say hello");
@@ -170,7 +216,14 @@ async fn a_stranger_and_an_absent_channel_get_the_same_answer() {
 
     // A stranger cannot even do that.
     let (code, _) = stranger
-        .post("/peer/hello", Hello { version: PEER_VERSION, since: 0 }.encode())
+        .post(
+            "/peer/hello",
+            Hello {
+                version: PEER_VERSION,
+                since: 0,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 404, "the operational gate is on hello too");
@@ -189,33 +242,64 @@ async fn a_peer_is_served_only_after_an_admin_authorises_it_in_the_log() {
     let (addr, server_pub, _h) = server_in(dir.path(), &[peer_key]).await;
     let channel = [101u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, server_pub);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
     say(&mut a, &s, &mut chain, channel, b"before").await;
 
-    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed).await.unwrap();
+    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed)
+        .await
+        .unwrap();
     let (code, _) = peer
-        .post("/peer/pull", Pull { channel, since: 0, max: 16 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 16,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 404, "an unauthorised peer is served nothing");
 
     // Alice authorises it, signed like any other membership act.
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &peer_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &peer_key,
+        &[],
+    );
     let (code, body) = a
         .post(
             "/channel/replicate",
-            ByAccount { channel, account: peer_key, action }.encode(TYPE_REPLICATE),
+            ByAccount {
+                channel,
+                account: peer_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
         )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let (code, body) = peer
-        .post("/peer/pull", Pull { channel, since: 0, max: 16 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 16,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
@@ -232,8 +316,9 @@ async fn a_peer_is_served_only_after_an_admin_authorises_it_in_the_log() {
             sqex_proto::channel::System::decode(&e.body)
                 .ok()
                 .flatten()
-                .is_some_and(|sys| sys.event == sqex_proto::channel::EVENT_REPLICATE
-                    && sys.subject == peer_key)
+                .is_some_and(|sys| {
+                    sys.event == sqex_proto::channel::EVENT_REPLICATE && sys.subject == peer_key
+                })
         }),
         "the authorisation must be visible to the members"
     );
@@ -241,17 +326,36 @@ async fn a_peer_is_served_only_after_an_admin_authorises_it_in_the_log() {
     // Withdrawal ends the subscription. It recalls nothing, and the test says
     // so by checking only that serving stops.
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_UNREPLICATE, &peer_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_UNREPLICATE,
+        &peer_key,
+        &[],
+    );
     let (code, body) = a
         .post(
             "/channel/unreplicate",
-            ByAccount { channel, account: peer_key, action }.encode(TYPE_UNREPLICATE),
+            ByAccount {
+                channel,
+                account: peer_key,
+                action,
+            }
+            .encode(TYPE_UNREPLICATE),
         )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
     let (code, _) = peer
-        .post("/peer/pull", Pull { channel, since: 0, max: 16 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 16,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 404, "serving must stop on withdrawal");
@@ -272,7 +376,9 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
     let origin = PubKey::new(server_pub);
     let channel = [111u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, server_pub);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
@@ -280,19 +386,40 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
         say(&mut a, &s, &mut chain, channel, text).await;
     }
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &peer_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &peer_key,
+        &[],
+    );
     let (code, _) = a
         .post(
             "/channel/replicate",
-            ByAccount { channel, account: peer_key, action }.encode(TYPE_REPLICATE),
+            ByAccount {
+                channel,
+                account: peer_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
         )
         .await
         .unwrap();
     assert_eq!(code, 200);
 
-    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed).await.unwrap();
+    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed)
+        .await
+        .unwrap();
     let (_, body) = peer
-        .post("/peer/pull", Pull { channel, since: 0, max: 64 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 64,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     let pulled = Pulled::decode(&body).unwrap();
@@ -301,9 +428,8 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
 
     // Every device here is its own account (SIP-22), so no credential is
     // needed and the lookup is never consulted — asserted rather than assumed.
-    let never = |_: &PubKey| -> Option<PubKey> {
-        panic!("a self-signed entry must not need a credential")
-    };
+    let never =
+        |_: &PubKey| -> Option<PubKey> { panic!("a self-signed entry must not need a credential") };
 
     // The control: unaltered, all of it stores.
     let store = Channels::open(None, PubKey::new([0xEE; 32]), None).unwrap();
@@ -339,7 +465,10 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
     let seq = last.seq;
     let store = Channels::open(None, PubKey::new([0xEE; 32]), None).unwrap();
     let took = take(&store, &origin, &channel, &repudiated, &never);
-    assert!(took.refused.contains(&(seq, Refused::Repudiated)), "{took:?}");
+    assert!(
+        took.refused.contains(&(seq, Refused::Repudiated)),
+        "{took:?}"
+    );
 
     // And a batch checked under the wrong origin verifies nothing at all,
     // which is what pinning the key independently is for.
@@ -365,25 +494,55 @@ async fn an_origin_that_equivocates_is_caught_and_nothing_is_chosen() {
     let origin = PubKey::new(server_pub);
     let channel = [121u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, server_pub);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
-    say(&mut a, &s, &mut chain, channel, b"what one reader was shown").await;
+    say(
+        &mut a,
+        &s,
+        &mut chain,
+        channel,
+        b"what one reader was shown",
+    )
+    .await;
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &peer_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &peer_key,
+        &[],
+    );
     let (code, _) = a
         .post(
             "/channel/replicate",
-            ByAccount { channel, account: peer_key, action }.encode(TYPE_REPLICATE),
+            ByAccount {
+                channel,
+                account: peer_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
         )
         .await
         .unwrap();
     assert_eq!(code, 200);
 
-    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed).await.unwrap();
+    let mut peer = Client::connect_as(addr, &server_pub, &peer_seed)
+        .await
+        .unwrap();
     let (_, body) = peer
-        .post("/peer/pull", Pull { channel, since: 0, max: 64 }.encode())
+        .post(
+            "/peer/pull",
+            Pull {
+                channel,
+                since: 0,
+                max: 64,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     let pulled = Pulled::decode(&body).unwrap();
@@ -392,20 +551,26 @@ async fn an_origin_that_equivocates_is_caught_and_nothing_is_chosen() {
     let store = Channels::open(None, PubKey::new([0xEE; 32]), None).unwrap();
     let took = take(&store, &origin, &channel, &pulled, &never);
     assert!(took.stored > 0);
-    assert!(store.equivocation_for(&channel).is_none(), "nothing said twice yet");
+    assert!(
+        store.equivocation_for(&channel).is_none(),
+        "nothing said twice yet"
+    );
 
     // The same position, told differently — and signed, because an unsigned
     // branch is something anybody could have written and proves nothing.
-    let (origin_seed, _) = squic::load_keypair(
-        &std::fs::read_to_string(dir.path().join("host_key")).unwrap(),
-    )
-    .unwrap();
+    let (origin_seed, _) =
+        squic::load_keypair(&std::fs::read_to_string(dir.path().join("host_key")).unwrap())
+            .unwrap();
     let mut second = pulled.clone();
     let e = second.entries.last_mut().unwrap();
     let stamp = e.stamp.as_mut().unwrap();
     stamp.head[0] ^= 1;
     let terms = ReceiptTerms {
-        place: Place { exchange: origin, instance: second.instance, channel },
+        place: Place {
+            exchange: origin,
+            instance: second.instance,
+            channel,
+        },
         seq: e.seq,
         posted: e.posted,
         entry_hash: stamp.entry_hash,
@@ -414,7 +579,10 @@ async fn an_origin_that_equivocates_is_caught_and_nothing_is_chosen() {
     stamp.receipt = receipt::sign(&origin_seed.to_bytes(), &terms);
 
     let took = take(&store, &origin, &channel, &second, &never);
-    assert!(took.equivocated, "the contradiction was not caught: {took:?}");
+    assert!(
+        took.equivocated,
+        "the contradiction was not caught: {took:?}"
+    );
     let proof = store
         .equivocation_for(&channel)
         .expect("a replica holding a contradiction must keep the proof");
@@ -454,7 +622,9 @@ fn a_replica_refuses_a_write_and_says_where_it_belongs() {
         prev: [0; 32],
         sig: [0; 64],
     };
-    let err = store.leave(&caller, &caller, &channel, &action).unwrap_err();
+    let err = store
+        .leave(&caller, &caller, &channel, &action)
+        .unwrap_err();
     match err {
         ChannelError::Replicated(named) => assert_eq!(named, origin),
         other => panic!("a replica accepted a write, or hid the origin: {other:?}"),
@@ -470,8 +640,8 @@ fn a_replica_refuses_a_write_and_says_where_it_belongs() {
 /// which SIP-34 says plainly it must.
 #[tokio::test]
 async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
-    use sqexd::replica::{Origin, pull_once};
     use sqex_proto::h3::H3Client;
+    use sqexd::replica::{Origin, pull_once};
 
     let origin_dir = tempfile::tempdir().unwrap();
     let replica_dir = tempfile::tempdir().unwrap();
@@ -491,12 +661,23 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     let (alice_seed, alice) = identity(131);
     let (bob_seed, bob) = identity(132);
     let channel = [131u8; 32];
-    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed).await.unwrap();
-    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed).await.unwrap();
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, origin_pub);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
-    say(&mut a, &s, &mut chain, channel, b"before the replica existed").await;
+    say(
+        &mut a,
+        &s,
+        &mut chain,
+        channel,
+        b"before the replica existed",
+    )
+    .await;
 
     let joining = Signer::new(bob_seed, bob, origin_pub).action_outside(
         channel,
@@ -510,8 +691,11 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     let (code, _) = b
         .post(
             "/channel/join",
-            sqex_proto::channel::ByChannelSigned { channel, action: joining }
-                .encode(sqex_proto::channel::TYPE_JOIN),
+            sqex_proto::channel::ByChannelSigned {
+                channel,
+                action: joining,
+            }
+            .encode(sqex_proto::channel::TYPE_JOIN),
         )
         .await
         .unwrap();
@@ -519,11 +703,22 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     say(&mut a, &s, &mut chain, channel, b"and one after").await;
 
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &replica_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &replica_key,
+        &[],
+    );
     let (code, body) = a
         .post(
             "/channel/replicate",
-            ByAccount { channel, account: replica_key, action }.encode(TYPE_REPLICATE),
+            ByAccount {
+                channel,
+                account: replica_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
         )
         .await
         .unwrap();
@@ -533,7 +728,10 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     // signed act. Resyncing from the exchange rather than guessing is what a
     // real client does, and skipping it is a broken chain on her next message.
     let info = s.info(&mut a, channel).await;
-    chain = Chain { seq: info.my_chain_seq, head: info.my_chain_head };
+    chain = Chain {
+        seq: info.my_chain_seq,
+        head: info.my_chain_head,
+    };
 
     // A real second exchange, not a bare store: replication pulls profiles as
     // well as entries, and a replica is an exchange.
@@ -561,11 +759,22 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
 
     // A second pull asks only for what is new, and there is nothing.
     let again = pull_once(&mut client, &replica, &spec).await.unwrap();
-    assert_eq!(again.get(&channel).unwrap().stored, 0, "a pull repeated itself");
+    assert_eq!(
+        again.get(&channel).unwrap().stored,
+        0,
+        "a pull repeated itself"
+    );
 
     // And it keeps up: a message posted now reaches the replica on the next
     // pull, which is what "replicates" means rather than "copied once".
-    say(&mut a, &s, &mut chain, channel, b"after the replica caught up").await;
+    say(
+        &mut a,
+        &s,
+        &mut chain,
+        channel,
+        b"after the replica caught up",
+    )
+    .await;
     let third = pull_once(&mut client, &replica, &spec).await.unwrap();
     assert_eq!(third.get(&channel).unwrap().stored, 1);
     assert_eq!(store.highest(&channel), t.stored + 1);
@@ -582,8 +791,8 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
 /// refuses rather than guessing.
 #[tokio::test]
 async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
-    use sqexd::channel::ChannelError;
     use sqex_proto::h3::H3Client;
+    use sqexd::channel::ChannelError;
     use sqexd::replica::{Origin, pull_once};
 
     let origin_dir = tempfile::tempdir().unwrap();
@@ -602,8 +811,12 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     let (bob_seed, bob) = identity(142);
     let channel = [141u8; 32];
 
-    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed).await.unwrap();
-    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed).await.unwrap();
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, origin_pub);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
@@ -620,8 +833,11 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     let (code, _) = b
         .post(
             "/channel/join",
-            sqex_proto::channel::ByChannelSigned { channel, action: joining }
-                .encode(sqex_proto::channel::TYPE_JOIN),
+            sqex_proto::channel::ByChannelSigned {
+                channel,
+                action: joining,
+            }
+            .encode(sqex_proto::channel::TYPE_JOIN),
         )
         .await
         .unwrap();
@@ -629,11 +845,22 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     say(&mut a, &s, &mut chain, channel, b"readable at the replica").await;
 
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &replica_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &replica_key,
+        &[],
+    );
     let (code, _) = a
         .post(
             "/channel/replicate",
-            ByAccount { channel, account: replica_key, action }.encode(TYPE_REPLICATE),
+            ByAccount {
+                channel,
+                account: replica_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
         )
         .await
         .unwrap();
@@ -659,7 +886,9 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         .fetch(&alice, &alice, &channel, 0, false)
         .expect("a member could not read from the replica");
     assert!(
-        read.entries.iter().any(|e| e.body == b"readable at the replica"),
+        read.entries
+            .iter()
+            .any(|e| e.body == b"readable at the replica"),
         "the message did not survive the copy"
     );
     let seen = whole
@@ -667,7 +896,9 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         .expect("the joiner was not derived as a member");
     assert_eq!(seen.members.len(), 2);
     assert!(
-        seen.members.iter().any(|m| m.account == alice && m.role == Role::Admin),
+        seen.members
+            .iter()
+            .any(|m| m.account == alice && m.role == Role::Admin),
         "the creator must be derived as the first admin"
     );
 
@@ -685,12 +916,20 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     let (_, body) = client
         .post(
             "/peer/pull",
-            sqex_proto::peer::Pull { channel, since: 2, max: 64 }.encode(),
+            sqex_proto::peer::Pull {
+                channel,
+                since: 2,
+                max: 64,
+            }
+            .encode(),
         )
         .await
         .unwrap();
     let pulled = Pulled::decode(&body).unwrap();
-    assert!(!pulled.entries.is_empty(), "the origin served nothing to skip into");
+    assert!(
+        !pulled.entries.is_empty(),
+        "the origin served nothing to skip into"
+    );
     sqexd::replica::take(&partial, &origin, &channel, &pulled, &|_| None);
     match partial.fetch(&alice, &alice, &channel, 0, false) {
         Err(ChannelError::Underived(named)) => assert_eq!(named, origin),
@@ -711,9 +950,9 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
 async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     use sqex_proto::blob_store::{Begin, ByChannelBlob, Commit, PutChunk, blob_id};
     use sqex_proto::channel_key::{ChannelKey, Put as KeyPut, seal_envelope, sign_envelope};
+    use sqex_proto::h3::H3Client;
     use sqex_proto::peer::PulledBlob;
     use sqex_proto::profile::{Profile, Put as ProfilePut, Record};
-    use sqex_proto::h3::H3Client;
     use sqexd::replica::{Origin, pull_once};
 
     let origin_dir = tempfile::tempdir().unwrap();
@@ -731,7 +970,9 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     let (alice_seed, alice) = identity(151);
     let channel = [151u8; 32];
 
-    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = Signer::new(alice_seed, alice, origin_pub);
     let mut chain = Chain::default();
 
@@ -791,7 +1032,13 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     let (code, body) = a
         .post(
             "/blob/begin",
-            Begin { channel, size: sealed[0].len() as u64, chunks: 1, expires_after: 0 }.encode(),
+            Begin {
+                channel,
+                size: sealed[0].len() as u64,
+                chunks: 1,
+                expires_after: 0,
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -800,7 +1047,12 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     let (code, _) = a
         .post(
             "/blob/put",
-            PutChunk { upload, index: 0, sealed: sealed[0].clone() }.encode(),
+            PutChunk {
+                upload,
+                index: 0,
+                sealed: sealed[0].clone(),
+            }
+            .encode(),
         )
         .await
         .unwrap();
@@ -811,7 +1063,15 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
     let (code, body) = a
-        .post("/blob/attach", ByChannelBlob { channel, blob: id, expires_after: 0 }.encode(sqex_proto::blob_store::TYPE_ATTACH))
+        .post(
+            "/blob/attach",
+            ByChannelBlob {
+                channel,
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(sqex_proto::blob_store::TYPE_ATTACH),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
@@ -823,19 +1083,28 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     let (code, _) = a
         .post(
             "/prekey/publish",
-            sqex_proto::prekey::Publish { prekeys: pool.mint_one_time(2) }.encode(),
+            sqex_proto::prekey::Publish {
+                prekeys: pool.mint_one_time(2),
+            }
+            .encode(),
         )
         .await
         .unwrap();
     assert_eq!(code, 200);
 
     // And a profile, signed by its subject.
-    let record = Record::sign(&alice_seed, &alice, 1, 1_700_000_000, Profile {
+    let record = Record::sign(
+        &alice_seed,
+        &alice,
+        1,
+        1_700_000_000,
+        Profile {
             flags: 0,
             name: "Alice".into(),
             title: String::new(),
             avatar: Vec::new(),
-        });
+        },
+    );
     let (code, body) = a
         .post("/profile/put", ProfilePut { record }.encode())
         .await
@@ -844,11 +1113,22 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
 
     // Authorise, then pull the lot.
     let info = s.info(&mut a, channel).await;
-    let action = s.action_at(&info, channel, sqex_proto::channel::EVENT_REPLICATE, &replica_key, &[]);
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &replica_key,
+        &[],
+    );
     let (code, body) = a
         .post(
             "/channel/replicate",
-            ByAccount { channel, account: replica_key, action }.encode(TYPE_REPLICATE),
+            ByAccount {
+                channel,
+                account: replica_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
         )
         .await
         .unwrap();
@@ -874,7 +1154,10 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
         .expect("the replica would not serve a key it holds");
     assert_eq!(got.envelopes.len(), 1, "the key envelope did not cross");
     assert_eq!(got.envelopes[0].ciphertext, envelope.ciphertext);
-    assert_eq!(got.envelopes[0].publisher, alice, "the publisher must survive");
+    assert_eq!(
+        got.envelopes[0].publisher, alice,
+        "the publisher must survive"
+    );
 
     // The blob crossed, whole, and hashes to its own name — which is the only
     // check a blob needs and the reason it carries no signature.
@@ -897,12 +1180,17 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     // below before this ran — so an empty pool here is replication declining to
     // copy it rather than there being nothing to copy.
     let at_origin = a
-        .post("/prekey/take", sqex_proto::prekey::Take { device: alice }.encode())
+        .post(
+            "/prekey/take",
+            sqex_proto::prekey::Take { device: alice }.encode(),
+        )
         .await
         .unwrap();
     assert_eq!(at_origin.0, 200);
     assert!(
-        sqex_proto::prekey::Taken::decode(&at_origin.1).unwrap().found,
+        sqex_proto::prekey::Taken::decode(&at_origin.1)
+            .unwrap()
+            .found,
         "the origin should hold a prekey for Alice, or this proves nothing"
     );
     assert!(
@@ -921,11 +1209,13 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     // The negative control for the blob, which is the only one of the three
     // whose check is a hash rather than a signature: bytes that do not hash to
     // the name are not the blob, and must not be stored under it.
-    let lying = PulledBlob { blobs: Vec::new(), sealed: b"different bytes entirely".to_vec() };
+    let lying = PulledBlob {
+        blobs: Vec::new(),
+        sealed: b"different bytes entirely".to_vec(),
+    };
     assert_ne!(
         blob_id(&[lying.sealed]),
         id,
         "bytes that hash to the same name would make the check meaningless"
     );
-
 }

@@ -30,10 +30,10 @@
 //! to *issue* one from a YubiKey, this belongs there and sqex should depend on
 //! it rather than keep a second copy.
 
+use crate::refusal::Code;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use sqnr_core::{Error, PubKey, Result};
-use crate::refusal::Code;
 
 /// Domain separator for a delegation signature.
 pub const DELEGATION_CONTEXT: &[u8] = b"sqnr-delegate-v1";
@@ -198,8 +198,8 @@ impl Credential {
         if self.scope != expect_scope {
             return Err(Invalid::WrongScope);
         }
-        let vk = VerifyingKey::from_bytes(self.account.as_bytes())
-            .map_err(|_| Invalid::BadSignature)?;
+        let vk =
+            VerifyingKey::from_bytes(self.account.as_bytes()).map_err(|_| Invalid::BadSignature)?;
         let b = body(
             &self.account,
             &self.delegate,
@@ -207,11 +207,8 @@ impl Credential {
             self.issued,
             self.not_after,
         );
-        vk.verify(
-            &signing_input(&b),
-            &Signature::from_bytes(&self.signature),
-        )
-        .map_err(|_| Invalid::BadSignature)
+        vk.verify(&signing_input(&b), &Signature::from_bytes(&self.signature))
+            .map_err(|_| Invalid::BadSignature)
     }
 
     pub fn wire_len(&self) -> usize {
@@ -292,7 +289,10 @@ mod tests {
     #[test]
     fn it_is_bounded_in_time_at_both_ends() {
         let (c, account) = credential();
-        assert_eq!(c.verify(&account, SCOPE_CHAT, 999), Err(Invalid::NotYetValid));
+        assert_eq!(
+            c.verify(&account, SCOPE_CHAT, 999),
+            Err(Invalid::NotYetValid)
+        );
         assert!(c.verify(&account, SCOPE_CHAT, 1000).is_ok());
         assert!(c.verify(&account, SCOPE_CHAT, 2000).is_ok());
         assert_eq!(c.verify(&account, SCOPE_CHAT, 2001), Err(Invalid::Expired));
@@ -362,14 +362,8 @@ mod tests {
         let (short, _) = credential();
         let (account_seed, _) = identity(1);
         let (_, device) = identity(2);
-        let long = Credential::issue(
-            &account_seed,
-            &device,
-            &"x".repeat(MAX_SCOPE),
-            1000,
-            2000,
-        )
-        .unwrap();
+        let long =
+            Credential::issue(&account_seed, &device, &"x".repeat(MAX_SCOPE), 1000, 2000).unwrap();
         assert_eq!(signing_input(&short.encode()).len(), 48);
         assert_eq!(signing_input(&long.encode()).len(), 48);
     }
@@ -459,15 +453,20 @@ impl Revocation {
     /// `now` allows a small skew forward: an account whose clock runs fast must
     /// not produce a revocation nobody will accept. There is no expiry — a
     /// withdrawal that lapsed would re-admit the key it withdrew.
-    pub fn verify(&self, expect_account: &PubKey, now: u64, skew: u64) -> std::result::Result<(), Invalid> {
+    pub fn verify(
+        &self,
+        expect_account: &PubKey,
+        now: u64,
+        skew: u64,
+    ) -> std::result::Result<(), Invalid> {
         if &self.account != expect_account {
             return Err(Invalid::WrongAccount);
         }
         if self.issued > now.saturating_add(skew) {
             return Err(Invalid::NotYetValid);
         }
-        let vk = VerifyingKey::from_bytes(self.account.as_bytes())
-            .map_err(|_| Invalid::BadSignature)?;
+        let vk =
+            VerifyingKey::from_bytes(self.account.as_bytes()).map_err(|_| Invalid::BadSignature)?;
         let body = revocation_body(&self.account, &self.device, self.issued);
         vk.verify(
             &revocation_input(&body),
@@ -529,7 +528,13 @@ mod revocation_tests {
         for (what, tampered) in [
             ("device", Revocation { device: other, ..r }),
             ("issued", Revocation { issued: 1001, ..r }),
-            ("account", Revocation { account: other, ..r }),
+            (
+                "account",
+                Revocation {
+                    account: other,
+                    ..r
+                },
+            ),
         ] {
             let expect = if what == "account" { &other } else { &account };
             assert!(

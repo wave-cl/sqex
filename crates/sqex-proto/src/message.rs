@@ -332,7 +332,9 @@ fn read_part(kind: u8, b: &[u8]) -> Result<Option<Part>> {
             let mut o = 0;
             let a = Attachment::read(b, &mut o)?;
             if o != b.len() {
-                return Err(Error::Malformed("attachment part has trailing bytes".into()));
+                return Err(Error::Malformed(
+                    "attachment part has trailing bytes".into(),
+                ));
             }
             Ok(Some(Part::Attachment(a)))
         }
@@ -886,7 +888,10 @@ mod tests {
 
         let mut bytes = Body::Post(Post::text("hi")).encode();
         bytes.push(0);
-        assert!(Body::decode(&bytes).is_err(), "trailing bytes are corruption");
+        assert!(
+            Body::decode(&bytes).is_err(),
+            "trailing bytes are corruption"
+        );
     }
 
     #[test]
@@ -1068,7 +1073,11 @@ mod call_tests {
                 panic!("a call must decode as a call whatever its reserved bits");
             };
             assert_eq!(media & MEDIA_AUDIO, MEDIA_AUDIO);
-            assert_eq!(media, MEDIA_AUDIO | bits, "reserved bits are carried, not masked");
+            assert_eq!(
+                media,
+                MEDIA_AUDIO | bits,
+                "reserved bits are carried, not masked"
+            );
         }
     }
 

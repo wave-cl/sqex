@@ -57,7 +57,11 @@ const ROUTES: &[(&str, &str, By)] = &[
     // command says so rather than implying a connection was made.
     ("POST", "/rendezvous/introduce", Cli("sqex meet")),
     // SIP-27 attestation.
-    ("POST", "/attest/lodge", Cli("sqex attest say, sqex attest withdraw")),
+    (
+        "POST",
+        "/attest/lodge",
+        Cli("sqex attest say, sqex attest withdraw"),
+    ),
     ("POST", "/attest/read", Cli("sqex attest read")),
     // SIP-28 resolution.
     ("POST", "/resolve/publish", Cli("sqex resolve publish")),
@@ -79,11 +83,19 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/blob/head", Chat("Chat::fetch_file")),
     ("POST", "/blob/get", Chat("Chat::fetch_file")),
     ("POST", "/blob/attach", Chat("/forward")),
-    ("POST", "/blob/detach", Chat("Chat::redact, via Chat::detach")),
+    (
+        "POST",
+        "/blob/detach",
+        Chat("Chat::redact, via Chat::detach"),
+    ),
     ("POST", "/prekey/publish", Chat("Chat::top_up_prekeys")),
     ("POST", "/prekey/take", Chat("Chat::ensure_epoch")),
     ("POST", "/prekey/count", Chat("Chat::top_up_prekeys")),
-    ("POST", "/prekey/clear", Chat("Chat::top_up_prekeys, after a lost store")),
+    (
+        "POST",
+        "/prekey/clear",
+        Chat("Chat::top_up_prekeys, after a lost store"),
+    ),
     ("POST", "/channel/create", Chat("/new, /public, open_dm")),
     ("POST", "/channel/join", Chat("/join")),
     ("POST", "/channel/leave", Chat("/leave")),
@@ -110,7 +122,11 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/peer/records", Peer("replica::pull_profiles")),
     // Reached when a fetch is refused with `equivocated`: the client asks for
     // the evidence rather than reporting a bare refusal.
-    ("POST", "/channel/equivocation", Chat("Chat::poll, on an equivocated refusal")),
+    (
+        "POST",
+        "/channel/equivocation",
+        Chat("Chat::poll, on an equivocated refusal"),
+    ),
     ("POST", "/channel/key/put", Chat("Chat::ensure_epoch")),
     ("POST", "/channel/key/get", Chat("Chat::collect_keys")),
     ("POST", "/channel/key/missing", Chat("Chat::stranded")),

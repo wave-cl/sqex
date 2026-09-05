@@ -128,10 +128,17 @@ async fn a_message_arrives_as_an_event_with_nothing_polling() {
     assert!(bob.subscribe().await.unwrap(), "bob did not subscribe");
     assert!(alice.subscribe().await.unwrap());
 
-    alice.send(&channel, "the exchange told you this").await.unwrap();
+    alice
+        .send(&channel, "the exchange told you this")
+        .await
+        .unwrap();
 
     let got = wait_for(&mut bob, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
-    let Some(ChatEvent::Channel { channel: c, last_seq }) = got else {
+    let Some(ChatEvent::Channel {
+        channel: c,
+        last_seq,
+    }) = got
+    else {
         panic!("no channel event reached bob: {got:?}");
     };
     assert_eq!(c, channel);
@@ -141,7 +148,10 @@ async fn a_message_arrives_as_an_event_with_nothing_polling() {
     // the same path as everybody else's, so there is one way a message gets on
     // screen rather than two that have to agree.
     let mine = wait_for(&mut alice, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
-    assert!(mine.is_some(), "the sender was not told about their own post");
+    assert!(
+        mine.is_some(),
+        "the sender was not told about their own post"
+    );
 }
 
 #[tokio::test]
@@ -173,7 +183,10 @@ async fn a_rename_reaches_everybody_who_shares_a_channel() {
         SOON,
     )
     .await;
-    assert!(got.is_some(), "a rename did not reach somebody sharing a channel");
+    assert!(
+        got.is_some(),
+        "a rename did not reach somebody sharing a channel"
+    );
 }
 
 /// **SIP-30: a profile event MUST NOT cross a block, in either direction.**
@@ -344,7 +357,10 @@ async fn a_change_between_subscribing_and_reading_is_not_lost() {
     bob.poll(&channel, &mut timeline, 0).await.unwrap();
 
     let got = wait_for(&mut bob, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
-    assert!(got.is_some(), "an event in the subscribe/read gap was dropped");
+    assert!(
+        got.is_some(),
+        "an event in the subscribe/read gap was dropped"
+    );
 }
 
 #[tokio::test]
@@ -428,7 +444,8 @@ async fn one_connection_carries_several_streams_and_then_refuses() {
     let (_, me) = identity(1);
     let mut freed = false;
     for _ in 0..50 {
-        srv.events.publish(&[me], sqex_proto::events::Event::Heartbeat);
+        srv.events
+            .publish(&[me], sqex_proto::events::Event::Heartbeat);
         tokio::time::sleep(Duration::from_millis(20)).await;
         if srv.events.count(&me) < sqexd::events::MAX_PER_IDENTITY {
             freed = true;
@@ -470,7 +487,10 @@ async fn a_subscribed_client_costs_the_exchange_nothing_while_nothing_happens() 
     );
 
     // And when something does happen, the client is told without having asked.
-    alice.send(&channel, "now something happened").await.unwrap();
+    alice
+        .send(&channel, "now something happened")
+        .await
+        .unwrap();
     let got = wait_for(&mut bob, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
     assert!(got.is_some());
 
@@ -504,7 +524,9 @@ async fn linked_device(
         .iter()
         .any(|d| d.device == owner.me)
     {
-        let own = owner.issue_credential(&owner.me, 90 * 24 * 60 * 60).unwrap();
+        let own = owner
+            .issue_credential(&owner.me, 90 * 24 * 60 * 60)
+            .unwrap();
         owner.register_self(&own).await.unwrap();
     }
     let credential = owner
@@ -553,7 +575,10 @@ async fn a_linked_device_receives_its_accounts_events() {
     );
 
     assert!(phone.subscribe().await.unwrap());
-    alice.send(&channel, "for bob, on whichever device").await.unwrap();
+    alice
+        .send(&channel, "for bob, on whichever device")
+        .await
+        .unwrap();
 
     let got = wait_for(&mut phone, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
     assert!(
@@ -610,14 +635,20 @@ async fn a_stream_being_read_can_be_dropped() {
     // times out with the read still holding the inner stream — exactly where
     // the pump task sits for all of its life.
     let waited = tokio::time::timeout(Duration::from_millis(150), raw.next()).await;
-    assert!(waited.is_err(), "control: the read completed, so nothing was in flight");
+    assert!(
+        waited.is_err(),
+        "control: the read completed, so nothing was in flight"
+    );
 
     // The line that used to panic.
     drop(raw);
 
     // Still usable afterwards, which is what a reconnect needs.
     let again = sqex_chat::events::Stream::open(&client).await;
-    assert!(again.is_ok(), "could not resubscribe after dropping a stream");
+    assert!(
+        again.is_ok(),
+        "could not resubscribe after dropping a stream"
+    );
 }
 
 /// **SIP-36: a ringing phone is not somebody typing, and the event says so.**

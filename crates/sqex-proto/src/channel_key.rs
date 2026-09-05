@@ -449,7 +449,9 @@ impl Put {
             }
             1 => {
                 if b.len() < o + 1 + ACTION_LEN {
-                    return Err(Error::Malformed("put claims a rotation and is short".into()));
+                    return Err(Error::Malformed(
+                        "put claims a rotation and is short".into(),
+                    ));
                 }
                 let a = Action::read(b, o + 1);
                 o += 1 + ACTION_LEN;
@@ -498,7 +500,11 @@ pub fn read_envelope_with_recipient(b: &[u8], o: &mut usize) -> Result<Envelope>
 }
 
 fn read_envelope(b: &[u8], o: &mut usize, with_recipient: bool) -> Result<Envelope> {
-    let head = if with_recipient { ENVELOPE_HEADER } else { ENVELOPE_HEADER - 32 };
+    let head = if with_recipient {
+        ENVELOPE_HEADER
+    } else {
+        ENVELOPE_HEADER - 32
+    };
     if b.len() < *o + head {
         return Err(Error::Malformed("envelope is truncated".into()));
     }
@@ -562,7 +568,10 @@ impl Get {
 
     pub fn decode(b: &[u8]) -> Result<Get> {
         if b.len() != 37 {
-            return Err(Error::Malformed(format!("get is {} bytes, want 37", b.len())));
+            return Err(Error::Malformed(format!(
+                "get is {} bytes, want 37",
+                b.len()
+            )));
         }
         if b[0] != TYPE_GET {
             return Err(Error::Malformed(format!("not a get (type {:#x})", b[0])));
@@ -636,7 +645,10 @@ impl Got {
 
     pub fn decode(b: &[u8]) -> Result<Got> {
         if b.len() < 10 {
-            return Err(Error::Malformed(format!("got is {} bytes, want at least 10", b.len())));
+            return Err(Error::Malformed(format!(
+                "got is {} bytes, want at least 10",
+                b.len()
+            )));
         }
         let count = u16::from_be_bytes(b[8..10].try_into().unwrap()) as usize;
         if count > MAX_ENVELOPES {
@@ -650,7 +662,10 @@ impl Got {
             envelopes.push(read_envelope(b, &mut o, false)?);
         }
         if o != b.len() {
-            return Err(Error::Malformed(format!("got has {} trailing bytes", b.len() - o)));
+            return Err(Error::Malformed(format!(
+                "got has {} trailing bytes",
+                b.len() - o
+            )));
         }
         Ok(Got {
             now: u64::from_be_bytes(b[0..8].try_into().unwrap()),
@@ -833,9 +848,17 @@ mod tests {
             key.sender_key(&channel, 1, &laptop)
         );
         let a = key.seal(&channel, 1, &phone, 0, b"from the phone").unwrap();
-        let b = key.seal(&channel, 1, &laptop, 0, b"from the laptop").unwrap();
-        assert_eq!(key.open(&channel, 1, &phone, 0, &a).unwrap(), b"from the phone");
-        assert_eq!(key.open(&channel, 1, &laptop, 0, &b).unwrap(), b"from the laptop");
+        let b = key
+            .seal(&channel, 1, &laptop, 0, b"from the laptop")
+            .unwrap();
+        assert_eq!(
+            key.open(&channel, 1, &phone, 0, &a).unwrap(),
+            b"from the phone"
+        );
+        assert_eq!(
+            key.open(&channel, 1, &laptop, 0, &b).unwrap(),
+            b"from the laptop"
+        );
         // And neither opens under the other's subkey.
         assert!(key.open(&channel, 1, &laptop, 0, &a).is_err());
     }
@@ -933,19 +956,32 @@ mod tests {
     fn put_and_got_round_trip() {
         let (seed, bob) = device(2);
         let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
-        let env = seal_envelope(&bob, prekey.id, &prekey.public, 1, &[ChannelKey::generate()])
-            .unwrap();
+        let env = seal_envelope(
+            &bob,
+            prekey.id,
+            &prekey.public,
+            1,
+            &[ChannelKey::generate()],
+        )
+        .unwrap();
 
         let put = Put {
             channel: [4u8; 32],
             epoch: 1,
             envelopes: vec![env.clone()],
-            action: Some(Action { chain_seq: 3, prev: [1; 32], sig: [2; 64] }),
+            action: Some(Action {
+                chain_seq: 3,
+                prev: [1; 32],
+                sig: [2; 64],
+            }),
         };
         assert_eq!(Put::decode(&put.encode()).unwrap(), put);
 
         // A same-epoch put writes no system entry and signs for nothing.
-        let unsigned = Put { action: None, ..put.clone() };
+        let unsigned = Put {
+            action: None,
+            ..put.clone()
+        };
         assert_eq!(Put::decode(&unsigned.encode()).unwrap(), unsigned);
 
         // Got omits the recipient, since it only ever answers one.
@@ -970,16 +1006,34 @@ mod tests {
         let instance = [4u8; 32];
         let channel = [7u8; 32];
 
-        let sealed =
-            seal_envelope(&bob, prekey.id, &prekey.public, 1, &[ChannelKey::generate()]).unwrap();
+        let sealed = seal_envelope(
+            &bob,
+            prekey.id,
+            &prekey.public,
+            1,
+            &[ChannelKey::generate()],
+        )
+        .unwrap();
         let published = sign_envelope(&seed, &exchange, &instance, &channel, 1, sealed.clone());
-        assert!(verify_envelope(&exchange, &instance, &channel, 1, &published));
+        assert!(verify_envelope(
+            &exchange, &instance, &channel, 1, &published
+        ));
         assert_ne!(published.publisher, PubKey::new([0; 32]));
 
         // Somebody else's signature over the same envelope.
-        let forged = sign_envelope(&other_seed, &exchange, &instance, &channel, 1, sealed.clone());
+        let forged = sign_envelope(
+            &other_seed,
+            &exchange,
+            &instance,
+            &channel,
+            1,
+            sealed.clone(),
+        );
         assert_ne!(forged.publisher, published.publisher);
-        let claimed = Envelope { publisher: published.publisher, ..forged };
+        let claimed = Envelope {
+            publisher: published.publisher,
+            ..forged
+        };
         assert!(
             !verify_envelope(&exchange, &instance, &channel, 1, &claimed),
             "an envelope verified under a publisher that did not sign it"
@@ -988,10 +1042,22 @@ mod tests {
         // And it does not travel: not to another exchange, another
         // incarnation, another channel, or another epoch.
         for (what, ok) in [
-            ("exchange", verify_envelope(&PubKey::new([8; 32]), &instance, &channel, 1, &published)),
-            ("instance", verify_envelope(&exchange, &[5; 32], &channel, 1, &published)),
-            ("channel", verify_envelope(&exchange, &instance, &[8; 32], 1, &published)),
-            ("epoch", verify_envelope(&exchange, &instance, &channel, 2, &published)),
+            (
+                "exchange",
+                verify_envelope(&PubKey::new([8; 32]), &instance, &channel, 1, &published),
+            ),
+            (
+                "instance",
+                verify_envelope(&exchange, &[5; 32], &channel, 1, &published),
+            ),
+            (
+                "channel",
+                verify_envelope(&exchange, &instance, &[8; 32], 1, &published),
+            ),
+            (
+                "epoch",
+                verify_envelope(&exchange, &instance, &channel, 2, &published),
+            ),
         ] {
             assert!(!ok, "an envelope verified under a changed {what}");
         }
@@ -1022,9 +1088,16 @@ mod tests {
                 &[ChannelKey::generate(), ChannelKey::generate()],
             )
             .unwrap();
-            envelopes.push(sign_envelope(&seed, &exchange, &[0; 32], &[0; 32], 1, sealed));
+            envelopes.push(sign_envelope(
+                &seed, &exchange, &[0; 32], &[0; 32], 1, sealed,
+            ));
         }
-        let put = Put { channel: [0; 32], epoch: 1, envelopes, action: None };
+        let put = Put {
+            channel: [0; 32],
+            epoch: 1,
+            envelopes,
+            action: None,
+        };
         let bytes = put.encode();
         // At the old cap of 256 this comes to 65,576 bytes — over the request
         // limit outright, not merely tight. Half of it leaves the margin
@@ -1047,8 +1120,14 @@ mod tests {
     fn an_envelope_whose_length_contradicts_its_range_is_refused() {
         let (seed, bob) = device(2);
         let (prekey, _) = Prekey::generate(&seed, KIND_ONE_TIME, 7);
-        let mut env =
-            seal_envelope(&bob, prekey.id, &prekey.public, 1, &[ChannelKey::generate()]).unwrap();
+        let mut env = seal_envelope(
+            &bob,
+            prekey.id,
+            &prekey.public,
+            1,
+            &[ChannelKey::generate()],
+        )
+        .unwrap();
         // Claim two epochs while carrying one key's worth of ciphertext.
         env.to_epoch = 2;
         let put = Put {
@@ -1091,4 +1170,3 @@ mod tests {
         assert_eq!(PutAck::decode(&p.encode()).unwrap(), p);
     }
 }
-

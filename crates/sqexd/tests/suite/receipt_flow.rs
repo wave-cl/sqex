@@ -86,19 +86,36 @@ async fn say(c: &mut Client, s: &Signer, chain: &mut Chain, channel: [u8; 32], t
 }
 
 async fn fetch_receipted(c: &mut Client, channel: [u8; 32], since: u64) -> Entries {
-    let req = Fetch { channel, since, wait_secs: 0, receipts: true };
+    let req = Fetch {
+        channel,
+        since,
+        wait_secs: 0,
+        receipts: true,
+    };
     let (code, body) = c.post("/channel/fetch", req.encode()).await.unwrap();
-    assert_eq!(code, 200, "receipted fetch refused: {}", common::said(&body));
+    assert_eq!(
+        code,
+        200,
+        "receipted fetch refused: {}",
+        common::said(&body)
+    );
     Entries::decode(&body, true).unwrap()
 }
 
 /// Check one entry's receipt the way SIP-34 requires: under the key the caller
 /// pinned, never one taken from the response.
 fn verify(server_pub: [u8; 32], channel: [u8; 32], instance: [u8; 32], e: &Entry) -> bool {
-    let stamp = e.stamp.as_ref().expect("a receipted fetch stamps every entry");
+    let stamp = e
+        .stamp
+        .as_ref()
+        .expect("a receipted fetch stamps every entry");
     receipt::verify(
         &ReceiptTerms {
-            place: Place { exchange: PubKey::new(server_pub), instance, channel },
+            place: Place {
+                exchange: PubKey::new(server_pub),
+                instance,
+                channel,
+            },
             seq: e.seq,
             posted: e.posted,
             entry_hash: stamp.entry_hash,
@@ -123,7 +140,9 @@ async fn every_entry_is_receipted_and_the_heads_chain_from_genesis() {
     let (alice_seed, _) = identity(41);
     let channel = [41u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = signer(server_pub, 41);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
@@ -173,7 +192,9 @@ async fn the_tip_is_served_and_verifiable_on_a_fetch_that_returned_nothing() {
     let (alice_seed, _) = identity(42);
     let channel = [42u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = signer(server_pub, 42);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
@@ -218,7 +239,9 @@ async fn a_receipted_post_is_the_exchange_saying_it_numbered_the_entry() {
     let (alice_seed, _) = identity(43);
     let channel = [43u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = signer(server_pub, 43);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
@@ -230,7 +253,9 @@ async fn a_receipted_post_is_the_exchange_saying_it_numbered_the_entry() {
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let posted = Posted::decode(&body, true).unwrap();
-    let stamp = posted.stamp.expect("a receipted post is answered with a receipt");
+    let stamp = posted
+        .stamp
+        .expect("a receipted post is answered with a receipt");
     assert!(receipt::verify(
         &ReceiptTerms {
             place: Place {
@@ -262,13 +287,20 @@ async fn a_plain_fetch_is_unchanged_and_carries_no_receipts() {
     let (alice_seed, _) = identity(44);
     let channel = [44u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = signer(server_pub, 44);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
     say(&mut a, &s, &mut chain, channel, b"hello").await;
 
-    let req = Fetch { channel, since: 0, wait_secs: 0, receipts: false };
+    let req = Fetch {
+        channel,
+        since: 0,
+        wait_secs: 0,
+        receipts: false,
+    };
     let (code, body) = a.post("/channel/fetch", req.encode()).await.unwrap();
     assert_eq!(code, 200);
     let seen = Entries::decode(&body, false).unwrap();
@@ -301,7 +333,9 @@ async fn two_receipts_at_one_position_make_a_portable_proof() {
     let (alice_seed, _) = identity(45);
     let channel = [45u8; 32];
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let s = signer(server_pub, 45);
     let mut chain = Chain::default();
     a_room(&mut a, &s, &mut chain, channel).await;
@@ -349,7 +383,11 @@ fn an_exchange_that_cannot_sign_refuses_rather_than_answering_in_the_other_shape
     // Not an integration test: a deployed sqexd always holds its key, so the
     // only way to reach this state is to build the store without one.
     use sqexd::channel::{ChannelError, Channels};
-    let exchange = PubKey::new(SigningKey::from_bytes(&[46u8; 32]).verifying_key().to_bytes());
+    let exchange = PubKey::new(
+        SigningKey::from_bytes(&[46u8; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
     let c = Channels::open(None, exchange, None).unwrap();
     let caller = identity(46).1;
     let err = c.fetch(&caller, &caller, &[46u8; 32], 0, true).unwrap_err();

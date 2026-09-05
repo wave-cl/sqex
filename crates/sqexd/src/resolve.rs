@@ -255,7 +255,9 @@ mod tests {
     #[test]
     fn the_whole_set_is_replaced_and_the_cap_is_enforced() {
         let store = Endpoints::new();
-        store.publish(key(4), 300, vec![v4(1), v4(2)], vec![]).unwrap();
+        store
+            .publish(key(4), 300, vec![v4(1), v4(2)], vec![])
+            .unwrap();
         store.publish(key(4), 300, vec![v4(3)], vec![]).unwrap();
         assert_eq!(store.resolve(&key(4), 0).endpoints, vec![v4(3)]);
 
@@ -288,7 +290,13 @@ mod tests {
 
         // An identity that only ever left a note is not resolvable, because it
         // never said where it was.
-        store.set_successor(key(7), Successor { successor: key(9), reason: String::new() });
+        store.set_successor(
+            key(7),
+            Successor {
+                successor: key(9),
+                reason: String::new(),
+            },
+        );
         assert!(!store.resolve(&key(7), 0).found);
     }
 

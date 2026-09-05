@@ -278,14 +278,11 @@ impl Trouble {
             ));
         }
         if self.gap {
-            parts.push(
-                "older messages have passed the retention window and are gone".to_string(),
-            );
+            parts.push("older messages have passed the retention window and are gone".to_string());
         }
         if self.restarted {
-            parts.push(
-                "this conversation was restarted — everything before it is gone".to_string(),
-            );
+            parts
+                .push("this conversation was restarted — everything before it is gone".to_string());
         }
         if self.unreadable > 0 {
             parts.push(format!(
@@ -758,10 +755,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         " sqex-chat ",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    left.push(Span::styled(
-        format!("{} ", env!("CARGO_PKG_VERSION")),
-        dim,
-    ));
+    left.push(Span::styled(format!("{} ", env!("CARGO_PKG_VERSION")), dim));
     f.render_widget(Paragraph::new(Line::from(left)), area);
 }
 
@@ -836,7 +830,11 @@ fn conversation_head(f: &mut Frame, app: &App, area: Rect) {
         }
         said += &app.topic;
     }
-    let hint = if app.has_avatar { "/avatar save <path>" } else { "" };
+    let hint = if app.has_avatar {
+        "/avatar save <path>"
+    } else {
+        ""
+    };
     let room = width.saturating_sub(hint.width() + 6);
     under.push(Span::styled(format!("     {}", truncate(&said, room)), dim));
     if !hint.is_empty() {
@@ -911,7 +909,10 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
                 None => spans.extend(identicon_of(&r.channel)),
             }
             spans.push(Span::styled(" ", base));
-            spans.push(Span::styled(format!("{:<w$}", row_label(r, w), w = w), base));
+            spans.push(Span::styled(
+                format!("{:<w$}", row_label(r, w), w = w),
+                base,
+            ));
             // `base`, not a bare style. The selected row is drawn reversed,
             // and a span that sets only a foreground keeps the terminal's own
             // background — so the count and the marker came out as holes
@@ -934,14 +935,22 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
             if r.at > 0 {
                 under.push(Span::styled(
                     format!("   {}", clock(r.at)),
-                    if selected { base } else { base.fg(palette::MUTED) },
+                    if selected {
+                        base
+                    } else {
+                        base.fg(palette::MUTED)
+                    },
                 ));
             }
             if !r.preview.is_empty() {
                 let room = (area.width as usize).saturating_sub(11);
                 under.push(Span::styled(
                     truncate(&r.preview, room),
-                    if selected { base } else { base.fg(palette::MUTED) },
+                    if selected {
+                        base
+                    } else {
+                        base.fg(palette::MUTED)
+                    },
                 ));
             }
             // Both lines run to the pane's edge, so a selected row is a bar
@@ -972,10 +981,7 @@ fn conversations(f: &mut Frame, app: &App, area: Rect) {
     } else {
         List::new(items)
     };
-    f.render_widget(
-        list.block(Block::default().borders(Borders::RIGHT)),
-        area,
-    );
+    f.render_widget(list.block(Block::default().borders(Borders::RIGHT)), area);
 }
 
 /// Break `text` into lines no wider than `width` columns.
@@ -1022,7 +1028,11 @@ fn wrap_to(text: &str, width: usize) -> Vec<String> {
 fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let mine = s.mine;
-    let align = if mine { Alignment::Right } else { Alignment::Left };
+    let align = if mine {
+        Alignment::Right
+    } else {
+        Alignment::Left
+    };
     let dim = Style::default().fg(palette::MUTED);
 
     // Who spoke, once for a run rather than against every line — but always
@@ -1106,7 +1116,11 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         .enumerate()
         .map(|(n, l)| {
             UnicodeWidthStr::width(l.as_str())
-                + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 }
+                + if n == last {
+                    UnicodeWidthStr::width(tail.as_str())
+                } else {
+                    0
+                }
         })
         .max()
         .unwrap_or(0);
@@ -1135,9 +1149,13 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         let tint = if s.redacted {
             dim.add_modifier(Modifier::ITALIC)
         } else if mine {
-            Style::default().fg(palette::SENT_FG).bg(palette::SENT_QUOTE_BG)
+            Style::default()
+                .fg(palette::SENT_FG)
+                .bg(palette::SENT_QUOTE_BG)
         } else {
-            Style::default().fg(palette::RECV_FG).bg(palette::RECV_QUOTE_BG)
+            Style::default()
+                .fg(palette::RECV_FG)
+                .bg(palette::RECV_QUOTE_BG)
         };
         let mut spans = Vec::new();
         if !mine {
@@ -1165,7 +1183,11 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
             ));
         }
         let used = UnicodeWidthStr::width(line.as_str())
-            + if n == last { UnicodeWidthStr::width(tail.as_str()) } else { 0 };
+            + if n == last {
+                UnicodeWidthStr::width(tail.as_str())
+            } else {
+                0
+            };
         spans.push(Span::styled(format!(" {line}"), style));
         // The padding goes *before* what trails the message, so the time ends
         // at the bubble's right edge rather than trailing off wherever the
@@ -1195,7 +1217,6 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
         }
         out.push(Line::from(spans).alignment(align));
     }
-
 
     if !s.reactions.is_empty() && !s.redacted {
         // A reaction is up to 32 bytes chosen by whoever sent it, and a
@@ -1271,8 +1292,12 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
 fn starts_run(a: Option<&Said>, b: &Said) -> bool {
     match a {
         None => true,
-        Some(a) => a.mine != b.mine || a.who != b.who || a.key != b.key
-            || b.at.saturating_sub(a.at) > RUN_GAP,
+        Some(a) => {
+            a.mine != b.mine
+                || a.who != b.who
+                || a.key != b.key
+                || b.at.saturating_sub(a.at) > RUN_GAP
+        }
     }
 }
 
@@ -1405,7 +1430,10 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // bottom of the view and nothing on screen says anything came.
     let scrolled = app.scroll > 0 && total > area.height.saturating_sub(2) as usize;
     let pane = if scrolled {
-        Rect { height: area.height.saturating_sub(1), ..area }
+        Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        }
     } else {
         area
     };
@@ -1485,12 +1513,18 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     );
     if scrolled {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("─── {scroll} more below · ^D or PgDn, End for the newest ───"),
-                Style::default().fg(palette::ATTENTION),
-            ))
-            .alignment(Alignment::Center)),
-            Rect { y: area.y + area.height - 1, height: 1, ..area },
+            Paragraph::new(
+                Line::from(Span::styled(
+                    format!("─── {scroll} more below · ^D or PgDn, End for the newest ───"),
+                    Style::default().fg(palette::ATTENTION),
+                ))
+                .alignment(Alignment::Center),
+            ),
+            Rect {
+                y: area.y + area.height - 1,
+                height: 1,
+                ..area
+            },
         );
     }
 
@@ -1507,7 +1541,13 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
             rows[y] = owner;
         }
     }
-    Drawn { pane, rows, scroll, total, room }
+    Drawn {
+        pane,
+        rows,
+        scroll,
+        total,
+        room,
+    }
 }
 
 /// What a search found, newest first.
@@ -1551,7 +1591,10 @@ fn results(f: &mut Frame, app: &App, area: Rect) {
             // result you cannot act on is only half an answer.
             Span::styled(format!("{:>4} ", h.seq), dim),
             Span::styled(clock(h.at), dim),
-            Span::styled(format!("{:>AUTHOR$} ", truncate(&h.who, AUTHOR)), Style::default().fg(palette::ACCENT)),
+            Span::styled(
+                format!("{:>AUTHOR$} ", truncate(&h.who, AUTHOR)),
+                Style::default().fg(palette::ACCENT),
+            ),
             Span::raw(before.to_string()),
             Span::styled(
                 hit.to_string(),
@@ -1577,7 +1620,9 @@ fn results(f: &mut Frame, app: &App, area: Rect) {
 /// gets an emoji whose width everything agrees on. In a layout made of columns
 /// that is the better trade.
 fn plain_emoji(s: &str) -> String {
-    s.chars().filter(|c| *c != '\u{fe0f}' && *c != '\u{fe0e}').collect()
+    s.chars()
+        .filter(|c| *c != '\u{fe0f}' && *c != '\u{fe0e}')
+        .collect()
 }
 
 /// The column an incoming message leaves for the pick cursor, before its
@@ -1592,36 +1637,82 @@ pub const COMMAND: usize = 28;
 
 /// The command list, by section.
 pub const HELP: &[(&str, &[(&str, &str)])] = &[
-    ("messages", &[
-        ("/file <path>", "send a file"),
-        ("/save <n> <path>", "keep one somebody sent"),
-        ("/forward <n> <m>", "send a file on to conversation m, without re-uploading"),
-        ("/redact <n>", "delete a message you posted, and the file it carried"),
-    ]),
-    ("conversations", &[
-        ("/new <name>", "a private group"),
-        ("/public <name>", "a channel anybody may find and join"),
-        ("/find [query]  /join <n>", "search the directory, and enter one"),
-        ("/invite <key>  /kick <key>", "add somebody; remove them and rotate the key"),
-        ("/op <key>  /deop <key>", "grant or withdraw admin here"),
-        ("/leave  /close", "leave it; or end it for everyone, permanently"),
-    ]),
-    ("this channel", &[
-        ("/name  /topic  /avatar", "what it is called, what it is for, its picture"),
-        ("/retain <secs> [max]", "how long it keeps what is said"),
-        ("/who  /read", "who is here and their keys in full; how far each has read"),
-        ("/rotate", "mint a new key for everyone currently here"),
-    ]),
-    ("finding things", &[
-        ("/search <text>", "find it in this conversation"),
-    ]),
-    ("you", &[
-        ("/profile [name | title]", "what you publish about yourself; `off` clears it"),
-        ("/block  /unblock  /blocked", "who may reach you"),
-        ("/whoami", "your key in full — the header carries only the first six"),
-        ("/mouse [on|off]", "scroll with the wheel, and hover a message for its full time; off by default, because it stops the terminal's own text selection"),
-        ("/reconnect", "try the exchange again now, rather than waiting out the backoff"),
-    ]),
+    (
+        "messages",
+        &[
+            ("/file <path>", "send a file"),
+            ("/save <n> <path>", "keep one somebody sent"),
+            (
+                "/forward <n> <m>",
+                "send a file on to conversation m, without re-uploading",
+            ),
+            (
+                "/redact <n>",
+                "delete a message you posted, and the file it carried",
+            ),
+        ],
+    ),
+    (
+        "conversations",
+        &[
+            ("/new <name>", "a private group"),
+            ("/public <name>", "a channel anybody may find and join"),
+            (
+                "/find [query]  /join <n>",
+                "search the directory, and enter one",
+            ),
+            (
+                "/invite <key>  /kick <key>",
+                "add somebody; remove them and rotate the key",
+            ),
+            ("/op <key>  /deop <key>", "grant or withdraw admin here"),
+            (
+                "/leave  /close",
+                "leave it; or end it for everyone, permanently",
+            ),
+        ],
+    ),
+    (
+        "this channel",
+        &[
+            (
+                "/name  /topic  /avatar",
+                "what it is called, what it is for, its picture",
+            ),
+            ("/retain <secs> [max]", "how long it keeps what is said"),
+            (
+                "/who  /read",
+                "who is here and their keys in full; how far each has read",
+            ),
+            ("/rotate", "mint a new key for everyone currently here"),
+        ],
+    ),
+    (
+        "finding things",
+        &[("/search <text>", "find it in this conversation")],
+    ),
+    (
+        "you",
+        &[
+            (
+                "/profile [name | title]",
+                "what you publish about yourself; `off` clears it",
+            ),
+            ("/block  /unblock  /blocked", "who may reach you"),
+            (
+                "/whoami",
+                "your key in full — the header carries only the first six",
+            ),
+            (
+                "/mouse [on|off]",
+                "scroll with the wheel, and hover a message for its full time; off by default, because it stops the terminal's own text selection",
+            ),
+            (
+                "/reconnect",
+                "try the exchange again now, rather than waiting out the backoff",
+            ),
+        ],
+    ),
 ];
 
 /// Everything the client can do, over the transcript.
@@ -1714,10 +1805,20 @@ fn directory(f: &mut Frame, app: &App, area: Rect) {
     ))];
     for (i, c) in app.found.iter().enumerate() {
         let mut spans = vec![
-            Span::styled(format!("{:>3}. ", i + 1), Style::default().fg(palette::MUTED)),
-            Span::styled(format!("#{}", c.name), Style::default().fg(palette::ATTENTION)),
             Span::styled(
-                format!("  {} member{}", c.members, if c.members == 1 { "" } else { "s" }),
+                format!("{:>3}. ", i + 1),
+                Style::default().fg(palette::MUTED),
+            ),
+            Span::styled(
+                format!("#{}", c.name),
+                Style::default().fg(palette::ATTENTION),
+            ),
+            Span::styled(
+                format!(
+                    "  {} member{}",
+                    c.members,
+                    if c.members == 1 { "" } else { "s" }
+                ),
                 Style::default().fg(palette::MUTED),
             ),
         ];
@@ -1782,7 +1883,9 @@ fn keys_line(width: usize, scrollable: bool) -> String {
     // rule below governs it too — the first version bypassed that and
     // overflowed a one-column terminal.
     let groups: Vec<&str> = if scrollable {
-        std::iter::once("^U/^D page").chain(GROUPS.iter().copied()).collect()
+        std::iter::once("^U/^D page")
+            .chain(GROUPS.iter().copied())
+            .collect()
     } else {
         GROUPS.to_vec()
     };
@@ -1826,7 +1929,10 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
         } else {
             format!(" {}", picked.key)
         };
-        (format!("{key}{hints}"), Style::default().fg(palette::ATTENTION))
+        (
+            format!("{key}{hints}"),
+            Style::default().fg(palette::ATTENTION),
+        )
     } else if let Some(s) = app.hovered.and_then(|i| app.said.get(i)) {
         // In the status line rather than floating by the pointer. A tooltip
         // over a transcript covers the message it is describing, and this line
@@ -2088,7 +2194,10 @@ mod tests {
 
     fn render(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| { draw(f, app); }).unwrap();
+        t.draw(|f| {
+            draw(f, app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -2171,7 +2280,10 @@ mod tests {
         app.trouble.no_key = Some(3);
         let out = render(&app, 100, 20);
         assert!(out.contains("no key for epoch 3"), "{out}");
-        assert!(!out.contains("nothing here yet"), "it claimed the room was empty");
+        assert!(
+            !out.contains("nothing here yet"),
+            "it claimed the room was empty"
+        );
     }
 
     #[test]
@@ -2181,7 +2293,10 @@ mod tests {
         app.said[0].has_file = true;
         let out = render(&app, 100, 20);
         assert!(out.contains("[notes.md, 4 KiB]"), "{out}");
-        assert!(out.contains("/save 3"), "the message number is not shown:\n{out}");
+        assert!(
+            out.contains("/save 3"),
+            "the message number is not shown:\n{out}"
+        );
         // And not on the line that has no file to save.
         assert!(!out.contains("/save 4"));
     }
@@ -2198,7 +2313,10 @@ mod tests {
             out.contains("^C quit"),
             "the status line should be free for things to act on"
         );
-        assert!(app.trouble.is_quiet(), "lost history is not a fault to chase");
+        assert!(
+            app.trouble.is_quiet(),
+            "lost history is not a fault to chase"
+        );
     }
 
     #[test]
@@ -2331,7 +2449,11 @@ mod tests {
             "the paging hint must come before the rest: {scrolled:?}"
         );
         // And it must not push the rest off a narrow screen entirely.
-        assert!(keys_line(80, true).contains("/help"), "{}", keys_line(80, true));
+        assert!(
+            keys_line(80, true).contains("/help"),
+            "{}",
+            keys_line(80, true)
+        );
     }
 
     #[test]
@@ -2363,7 +2485,10 @@ mod tests {
         }];
         let out = render(&app, 80, 20);
 
-        assert!(out.contains("message deleted"), "no tombstone drawn:\n{out}");
+        assert!(
+            out.contains("message deleted"),
+            "no tombstone drawn:\n{out}"
+        );
         assert!(
             !out.contains("the original words"),
             "the redacted text was rendered anyway:\n{out}"
@@ -2413,7 +2538,10 @@ mod tests {
             .position(|l| l.contains("we ship on friday"))
             .expect("the message is not on screen");
         let row = lines[at + 1];
-        assert!(row.contains("👍"), "no reaction row under the message:\n{out}");
+        assert!(
+            row.contains("👍"),
+            "no reaction row under the message:\n{out}"
+        );
         assert!(row.contains('2'), "the count is missing:\n{out}");
         assert!(row.contains("🎉"), "only one of the two was drawn:\n{out}");
         // And under *that* message, not the next one.
@@ -2445,7 +2573,10 @@ mod tests {
         assert!(out.contains("thursd"), "{out}");
         // Who is being answered, not which number: a sequence nobody has
         // memorised is not information.
-        assert!(out.contains("Alice"), "the reply did not name its author:\n{out}");
+        assert!(
+            out.contains("Alice"),
+            "the reply did not name its author:\n{out}"
+        );
         assert!(
             out.contains("E4LUkjrZ"),
             "the reply named somebody with no key beside it:\n{out}"
@@ -2479,7 +2610,10 @@ mod tests {
         // on the right edge too, pointing in at it.
         app.picked = Some(1);
         let out = render(&app, 80, 20);
-        assert!(out.contains('◂'), "nothing marks the picked message:\n{out}");
+        assert!(
+            out.contains('◂'),
+            "nothing marks the picked message:\n{out}"
+        );
         // The mode's own keys replace the command list: somebody who just
         // pressed Esc needs to be told what the mode does.
         assert!(out.contains("a react"), "{out}");
@@ -2491,9 +2625,15 @@ mod tests {
         // edit, so offering it would be a promise the protocol breaks.
         app.picked = Some(0);
         let out = render(&app, 80, 20);
-        assert!(!out.contains("e rewrite"), "offered to rewrite bob's message:\n{out}");
+        assert!(
+            !out.contains("e rewrite"),
+            "offered to rewrite bob's message:\n{out}"
+        );
         // Bob's is on the left, so its cursor is on the left edge.
-        assert!(out.contains('▸'), "nothing marks an incoming picked message:\n{out}");
+        assert!(
+            out.contains('▸'),
+            "nothing marks an incoming picked message:\n{out}"
+        );
     }
 
     #[test]
@@ -2615,14 +2755,20 @@ mod tests {
         for (i, key) in [(0, ALICE), (1, CAROL)] {
             app.hovered = Some(i);
             let out = render(&app, 130, 24);
-            assert!(out.contains(key), "hovering did not give the whole key:\n{out}");
+            assert!(
+                out.contains(key),
+                "hovering did not give the whole key:\n{out}"
+            );
         }
         app.hovered = None;
         // And picking, which is the same answer without a mouse.
         for (i, key) in [(0, ALICE), (1, CAROL)] {
             app.picked = Some(i);
             let out = render(&app, 130, 24);
-            assert!(out.contains(key), "picking did not give the whole key:\n{out}");
+            assert!(
+                out.contains(key),
+                "picking did not give the whole key:\n{out}"
+            );
             assert!(out.contains("c copy key"), "no way to take it:\n{out}");
         }
     }
@@ -2643,7 +2789,10 @@ mod tests {
 
         app.picked = Some(0);
         let theirs = render(&app, 130, 24);
-        assert!(theirs.contains("m message"), "no way to reach them:\n{theirs}");
+        assert!(
+            theirs.contains("m message"),
+            "no way to reach them:\n{theirs}"
+        );
 
         app.picked = Some(1);
         let mine = render(&app, 130, 24);
@@ -2663,7 +2812,15 @@ mod tests {
     fn the_frame_reports_the_last_message_on_screen_not_the_newest() {
         let mut app = sample();
         app.said = (0..60)
-            .map(|n| said("Alice", ALICE, false, &format!("message {n}"), 3600 + n as u64))
+            .map(|n| {
+                said(
+                    "Alice",
+                    ALICE,
+                    false,
+                    &format!("message {n}"),
+                    3600 + n as u64,
+                )
+            })
             .collect();
         let newest = app.said.len() - 1;
 
@@ -2697,7 +2854,15 @@ mod tests {
     fn the_view_follows_the_pick_off_the_top_of_the_pane() {
         let mut app = sample();
         app.said = (0..60)
-            .map(|n| said("Alice", ALICE, false, &format!("message {n}"), 3600 + n as u64))
+            .map(|n| {
+                said(
+                    "Alice",
+                    ALICE,
+                    false,
+                    &format!("message {n}"),
+                    3600 + n as u64,
+                )
+            })
             .collect();
 
         // Start where Esc would put it: the newest, at the bottom.
@@ -2860,7 +3025,10 @@ mod tests {
             },
         ];
         let out = render(&app, 100, 20);
-        assert!(out.contains("Alice Byrne"), "the list dropped the name:\n{out}");
+        assert!(
+            out.contains("Alice Byrne"),
+            "the list dropped the name:\n{out}"
+        );
         // The key is not on the row. It is a Tab and an Esc away, and on the
         // conversation once one is open — see the SIP-21 note on `author`.
         assert!(
@@ -2935,7 +3103,13 @@ mod tests {
             seq: 1,
             at: 0,
             reactions: (0..40)
-                .map(|i| (format!("{}\u{fe0f}", char::from(b'a' + i as u8 % 26)), 1, false))
+                .map(|i| {
+                    (
+                        format!("{}\u{fe0f}", char::from(b'a' + i as u8 % 26)),
+                        1,
+                        false,
+                    )
+                })
                 .collect(),
             ..Default::default()
         }];
@@ -2949,7 +3123,10 @@ mod tests {
         }
         // And the ones that did not fit are counted rather than dropped in
         // silence.
-        assert!(out.contains('+'), "the hidden reactions were not counted:\n{out}");
+        assert!(
+            out.contains('+'),
+            "the hidden reactions were not counted:\n{out}"
+        );
     }
 
     /// The ordinary case still draws every reaction, with no "+n".
@@ -2973,7 +3150,10 @@ mod tests {
         for e in ["👍", "🎉", "👀"] {
             assert!(out.contains(e), "{e} was dropped:\n{out}");
         }
-        assert!(!out.contains('+'), "a full row claimed to be truncated:\n{out}");
+        assert!(
+            !out.contains('+'),
+            "a full row claimed to be truncated:\n{out}"
+        );
     }
 
     /// Read cell by cell, because that is what the terminal is handed. A
@@ -2981,7 +3161,10 @@ mod tests {
     /// twice; `TestBackend` settles it.
     fn columns(app: &App, w: u16, h: u16) -> Vec<(usize, usize)> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| { draw(f, app); }).unwrap();
+        t.draw(|f| {
+            draw(f, app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         // For each row of the transcript pane, the first and last column
         // holding anything.
@@ -3011,7 +3194,10 @@ mod tests {
     /// difference has produced two wrong bug reports here already.
     fn transcript_text(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| { draw(f, app); }).unwrap();
+        t.draw(|f| {
+            draw(f, app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         ((2 + HEAD)..buf.area.height.saturating_sub(4))
             .map(|y| {
@@ -3023,11 +3209,13 @@ mod tests {
             .join("\n")
     }
 
-
     /// A row of cells, as symbols, so a width can be counted in columns.
     fn row_at(app: &App, w: u16, h: u16, y: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| { draw(f, app); }).unwrap();
+        t.draw(|f| {
+            draw(f, app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().to_string())
@@ -3037,7 +3225,10 @@ mod tests {
     /// The colour of the first `●` on screen.
     fn light(app: &App) -> Option<Color> {
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| { draw(f, app); }).unwrap();
+        t.draw(|f| {
+            draw(f, app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.width)
             .find(|x| buf[(*x, 0)].symbol() == "●")
@@ -3054,7 +3245,10 @@ mod tests {
         app.name = "Alice".into();
         let top = row_at(&app, 100, 24, 0);
         assert!(top.starts_with(" ● Alice"), "{top:?}");
-        assert!(!top.contains("9hSR6S"), "the key is still there too: {top:?}");
+        assert!(
+            !top.contains("9hSR6S"),
+            "the key is still there too: {top:?}"
+        );
 
         // With none, a stub of the key: a header naming nobody is worse than
         // one naming them roughly.
@@ -3092,9 +3286,15 @@ mod tests {
         ] {
             app.link = link;
             let top = row_at(&app, 100, 24, 0);
-            assert!(top.contains(word), "{link:?} does not say {word:?}: {top:?}");
+            assert!(
+                top.contains(word),
+                "{link:?} does not say {word:?}: {top:?}"
+            );
             for wrong in other {
-                assert!(!top.contains(wrong), "{link:?} also says {wrong:?}: {top:?}");
+                assert!(
+                    !top.contains(wrong),
+                    "{link:?} also says {wrong:?}: {top:?}"
+                );
             }
         }
     }
@@ -3127,7 +3327,10 @@ mod tests {
     fn the_conversation_is_headed_on_its_own_pane() {
         let app = sample();
         let head = row_at(&app, 100, 24, 2);
-        assert!(head.contains("bob"), "the header does not name it: {head:?}");
+        assert!(
+            head.contains("bob"),
+            "the header does not name it: {head:?}"
+        );
     }
 
     #[test]
@@ -3142,7 +3345,10 @@ mod tests {
             );
             // And the rule is the pane's, not the window's: the conversation
             // list keeps its own border.
-            assert!(!rule.starts_with('─'), "the rule ran across the list: {rule:?}");
+            assert!(
+                !rule.starts_with('─'),
+                "the rule ran across the list: {rule:?}"
+            );
         }
     }
 
@@ -3253,7 +3459,9 @@ mod tests {
         let same = identicon_of(&[7u8; 32]);
         let other = identicon_of(&[8u8; 32]);
         let colours = |v: &Vec<Span<'static>>| {
-            v.iter().map(|s| (s.style.fg, s.style.bg)).collect::<Vec<_>>()
+            v.iter()
+                .map(|s| (s.style.fg, s.style.bg))
+                .collect::<Vec<_>>()
         };
         assert_eq!(colours(&one), colours(&same));
         assert_ne!(colours(&one), colours(&other));
@@ -3273,10 +3481,16 @@ mod tests {
     #[test]
     fn every_pairing_is_legible() {
         fn luminance(c: Color) -> f64 {
-            let Color::Rgb(r, g, b) = c else { panic!("not truecolour: {c:?}") };
+            let Color::Rgb(r, g, b) = c else {
+                panic!("not truecolour: {c:?}")
+            };
             let f = |v: u8| {
                 let v = f64::from(v) / 255.0;
-                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
             };
             0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
         }
@@ -3375,7 +3589,10 @@ mod tests {
         app.rows[0].unread = 3;
         app.rows[0].waiting = true;
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
 
         // The row the cursor is on: every cell up to the list's border has to
@@ -3443,11 +3660,22 @@ mod tests {
     fn scrolling_back_reaches_what_the_tail_hid() {
         let mut app = sample();
         app.said = (0..60)
-            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .map(|n| {
+                said(
+                    "bob",
+                    "8qbHbw2B",
+                    false,
+                    &format!("message number {n}"),
+                    3661,
+                )
+            })
             .collect();
         let bottom = render(&app, 100, 24);
         assert!(bottom.contains("message number 59"), "{bottom}");
-        assert!(!bottom.contains("message number 0 "), "nothing was hidden to find");
+        assert!(
+            !bottom.contains("message number 0 "),
+            "nothing was hidden to find"
+        );
 
         // Far enough back to reach the first of them.
         app.scroll = 500;
@@ -3465,7 +3693,15 @@ mod tests {
     fn scrolling_stops_at_the_oldest_line() {
         let mut app = sample();
         app.said = (0..60)
-            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .map(|n| {
+                said(
+                    "bob",
+                    "8qbHbw2B",
+                    false,
+                    &format!("message number {n}"),
+                    3661,
+                )
+            })
             .collect();
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
 
@@ -3488,13 +3724,30 @@ mod tests {
     fn a_scrolled_transcript_says_there_is_more_below() {
         let mut app = sample();
         app.said = (0..60)
-            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .map(|n| {
+                said(
+                    "bob",
+                    "8qbHbw2B",
+                    false,
+                    &format!("message number {n}"),
+                    3661,
+                )
+            })
             .collect();
-        assert!(!render(&app, 100, 24).contains("more below"), "at the bottom");
+        assert!(
+            !render(&app, 100, 24).contains("more below"),
+            "at the bottom"
+        );
         app.scroll = 20;
         let out = render(&app, 100, 24);
-        assert!(out.contains("more below"), "no mark of being scrolled:\n{out}");
-        assert!(out.contains("End"), "and nothing says how to get back:\n{out}");
+        assert!(
+            out.contains("more below"),
+            "no mark of being scrolled:\n{out}"
+        );
+        assert!(
+            out.contains("End"),
+            "and nothing says how to get back:\n{out}"
+        );
     }
 
     /// The map from rows to messages has to move with the view, or hovering
@@ -3503,7 +3756,15 @@ mod tests {
     fn the_map_follows_the_scroll() {
         let mut app = sample();
         app.said = (0..60)
-            .map(|n| said("bob", "8qbHbw2B", false, &format!("message number {n}"), 3661))
+            .map(|n| {
+                said(
+                    "bob",
+                    "8qbHbw2B",
+                    false,
+                    &format!("message number {n}"),
+                    3661,
+                )
+            })
             .collect();
         app.scroll = 20;
         let (rows, drawn) = drawn_at(&app, 100, 24);
@@ -3526,7 +3787,10 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > 3, "only {checked} messages were on screen to check");
+        assert!(
+            checked > 3,
+            "only {checked} messages were on screen to check"
+        );
     }
 
     /// The map has to come from the frame that drew it. A second copy of the
@@ -3557,7 +3821,11 @@ mod tests {
         let x = hover.pane.x + 1;
         for text in ["bob", "are you there?", "🧡"] {
             let y = row_of(&rows, &hover, text);
-            assert_eq!(hover.at(x, y), Some(0), "{text:?} is not part of its message");
+            assert_eq!(
+                hover.at(x, y),
+                Some(0),
+                "{text:?} is not part of its message"
+            );
         }
     }
 
@@ -3583,7 +3851,11 @@ mod tests {
         let x = hover.pane.x + 1;
         // The newest is on screen; the oldest has scrolled off.
         let y = row_of(&rows, &hover, "message number 39");
-        assert_eq!(hover.at(x, y), Some(39), "the newest message is misattributed");
+        assert_eq!(
+            hover.at(x, y),
+            Some(39),
+            "the newest message is misattributed"
+        );
         assert!(
             !rows.iter().any(|r| r.contains("message number 0 ")),
             "nothing scrolled, so this proves nothing"
@@ -3600,11 +3872,19 @@ mod tests {
         let (rows, hover) = drawn_at(&app, 100, 24);
         let x = hover.pane.x + 1;
         let y = row_of(&rows, &hover, "───");
-        assert_eq!(hover.at(x, y), None, "a day separator claimed to be a message");
+        assert_eq!(
+            hover.at(x, y),
+            None,
+            "a day separator claimed to be a message"
+        );
 
         // And outside the pane: the conversation list, and the input box.
         let anywhere = row_of(&rows, &hover, "i am");
-        assert_eq!(hover.at(0, anywhere), None, "the list is not the transcript");
+        assert_eq!(
+            hover.at(0, anywhere),
+            None,
+            "the list is not the transcript"
+        );
         assert_eq!(hover.at(x, 23), None, "the input box is not the transcript");
     }
 
@@ -3617,7 +3897,10 @@ mod tests {
         let out = render(&app, 100, 24);
         let want = stamp(app.said[0].at);
         assert!(!want.is_empty());
-        assert!(out.contains(&want), "the full time is not on screen:\n{out}");
+        assert!(
+            out.contains(&want),
+            "the full time is not on screen:\n{out}"
+        );
         // And it stands down for the keys line when nothing is under it.
         app.hovered = None;
         assert!(!render(&app, 100, 24).contains(&want));
@@ -3630,7 +3913,10 @@ mod tests {
     fn what_the_client_has_to_say_outranks_every_hint() {
         let mut app = sample();
         app.picked = Some(0);
-        assert!(render(&app, 110, 24).contains("a react"), "no hints when quiet");
+        assert!(
+            render(&app, 110, 24).contains("a react"),
+            "no hints when quiet"
+        );
 
         app.trouble.message = Some("could not reach the clipboard. their key: abc".into());
         let out = render(&app, 110, 24);
@@ -3677,7 +3963,10 @@ mod tests {
         ];
         let cols = columns(&app, 100, 20);
         let pane = 100 - 31;
-        let incoming = cols.iter().find(|(a, _)| *a <= 2).expect("nothing on the left");
+        let incoming = cols
+            .iter()
+            .find(|(a, _)| *a <= 2)
+            .expect("nothing on the left");
         let outgoing = cols
             .iter()
             .find(|(_, b)| *b >= pane - 3)
@@ -3776,7 +4065,11 @@ mod tests {
     fn an_identicon_is_stable_for_a_key_and_differs_between_keys() {
         let a = identicon("8qbHbw2B");
         assert_eq!(a.len(), ICON);
-        let styles = |v: &[Span]| v.iter().map(|s| (s.style.fg, s.style.bg)).collect::<Vec<_>>();
+        let styles = |v: &[Span]| {
+            v.iter()
+                .map(|s| (s.style.fg, s.style.bg))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(styles(&a), styles(&identicon("8qbHbw2B")), "not stable");
         assert_ne!(
             styles(&a),
@@ -3785,7 +4078,10 @@ mod tests {
         );
         // Derived from the key, so a key that differs in one character does
         // not draw the same thing.
-        assert_ne!(styles(&identicon("aaaaaaaa")), styles(&identicon("aaaaaaab")));
+        assert_ne!(
+            styles(&identicon("aaaaaaaa")),
+            styles(&identicon("aaaaaaab"))
+        );
     }
 
     /// A conversation sits against the composer, not at the top of an empty
@@ -3819,8 +4115,14 @@ mod tests {
             .lines()
             .find(|l| l.contains("here it is"))
             .expect("the message is not on screen");
-        assert!(line.contains("/save 12"), "the file hint left the line: {line:?}");
-        assert!(line.contains("(edited)"), "the edit mark left the line: {line:?}");
+        assert!(
+            line.contains("/save 12"),
+            "the file hint left the line: {line:?}"
+        );
+        assert!(
+            line.contains("(edited)"),
+            "the edit mark left the line: {line:?}"
+        );
         assert!(
             line.contains(clock(3661).trim()),
             "the time left the line: {line:?}"
@@ -3844,7 +4146,10 @@ mod tests {
             3661,
         )];
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
 
         // Every row holding part of the message has the same run of coloured
@@ -3877,7 +4182,10 @@ mod tests {
         let mut app = sample();
         app.said = vec![said("bob", "8qbHbw2B", false, "hello", 3661)];
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         let painted = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
@@ -3885,7 +4193,10 @@ mod tests {
             .expect("the message is not on screen");
         let cell = &buf[painted];
         assert!(cell.style().bg.is_some(), "no bubble behind the text");
-        assert!(cell.style().fg.is_some(), "the text took the terminal's colour");
+        assert!(
+            cell.style().fg.is_some(),
+            "the text took the terminal's colour"
+        );
     }
 
     /// A deleted message is not given a bubble: a gap should look like a gap,
@@ -3897,7 +4208,10 @@ mod tests {
         s.redacted = true;
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         let painted = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
@@ -3912,7 +4226,10 @@ mod tests {
         app.rows[0].preview = "see you at six".into();
         app.rows[0].at = 3661;
         let out = render(&app, 100, 24);
-        assert!(out.contains("see you at six"), "no preview in the list:\n{out}");
+        assert!(
+            out.contains("see you at six"),
+            "no preview in the list:\n{out}"
+        );
         assert!(
             out.contains(clock(3661).trim()),
             "no time against the preview:\n{out}"
@@ -3985,7 +4302,10 @@ mod tests {
             .expect("no divider drawn");
         let third = rows.iter().position(|l| l.contains("message 3")).unwrap();
         let second = rows.iter().position(|l| l.contains("message 2")).unwrap();
-        assert!(second < line && line < third, "the divider is in the wrong place:\n{out}");
+        assert!(
+            second < line && line < third,
+            "the divider is in the wrong place:\n{out}"
+        );
         // Three messages sit below it.
         assert!(rows[line].contains("3 unread"), "{}", rows[line]);
     }
@@ -3995,7 +4315,10 @@ mod tests {
         let mut app = sample();
         app.divider = None;
         let out = render(&app, 100, 24);
-        assert!(!out.contains("unread"), "a divider appeared with nothing new:\n{out}");
+        assert!(
+            !out.contains("unread"),
+            "a divider appeared with nothing new:\n{out}"
+        );
     }
 
     /// The status line stopped being the command list, so the list has to be
@@ -4008,13 +4331,16 @@ mod tests {
         // A sample from each section, and the keys that are not commands at
         // all — which were the least discoverable thing in the client.
         for want in [
-            "Esc", "react", "rewrite", "/file", "/forward", "/op", "/close", "/retain",
-            "/profile", "/blocked", "/who", "/read",
+            "Esc", "react", "rewrite", "/file", "/forward", "/op", "/close", "/retain", "/profile",
+            "/blocked", "/who", "/read",
         ] {
             assert!(out.contains(want), "{want} is not in the help:\n{out}");
         }
         // And it is a view over the transcript, not a line under it.
-        assert!(!out.contains("are you there?"), "the transcript showed through");
+        assert!(
+            !out.contains("are you there?"),
+            "the transcript showed through"
+        );
     }
 
     #[test]
@@ -4063,12 +4389,18 @@ mod tests {
         assert!(out.contains("we ship on friday"), "{out}");
         // The author, with the key beside the name like everywhere else.
         assert!(out.contains("Alice"), "{out}");
-        assert!(out.contains("E4LUkjrZ"), "the result dropped the key:\n{out}");
+        assert!(
+            out.contains("E4LUkjrZ"),
+            "the result dropped the key:\n{out}"
+        );
         assert!(out.contains("1 message matching"), "{out}");
         // The sequence number, which is what /save and /redact take.
         assert!(out.contains("  1 "), "no number to act on:\n{out}");
         // A view over the transcript, not a line under it.
-        assert!(!out.contains("are you there?"), "the transcript showed through");
+        assert!(
+            !out.contains("are you there?"),
+            "the transcript showed through"
+        );
     }
 
     /// Nothing found says so where the results would have been, and says what
@@ -4116,7 +4448,10 @@ mod tests {
     /// sentence that wrapped.
     fn flowed(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| { draw(f, app); }).unwrap();
+        t.draw(|f| {
+            draw(f, app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         (0..buf.area.height)
             .map(|y| {
@@ -4138,9 +4473,17 @@ mod tests {
         let mut app = sample();
         app.searching = true;
         app.query = "friday".into();
-        app.hits = vec![hit("bob (8qbHbw2B)", "we ship on friday, not thursday", "friday", 3661)];
+        app.hits = vec![hit(
+            "bob (8qbHbw2B)",
+            "we ship on friday, not thursday",
+            "friday",
+            3661,
+        )];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         let marked: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -4161,7 +4504,10 @@ mod tests {
             s.reactions = vec![("👍".into(), 2, false)];
             app.said = vec![s];
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            t.draw(|f| { draw(f, &app); }).unwrap();
+            t.draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
             let buf = t.backend().buffer().clone();
             // The bubble's right edge, and the reaction chips' right edge.
             let right_of = |bg: Color| {
@@ -4172,7 +4518,11 @@ mod tests {
                     .max()
             };
             (
-                right_of(if mine { palette::SENT_BG } else { palette::RECV_BG }),
+                right_of(if mine {
+                    palette::SENT_BG
+                } else {
+                    palette::RECV_BG
+                }),
                 right_of(palette::CHIP_BG),
             )
         };
@@ -4197,14 +4547,20 @@ mod tests {
         s.reactions = vec![("👍".into(), 1, true)];
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         let chip = (0..buf.area.height)
             .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
             .find(|(x, y)| buf[(*x, *y)].symbol() == "👍")
             .expect("no reaction drawn");
         assert_eq!(buf[chip].style().bg, Some(palette::CHIP_BG));
-        assert!(buf[chip].style().fg.is_some(), "the chip took the terminal's colour");
+        assert!(
+            buf[chip].style().fg.is_some(),
+            "the chip took the terminal's colour"
+        );
     }
 
     /// Every emoji the picker offers is one whose width nothing argues about.
@@ -4231,7 +4587,10 @@ mod tests {
         s.reactions = vec![("\u{2764}\u{fe0f}".into(), 1, false)];
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         // No cell inside the chip run is left without a background.
         let run: Vec<(u16, u16)> = (0..buf.area.height)
@@ -4264,7 +4623,10 @@ mod tests {
         ));
         app.said = vec![s];
         let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-        t.draw(|f| { draw(f, &app); }).unwrap();
+        t.draw(|f| {
+            draw(f, &app);
+        })
+        .unwrap();
         let buf = t.backend().buffer().clone();
         let right_of = |bg: Color| {
             (0..buf.area.height)
@@ -4275,7 +4637,10 @@ mod tests {
         };
         let quote = right_of(palette::RECV_QUOTE_BG).expect("the quotation has no tint");
         let body = right_of(palette::RECV_BG).expect("no bubble");
-        assert_eq!(quote, body, "the quotation and the message are different widths");
+        assert_eq!(
+            quote, body,
+            "the quotation and the message are different widths"
+        );
     }
 
     /// A deleted message gets no bubble, and so no padding shaped like one:
@@ -4329,9 +4694,16 @@ mod tests {
             }
             app.said = vec![s];
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            t.draw(|f| { draw(f, &app); }).unwrap();
+            t.draw(|f| {
+                draw(f, &app);
+            })
+            .unwrap();
             let buf = t.backend().buffer().clone();
-            let bg = if mine { palette::SENT_BG } else { palette::RECV_BG };
+            let bg = if mine {
+                palette::SENT_BG
+            } else {
+                palette::RECV_BG
+            };
 
             // The last row of the bubble is the one carrying the trailer.
             let y = (0..buf.area.height)
@@ -4381,7 +4753,10 @@ mod tests {
             let mut app2 = sample();
             app2.said = vec![s];
             let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
-            t.draw(|f| { draw(f, &app2); }).unwrap();
+            t.draw(|f| {
+                draw(f, &app2);
+            })
+            .unwrap();
             let buf = t.backend().buffer().clone();
             (0..buf.area.height)
                 .flat_map(|y| (31..buf.area.width).map(move |x| (x, y)))
@@ -4395,7 +4770,10 @@ mod tests {
         // made a one-line answer as wide as the paragraph it answered.
         let plain = width_of(plain);
         let short = width_of(short);
-        assert!(short <= plain.max(plain_start() + QUOTE_FLOOR as u16), "the quotation stretched the bubble: {short} > {plain}");
+        assert!(
+            short <= plain.max(plain_start() + QUOTE_FLOOR as u16),
+            "the quotation stretched the bubble: {short} > {plain}"
+        );
         assert!(short >= plain, "the floor should never narrow a bubble");
     }
 
@@ -4486,7 +4864,10 @@ mod tests {
             })
             .collect();
         let out = render(&app, 80, 20);
-        assert!(out.contains("message 199"), "the newest message scrolled off");
+        assert!(
+            out.contains("message 199"),
+            "the newest message scrolled off"
+        );
         assert!(!out.contains("message 0 "), "it showed the oldest instead");
     }
 }

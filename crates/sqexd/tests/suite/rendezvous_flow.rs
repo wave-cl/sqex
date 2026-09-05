@@ -55,9 +55,12 @@ fn who(b: u8) -> ([u8; 32], PubKey) {
 }
 
 async fn ask(c: &mut Client, peer: PubKey, wait_secs: u16) -> (u16, Vec<u8>) {
-    c.post("/rendezvous/introduce", Introduce { peer, wait_secs }.encode())
-        .await
-        .unwrap()
+    c.post(
+        "/rendezvous/introduce",
+        Introduce { peer, wait_secs }.encode(),
+    )
+    .await
+    .unwrap()
 }
 
 /// **Neither side learns anything until both have asked**, and the answer that
@@ -70,12 +73,17 @@ async fn one_side_asking_discloses_nothing_at_all() {
     let (alice_seed, _) = who(11);
     let (_, bob) = who(12);
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
     let (code, body) = ask(&mut a, bob, 0).await;
     assert_eq!(code, 200, "{}", common::said(&body));
     let got = Introduced::decode(&body).unwrap();
     assert!(!got.ready);
-    assert!(got.addr.is_none(), "an address was disclosed to one side alone");
+    assert!(
+        got.addr.is_none(),
+        "an address was disclosed to one side alone"
+    );
     assert_eq!(got.start_at, 0);
     assert!(got.now > 0, "the exchange always states its own clock");
     assert_eq!(
@@ -101,8 +109,12 @@ async fn both_asking_completes_the_pair_with_one_start_for_both() {
     let (alice_seed, alice) = who(21);
     let (bob_seed, bob) = who(22);
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &bob_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &bob_seed)
+        .await
+        .unwrap();
 
     let (_, first) = ask(&mut a, bob, 0).await;
     assert!(!Introduced::decode(&first).unwrap().ready);
@@ -137,7 +149,10 @@ async fn both_asking_completes_the_pair_with_one_start_for_both() {
         for_alice.start_at, for_bob.start_at,
         "the two sides were told different moments to begin"
     );
-    assert!(for_alice.start_at > for_alice.now, "the start is in the future");
+    assert!(
+        for_alice.start_at > for_alice.now,
+        "the start is in the future"
+    );
 }
 
 /// The first party to ask **waits** for the second, and both are answered
@@ -151,8 +166,12 @@ async fn the_first_to_ask_waits_and_is_woken_by_the_second() {
     let (alice_seed, alice) = who(31);
     let (bob_seed, bob) = who(32);
 
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &bob_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &bob_seed)
+        .await
+        .unwrap();
 
     let waiting = tokio::spawn(async move {
         let started = tokio::time::Instant::now();
@@ -185,7 +204,9 @@ async fn a_wait_that_nobody_joins_ends_saying_nothing() {
     let (addr, server_pub, _h) = server_in(dir.path()).await;
     let (alice_seed, _) = who(41);
     let (_, nobody) = who(42);
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
 
     let started = tokio::time::Instant::now();
     let (code, body) = ask(&mut a, nobody, 1).await;
@@ -207,7 +228,9 @@ async fn an_identity_cannot_introduce_itself_to_itself() {
     let dir = tempfile::tempdir().unwrap();
     let (addr, server_pub, _h) = server_in(dir.path()).await;
     let (alice_seed, alice) = who(51);
-    let mut a = Client::connect_as(addr, &server_pub, &alice_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
 
     let (code, body) = ask(&mut a, alice, 0).await;
     assert_eq!(code, 200);
@@ -261,30 +284,36 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
     let alice_port = port_of();
     let bob_port = port_of();
 
-    let mut a = sqex_proto::h3::H3Client::connect_from(
-        addr,
-        &server_pub,
-        &alice_seed,
-        Some(alice_port),
-    )
-    .await
-    .unwrap();
-    let mut b = sqex_proto::h3::H3Client::connect_from(
-        addr,
-        &server_pub,
-        &bob_seed,
-        Some(bob_port),
-    )
-    .await
-    .unwrap();
+    let mut a =
+        sqex_proto::h3::H3Client::connect_from(addr, &server_pub, &alice_seed, Some(alice_port))
+            .await
+            .unwrap();
+    let mut b =
+        sqex_proto::h3::H3Client::connect_from(addr, &server_pub, &bob_seed, Some(bob_port))
+            .await
+            .unwrap();
 
     let (code, _) = a
-        .post("/rendezvous/introduce", Introduce { peer: bob, wait_secs: 0 }.encode())
+        .post(
+            "/rendezvous/introduce",
+            Introduce {
+                peer: bob,
+                wait_secs: 0,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
     let (code, body) = b
-        .post("/rendezvous/introduce", Introduce { peer: alice, wait_secs: 0 }.encode())
+        .post(
+            "/rendezvous/introduce",
+            Introduce {
+                peer: alice,
+                wait_secs: 0,
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -312,7 +341,10 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
         let listener = squic::listen(
             alice_port,
             &ed25519_dalek::SigningKey::from_bytes(&alice_seed),
-            squic::Config { punch: vec![bob_port], ..Default::default() },
+            squic::Config {
+                punch: vec![bob_port],
+                ..Default::default()
+            },
         )
         .await
         .expect("alice could not listen on the port she was introduced at");

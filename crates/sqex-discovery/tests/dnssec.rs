@@ -103,7 +103,6 @@ async fn a_signed_zone_without_a_record_is_not_published_rather_than_unsigned() 
     );
 }
 
-
 /// The reference deployment, end to end: a real signed record, parsed into the
 /// key and address a client would dial.
 ///

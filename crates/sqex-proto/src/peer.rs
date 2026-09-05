@@ -332,10 +332,7 @@ mod tests {
             max: 64,
         };
         assert_eq!(Pull::decode(&p.encode()).unwrap(), p);
-        let greedy = Pull {
-            max: u16::MAX,
-            ..p
-        };
+        let greedy = Pull { max: u16::MAX, ..p };
         assert_eq!(Pull::decode(&greedy.encode()).unwrap().max, MAX_PULL);
     }
 
@@ -500,7 +497,10 @@ impl PullBlob {
             )));
         }
         if b[0] != TYPE_BLOB {
-            return Err(Error::Malformed(format!("not a blob pull (type {:#x})", b[0])));
+            return Err(Error::Malformed(format!(
+                "not a blob pull (type {:#x})",
+                b[0]
+            )));
         }
         Ok(PullBlob {
             channel: b[1..33].try_into().unwrap(),

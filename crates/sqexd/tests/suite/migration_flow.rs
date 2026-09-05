@@ -77,7 +77,9 @@ fn a_database_from_before_a_column_existed_gains_it_on_open() {
     // failing on every fetch.
     let channel = [1u8; 32];
     let caller = PubKey::new([2u8; 32]);
-    let err = store.fetch(&caller, &caller, &channel, 0, false).unwrap_err();
+    let err = store
+        .fetch(&caller, &caller, &channel, 0, false)
+        .unwrap_err();
     assert!(
         !matches!(err, sqexd::channel::ChannelError::Storage),
         "a fetch still fails with a storage error: {err:?}"
@@ -189,7 +191,10 @@ fn a_database_in_the_shape_the_last_release_left_comes_up_to_date() {
             .filter(|n| !n.starts_with("sqlite_"))
             .collect()
     };
-    assert!(tables.len() > 10, "the schema should declare more than this");
+    assert!(
+        tables.len() > 10,
+        "the schema should declare more than this"
+    );
 
     let mut missing: Vec<String> = Vec::new();
     for t in &tables {

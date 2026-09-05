@@ -127,7 +127,10 @@ mod tests {
         b.record(me, 30, true);
 
         assert!(!b.read(&me, None).found, "hidden from an anonymous querier");
-        assert!(!b.read(&me, Some(&other)).found, "hidden from another identity");
+        assert!(
+            !b.read(&me, Some(&other)).found,
+            "hidden from another identity"
+        );
         assert!(b.read(&me, Some(&me)).found, "its owner can read it");
     }
 

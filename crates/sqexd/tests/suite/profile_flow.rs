@@ -13,7 +13,8 @@ use sqex_proto::channel::{
     direct_message_id,
 };
 use sqex_proto::profile::{
-    Block, Blocks, ByAccount, FLAG_WITHHOLD, Record, Got, MAX_UPDATES_PER_HOUR, Profile, Put, TYPE_GET,
+    Block, Blocks, ByAccount, FLAG_WITHHOLD, Got, MAX_UPDATES_PER_HOUR, Profile, Put, Record,
+    TYPE_GET,
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -77,7 +78,11 @@ fn created_head(s: &Signer, channel: [u8; 32], visibility: Visibility, name: &st
 /// What signs for identity `b` against this exchange (SIP-31).
 fn signer(pubkey: [u8; 32], b: u8) -> Signer {
     let sk = SigningKey::from_bytes(&[b; 32]);
-    Signer::new(sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()), pubkey)
+    Signer::new(
+        sk.to_bytes(),
+        PubKey::new(sk.verifying_key().to_bytes()),
+        pubkey,
+    )
 }
 
 fn profile(name: &str, title: &str, flags: u8) -> Profile {
@@ -116,7 +121,14 @@ async fn block(c: &mut Client, who: &PubKey, add: bool) -> u16 {
 }
 
 fn public(signer: &Signer, channel: [u8; 32]) -> Create {
-    signer.create(channel, instance_for(channel, 0), Visibility::Public, 3600, "shared", vec![])
+    signer.create(
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "shared",
+        vec![],
+    )
 }
 
 #[tokio::test]
@@ -127,7 +139,17 @@ async fn a_profile_is_published_and_read() {
     let (mut b, _) = peer(addr, pubkey, 22).await;
 
     assert!(!get(&mut b, &alice).await.found, "nothing published yet");
-    assert_eq!(put_as(&mut a, &[21; 32], &alice, 1, profile("Colin Lyons", "Infrastructure", 0)).await, 200);
+    assert_eq!(
+        put_as(
+            &mut a,
+            &[21; 32],
+            &alice,
+            1,
+            profile("Colin Lyons", "Infrastructure", 0)
+        )
+        .await,
+        200
+    );
 
     let got = get(&mut b, &alice).await;
     assert!(got.found);
@@ -136,7 +158,10 @@ async fn a_profile_is_published_and_read() {
     assert!(got.updated > 0);
 
     // Replacement is whole: there is no partial update to get wrong.
-    assert_eq!(put_as(&mut a, &[21; 32], &alice, 2, profile("C. Lyons", "", 0)).await, 200);
+    assert_eq!(
+        put_as(&mut a, &[21; 32], &alice, 2, profile("C. Lyons", "", 0)).await,
+        200
+    );
     let got = get(&mut b, &alice).await;
     assert_eq!(got.profile().name, "C. Lyons");
     assert!(got.profile().title.is_empty());
@@ -151,21 +176,40 @@ async fn a_withheld_profile_looks_exactly_like_one_that_does_not_exist() {
     let (_, never) = peer(addr, pubkey, 33).await;
     let channel = [1u8; 32];
 
-    assert_eq!(put_as(&mut a, &[31; 32], &alice, 1, profile("Hidden", "", FLAG_WITHHOLD)).await, 200);
+    assert_eq!(
+        put_as(
+            &mut a,
+            &[31; 32],
+            &alice,
+            1,
+            profile("Hidden", "", FLAG_WITHHOLD)
+        )
+        .await,
+        200
+    );
 
     // A stranger is told the same thing about a withheld profile as about one
     // that was never published. Answering "exists but hidden" would itself be
     // the disclosure.
     let withheld = get(&mut b, &alice).await;
     let absent = get(&mut b, &never).await;
-    assert_eq!(withheld, Got { now: withheld.now, ..absent.clone() });
+    assert_eq!(
+        withheld,
+        Got {
+            now: withheld.now,
+            ..absent.clone()
+        }
+    );
     assert!(!withheld.found);
 
     // Sharing a channel is the visibility rule, and it is a relationship the
     // exchange already knows.
-    a.post("/channel/create", public(&signer(pubkey, 31), channel).encode())
-        .await
-        .unwrap();
+    a.post(
+        "/channel/create",
+        public(&signer(pubkey, 31), channel).encode(),
+    )
+    .await
+    .unwrap();
     let joining = signer(pubkey, 32).action_outside(
         channel,
         instance_for(channel, 0),
@@ -177,7 +221,11 @@ async fn a_withheld_profile_looks_exactly_like_one_that_does_not_exist() {
     );
     b.post(
         "/channel/join",
-        ByChannelSigned { channel, action: joining }.encode(sqex_proto::channel::TYPE_JOIN),
+        ByChannelSigned {
+            channel,
+            action: joining,
+        }
+        .encode(sqex_proto::channel::TYPE_JOIN),
     )
     .await
     .unwrap();
@@ -195,7 +243,18 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
     let (mut mallory, _) = peer(addr, pubkey, 42).await;
     let channel = [2u8; 32];
 
-    assert_eq!(block(&mut alice, &{ let (_, m) = peer(addr, pubkey, 42).await; m }, true).await, 200);
+    assert_eq!(
+        block(
+            &mut alice,
+            &{
+                let (_, m) = peer(addr, pubkey, 42).await;
+                m
+            },
+            true
+        )
+        .await,
+        200
+    );
 
     // Built private rather than built public and flipped: SIP-32's `created`
     // commits to the visibility and the name.
@@ -268,7 +327,10 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
                     Visibility::Private,
                     3600,
                     "",
-                    vec![Invitee { account: alice_key, role: Role::Admin }],
+                    vec![Invitee {
+                        account: alice_key,
+                        role: Role::Admin,
+                    }],
                 )
                 .encode(),
         )
@@ -281,7 +343,11 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
         .await
         .unwrap();
     let info = ChannelInfo::decode(&body).unwrap();
-    assert_eq!(info.members.len(), 1, "alone in it, and may post indefinitely");
+    assert_eq!(
+        info.members.len(),
+        1,
+        "alone in it, and may post indefinitely"
+    );
 
     // Unblocking and creating again lets Alice take her half of the
     // identifier, which is hers by arithmetic.
@@ -299,7 +365,10 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
                     Visibility::Private,
                     3600,
                     "",
-                    vec![Invitee { account: mallory_key, role: Role::Admin }],
+                    vec![Invitee {
+                        account: mallory_key,
+                        role: Role::Admin,
+                    }],
                 )
                 .encode(),
         )
@@ -311,7 +380,9 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
     // first create is answered `created: 0` with the incarnation that stands
     // and changes nothing, and the second names it and signs the `joined` the
     // exchange will actually write. One extra round trip, only here.
-    let standing = sqex_proto::channel::Created::decode(&body).unwrap().instance;
+    let standing = sqex_proto::channel::Created::decode(&body)
+        .unwrap()
+        .instance;
     let me = signer(pubkey, 51);
     let mut back = me.create(
         dm,
@@ -319,17 +390,12 @@ async fn a_blocked_direct_message_leaves_the_sender_alone_in_it() {
         Visibility::Private,
         3600,
         "",
-        vec![Invitee { account: mallory_key, role: Role::Admin }],
+        vec![Invitee {
+            account: mallory_key,
+            role: Role::Admin,
+        }],
     );
-    back.actions = vec![me.action_outside(
-        dm,
-        standing,
-        EVENT_JOINED,
-        &alice_key,
-        &[],
-        0,
-        GENESIS,
-    )];
+    back.actions = vec![me.action_outside(dm, standing, EVENT_JOINED, &alice_key, &[], 0, GENESIS)];
     let (code, body) = alice.post("/channel/create", back.encode()).await.unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
     let (code, body) = alice
@@ -349,7 +415,17 @@ async fn a_blocked_account_is_told_nothing_about_the_blocker() {
     let (mut alice, alice_key) = peer(addr, pubkey, 61).await;
     let (mut mallory, mallory_key) = peer(addr, pubkey, 62).await;
 
-    assert_eq!(put_as(&mut alice, &[61; 32], &alice_key, 1, profile("Alice", "", 0)).await, 200);
+    assert_eq!(
+        put_as(
+            &mut alice,
+            &[61; 32],
+            &alice_key,
+            1,
+            profile("Alice", "", 0)
+        )
+        .await,
+        200
+    );
     assert!(get(&mut mallory, &alice_key).await.found);
 
     assert_eq!(block(&mut alice, &mallory_key, true).await, 200);
@@ -428,7 +504,8 @@ async fn a_profile_at_or_below_the_serial_held_is_refused() {
     let got = get(&mut a, &alice).await;
     assert!(got.found);
     assert_eq!(
-        got.profile().name, "current",
+        got.profile().name,
+        "current",
         "a refused record must not have overwritten the one held"
     );
 }
@@ -447,13 +524,30 @@ async fn profile_updates_are_rate_limited() {
     for i in 0..MAX_UPDATES_PER_HOUR {
         let s = i as u64 + 1;
         assert_eq!(
-            put_as(&mut a, &[81; 32], &alice, s, profile(&format!("n{i}"), "", 0)).await,
+            put_as(
+                &mut a,
+                &[81; 32],
+                &alice,
+                s,
+                profile(&format!("n{i}"), "", 0)
+            )
+            .await,
             200,
             "at {i}"
         );
     }
     let over = MAX_UPDATES_PER_HOUR as u64 + 1;
-    assert_eq!(put_as(&mut a, &[81; 32], &alice, over, profile("one too many", "", 0)).await, 507);
+    assert_eq!(
+        put_as(
+            &mut a,
+            &[81; 32],
+            &alice,
+            over,
+            profile("one too many", "", 0)
+        )
+        .await,
+        507
+    );
 }
 
 #[tokio::test]
@@ -469,7 +563,17 @@ async fn the_profile_store_survives_a_restart() {
         let (_, mk) = peer(addr, pubkey, mallory_b).await;
         alice_key = ak;
         mallory_key = mk;
-        assert_eq!(put_as(&mut a, &[alice_b; 32], &alice_key, 1, profile("Durable", "", 0)).await, 200);
+        assert_eq!(
+            put_as(
+                &mut a,
+                &[alice_b; 32],
+                &alice_key,
+                1,
+                profile("Durable", "", 0)
+            )
+            .await,
+            200
+        );
         assert_eq!(block(&mut a, &mallory_key, true).await, 200);
     }
     first.abort();

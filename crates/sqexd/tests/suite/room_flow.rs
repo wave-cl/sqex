@@ -14,9 +14,7 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-async fn bare_server(
-    dir: &std::path::Path,
-) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn bare_server(dir: &std::path::Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
@@ -52,12 +50,23 @@ async fn join(client: &mut Client, room: &RoomId, me: PubKey) -> Roster {
         .post("/room/join", Join::new(room, &me).encode())
         .await
         .unwrap();
-    assert_eq!(code, 200, "{}", Refusal::decode(&body).map(|r| r.to_string()).unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned()));
+    assert_eq!(
+        code,
+        200,
+        "{}",
+        Refusal::decode(&body)
+            .map(|r| r.to_string())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned())
+    );
     Roster::decode(&body).unwrap()
 }
 
 fn names(roster: &Roster) -> Vec<[u8; 32]> {
-    roster.members.iter().map(|m| *m.identity.as_bytes()).collect()
+    roster
+        .members
+        .iter()
+        .map(|m| *m.identity.as_bytes())
+        .collect()
 }
 
 #[tokio::test]
@@ -69,12 +78,24 @@ async fn everyone_in_a_room_finds_everyone_else() {
     let (a_seed, a_id) = identity(21);
     let (b_seed, b_id) = identity(22);
     let (c_seed, c_id) = identity(23);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
-    let mut c = Client::connect_as(addr, &server_pub, &c_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
+    let mut c = Client::connect_as(addr, &server_pub, &c_seed)
+        .await
+        .unwrap();
 
-    assert!(join(&mut a, &room, a_id).await.members.is_empty(), "first in is alone");
-    assert_eq!(names(&join(&mut b, &room, b_id).await), vec![*a_id.as_bytes()]);
+    assert!(
+        join(&mut a, &room, a_id).await.members.is_empty(),
+        "first in is alone"
+    );
+    assert_eq!(
+        names(&join(&mut b, &room, b_id).await),
+        vec![*a_id.as_bytes()]
+    );
     join(&mut c, &room, c_id).await;
 
     // Everyone's roster is everyone else, in the same order for all of them.
@@ -104,8 +125,12 @@ async fn an_identity_that_cannot_prove_the_secret_is_rejected_by_the_members() {
 
     let (a_seed, a_id) = identity(31);
     let (eve_seed, eve_id) = identity(32);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut eve = Client::connect_as(addr, &server_pub, &eve_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut eve = Client::connect_as(addr, &server_pub, &eve_seed)
+        .await
+        .unwrap();
 
     join(&mut a, &room, a_id).await;
 
@@ -114,11 +139,18 @@ async fn an_identity_that_cannot_prove_the_secret_is_rejected_by_the_members() {
     let (code, body) = eve
         .post(
             "/room/join",
-            Join { handle: room.handle(), proof: [0x5a; 32] }.encode(),
+            Join {
+                handle: room.handle(),
+                proof: [0x5a; 32],
+            }
+            .encode(),
         )
         .await
         .unwrap();
-    assert_eq!(code, 200, "the exchange cannot tell, and does not pretend to");
+    assert_eq!(
+        code, 200,
+        "the exchange cannot tell, and does not pretend to"
+    );
     let _ = Roster::decode(&body).unwrap();
 
     // A sees her in the roster, and throws her out on her proof.
@@ -167,7 +199,9 @@ async fn a_room_holds_only_so_many_and_refuses_the_rest() {
     }
 
     let (late_seed, late_id) = identity(90);
-    let mut late = Client::connect_as(addr, &server_pub, &late_seed).await.unwrap();
+    let mut late = Client::connect_as(addr, &server_pub, &late_seed)
+        .await
+        .unwrap();
     let (code, body) = late
         .post("/room/join", Join::new(&room, &late_id).encode())
         .await
@@ -196,13 +230,23 @@ async fn leaving_is_immediate_and_the_others_see_it() {
 
     let (a_seed, a_id) = identity(61);
     let (b_seed, b_id) = identity(62);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
     join(&mut a, &room, a_id).await;
     join(&mut b, &room, b_id).await;
 
     let (code, body) = b
-        .post("/room/leave", Leave { handle: room.handle() }.encode())
+        .post(
+            "/room/leave",
+            Leave {
+                handle: room.handle(),
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -211,11 +255,20 @@ async fn leaving_is_immediate_and_the_others_see_it() {
         "b was in the room and should be reported as having left it"
     );
 
-    assert!(join(&mut a, &room, a_id).await.members.is_empty(), "b is gone");
+    assert!(
+        join(&mut a, &room, a_id).await.members.is_empty(),
+        "b is gone"
+    );
 
     // Leaving a room you are not in is not an error; it is just nothing.
     let (code, body) = b
-        .post("/room/leave", Leave { handle: room.handle() }.encode())
+        .post(
+            "/room/leave",
+            Leave {
+                handle: room.handle(),
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 200);
@@ -233,8 +286,12 @@ async fn two_rooms_on_one_exchange_know_nothing_of_each_other() {
 
     let (a_seed, a_id) = identity(71);
     let (b_seed, b_id) = identity(72);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     join(&mut a, &one, a_id).await;
     assert!(
@@ -261,7 +318,13 @@ async fn an_anonymous_connection_has_no_room() {
     assert_eq!(code, 403);
 
     let (code, _) = anon
-        .post("/room/leave", Leave { handle: room.handle() }.encode())
+        .post(
+            "/room/leave",
+            Leave {
+                handle: room.handle(),
+            }
+            .encode(),
+        )
         .await
         .unwrap();
     assert_eq!(code, 403);
@@ -274,7 +337,9 @@ async fn a_malformed_join_is_refused_without_disturbing_anything() {
     let room = RoomId::generate();
 
     let (a_seed, a_id) = identity(85);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
     join(&mut a, &room, a_id).await;
 
     for body in [vec![], vec![0x01], vec![0xff; 65]] {

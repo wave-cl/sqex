@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 
 use sqnr_core::PubKey;
 
-use crate::channel::KIND_SYSTEM;
 use crate::blob::Attachment;
+use crate::channel::KIND_SYSTEM;
 use crate::message::{Body, EDIT_WINDOW, Post};
 
 /// What SIP-31 verification concluded about an entry.
@@ -759,7 +759,10 @@ mod tests {
                 post: Post::text("third thoughts"),
             },
         );
-        let t = Timeline::fold(&[post(1, 1, 100, "first"), first.clone(), second.clone()], &[]);
+        let t = Timeline::fold(
+            &[post(1, 1, 100, "first"), first.clone(), second.clone()],
+            &[],
+        );
         assert_eq!(t.get(1).unwrap().post.body_text(), Some("third thoughts"));
 
         // And folding them the other way round reaches the same state, which
@@ -778,9 +781,19 @@ mod tests {
         };
         assert!(Timeline::fold(&entries(1), &[]).get(1).unwrap().redacted);
         // An admin, which is the moderation path.
-        assert!(Timeline::fold(&entries(9), &[key(9)]).get(1).unwrap().redacted);
+        assert!(
+            Timeline::fold(&entries(9), &[key(9)])
+                .get(1)
+                .unwrap()
+                .redacted
+        );
         // Anybody else.
-        assert!(!Timeline::fold(&entries(2), &[key(9)]).get(1).unwrap().redacted);
+        assert!(
+            !Timeline::fold(&entries(2), &[key(9)])
+                .get(1)
+                .unwrap()
+                .redacted
+        );
     }
 
     #[test]

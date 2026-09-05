@@ -250,7 +250,10 @@ async fn full_admin_flow() {
         .expect("the added key is in the returned list");
     // Provenance was recorded: the label the operator gave and the signing admin.
     assert_eq!(entry["label"].as_str(), Some("test-peer"));
-    assert_eq!(entry["added_by"].as_str(), Some(admin_pub.to_base58().as_str()));
+    assert_eq!(
+        entry["added_by"].as_str(),
+        Some(admin_pub.to_base58().as_str())
+    );
     assert_eq!(
         client.get("/exchange/ping").await.0,
         200,

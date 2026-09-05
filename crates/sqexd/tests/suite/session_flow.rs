@@ -7,17 +7,15 @@
 use std::net::SocketAddr;
 
 use ed25519_dalek::SigningKey;
+use sqex_proto::refusal::{Code, Refusal};
 use sqex_proto::session::{
     BySession, DatagramFrame, Frames, Open, OpenAck, OpenState, SendFrame, Session,
 };
-use sqex_proto::refusal::{Code, Refusal};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-async fn bare_server(
-    dir: &std::path::Path,
-) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+async fn bare_server(dir: &std::path::Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
@@ -91,8 +89,12 @@ async fn two_peers_exchange_data_through_the_exchange() {
     let (a_eph, a_eph_pub) = ephemeral();
     let (b_eph, b_eph_pub) = ephemeral();
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     // A asks first and learns nothing: consent is mutual.
     let ack = open_session(&mut a, b_id, a_eph_pub).await;
@@ -111,7 +113,9 @@ async fn two_peers_exchange_data_through_the_exchange() {
     let b_sess = Session::derive(&b_seed, &b_eph, &a_id, &b_ack.peer_ephemeral).unwrap();
 
     // A speaks; B hears.
-    let ct = a_sess.seal(0, b"the exchange carries this but cannot read it").unwrap();
+    let ct = a_sess
+        .seal(0, b"the exchange carries this but cannot read it")
+        .unwrap();
     let (code, _) = a
         .post(
             "/session/send",
@@ -148,7 +152,10 @@ async fn two_peers_exchange_data_through_the_exchange() {
     .await
     .unwrap();
     let got = recv(&mut a, id).await;
-    assert_eq!(a_sess.open(got.frames[0].0, &got.frames[0].1).unwrap(), b"heard you");
+    assert_eq!(
+        a_sess.open(got.frames[0].0, &got.frames[0].1).unwrap(),
+        b"heard you"
+    );
 
     handle.abort();
 }
@@ -162,8 +169,12 @@ async fn the_exchange_cannot_read_what_it_carries() {
     let (b_seed, b_id) = identity(22);
     let (a_eph, a_eph_pub) = ephemeral();
     let (b_eph, b_eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     open_session(&mut a, b_id, a_eph_pub).await;
     let b_ack = open_session(&mut b, a_id, b_eph_pub).await;
@@ -201,7 +212,10 @@ async fn the_exchange_cannot_read_what_it_carries() {
         "an impostor in the middle cannot open the frame"
     );
     let b_sess = Session::derive(&b_seed, &b_eph, &a_id, &b_ack.peer_ephemeral).unwrap();
-    assert_eq!(b_sess.open(got.frames[0].0, &got.frames[0].1).unwrap(), secret);
+    assert_eq!(
+        b_sess.open(got.frames[0].0, &got.frames[0].1).unwrap(),
+        secret
+    );
 
     handle.abort();
 }
@@ -214,7 +228,9 @@ async fn an_identity_cannot_be_probed_for_by_asking() {
     let (a_seed, _a_id) = identity(31);
     let (_b_seed, b_id) = identity(32);
     let (_eph, eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
 
     // B has never connected at all. Asking repeatedly must reveal nothing.
     for _ in 0..3 {
@@ -238,9 +254,15 @@ async fn a_third_identity_cannot_join_or_read_a_session() {
     let (_a_eph, a_eph_pub) = ephemeral();
     let (_b_eph, b_eph_pub) = ephemeral();
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
-    let mut eve = Client::connect_as(addr, &server_pub, &eve_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
+    let mut eve = Client::connect_as(addr, &server_pub, &eve_seed)
+        .await
+        .unwrap();
 
     open_session(&mut a, b_id, a_eph_pub).await;
     let id = open_session(&mut b, a_id, b_eph_pub).await.session_id;
@@ -287,8 +309,12 @@ async fn either_peer_may_close_and_the_other_learns() {
     let (b_seed, b_id) = identity(52);
     let (_a_eph, a_eph_pub) = ephemeral();
     let (_b_eph, b_eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     open_session(&mut a, b_id, a_eph_pub).await;
     let id = open_session(&mut b, a_id, b_eph_pub).await.session_id;
@@ -339,8 +365,12 @@ async fn frames_ride_datagrams_with_the_same_keys() {
     let (b_seed, b_id) = identity(72);
     let (a_eph, a_eph_pub) = ephemeral();
     let (b_eph, b_eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     // Datagrams have to be available on both ends, or there is no fast path.
     assert!(
@@ -409,8 +439,12 @@ async fn a_datagram_stream_flows_and_tolerates_gaps() {
     let (b_seed, b_id) = identity(82);
     let (a_eph, a_eph_pub) = ephemeral();
     let (b_eph, b_eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     open_session(&mut a, b_id, a_eph_pub).await;
     let b_ack = open_session(&mut b, a_id, b_eph_pub).await;
@@ -423,7 +457,9 @@ async fn a_datagram_stream_flows_and_tolerates_gaps() {
     // packet would.
     let sent: Vec<u64> = vec![0, 1, 3, 4];
     for seq in &sent {
-        let ct = a_sess.seal_datagram(*seq, format!("frame {seq}").as_bytes()).unwrap();
+        let ct = a_sess
+            .seal_datagram(*seq, format!("frame {seq}").as_bytes())
+            .unwrap();
         a.send_datagram(
             DatagramFrame {
                 session_id: id,
@@ -448,7 +484,10 @@ async fn a_datagram_stream_flows_and_tolerates_gaps() {
         seen.push(f.seq);
     }
     seen.sort_unstable();
-    assert_eq!(seen, sent, "every sent frame arrived; the gap was never needed");
+    assert_eq!(
+        seen, sent,
+        "every sent frame arrived; the gap was never needed"
+    );
 
     handle.abort();
 }
@@ -467,9 +506,15 @@ async fn a_stranger_cannot_inject_datagrams() {
     let (_a_eph, a_eph_pub) = ephemeral();
     let (_b_eph, b_eph_pub) = ephemeral();
 
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
-    let eve = Client::connect_as(addr, &server_pub, &eve_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
+    let eve = Client::connect_as(addr, &server_pub, &eve_seed)
+        .await
+        .unwrap();
 
     open_session(&mut a, b_id, a_eph_pub).await;
     let id = open_session(&mut b, a_id, b_eph_pub).await.session_id;
@@ -485,8 +530,12 @@ async fn a_stranger_cannot_inject_datagrams() {
     .unwrap();
 
     // Nothing should reach B. Give the forwarder a generous window to be wrong.
-    let nothing = tokio::time::timeout(std::time::Duration::from_millis(700), b.read_datagram()).await;
-    assert!(nothing.is_err(), "an outsider's datagram must not be relayed");
+    let nothing =
+        tokio::time::timeout(std::time::Duration::from_millis(700), b.read_datagram()).await;
+    assert!(
+        nothing.is_err(),
+        "an outsider's datagram must not be relayed"
+    );
 
     handle.abort();
 }
@@ -505,8 +554,12 @@ async fn measure_carriage_latency() {
     let (b_seed, b_id) = identity(102);
     let (a_eph, a_eph_pub) = ephemeral();
     let (b_eph, b_eph_pub) = ephemeral();
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     open_session(&mut a, b_id, a_eph_pub).await;
     let b_ack = open_session(&mut b, a_id, b_eph_pub).await;
@@ -524,7 +577,12 @@ async fn measure_carriage_latency() {
         let ct = a_sess.seal_datagram(seq, b"20ms of audio").unwrap();
         let t0 = std::time::Instant::now();
         a.send_datagram(
-            DatagramFrame { session_id: id, seq, ciphertext: ct }.encode(),
+            DatagramFrame {
+                session_id: id,
+                seq,
+                ciphertext: ct,
+            }
+            .encode(),
         )
         .unwrap();
         let got = b.read_datagram().await.unwrap();
@@ -539,9 +597,17 @@ async fn measure_carriage_latency() {
     for seq in 0..N as u64 {
         let ct = a_sess.seal(seq, b"20ms of audio").unwrap();
         let t0 = std::time::Instant::now();
-        a.post("/session/send", SendFrame { session_id: id, seq, ciphertext: ct }.encode())
-            .await
-            .unwrap();
+        a.post(
+            "/session/send",
+            SendFrame {
+                session_id: id,
+                seq,
+                ciphertext: ct,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
         loop {
             let f = recv(&mut b, id).await;
             if !f.frames.is_empty() {
@@ -557,7 +623,10 @@ async fn measure_carriage_latency() {
     println!("\n─── carriage latency over loopback, {N} frames ───");
     println!("  datagram (push)          : {dg:?} per frame");
     println!("  reliable (POST + drain)  : {rel:?} per frame");
-    println!("  reliable + {POLL}ms polling : ~{:?} per frame (as the CLI polls)", rel + std::time::Duration::from_millis(POLL / 2));
+    println!(
+        "  reliable + {POLL}ms polling : ~{:?} per frame (as the CLI polls)",
+        rel + std::time::Duration::from_millis(POLL / 2)
+    );
     println!("\n  A voice budget is ~150ms mouth-to-ear. Loopback removes the");
     println!("  network, so these show protocol overhead only: the datagram path");
     println!("  adds ~nothing, while polling alone spends most of the budget.\n");
@@ -581,8 +650,12 @@ async fn calling_someone_again_does_not_resume_the_last_call_with_new_keys() {
 
     let (a_seed, a_id) = identity(141);
     let (b_seed, b_id) = identity(142);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     // The first call. Nobody closes it — they crashed, or the lid shut.
     let (a_eph1, a_pub1) = ephemeral();
@@ -632,8 +705,12 @@ async fn re_offering_the_same_ephemeral_still_resumes() {
 
     let (a_seed, a_id) = identity(151);
     let (b_seed, b_id) = identity(152);
-    let mut a = Client::connect_as(addr, &server_pub, &a_seed).await.unwrap();
-    let mut b = Client::connect_as(addr, &server_pub, &b_seed).await.unwrap();
+    let mut a = Client::connect_as(addr, &server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(addr, &server_pub, &b_seed)
+        .await
+        .unwrap();
 
     let (_a_eph, a_pub) = ephemeral();
     let (_b_eph, b_pub) = ephemeral();

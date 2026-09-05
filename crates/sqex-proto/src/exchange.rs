@@ -27,7 +27,10 @@ impl Pong {
 
     pub fn decode(b: &[u8]) -> Result<Pong> {
         if b.len() != 9 {
-            return Err(Error::Malformed(format!("pong is {} bytes, want 9", b.len())));
+            return Err(Error::Malformed(format!(
+                "pong is {} bytes, want 9",
+                b.len()
+            )));
         }
         if b[0] != TYPE_PONG {
             return Err(Error::Malformed(format!("not a pong (type {:#x})", b[0])));

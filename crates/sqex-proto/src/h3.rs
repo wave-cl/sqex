@@ -106,7 +106,11 @@ impl H3Client {
             .uri(format!("https://sqex{path}"))
             .body(())
             .map_err(|e| e.to_string())?;
-        let mut stream = self.send.send_request(req).await.map_err(|e| e.to_string())?;
+        let mut stream = self
+            .send
+            .send_request(req)
+            .await
+            .map_err(|e| e.to_string())?;
         if !body.is_empty() {
             stream
                 .send_data(bytes::Bytes::from(body))

@@ -549,9 +549,27 @@ mod tests {
         };
         assert_eq!(Begin::decode(&b.encode()).unwrap(), b);
 
-        assert!(Begin::decode(&Begin { size: MAX_BLOB + 1, ..b }.encode()).is_err());
+        assert!(
+            Begin::decode(
+                &Begin {
+                    size: MAX_BLOB + 1,
+                    ..b
+                }
+                .encode()
+            )
+            .is_err()
+        );
         assert!(Begin::decode(&Begin { chunks: 0, ..b }.encode()).is_err());
-        assert!(Begin::decode(&Begin { chunks: MAX_CHUNKS + 1, ..b }.encode()).is_err());
+        assert!(
+            Begin::decode(
+                &Begin {
+                    chunks: MAX_CHUNKS + 1,
+                    ..b
+                }
+                .encode()
+            )
+            .is_err()
+        );
     }
 
     #[test]

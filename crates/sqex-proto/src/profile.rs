@@ -376,7 +376,9 @@ mod tests {
 
     #[test]
     fn a_profile_round_trips() {
-        let p = Put { record: signed(profile()) };
+        let p = Put {
+            record: signed(profile()),
+        };
         assert_eq!(Put::decode(&p.encode()).unwrap(), p);
         assert!(p.record.verify());
     }
@@ -385,7 +387,9 @@ mod tests {
     fn an_empty_profile_round_trips() {
         // Every field may be empty; a person who publishes nothing is not an
         // error.
-        let p = Put { record: signed(Profile::default()) };
+        let p = Put {
+            record: signed(Profile::default()),
+        };
         assert_eq!(Put::decode(&p.encode()).unwrap(), p);
     }
 
@@ -397,13 +401,64 @@ mod tests {
         assert!(base.verify());
 
         for (what, tampered) in [
-            ("name", Record { profile: Profile { name: "Someone Else".into(), ..profile() }, ..base.clone() }),
-            ("title", Record { profile: Profile { title: "Moderator".into(), ..profile() }, ..base.clone() }),
-            ("flags", Record { profile: Profile { flags: FLAG_WITHHOLD, ..profile() }, ..base.clone() }),
-            ("serial", Record { serial: 4, ..base.clone() }),
-            ("issued_at", Record { issued_at: 1001, ..base.clone() }),
-            ("account", Record { account: PubKey::new([1u8; 32]), ..base.clone() }),
-            ("device", Record { device: PubKey::new([2u8; 32]), ..base.clone() }),
+            (
+                "name",
+                Record {
+                    profile: Profile {
+                        name: "Someone Else".into(),
+                        ..profile()
+                    },
+                    ..base.clone()
+                },
+            ),
+            (
+                "title",
+                Record {
+                    profile: Profile {
+                        title: "Moderator".into(),
+                        ..profile()
+                    },
+                    ..base.clone()
+                },
+            ),
+            (
+                "flags",
+                Record {
+                    profile: Profile {
+                        flags: FLAG_WITHHOLD,
+                        ..profile()
+                    },
+                    ..base.clone()
+                },
+            ),
+            (
+                "serial",
+                Record {
+                    serial: 4,
+                    ..base.clone()
+                },
+            ),
+            (
+                "issued_at",
+                Record {
+                    issued_at: 1001,
+                    ..base.clone()
+                },
+            ),
+            (
+                "account",
+                Record {
+                    account: PubKey::new([1u8; 32]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "device",
+                Record {
+                    device: PubKey::new([2u8; 32]),
+                    ..base.clone()
+                },
+            ),
         ] {
             assert!(!tampered.verify(), "a signature survived a changed {what}");
         }
@@ -414,9 +469,15 @@ mod tests {
     /// would notice.
     #[test]
     fn a_name_of_equal_length_cannot_be_swapped() {
-        let base = signed(Profile { name: "book club".into(), ..profile() });
+        let base = signed(Profile {
+            name: "book club".into(),
+            ..profile()
+        });
         let swapped = Record {
-            profile: Profile { name: "team chat".into(), ..base.profile.clone() },
+            profile: Profile {
+                name: "team chat".into(),
+                ..base.profile.clone()
+            },
             ..base.clone()
         };
         assert_eq!(base.profile.name.len(), swapped.profile.name.len());
@@ -461,9 +522,18 @@ mod tests {
     #[test]
     fn oversized_fields_are_refused() {
         for p in [
-            Profile { name: "x".repeat(MAX_NAME + 1), ..profile() },
-            Profile { title: "x".repeat(MAX_TITLE + 1), ..profile() },
-            Profile { avatar: vec![0; MAX_AVATAR + 1], ..profile() },
+            Profile {
+                name: "x".repeat(MAX_NAME + 1),
+                ..profile()
+            },
+            Profile {
+                title: "x".repeat(MAX_TITLE + 1),
+                ..profile()
+            },
+            Profile {
+                avatar: vec![0; MAX_AVATAR + 1],
+                ..profile()
+            },
         ] {
             assert!(Put::decode(&Put { record: signed(p) }.encode()).is_err());
         }
@@ -530,7 +600,13 @@ pub struct Record {
     pub signature: [u8; 64],
 }
 
-fn record_body(account: &PubKey, device: &PubKey, serial: u64, issued_at: u64, p: &Profile) -> Vec<u8> {
+fn record_body(
+    account: &PubKey,
+    device: &PubKey,
+    serial: u64,
+    issued_at: u64,
+    p: &Profile,
+) -> Vec<u8> {
     let mut b = Vec::with_capacity(96);
     b.extend_from_slice(account.as_bytes());
     b.extend_from_slice(device.as_bytes());
@@ -588,8 +664,11 @@ impl Record {
             self.issued_at,
             &self.profile,
         );
-        vk.verify(&record_input(&body), &Signature::from_bytes(&self.signature))
-            .is_ok()
+        vk.verify(
+            &record_input(&body),
+            &Signature::from_bytes(&self.signature),
+        )
+        .is_ok()
     }
 
     pub fn encode(&self) -> Vec<u8> {
