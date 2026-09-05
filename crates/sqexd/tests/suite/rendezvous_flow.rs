@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use sqex_proto::rendezvous::{INTRODUCED_LEN, Introduce, Introduced};
+use sqex_proto::rendezvous::{INTRODUCED_LEN, Introduce, Introduced, START_LEAD_SECS};
 use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -149,9 +149,19 @@ async fn both_asking_completes_the_pair_with_one_start_for_both() {
         for_alice.start_at, for_bob.start_at,
         "the two sides were told different moments to begin"
     );
-    assert!(
-        for_alice.start_at > for_alice.now,
-        "the start is in the future"
+    // The nominated moment is in the future **when the pair completes**, which
+    // is Bob's answer. Checking it against Alice's `now` instead failed 3 runs
+    // in 12: her answer is collected after the 1.2s sleep above, leaving a
+    // nominal margin of START_LEAD_SECS - 1.2s = 0.8s, and since these
+    // timestamps are whole seconds that margin is zero whenever the pair
+    // happens to complete late within a second. The design never promised the
+    // start stays in the future however long a peer waits before collecting --
+    // only that both are told the same one, which the assertion above checks
+    // and the sleep makes meaningful.
+    assert_eq!(
+        for_bob.start_at,
+        for_bob.now + START_LEAD_SECS,
+        "the pair was not given the lead the protocol specifies"
     );
 }
 
