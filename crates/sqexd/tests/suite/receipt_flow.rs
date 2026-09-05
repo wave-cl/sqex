@@ -352,7 +352,7 @@ fn an_exchange_that_cannot_sign_refuses_rather_than_answering_in_the_other_shape
     let exchange = PubKey::new(SigningKey::from_bytes(&[46u8; 32]).verifying_key().to_bytes());
     let c = Channels::open(None, exchange, None).unwrap();
     let caller = identity(46).1;
-    let err = c.fetch(&caller, &[46u8; 32], 0, true).unwrap_err();
+    let err = c.fetch(&caller, &caller, &[46u8; 32], 0, true).unwrap_err();
     assert!(
         matches!(err, ChannelError::NoReceipts | ChannelError::NoSuchChannel),
         "a store with no seed must refuse a receipted fetch, got {err:?}"

@@ -54,6 +54,7 @@ use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded,
 };
 use sqex_proto::entry_sig::{ActionTerms, EntryTerms, GENESIS, Place, link, verify_action, verify_entry};
+use sqex_proto::message::SIGNAL_CALL_STATE;
 use sqex_proto::receipt::{self, HEAD_GENESIS, ReceiptTerms};
 use sqnr_core::PubKey;
 use tokio::sync::Notify;
@@ -295,8 +296,41 @@ pub struct Channels {
     /// indicator that survived a restart would be describing a keyboard nobody
     /// is at. SIP-16 forbids storing these at all, and an exchange that dropped
     /// every one of them would still conform.
-    #[allow(clippy::type_complexity)]
-    signals: Mutex<HashMap<([u8; 32], PubKey), Vec<(PubKey, u8, Vec<u8>, u64)>>>,
+    signals: Mutex<SignalQueues>,
+}
+
+/// Signals waiting, by channel and recipient account.
+type SignalQueues = HashMap<([u8; 32], PubKey), Vec<Pending>>;
+
+/// One signal waiting for a recipient.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// The account the exchange observed sending it. SIP-31 is clear this is
+    /// the exchange's assertion and not a signature, which is why nothing
+    /// durable may be derived from a signal.
+    from: PubKey,
+    /// The device it was sent from, which never receives it back.
+    ///
+    /// **Taken from the connection, not from the signal's body.** SIP-36 words
+    /// its rule as excluding "the device named in `device`", and a client's
+    /// claim about which device it is is exactly the kind of assertion SIP-16
+    /// says is not a fact — a client naming somebody else's device could
+    /// silence their ring. The body's field is for the recipients; this is for
+    /// routing.
+    from_device: PubKey,
+    kind: u8,
+    body: Vec<u8>,
+    at: u64,
+    /// SIP-36 rule 1: which of the recipient's devices have already collected
+    /// this, for the one kind delivered per device rather than per account.
+    ///
+    /// `None` for every other kind, which is delivered once to whichever
+    /// connection asks first and then dropped — the behaviour SIP-16 defines
+    /// and this must not change. Recording takers lazily, rather than
+    /// enumerating a recipient's devices when the signal is sent, means the
+    /// exchange needs no view of the device registry here and a device that
+    /// never connects simply lets its copy expire.
+    taken_by: Option<Vec<PubKey>>,
 }
 
 const SCHEMA: &str = r#"
@@ -1283,6 +1317,7 @@ impl Channels {
     pub fn fetch(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         since: u64,
         receipts: bool,
@@ -1381,7 +1416,7 @@ impl Channels {
             first,
             last,
             entries,
-            signals: self.take_signals(channel, caller),
+            signals: self.take_signals(channel, caller, device),
             tip,
         })
     }
@@ -3413,10 +3448,17 @@ impl Channels {
     pub fn signal(
         &self,
         caller: &PubKey,
+        device: &PubKey,
         channel: &[u8; 32],
         kind: u8,
         body: &[u8],
     ) -> Result<(), ChannelError> {
+        // SIP-36's first delivery rule, and the only kind it applies to. An
+        // exchange MUST NOT apply it to typing: a signal that reached one
+        // connection has rung one of somebody's phones and left the rest
+        // silent, which is what rule 1 exists to fix and is exactly the
+        // behaviour typing wants.
+        let per_device = kind == SIGNAL_CALL_STATE;
         let recipients: Vec<PubKey> = {
             let db = self.db.lock().unwrap();
             visibility_of(&db, channel)?;
@@ -3431,18 +3473,34 @@ impl Channels {
                     Ok(PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])))
                 })
                 .map_err(storage("query signal recipients"))?;
-            rows.filter_map(|r| r.ok()).filter(|a| a != caller).collect()
+            // SIP-36's second rule: a ring state also goes to the sender's
+            // **other** devices, and is excluded only from the one that sent
+            // it. That is a deliberate exception to the ordinary rule, and the
+            // ordinary rule's own justification is what shows it to be one — a
+            // client does not need telling that its own keyboard is in use, and
+            // a device very much does need telling that its user answered
+            // somewhere else.
+            rows.filter_map(|r| r.ok())
+                .filter(|a| per_device || a != caller)
+                .collect()
         };
 
         let now = now_unix();
         let mut pending = self.signals.lock().unwrap();
         for who in recipients {
             let q = pending.entry((*channel, who)).or_default();
-            q.retain(|(_, _, _, at)| now.saturating_sub(*at) < SIGNAL_TTL);
+            q.retain(|p| now.saturating_sub(p.at) < SIGNAL_TTL);
             while q.len() >= MAX_SIGNALS {
                 q.remove(0);
             }
-            q.push((*caller, kind, body.to_vec(), now));
+            q.push(Pending {
+                from: *caller,
+                from_device: *device,
+                kind,
+                body: body.to_vec(),
+                at: now,
+                taken_by: per_device.then(Vec::new),
+            });
         }
         drop(pending);
         self.wake(channel);
@@ -3450,20 +3508,44 @@ impl Channels {
     }
 
     /// Collect and discard whatever is waiting. Delivered at most once.
-    fn take_signals(&self, channel: &[u8; 32], who: &PubKey) -> Vec<Signalled> {
+    fn take_signals(&self, channel: &[u8; 32], who: &PubKey, device: &PubKey) -> Vec<Signalled> {
         let now = now_unix();
         let mut pending = self.signals.lock().unwrap();
-        let Some(q) = pending.remove(&(*channel, *who)) else {
+        let Some(q) = pending.get_mut(&(*channel, *who)) else {
             return Vec::new();
         };
-        q.into_iter()
-            .filter(|(_, _, _, at)| now.saturating_sub(*at) < SIGNAL_TTL)
-            .map(|(account, kind, body, _)| Signalled {
-                account,
-                kind,
-                body,
-            })
-            .collect()
+        q.retain(|p| now.saturating_sub(p.at) < SIGNAL_TTL);
+        let mut out = Vec::new();
+        for p in q.iter_mut() {
+            match &mut p.taken_by {
+                // SIP-16's ordinary rule: at most once per recipient, and gone.
+                None => out.push(Signalled {
+                    account: p.from,
+                    kind: p.kind,
+                    body: p.body.clone(),
+                }),
+                // SIP-36 rule 1, and rule 2's exclusion. Never back to the
+                // device that sent it — that one already knows — and at most
+                // once to each of the others.
+                Some(taken) => {
+                    if device != &p.from_device && !taken.contains(device) {
+                        taken.push(*device);
+                        out.push(Signalled {
+                            account: p.from,
+                            kind: p.kind,
+                            body: p.body.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // The per-account ones are spent; the per-device ones stay until their
+        // TTL, because another of this account's devices has not seen them yet.
+        q.retain(|p| p.taken_by.is_some());
+        if q.is_empty() {
+            pending.remove(&(*channel, *who));
+        }
+        out
     }
 }
 
@@ -3653,7 +3735,7 @@ mod tests {
 
         // Nothing has ever been posted here, so nothing can have been
         // delivered to anybody.
-        c.fetch(&alice, &[7; 32], 9_999, false).unwrap();
+        c.fetch(&alice, &alice, &[7; 32], 9_999, false).unwrap();
 
         let marks = c.cursors(&alice, &[7; 32]).unwrap();
         let mine = marks
@@ -3708,7 +3790,7 @@ mod tests {
         }
 
         assert!(stored_bytes(&c) <= cap, "the cap is not enforced");
-        let got = c.fetch(&alice, &[7; 32], 0, false).unwrap();
+        let got = c.fetch(&alice, &alice, &[7; 32], 0, false).unwrap();
         let member: Vec<&Entry> = got.entries.iter().filter(|e| e.kind == KIND_MEMBER).collect();
         assert_eq!(member.len(), 4, "want the four newest kept");
         // Oldest first, exactly as the count prune does: what survives is the
@@ -3731,7 +3813,7 @@ mod tests {
             )
             .unwrap();
         }
-        let got = c.fetch(&alice, &[7; 32], 0, false).unwrap();
+        let got = c.fetch(&alice, &alice, &[7; 32], 0, false).unwrap();
         assert_eq!(got.entries.iter().filter(|e| e.kind == KIND_MEMBER).count(), 20);
     }
 

@@ -2845,6 +2845,94 @@ impl Chat {
             .await;
     }
 
+    /// SIP-36: invite this channel to a call, and return where the invitation
+    /// landed along with the room secret.
+    ///
+    /// The secret is minted here, uniformly at random as SIP-13 requires, and
+    /// is sealed into the channel with the rest of the body — so it reaches
+    /// exactly the members and their devices, and the exchange carries a room
+    /// it cannot join.
+    ///
+    /// `expires_after` is not set from here: `send_body` posts without one, and
+    /// SIP-36 asks for a short one on a `Call` because the entry holds a bearer
+    /// capability that outlives its usefulness within a minute. Setting it
+    /// needs a `send_body` that takes a timer, which is a change to a shared
+    /// path; recorded here rather than quietly skipped. It shortens an exposure
+    /// and closes nothing — the room lives as long as it lives, and a member
+    /// who read the entry keeps the secret.
+    pub async fn call(
+        &mut self,
+        channel: &[u8; 32],
+        media: u8,
+        ring_secs: u16,
+    ) -> Result<(Posted, [u8; 32])> {
+        use rand_core::RngCore;
+        let mut secret = [0u8; 32];
+        rand_core::OsRng.fill_bytes(&mut secret);
+        let posted = self
+            .send_body(
+                channel,
+                Body::Call {
+                    media,
+                    ring_secs,
+                    secret,
+                },
+            )
+            .await?;
+        Ok((posted, secret))
+    }
+
+    /// SIP-36: record how a call ended.
+    ///
+    /// An ordinary entry — signed, chained, sealed and receipted like any other
+    /// — and the only durable account of the call. Any member may post one, and
+    /// two targeting one invitation are not an error: two parties observed the
+    /// same call ending.
+    pub async fn end_call(
+        &mut self,
+        channel: &[u8; 32],
+        target: u64,
+        outcome: u8,
+        duration: u32,
+    ) -> Result<Posted> {
+        self.send_body(
+            channel,
+            Body::CallEnd {
+                target,
+                outcome,
+                duration,
+            },
+        )
+        .await
+    }
+
+    /// SIP-36: say what this device is doing about a call.
+    ///
+    /// Ephemeral and forgeable, like every signal. It drives a ringing screen
+    /// and nothing else — the call's outcome comes from the log, and from the
+    /// missed-call derivation when no entry arrives.
+    pub async fn ring_state(&mut self, channel: &[u8; 32], target: u64, state: u8) {
+        use sqex_proto::channel::SignalOut;
+        use sqex_proto::message::{SIGNAL_CALL_STATE, Signal};
+        let body = Signal::CallState {
+            target,
+            state,
+            device: self.device,
+        }
+        .encode();
+        let _ = self
+            .post(
+                "/channel/signal",
+                SignalOut {
+                    channel: *channel,
+                    kind: SIGNAL_CALL_STATE,
+                    body,
+                }
+                .encode(),
+            )
+            .await;
+    }
+
     /// Fetch what is new, open it, and fold it into a conversation.
     ///
     /// `timeline` carries what we already had, so this is incremental: the

@@ -27,6 +27,44 @@ pub const TYPE_REACTION: u8 = 0x02;
 pub const TYPE_EDIT: u8 = 0x03;
 pub const TYPE_REDACT: u8 = 0x04;
 pub const TYPE_METADATA: u8 = 0x05;
+/// SIP-36: an invitation to a call, carrying a SIP-13 room secret.
+pub const TYPE_CALL: u8 = 0x06;
+/// SIP-36: the durable record of how a call ended.
+pub const TYPE_CALL_END: u8 = 0x07;
+
+/// SIP-36 `media` bit 0: audio.
+pub const MEDIA_AUDIO: u8 = 0x01;
+
+pub const CALL_ANSWERED: u8 = 0x01;
+pub const CALL_DECLINED: u8 = 0x02;
+pub const CALL_MISSED: u8 = 0x03;
+pub const CALL_CANCELLED: u8 = 0x04;
+pub const CALL_FAILED: u8 = 0x05;
+
+pub const RING_RINGING: u8 = 0x01;
+pub const RING_ACCEPTED: u8 = 0x02;
+pub const RING_DECLINED: u8 = 0x03;
+pub const RING_BUSY: u8 = 0x04;
+pub const RING_ENDED: u8 = 0x05;
+
+/// SIP-36: should this device leave the room, having seen a sibling accept the
+/// same call?
+///
+/// Two of one person's devices may accept before either sees the other's
+/// signal. SIP-13 offers no arbitration and cannot — a room is named by a
+/// secret, holding it *is* what membership consists of, and there is no
+/// authority to appeal to. So this is convention: the lower-sorting key wins,
+/// the same tiebreak SIP-12 uses to decide which peer is `first`.
+///
+/// **Not a guarantee, and an implementation must not treat it as one.** If the
+/// signal is dropped — and SIP-16 permits dropping every signal — both devices
+/// stay in the room and one person is present twice. That is cosmetic: both
+/// belong to the same person, both legitimately hold the secret, and no
+/// security property depends on the count. Saying so is better than specifying
+/// a consensus protocol for a wart.
+pub fn yields_to(mine: &PubKey, sibling: &PubKey) -> bool {
+    sibling.as_bytes() < mine.as_bytes()
+}
 
 pub const PART_TEXT: u8 = 0x01;
 pub const PART_ATTACHMENT: u8 = 0x02;
@@ -41,6 +79,10 @@ pub const SIGNAL_TYPING: u8 = 0x01;
 /// Reserved: a read marker in an earlier draft, now SIP-16's durable cursor.
 /// A receiver ignores it, as it ignores any unknown kind.
 pub const SIGNAL_RESERVED_READ: u8 = 0x02;
+/// SIP-36: ring state. The one signal kind an exchange treats differently —
+/// delivered per device rather than per account, and back to the sender's own
+/// other devices. See SIP-36's two delivery rules.
+pub const SIGNAL_CALL_STATE: u8 = 0x03;
 
 pub const MAX_TEXT: usize = 16 * 1024;
 pub const MAX_PARTS: usize = 32;
@@ -115,6 +157,43 @@ pub enum Body {
         name: String,
         topic: String,
         avatar: Option<Attachment>,
+    },
+    /// SIP-36: an invitation to a call.
+    ///
+    /// **The secret is a bearer capability with no revocation, in a durable
+    /// log.** SIP-13 says of every room secret that anyone given it can join
+    /// and can pass it on, and that there is no way to remove somebody.
+    /// Sealing the body under SIP-17 restricts who is *given* it to the
+    /// channel's members, which is the strongest available answer and does
+    /// nothing about the rest: a member removed tomorrow keeps every secret
+    /// they read today, and a call that ended has not closed its room.
+    Call {
+        /// A bitfield. Bit 0 is audio; **every other bit is reserved and a
+        /// receiver ignores what it does not know** — including bit 1, which
+        /// is not video. There is no video framing in this stack, SIP-15
+        /// defines audio and says nothing about a second stream, and a client
+        /// must not infer one.
+        media: u8,
+        /// How long the caller intends to wait. Advisory to a callee's
+        /// interface, and load-bearing for one thing: deciding that an
+        /// unanswered call was missed.
+        ring_secs: u16,
+        /// A SIP-13 room secret, generated uniformly at random by the caller.
+        secret: [u8; 32],
+    },
+    /// SIP-36: how a call ended.
+    ///
+    /// **The only durable account of the call**, signed and chained like any
+    /// other entry, which is the point of putting it in the log rather than
+    /// deriving it from signals. Two of these targeting one `Call` are not an
+    /// error — two parties observed the same call ending.
+    CallEnd {
+        /// The `seq` of the `Call` entry, in the shape `Reaction`, `Edit` and
+        /// `Redact` already use.
+        target: u64,
+        outcome: u8,
+        /// Seconds of media, and 0 for every outcome but answered.
+        duration: u32,
     },
 }
 
@@ -408,6 +487,26 @@ impl Body {
                     None => out.push(0),
                 }
             }
+            Body::Call {
+                media,
+                ring_secs,
+                secret,
+            } => {
+                out.push(TYPE_CALL);
+                out.push(*media);
+                out.extend_from_slice(&ring_secs.to_be_bytes());
+                out.extend_from_slice(secret);
+            }
+            Body::CallEnd {
+                target,
+                outcome,
+                duration,
+            } => {
+                out.push(TYPE_CALL_END);
+                out.extend_from_slice(&target.to_be_bytes());
+                out.push(*outcome);
+                out.extend_from_slice(&duration.to_be_bytes());
+            }
         }
         out
     }
@@ -519,6 +618,32 @@ impl Body {
                     avatar,
                 }))
             }
+            TYPE_CALL => {
+                if b.len() != 1 + 1 + 2 + 32 {
+                    return Err(Error::Malformed(format!(
+                        "call is {} bytes, want 36",
+                        b.len()
+                    )));
+                }
+                Ok(Some(Body::Call {
+                    media: b[1],
+                    ring_secs: u16::from_be_bytes(b[2..4].try_into().unwrap()),
+                    secret: b[4..36].try_into().unwrap(),
+                }))
+            }
+            TYPE_CALL_END => {
+                if b.len() != 1 + 8 + 1 + 4 {
+                    return Err(Error::Malformed(format!(
+                        "call end is {} bytes, want 14",
+                        b.len()
+                    )));
+                }
+                Ok(Some(Body::CallEnd {
+                    target: u64::from_be_bytes(b[1..9].try_into().unwrap()),
+                    outcome: b[9],
+                    duration: u32::from_be_bytes(b[10..14].try_into().unwrap()),
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -542,12 +667,47 @@ fn done(b: &[u8], o: usize) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Typing(bool),
+    /// SIP-36 ring state.
+    ///
+    /// **Nothing durable may be derived from one.** SIP-16 sets the standard of
+    /// service plainly — an exchange that dropped every signal it was ever
+    /// given would still conform — and SIP-31 notes that a signal carries an
+    /// account the exchange asserted and is forgeable by it permanently. So an
+    /// exchange can synthesise one of these naming any member and any device:
+    /// it can make a client show that somebody declined, or silence a ringing
+    /// device by claiming a sibling accepted. A client MUST NOT write a call's
+    /// outcome from one, MUST NOT show its claim as a fact about a person, and
+    /// falls back on [`crate::timeline::CallRecord::outcome`] when signals do
+    /// not arrive. They drive a ringing screen and nothing else.
+    CallState {
+        /// The `seq` of the `Call` entry this is about.
+        target: u64,
+        state: u8,
+        /// The SIP-22 device key of the signalling client, which is what makes
+        /// SIP-36's fan-out rules expressible. **The exchange does not take
+        /// this on trust for its own routing** — it excludes the device it
+        /// observed on the connection, for the reason SIP-16 gives about
+        /// `account`: a client's claim about who it is is not a fact.
+        device: PubKey,
+    },
 }
 
 impl Signal {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Signal::Typing(on) => vec![SIGNAL_TYPING, u8::from(*on)],
+            Signal::CallState {
+                target,
+                state,
+                device,
+            } => {
+                let mut out = Vec::with_capacity(1 + 8 + 1 + 32);
+                out.push(SIGNAL_CALL_STATE);
+                out.extend_from_slice(&target.to_be_bytes());
+                out.push(*state);
+                out.extend_from_slice(device.as_bytes());
+                out
+            }
         }
     }
 
@@ -566,6 +726,19 @@ impl Signal {
                     )));
                 }
                 Ok(Some(Signal::Typing(b[1] != 0)))
+            }
+            SIGNAL_CALL_STATE => {
+                if b.len() != 1 + 8 + 1 + 32 {
+                    return Err(Error::Malformed(format!(
+                        "call state signal is {} bytes, want 42",
+                        b.len()
+                    )));
+                }
+                Ok(Some(Signal::CallState {
+                    target: u64::from_be_bytes(b[1..9].try_into().unwrap()),
+                    state: b[9],
+                    device: PubKey::new(b[10..42].try_into().unwrap()),
+                }))
             }
             _ => Ok(None),
         }
@@ -852,5 +1025,75 @@ mod tests {
         assert_eq!(post.body_text(), Some("see above"));
         assert_eq!(post.mentions().count(), 1);
         assert_eq!(post.attachments().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+
+    #[test]
+    fn a_call_and_its_ending_round_trip() {
+        let call = Body::Call {
+            media: MEDIA_AUDIO,
+            ring_secs: 30,
+            secret: [7; 32],
+        };
+        assert_eq!(Body::decode(&call.encode()).unwrap(), Some(call.clone()));
+        let end = Body::CallEnd {
+            target: 41,
+            outcome: CALL_ANSWERED,
+            duration: 95,
+        };
+        assert_eq!(Body::decode(&end.encode()).unwrap(), Some(end.clone()));
+
+        // Truncation is malformed, not unknown: the ignore rules are for a type
+        // a reader has not heard of.
+        assert!(Body::decode(&call.encode()[..20]).is_err());
+        assert!(Body::decode(&end.encode()[..8]).is_err());
+    }
+
+    /// **Bit 1 is not video.** SIP-15 defines audio and says nothing about a
+    /// second stream, so a client must not infer one — and an implementation
+    /// tempted to read this bit would be inventing a wire format.
+    #[test]
+    fn every_media_bit_but_audio_is_reserved_and_carried_untouched() {
+        for bits in [0x00u8, 0x02, 0xFE, 0xFF] {
+            let b = Body::Call {
+                media: MEDIA_AUDIO | bits,
+                ring_secs: 1,
+                secret: [0; 32],
+            };
+            let Some(Body::Call { media, .. }) = Body::decode(&b.encode()).unwrap() else {
+                panic!("a call must decode as a call whatever its reserved bits");
+            };
+            assert_eq!(media & MEDIA_AUDIO, MEDIA_AUDIO);
+            assert_eq!(media, MEDIA_AUDIO | bits, "reserved bits are carried, not masked");
+        }
+    }
+
+    #[test]
+    fn a_ring_state_round_trips_and_an_unknown_kind_is_ignored() {
+        let s = Signal::CallState {
+            target: 9,
+            state: RING_RINGING,
+            device: PubKey::new([3; 32]),
+        };
+        assert_eq!(Signal::decode(&s.encode()).unwrap(), Some(s));
+        assert!(Signal::decode(&s.encode()[..10]).is_err());
+        // The forward-compatibility rule SIP-19 already had, still holding.
+        assert_eq!(Signal::decode(&[0x7f, 0, 0]).unwrap(), None);
+    }
+
+    /// The tiebreak is on key order and is symmetric: exactly one of two
+    /// devices yields, never both and never neither.
+    #[test]
+    fn exactly_one_of_two_devices_yields() {
+        let low = PubKey::new([1; 32]);
+        let high = PubKey::new([2; 32]);
+        assert!(yields_to(&high, &low));
+        assert!(!yields_to(&low, &high));
+        // A device never yields to itself, which would leave nobody in the room.
+        assert!(!yields_to(&low, &low));
     }
 }

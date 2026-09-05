@@ -619,3 +619,70 @@ async fn a_stream_being_read_can_be_dropped() {
     let again = sqex_chat::events::Stream::open(&client).await;
     assert!(again.is_ok(), "could not resubscribe after dropping a stream");
 }
+
+/// **SIP-36: a ringing phone is not somebody typing, and the event says so.**
+///
+/// SIP-30 exists so an idle client can be quiet, and a client that has
+/// throttled its signal fetching is behaving correctly — so a ring announced
+/// only as `Signal` would arrive at whatever cadence that client saved. A
+/// distinguishable kind is the whole point.
+///
+/// It also pins where the event comes from. SIP-36's flow reads as though
+/// writing the invitation produces it, but in a private channel — which a DM
+/// is — the body is sealed under SIP-17 and **the exchange cannot tell a call
+/// from a sentence**. The ring state is in the clear and names the invitation,
+/// so it is what the exchange derives this from.
+#[tokio::test]
+async fn a_call_rings_as_its_own_event_and_typing_does_not() {
+    use sqex_proto::message::{MEDIA_AUDIO, RING_RINGING};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _srv, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 31, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 32, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(31);
+    let (_, bob_key) = identity(32);
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    assert!(bob.subscribe().await.unwrap(), "bob did not subscribe");
+
+    // The control first, so a stray `Ringing` from anything else would be
+    // caught rather than attributed to the call below.
+    alice.typing(&channel, true).await;
+    let typed = wait_for(&mut bob, |e| matches!(e, ChatEvent::Signal { .. }), SOON).await;
+    assert!(typed.is_some(), "typing did not arrive at all");
+    assert!(
+        !collect_for(&mut bob, Duration::from_millis(200))
+            .await
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Ringing { .. })),
+        "typing must not ring a phone"
+    );
+
+    let (posted, secret) = alice.call(&channel, MEDIA_AUDIO, 30).await.unwrap();
+    alice.ring_state(&channel, posted.seq, RING_RINGING).await;
+
+    let got = wait_for(&mut bob, |e| matches!(e, ChatEvent::Ringing { .. }), SOON).await;
+    let Some(ChatEvent::Ringing { channel: c, seq }) = got else {
+        panic!("no ringing event reached bob: {got:?}");
+    };
+    assert_eq!(c, channel);
+    assert_eq!(seq, posted.seq, "the event must name the invitation");
+
+    // And the invitation itself is a sealed entry bob can open, carrying the
+    // room secret the exchange never saw.
+    let mut timeline = sqex_proto::timeline::Timeline::new();
+    bob.poll(&channel, &mut timeline, 0).await.unwrap();
+    let call = timeline
+        .call(posted.seq)
+        .expect("the invitation did not fold into a call");
+    assert_eq!(call.secret, secret, "the callee must reach the same room");
+    assert_eq!(call.ring_secs, 30);
+    assert_eq!(call.outcome(call.posted), None, "it is still ringing");
+    assert_eq!(
+        call.outcome(call.posted + 31),
+        Some(sqex_proto::message::CALL_MISSED),
+        "and nobody answered"
+    );
+}

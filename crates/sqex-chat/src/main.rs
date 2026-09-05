@@ -1053,6 +1053,15 @@ impl Dirty {
             ChatEvent::Cursor { channel } => {
                 self.receipts.insert(channel);
             }
+            // SIP-36. `sqex-chat` is a terminal client with no media: it can
+            // show that a call is ringing, and cannot answer one. Marking the
+            // channel is what puts the invitation in front of the reader, and
+            // is deliberately *not* a throttled signal fetch — the whole point
+            // of a distinct kind is that a client which has quietened its
+            // signal polling still hears a phone.
+            ChatEvent::Ringing { channel, .. } => {
+                self.channels.insert(channel);
+            }
             ChatEvent::Membership {
                 channel, account, ..
             } => {

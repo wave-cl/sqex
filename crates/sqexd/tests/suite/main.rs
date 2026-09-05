@@ -31,6 +31,7 @@ mod common;
 mod admin_flow;
 mod beacon_flow;
 mod blob_flow;
+mod call_flow;
 mod channel_flow;
 mod device_flow;
 mod mailbox_flow;

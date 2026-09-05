@@ -48,6 +48,7 @@ use sqex_proto::blob_store::{
 use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
+use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::device::{
     AdmissionRequest, ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke,
 };
@@ -1368,15 +1369,39 @@ async fn route(
         },
         // Relayed to the other members and stored nowhere. An exchange that
         // dropped every one of these would still conform.
-        ("POST", "/channel/signal") => match (account, SignalOut::decode(body)) {
+        ("POST", "/channel/signal") => match (who, SignalOut::decode(body)) {
             (None, _) => no_identity("signalling"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => {
-                match server.channels.signal(&me, &req.channel, req.kind, &req.body) {
+            (Some((me, dev)), Ok(req)) => {
+                match server.channels.signal(&me, &dev, &req.channel, req.kind, &req.body) {
                     Ok(()) => {
                         // Not to the sender: a client does not need telling
                         // that its own keyboard is being used.
                         server.tell_others(&req.channel, &me, EventKind::Signal { channel: req.channel });
+                        // SIP-36. A ringing phone is not a keyboard, and a
+                        // client that has quietened its signal polling —
+                        // which SIP-30 exists to let it do — would otherwise
+                        // hear this at whatever cadence it saved.
+                        //
+                        // **The signal is what the exchange can see, and the
+                        // entry is not.** SIP-36's flow reads as though the
+                        // invitation drives this event, but in a private
+                        // channel the body is sealed under SIP-17 and the
+                        // exchange cannot tell a call from a sentence. The
+                        // ring state is in the clear and carries the
+                        // invitation's `seq`, so it is what this is derived
+                        // from — and it discloses nothing the signal did not
+                        // already disclose by existing.
+                        if let Ok(Some(Signal::CallState { target, state, .. })) =
+                            Signal::decode(&req.body)
+                            && state == RING_RINGING
+                        {
+                            server.tell_others(
+                                &req.channel,
+                                &me,
+                                EventKind::Ringing { channel: req.channel, seq: target },
+                            );
+                        }
                         (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
                     }
                     Err(e) => refused(e),
@@ -1387,7 +1412,7 @@ async fn route(
         ("POST", "/channel/fetch") => match (account, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match fetch_waiting(server, &me, &req).await {
+            (Some(me), Ok(req)) => match fetch_waiting(server, &me, &device.unwrap_or(me), &req).await {
                 Ok(entries) => (200, "application/octet-stream", entries.encode()),
                 Err(e) => refused(e),
             },
@@ -1762,10 +1787,11 @@ fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
 async fn fetch_waiting(
     server: &Arc<Server>,
     me: &PubKey,
+    device: &PubKey,
     req: &ChannelFetch,
 ) -> std::result::Result<sqex_proto::channel::Entries, ChannelError> {
     let notify = server.channels.notifier(&req.channel);
-    let first = server.channels.fetch(me, &req.channel, req.since, req.receipts)?;
+    let first = server.channels.fetch(me, device, &req.channel, req.since, req.receipts)?;
     if !first.entries.is_empty() || !first.signals.is_empty() || req.wait_secs == 0 {
         return Ok(first);
     }
@@ -1775,7 +1801,7 @@ async fn fetch_waiting(
         let waited = tokio::time::timeout_at(deadline, notify.notified()).await;
         // Re-check membership as well as entries: an answer is owed to whoever
         // the caller is *now*, not who they were when they parked.
-        let again = server.channels.fetch(me, &req.channel, req.since, req.receipts)?;
+        let again = server.channels.fetch(me, device, &req.channel, req.since, req.receipts)?;
         // A signal is as good a reason to answer as an entry: SIP-16 says a
         // held request returns as soon as either arrives for the caller.
         if !again.entries.is_empty() || !again.signals.is_empty() || waited.is_err() {
