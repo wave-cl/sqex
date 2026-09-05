@@ -1597,8 +1597,9 @@ async fn handle_key(
             if let Some(target) = app.editing.take() {
                 let Some(at) = selected_index(open, app) else { return };
                 let channel = open[at].channel;
-                if let Err(e) = chat.edit(&channel, target, SipPost::text(&text)).await {
-                    app.trouble.message = Some(e.to_string());
+                match chat.edit(&channel, target, SipPost::text(&text)).await {
+                    Ok(_) => app.scroll = 0,
+                    Err(e) => app.trouble.message = Some(e.to_string()),
                 }
                 settle_here(chat, open, app, at).await;
                 return;
@@ -1606,8 +1607,9 @@ async fn handle_key(
             if let Some((target, _)) = app.replying.take() {
                 let Some(at) = selected_index(open, app) else { return };
                 let channel = open[at].channel;
-                if let Err(e) = chat.reply(&channel, target, &text).await {
-                    app.trouble.message = Some(e.to_string());
+                match chat.reply(&channel, target, &text).await {
+                    Ok(_) => app.scroll = 0,
+                    Err(e) => app.trouble.message = Some(e.to_string()),
                 }
                 settle_here(chat, open, app, at).await;
                 return;
@@ -1764,6 +1766,12 @@ async fn handle_key(
             // a dropped connection destroyed it — the one loss in this client
             // that trying again cannot undo.
             let typed = matches!(cmd, Command::Send(_)).then(|| text.clone());
+            // Whether this puts something of the reader's own into the
+            // transcript. Only those come back to the bottom: a command whose
+            // answer is a note in the status line changes nothing down there,
+            // and `/who` typed while reading history should leave the history
+            // where it is.
+            let posts = matches!(cmd, Command::Send(_) | Command::File(_));
             let outcome = match cmd {
                 Command::Send(text) => chat.send(&channel, &text).await.map(|_| None),
                 Command::File(path) => send_file(chat, &channel, &path).await.map(Some),
@@ -2025,6 +2033,19 @@ async fn handle_key(
             poll_one(chat, &mut open[i], app).await;
             let note = match outcome {
                 Ok(note) => {
+                    // Your own message lands at the newest of the conversation,
+                    // so that is where you have to be to see it. Somebody
+                    // several pages back who sends one would otherwise watch
+                    // nothing happen — the message is there, below the pane,
+                    // and the screen does not move.
+                    //
+                    // Only on success: a refusal puts the words back in the
+                    // composer, and throwing the view to the bottom as well
+                    // would lose the reader's place for a message that was
+                    // never posted.
+                    if posts {
+                        app.scroll = 0;
+                    }
                     open[i].note = note.clone().map(|n| (n, std::time::Instant::now()));
                     note
                 }
