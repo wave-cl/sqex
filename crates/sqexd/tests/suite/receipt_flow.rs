@@ -359,3 +359,78 @@ fn an_exchange_that_cannot_sign_refuses_rather_than_answering_in_the_other_shape
     );
     assert_eq!(Code::NoReceipts.as_str(), "no_receipts");
 }
+
+/// The same check against a **deployed** exchange, opt-in.
+///
+/// Every test above runs sqexd in-process, where the binary under test and the
+/// key that signs are the same objects the assertions hold. That proves the
+/// logic and not the deployment: it cannot catch a released binary that lost
+/// its seed on the way to the box, a config that turned receipts off, or an
+/// exchange whose published key is not the one it signs with — which is the
+/// failure that would matter most, because a receipt checked under a key
+/// nobody pinned is worth nothing.
+///
+/// Ignored so CI stays hermetic. Run it against `ex` with:
+///
+/// ```text
+/// SQEX_LIVE_ADDR=95.216.183.51:443 \
+/// SQEX_LIVE_KEY=2j68p8rZKXE6W1f6LerRGB2SPTH8JkbfMmZRFTzcLKyW \
+///   cargo test -p sqexd --test suite -- --ignored receipts_verify_against_a_deployed_exchange
+/// ```
+///
+/// It creates a channel under a random identifier, posts one message, and
+/// closes the channel again, so it leaves nothing behind but the entries in a
+/// closed channel's retention window.
+#[tokio::test]
+#[ignore = "needs a deployed exchange; set SQEX_LIVE_ADDR and SQEX_LIVE_KEY"]
+async fn receipts_verify_against_a_deployed_exchange() {
+    use rand::RngCore;
+    use sqex_proto::channel::{ByChannel, TYPE_CLOSE};
+
+    let Ok(addr) = std::env::var("SQEX_LIVE_ADDR") else {
+        panic!("set SQEX_LIVE_ADDR, e.g. 95.216.183.51:443");
+    };
+    let key: PubKey = std::env::var("SQEX_LIVE_KEY")
+        .expect("set SQEX_LIVE_KEY to the exchange's published identity")
+        .parse()
+        .expect("SQEX_LIVE_KEY is base58");
+    let addr: SocketAddr = addr.parse().expect("SQEX_LIVE_ADDR is host:port");
+    let server_pub = *key.as_bytes();
+
+    // A fresh identity and a random channel, so a repeat run collides with
+    // nothing and nobody else's conversation is touched.
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    let mut channel = [0u8; 32];
+    rand::rng().fill_bytes(&mut channel);
+
+    let mut c = Client::connect_as(addr, &server_pub, &seed)
+        .await
+        .expect("the deployed exchange did not answer");
+    let me = PubKey::new(SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+    let s = Signer::new(seed, me, server_pub);
+    let mut chain = Chain::default();
+    a_room(&mut c, &s, &mut chain, channel).await;
+    say(&mut c, &s, &mut chain, channel, b"a receipt for this").await;
+
+    let instance = instance_for(channel, 0);
+    let seen = fetch_receipted(&mut c, channel, 0).await;
+    let mut head = HEAD_GENESIS;
+    for e in &seen.entries {
+        assert!(
+            verify(server_pub, channel, instance, e),
+            "the deployed exchange signed entry {} under a key we did not pin",
+            e.seq
+        );
+        let stamp = e.stamp.unwrap();
+        assert_eq!(receipt::advance(&head, &stamp.entry_hash), stamp.head);
+        head = stamp.head;
+    }
+    assert_eq!(seen.tip.unwrap().stamp.head, head);
+
+    let (code, _) = c
+        .post("/channel/close", ByChannel { channel }.encode(TYPE_CLOSE))
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "the test channel was left behind");
+}
