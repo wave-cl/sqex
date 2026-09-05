@@ -22,6 +22,7 @@ pub mod events;
 pub mod exchange;
 pub mod mailbox;
 pub mod message;
+pub mod peer;
 pub mod prekey;
 pub mod profile;
 pub mod receipt;

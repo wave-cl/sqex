@@ -36,6 +36,7 @@ use sqex_proto::channel::{
     SignalOut, TYPE_CURSORS as CH_CURSORS, TYPE_REDACT as CH_REDACT, Create as ChannelCreate, Created, Fetch as ChannelFetch,
     ByAccount as ChannelByAccount, Invite as ChannelInvite, List as ChannelList, Mine as ChannelMine,
     Directory as ChannelDirectory, Post as ChannelPost, TYPE_REMOVE as CH_REMOVE,
+    TYPE_REPLICATE as CH_REPLICATE, TYPE_UNREPLICATE as CH_UNREPLICATE,
     Retain as ChannelRetain, TYPE_CLOSE as CH_CLOSE,
     TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
 };
@@ -49,6 +50,7 @@ use sqex_proto::channel_key::{
     Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING,
 };
 use sqex_proto::message::{RING_RINGING, Signal};
+use sqex_proto::peer::{Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull};
 use sqex_proto::device::{
     AdmissionRequest, ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke,
 };
@@ -199,6 +201,12 @@ pub struct Server {
     /// version already refused is an outage nobody can see, since a refused
     /// envelope is dropped in silence at both ends.
     accepted_envelope_versions: Vec<u8>,
+    /// SIP-35: the exchanges this one will serve replication to.
+    ///
+    /// The operational half of the gate. Being here lets a peer speak the
+    /// peering routes; it gives it no channel, which takes a signed
+    /// authorisation from one of that channel's admins.
+    replication_peers: Vec<PubKey>,
 }
 
 impl Server {
@@ -326,6 +334,7 @@ pub async fn bind(
         state: Mutex::new(state),
         admins: RwLock::new(config.admins),
         welcome: None,
+        replication_peers: config.replication_peers.clone(),
         transport: Arc::clone(&listener),
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
@@ -1247,6 +1256,39 @@ async fn route(
                 }
             }
         },
+        // SIP-35: who may hold a copy of this channel, decided by an admin and
+        // written into the log the members read — never by an operator out of
+        // band, which would make a channel's copies invisible to the people in
+        // it.
+        ("POST", "/channel/replicate") => match (who, ChannelByAccount::decode(body, CH_REPLICATE)) {
+            (None, _) => no_identity("authorising replication"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some((me, dev)), Ok(req)) => match server.channels.replicate(
+                &me, &dev, &req.channel, &req.account, &req.action, true,
+            ) {
+                Ok(()) => {
+                    server.tell(&req.channel, EventKind::Channel { channel: req.channel, last_seq: 0 });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
+                Err(e) => refused(e),
+            },
+        },
+        // **The end of a subscription, and not a recall.** What a replica
+        // already holds was lawfully obtained and no protocol can unsend it.
+        ("POST", "/channel/unreplicate") => match (who, ChannelByAccount::decode(body, CH_UNREPLICATE)) {
+            (None, _) => no_identity("withdrawing replication"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some((me, dev)), Ok(req)) => match server.channels.replicate(
+                &me, &dev, &req.channel, &req.account, &req.action, false,
+            ) {
+                Ok(()) => {
+                    server.tell(&req.channel, EventKind::Channel { channel: req.channel, last_seq: 0 });
+                    (200, "application/octet-stream", ChannelAck { now: now_unix() }.encode())
+                }
+                Err(e) => refused(e),
+            },
+        },
+
         ("POST", "/channel/remove") => match (who, ChannelByAccount::decode(body, CH_REMOVE)) {
             (None, _) => no_identity("removing from a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -1407,6 +1449,41 @@ async fn route(
                     Err(e) => refused(e),
                 }
             }
+        },
+
+        // SIP-35 peering. **Every refusal here is the same refusal.** These
+        // routes are reachable by strangers, and a reply that varied by cause
+        // would make them an existence oracle for private channels — the same
+        // rule SIP-24 gives its admission endpoint and SIP-4 a withheld beacon.
+        // So an unknown peer, an absent channel, a channel that exists and is
+        // not replicated to this peer, and an origin that cannot receipt all
+        // produce one 404 with nothing in it.
+        ("POST", "/peer/hello") => match (peer.identity, PeerHello::decode(body)) {
+            (Some(who), Ok(hello)) if server.replication_peers.contains(&who) => {
+                let hi = Hi {
+                    now: now_unix(),
+                    version: hello.version.min(PEER_VERSION),
+                    exchange: server.public_key,
+                    window_secs: sqex_proto::channel::MAX_RETENTION,
+                };
+                (200, "application/octet-stream", hi.encode())
+            }
+            _ => peering_refused(),
+        },
+        ("POST", "/peer/pull") => match (peer.identity, PeerPull::decode(body)) {
+            (Some(who), Ok(req))
+                if server.replication_peers.contains(&who)
+                    && server.channels.replicates_to(&req.channel, &who) =>
+            {
+                match server.channels.pull(&req.channel, req.since, req.max) {
+                    Ok(pulled) => (200, "application/octet-stream", pulled.encode()),
+                    // Not `refused(e)`: the cause is exactly what must not
+                    // leak. A peer that got this far is authorised, and
+                    // anything still wrong is this exchange's problem.
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
         },
 
         ("POST", "/channel/fetch") => match (account, ChannelFetch::decode(body)) {
@@ -1820,6 +1897,21 @@ fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
             "{action} requires an advertised Ed25519 identity (SIP-3)"
         )),
     )
+}
+
+/// The one answer every SIP-35 peering route gives when it will not serve.
+///
+/// **Identical for every cause**, and that is the whole point: an unknown peer,
+/// an absent channel, a channel that exists and is not replicated to this peer,
+/// and an origin that cannot issue receipts must be indistinguishable. These
+/// routes are reachable by strangers, and a reply that varied would turn them
+/// into an existence oracle for private channels — the rule SIP-24 gives its
+/// admission endpoint and SIP-4 a withheld beacon.
+///
+/// It carries no detail for the same reason. A detail string is a reply that
+/// varies.
+fn peering_refused() -> (u16, &'static str, Vec<u8>) {
+    refuse(404, Code::NoSuchChannel, None)
 }
 
 fn error_status(e: &Error) -> (u16, &'static str) {

@@ -78,6 +78,11 @@ pub const TYPE_FETCH_RECEIPTED: u8 = 0x13;
 /// SIP-34: a post whose answer carries a receipt, so a poster learns its entry
 /// was numbered rather than accepted and discarded.
 pub const TYPE_POST_RECEIPTED: u8 = 0x14;
+/// SIP-35: authorise replication of this channel to a replica exchange.
+pub const TYPE_REPLICATE: u8 = 0x15;
+/// SIP-35: withdraw that authorisation. **Not a recall** — a replica stops
+/// accepting new entries, and what it holds was lawfully obtained.
+pub const TYPE_UNREPLICATE: u8 = 0x16;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.
@@ -104,6 +109,22 @@ pub const EVENT_CREATED: u8 = 0x09;
 /// This left no record whatsoever before, so a public room could be renamed
 /// with nothing to show for it — a gap that needs no second exchange to matter.
 pub const EVENT_RENAMED: u8 = 0x0a;
+/// SIP-35: `actor` authorised replication of this channel to `subject`, a
+/// replica exchange's Ed25519 identity.
+///
+/// **An entry, so the members can see it.** An out-of-band arrangement between
+/// two operators would have been simpler and would have made a channel's copies
+/// invisible to the people in it. It lands in the log they already read, signed
+/// by whoever did it, and replicates with the channel — so a reader at a replica
+/// can see the authority under which the replica holds what it is showing them.
+pub const EVENT_REPLICATE: u8 = 0x0b;
+/// SIP-35: `actor` withdrew that authorisation.
+///
+/// **Not a revocation of a copy.** A replica stops accepting new entries and
+/// should stop serving, but what it holds was lawfully obtained and no protocol
+/// can unsend it. An implementation MUST NOT describe this as recalling
+/// anything; it is the end of a subscription.
+pub const EVENT_UNREPLICATE: u8 = 0x0c;
 
 /// The body of an entry the exchange wrote itself.
 ///
@@ -152,7 +173,7 @@ impl System {
                 b.len()
             )));
         }
-        if b[0] == 0 || b[0] > EVENT_RENAMED {
+        if b[0] == 0 || b[0] > EVENT_UNREPLICATE {
             return Ok(None);
         }
         Ok(Some(System {
@@ -1159,6 +1180,18 @@ pub struct Receipted {
 pub const RECEIPTED_LEN: usize = 32 + 32 + 64;
 
 impl Receipted {
+    /// SIP-35 writes these outside an `Entries`, so the reader and writer are
+    /// shared rather than reimplemented per response.
+    pub fn write_into(&self, out: &mut Vec<u8>) {
+        self.write(out);
+    }
+
+    /// The pair to [`Receipted::write_into`]. The caller has already checked
+    /// the buffer is long enough, as every fixed-layout reader here does.
+    pub fn read_from(b: &[u8], at: usize) -> Receipted {
+        Receipted::read(b, at)
+    }
+
     fn write(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.entry_hash);
         out.extend_from_slice(&self.head);
@@ -1199,6 +1232,18 @@ impl Entry {
         ENTRY_HEADER
             + if self.stamp.is_some() { RECEIPTED_LEN } else { 0 }
             + self.body.len()
+    }
+
+    /// Write one in the receipted shape, for SIP-35's `Pulled` — where a
+    /// receipt is not optional, because a replica that stored an entry without
+    /// one would have taken the origin's word for its position.
+    pub fn write_receipted(&self, out: &mut Vec<u8>) {
+        self.write(out);
+    }
+
+    /// Read one written by [`Entry::write_receipted`].
+    pub fn read_receipted(b: &[u8], o: &mut usize) -> Result<Entry> {
+        Entry::read(b, o, true)
     }
 
     fn write(&self, out: &mut Vec<u8>) {

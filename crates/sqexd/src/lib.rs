@@ -10,6 +10,7 @@ pub mod events;
 pub mod mailbox;
 pub mod prekey;
 pub mod profile;
+pub mod replica;
 pub mod room;
 pub mod server;
 pub mod session;

@@ -38,6 +38,7 @@ mod mailbox_flow;
 mod private_channel_flow;
 mod profile_flow;
 mod receipt_flow;
+mod replica_flow;
 mod room_flow;
 mod route_coverage;
 mod session_flow;

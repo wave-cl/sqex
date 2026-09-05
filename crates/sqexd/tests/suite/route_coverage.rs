@@ -85,6 +85,15 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/channel/list", Chat("/find")),
     ("POST", "/channel/invite", Chat("/invite")),
     ("POST", "/channel/remove", Chat("/kick")),
+    // SIP-35. All four are served and nothing calls them yet, which is the
+    // honest state of that SIP: an origin can be authorised, can be asked, and
+    // can answer, and no replica pulls. `sqexd` has no runtime sQUIC client to
+    // pull with — `sqnr` is a dev-dependency here, and promoting it would link
+    // libpcsclite into a server that never touches a YubiKey.
+    ("POST", "/channel/replicate", Unreachable("SIP-35: no client authorises replication yet")),
+    ("POST", "/channel/unreplicate", Unreachable("SIP-35: no client withdraws it yet")),
+    ("POST", "/peer/hello", Unreachable("SIP-35: sqexd has no outbound client to peer with")),
+    ("POST", "/peer/pull", Unreachable("SIP-35: nothing replicates yet")),
     ("POST", "/channel/key/put", Chat("Chat::ensure_epoch")),
     ("POST", "/channel/key/get", Chat("Chat::collect_keys")),
     ("POST", "/channel/key/missing", Chat("Chat::stranded")),
@@ -218,9 +227,15 @@ fn the_unreachable_routes_are_the_ones_we_know_about() {
         .map(|(_, p, _)| *p)
         .collect();
 
-    // Empty, and the assertion below is what keeps it that way: a route added
-    // with nothing able to call it fails here until somebody decides which.
-    let expected: Vec<&str> = vec![];
+    // Four, all SIP-35's, and they are the reason that SIP is not Active: its
+    // origin half is built and its replica half has no transport. This list
+    // reaching empty again is what finishing it looks like.
+    let expected: Vec<&str> = vec![
+        "/channel/replicate",
+        "/channel/unreplicate",
+        "/peer/hello",
+        "/peer/pull",
+    ];
 
     let mut open_sorted = open.clone();
     open_sorted.sort();

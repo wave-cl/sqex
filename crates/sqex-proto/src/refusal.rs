@@ -90,6 +90,11 @@ pub enum Code {
     UsedInstance,
     /// SIP-34: a receipted request to an exchange that issues no receipts.
     NoReceipts,
+    /// SIP-35: this channel already has as many replicas as it may.
+    TooManyReplicas,
+    /// SIP-35: a write to a channel this exchange only replicates. The detail
+    /// carries the origin's key, which is where the write belongs.
+    Replicated,
 
     // SIP-18 blobs.
     NoSuchUpload,
@@ -171,6 +176,8 @@ impl Code {
             Code::BrokenChain => 34,
             Code::UsedInstance => 35,
             Code::NoReceipts => 55,
+            Code::TooManyReplicas => 56,
+            Code::Replicated => 57,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -245,6 +252,8 @@ impl Code {
             34 => Code::BrokenChain,
             35 => Code::UsedInstance,
             55 => Code::NoReceipts,
+            56 => Code::TooManyReplicas,
+            57 => Code::Replicated,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -319,6 +328,8 @@ impl Code {
             Code::BrokenChain => "broken_chain",
             Code::UsedInstance => "used_instance",
             Code::NoReceipts => "no_receipts",
+            Code::TooManyReplicas => "too_many_replicas",
+            Code::Replicated => "replicated",
 
             Code::NoSuchUpload => "no_such_upload",
             Code::NoSuchBlob => "no_such_blob",
@@ -389,6 +400,8 @@ impl Code {
         Code::BrokenChain,
         Code::UsedInstance,
         Code::NoReceipts,
+        Code::TooManyReplicas,
+        Code::Replicated,
         Code::NoSuchUpload,
         Code::NoSuchBlob,
         Code::BadChunk,

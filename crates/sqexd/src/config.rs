@@ -70,6 +70,18 @@ pub struct FileConfig {
     /// happened to say when it was written.
     #[serde(default)]
     pub accepted_envelope_versions: Option<Vec<u8>>,
+
+    /// SIP-35: base58 Ed25519 identities of exchanges this one will serve
+    /// replication to.
+    ///
+    /// The **operational** half of the gate, and only that half. Being on this
+    /// list lets a peer speak the peering routes at all; it does not give it a
+    /// single channel, which takes a signed authorisation by one of that
+    /// channel's admins. Empty — the default — means this exchange serves
+    /// replication to nobody and its peering routes refuse everyone
+    /// identically.
+    #[serde(default)]
+    pub replication_peers: Vec<String>,
 }
 
 /// Configuration with everything parsed and resolved.
@@ -84,6 +96,7 @@ pub struct Config {
     /// The channel every account joins on first sight. Empty is off.
     pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
+    pub replication_peers: Vec<PubKey>,
 }
 
 impl FileConfig {
@@ -92,6 +105,17 @@ impl FileConfig {
         let listen = parse_listen(&self.listen)?;
         let admins = parse_keys(&self.admins, "admins")?;
         let seed_whitelist = parse_keys(&self.seed_whitelist, "seed_whitelist")?;
+        let replication_peers = parse_keys(&self.replication_peers, "replication_peers")?;
+        // SIP-35 caps the peers an origin will serve, and an operator who set
+        // more should hear so at load rather than discover that some of them
+        // are silently ignored.
+        if replication_peers.len() > sqex_proto::peer::MAX_PEERS {
+            return Err(Error::Malformed(format!(
+                "replication_peers holds {}, limit is {}",
+                replication_peers.len(),
+                sqex_proto::peer::MAX_PEERS
+            )));
+        }
 
         // SIP-29 reserves version 0 and forbids emitting it, and an empty list
         // would refuse every caller in silence — both are configuration
@@ -114,6 +138,7 @@ impl FileConfig {
             challenge_ttl: std::time::Duration::from_secs(self.challenge_ttl_secs.max(1)),
             welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
+            replication_peers,
         })
     }
 }
