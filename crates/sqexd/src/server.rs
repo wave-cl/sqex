@@ -22,6 +22,7 @@ use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
 use crate::config::{Config, OriginConfig};
 use crate::attest::{Attestations, LodgeError};
+use crate::rendezvous::Rendezvous;
 use crate::resolve::Endpoints;
 use crate::device::Registry;
 use crate::events::Subscribers;
@@ -54,6 +55,7 @@ use sqex_proto::channel_key::{
 };
 use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::attest::{Attestation, Query as AttestQuery};
+use sqex_proto::rendezvous::Introduce;
 use sqex_proto::resolve::{
     Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
 };
@@ -111,12 +113,21 @@ const MAX_BODY: usize = 64 * 1024;
 /// exposes, and the Ed25519 name SIP-3 lets a caller assert. A caller may have
 /// neither (an anonymous, ephemeral connection), the key alone (a persistent
 /// caller that did not advertise), or both.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct Peer {
     /// MAC1-verified X25519 transport key (SIP-2).
     pub key: Option<[u8; 32]>,
     /// MAC1-bound Ed25519 identity, if the caller advertised one (SIP-3).
     pub identity: Option<PubKey>,
+    /// Where this connection actually came from.
+    ///
+    /// **Observed, never asserted.** SIP-25 introduces two identities by
+    /// telling each the other's address, and the only address it may disclose
+    /// is the one the exchange saw — a caller-supplied one would make the
+    /// introduction route a way to point traffic at somebody who never asked
+    /// for it. SIP-4 forbids publishing this as a *liveness* answer for a
+    /// different reason, and nothing else here reads it.
+    pub addr: std::net::SocketAddr,
 }
 
 /// Live connections by the identity that advertised itself on them (SIP-3).
@@ -170,6 +181,9 @@ pub struct Server {
     admins: RwLock<Vec<PubKey>>,
     challenges: Challenges,
     beacons: Beacons,
+    /// SIP-25: who has asked to be introduced to whom. Nothing is disclosed
+    /// until both sides have asked, independently.
+    rendezvous: Rendezvous,
     /// SIP-27: what identities have said about each other. The exchange holds
     /// these and is not an authority over them — it checks that an issuer
     /// signed, and cannot check whether a claim is true.
@@ -383,6 +397,7 @@ pub async fn bind(
         beacons: Beacons::new(),
         endpoints: Endpoints::new(),
         attestations: Attestations::new(),
+        rendezvous: Rendezvous::new(),
         mailbox: Mailbox::new(),
         rooms: Rooms::new(),
         // The channel log lives beside the state file, so a memory-only
@@ -533,6 +548,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
             let peer = Peer {
                 key: listener.peer_key(&incoming),
                 identity: listener.peer_identity(&incoming).map(PubKey::new),
+                addr: incoming.remote_address(),
             };
             let server = Arc::clone(&server);
             tokio::spawn(async move {
@@ -895,6 +911,33 @@ async fn route(
                 }
             },
         },
+        // SIP-25 rendezvous. **Both sides must have asked**, and until they
+        // have, the answer says nothing — not the address, and not that
+        // anybody asked, which would itself be a signal about somebody who has
+        // not consented. The address disclosed is the one this exchange
+        // observed on the connection, never one a caller supplied: an
+        // introduction to an address a third party chose is the shape a
+        // reflection abuse takes.
+        //
+        // This coordinates and does not punch. `squic::dial` binds a fresh
+        // ephemeral port, so a peer cannot dial from the port named here, and
+        // reusing that mapping is the whole mechanism — see SIP-25.
+        ("POST", "/rendezvous/introduce") => match (peer.identity, Introduce::decode(body)) {
+            (None, _) => no_identity("asking for an introduction"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                // Recorded with the observed address first, so a wait that
+                // finds the pair already complete answers from real data.
+                let first = server.rendezvous.request(&me, peer.addr, &req.peer);
+                let out = if first.ready || req.wait_secs == 0 {
+                    first
+                } else {
+                    server.rendezvous.wait(&me, &req.peer, req.wait_secs).await
+                };
+                (200, "application/octet-stream", out.encode())
+            }
+        },
+
         // SIP-27 attestation. **Anybody may lodge one**: it carries its own
         // proof, so who handed it over establishes nothing, and requiring the
         // issuer to do it would mean an issuer who has gone away can never be

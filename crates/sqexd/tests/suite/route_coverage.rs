@@ -53,6 +53,9 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/admin/command", Sqnr("signed transactions")),
     ("POST", "/beacon/beat", Cli("sqex beacon")),
     ("POST", "/beacon/read", Cli("sqex beacon read")),
+    // SIP-25 rendezvous. Coordination only: nothing punches yet, and the
+    // command says so rather than implying a connection was made.
+    ("POST", "/rendezvous/introduce", Cli("sqex meet")),
     // SIP-27 attestation.
     ("POST", "/attest/lodge", Cli("sqex attest say, sqex attest withdraw")),
     ("POST", "/attest/read", Cli("sqex attest read")),

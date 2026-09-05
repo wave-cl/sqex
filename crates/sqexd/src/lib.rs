@@ -12,6 +12,7 @@ pub mod mailbox;
 pub mod peer_client;
 pub mod prekey;
 pub mod profile;
+pub mod rendezvous;
 pub mod replica;
 pub mod resolve;
 pub mod room;

@@ -17,6 +17,7 @@ use sqex_proto::attest::{
     Query as AttestQuery,
 };
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
+use sqex_proto::rendezvous::{Introduce, Introduced};
 use sqex_proto::resolve::{
     Endpoint, KIND_DNS, KIND_IPV4, KIND_IPV6, MAX_HOST, Publish as ResolvePublish,
     Resolve as ResolveGet, Resolved, Successor as ResolveSuccessor,
@@ -68,6 +69,22 @@ enum Cmd {
     Beacon {
         #[command(subcommand)]
         cmd: BeaconCmd,
+    },
+    /// Rendezvous: ask to be introduced to a peer, so the two of you can
+    /// connect directly.
+    ///
+    /// **The exchange coordinates; it does not punch.** This asks, waits for
+    /// the other side to ask too, and prints what both were told. Making the
+    /// connection needs a transport that can dial from the port the exchange
+    /// observed, which sQUIC cannot yet do — see SIP-25.
+    Meet {
+        /// The peer's identity, base58. They must ask for you as well: an
+        /// introduction discloses an address, so both sides consent or neither
+        /// learns anything.
+        peer: String,
+        /// How long to wait for them, in seconds.
+        #[arg(short = 'w', long, default_value_t = 30)]
+        wait: u16,
     },
     /// Attestation: sign a statement about another identity, or read what has
     /// been said about one.
@@ -305,6 +322,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
+        Cmd::Meet { peer, wait } => meet(&cli, &cfg, peer, *wait).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
         Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
@@ -758,6 +776,45 @@ async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
         return Err(format!("delete failed ({code})"));
     }
     Ok(body.first().copied().unwrap_or(0) != 0)
+}
+
+// ---- rendezvous -------------------------------------------------------------
+
+async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16) -> Result<(), String> {
+    let signer = load_software_identity(cli, cfg)?;
+    let them = parse_key(peer)?;
+    let (addr, server) = endpoint(cli, cfg).await?;
+    // As ourselves: the exchange pairs identities, and an anonymous caller has
+    // none to pair.
+    let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+    let req = Introduce { peer: them, wait_secs: wait };
+    // The request is a long poll and may sit for `wait` seconds by design; the
+    // client's own deadline is generous enough to allow it.
+    let (code, body) = client.post("/rendezvous/introduce", req.encode()).await?;
+    if code != 200 {
+        return Err(format!("introduction refused ({code}): {}", said(&body)));
+    }
+    let got = Introduced::decode(&body).map_err(|e| e.to_string())?;
+    if !got.ready {
+        // Deliberately says nothing about whether they asked. That would be a
+        // signal about somebody who has not consented.
+        println!("no introduction: both sides must ask, and this one has not completed");
+        return Ok(());
+    }
+    let there = got.addr.ok_or("an introduction with no address")?;
+    println!("{them} was seen at {there}");
+    // Against the exchange's clock, because the three do not agree and only one
+    // of them is shared.
+    println!(
+        "  both sides were told to begin in {}s (exchange clock {})",
+        got.start_at.saturating_sub(got.now),
+        got.now
+    );
+    println!(
+        "  nothing connects yet: punching needs a dial from the port the exchange \
+         observed, and sQUIC binds a fresh one. SIP-12 relays instead, today"
+    );
+    Ok(())
 }
 
 // ---- attest -----------------------------------------------------------------
