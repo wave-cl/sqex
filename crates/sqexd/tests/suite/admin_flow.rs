@@ -379,20 +379,22 @@ async fn status_reports_accepted_and_arriving_envelope_versions() {
     handle.abort();
 }
 
-/// The trap the v4 cut walks past, pinned so nobody rediscovers it on a live
-/// exchange: a server told to accept an envelope version this build does not
-/// implement **starts perfectly happily and then accepts nothing**. There is no
-/// error, no log line and no reply — a refused envelope is dropped in silence
-/// by design (SIP-6), so the operator sees a healthy process and a dead port.
+/// The trap the v4 cut walked past, now closed at the transport and pinned
+/// here so it stays closed.
 ///
-/// ex was configured `accepted_envelope_versions = [3]` right up to this cut,
-/// which is exactly this state under a v4 binary. The config had to be edited
-/// in the same breath as the binary was installed.
+/// It used to be that a server told to accept an envelope version this build
+/// does not implement **started perfectly happily and then accepted nothing** —
+/// no error, no log line and no reply, because a refused envelope is dropped in
+/// silence by design (SIP-6). The operator saw a healthy process and a dead
+/// port. ex was configured `accepted_envelope_versions = [3]` right up to the
+/// cut, which is exactly that state under a v4 binary.
 ///
-/// squic validates `envelope_version` on dial but has no equivalent guard on
-/// listen. Until it does, this test is the only thing that says so out loud.
+/// squic v0.24.1 refuses to bind on such a set, so the failure is now loud and
+/// arrives before the socket exists. This test asserts the loudness: that
+/// `bind` fails, and that the error says which versions were the problem rather
+/// than surfacing as some unrelated I/O complaint.
 #[tokio::test]
-async fn a_retired_accepted_version_leaves_the_server_up_and_unreachable() {
+async fn a_retired_accepted_version_is_refused_at_bind() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("host_key");
     let (server_sk, _) = squic::generate_keypair();
@@ -405,26 +407,17 @@ async fn a_retired_accepted_version_leaves_the_server_up_and_unreachable() {
     let config_path = dir.path().join("sqexd.toml");
     std::fs::write(&config_path, &config_toml).unwrap();
 
-    // It binds and serves. That is the whole problem.
-    let (addr, server_pub, handle) = spawn_server(&config_toml, config_path).await;
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
 
-    let dialled = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        squic::dial(
-            addr,
-            &server_pub,
-            SquicConfig {
-                alpn_protocols: vec![b"h3".to_vec()],
-                ..Default::default()
-            },
-        ),
-    )
-    .await;
-
+    let err = match sqexd::bind(config, Some(config_path), signing_key).await {
+        Ok(_) => panic!("sqexd bound on an envelope version it cannot parse"),
+        Err(e) => e.to_string(),
+    };
     assert!(
-        dialled.is_err() || dialled.unwrap().is_err(),
-        "a server accepting only a retired envelope version answered a v4 client"
+        err.contains("accepted_envelope_versions"),
+        "bind failed for the wrong reason: {err}"
     );
-
-    handle.abort();
 }
