@@ -680,6 +680,34 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// The member entries we hold and never opened, oldest first.
+    ///
+    /// `put_message` writes a NULL body for an entry it could not open, and
+    /// `redact_message` writes an empty one instead precisely so the two stay
+    /// apart across a restart — this is the query that distinction exists for.
+    ///
+    /// The caller has its own list of what the current fold could not open,
+    /// but that covers only entries this poll fetched. Anything stored by an
+    /// earlier run is never re-folded, so without this the report is empty on
+    /// every poll but the first.
+    pub fn unopened(&self, channel: &[u8; 32]) -> Result<Vec<u64>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT seq FROM message
+                 WHERE channel = ?1 AND kind = ?2 AND sealed IS NULL
+                 ORDER BY seq ASC",
+            )
+            .map_err(storage("prepare unopened"))?;
+        let rows = stmt
+            .query_map(params![&channel[..], KIND_MEMBER], |r| {
+                r.get::<_, i64>(0).map(|n| n as u64)
+            })
+            .map_err(storage("query unopened"))?;
+        rows.collect::<std::result::Result<Vec<u64>, _>>()
+            .map_err(storage("read unopened"))
+    }
+
     /// Everything we have kept for a channel, oldest first.
     ///
     /// Returns the decrypted body bytes; decoding them is the caller's job,
@@ -1252,6 +1280,55 @@ mod tests {
         assert_eq!(
             s.held(&[9; 32]).unwrap(),
             0,
+            "a different channel is not counted"
+        );
+    }
+
+    #[test]
+    fn unopened_reports_held_entries_that_never_opened() {
+        // The distinction this rests on: a NULL body means held and never
+        // opened, an empty body means redacted. `redact_message` writes the
+        // empty one on purpose so the two survive a restart apart, and a
+        // report that confused them would call deleted messages lost history.
+        let s = Store::open(&seed(1), None).unwrap();
+        assert!(s.unopened(&[7; 32]).unwrap().is_empty(), "nothing held");
+
+        let put = |seq: u64, kind: u8, plain: Option<&[u8]>| {
+            s.put_message(
+                &[7; 32],
+                Kept {
+                    seq,
+                    account: key(2),
+                    posted: 100 + seq,
+                    kind,
+                    plain,
+                },
+            )
+            .unwrap()
+        };
+        put(1, 1, Some(b"opened"));
+        put(2, 1, None);
+        put(3, 0, None);
+        put(4, 1, Some(b"also opened"));
+        put(5, 1, None);
+
+        assert_eq!(
+            s.unopened(&[7; 32]).unwrap(),
+            vec![2, 5],
+            "only member entries with no body, oldest first"
+        );
+
+        // A redaction empties the body rather than nulling it, so a deleted
+        // message must not surface as history nobody could read.
+        s.redact_message(&[7; 32], 4).unwrap();
+        assert_eq!(
+            s.unopened(&[7; 32]).unwrap(),
+            vec![2, 5],
+            "a redacted message is not unopened"
+        );
+
+        assert!(
+            s.unopened(&[9; 32]).unwrap().is_empty(),
             "a different channel is not counted"
         );
     }

@@ -3399,7 +3399,18 @@ impl Chat {
             && info.visibility != Visibility::Public
             && self.store.held(channel)? > 0)
             .then_some(info.epoch);
-        let shut: Vec<u64> = timeline.unreadable().to_vec();
+        // What this poll's fold could not open, *plus* what earlier runs left
+        // unopened. The fold alone reports only entries fetched just now, so a
+        // conversation whose history was already on disk read as an ordinary
+        // empty one on every poll after the first — the same blind spot the
+        // `no_key` guard had, in the one place that reports history as gone.
+        let mut shut = self.store.unopened(channel)?;
+        for seq in timeline.unreadable() {
+            if !shut.contains(seq) {
+                shut.push(*seq);
+            }
+        }
+        shut.sort_unstable();
         Ok(Conversation {
             lost: if have_current { shut.len() } else { 0 },
             unreadable: if have_current { Vec::new() } else { shut },
