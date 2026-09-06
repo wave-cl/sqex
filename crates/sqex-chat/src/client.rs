@@ -361,6 +361,15 @@ pub struct Conversation {
     /// Entries held under a superseded epoch we have no key for. Gone for
     /// good, as against `unreadable`, which is something to wait for.
     pub lost: usize,
+    /// The epoch in force, when we hold no key for it — SIP-17's *stranded*
+    /// member: one who can fetch entries and open none of them.
+    ///
+    /// Reported on every poll rather than only when this one folded an
+    /// unreadable entry. Those two are not the same, and the difference is a
+    /// real conversation that read as empty: entries stored by an earlier run
+    /// are not re-folded, so a later poll finds nothing to classify and says
+    /// nothing, while the reader sits in front of messages nobody can open.
+    pub no_key: Option<u32>,
     /// Somebody is typing (SIP-19's only signal).
     pub typing: bool,
     pub last: u64,
@@ -3381,10 +3390,20 @@ impl Chat {
         let _ = self.refresh_profiles(&members, now).await;
 
         let have_current = self.store.key(channel, info.epoch)?.is_some();
+        // A public channel is stored in the clear and has no epoch, so having
+        // no key for it is the ordinary state rather than a fault. And a
+        // private channel we hold nothing in is not stranded, it is empty —
+        // saying "this cannot be read" of a conversation with nothing in it
+        // would be a warning about nothing.
+        let no_key = (!have_current
+            && info.visibility != Visibility::Public
+            && self.store.held(channel)? > 0)
+            .then_some(info.epoch);
         let shut: Vec<u64> = timeline.unreadable().to_vec();
         Ok(Conversation {
             lost: if have_current { shut.len() } else { 0 },
             unreadable: if have_current { Vec::new() } else { shut },
+            no_key,
             timeline: timeline.clone(),
             gap,
             restarted,

@@ -655,6 +655,23 @@ impl Store {
         Ok(())
     }
 
+    /// How many entries are held for `channel`, opened or not.
+    ///
+    /// A count rather than `messages().len()`, because the one caller asks
+    /// precisely when it cannot open any of them — loading every sealed body
+    /// to discover there is at least one would be work done to throw away.
+    pub fn held(&self, channel: &[u8; 32]) -> Result<usize> {
+        let n: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .map_err(storage("count held"))?;
+        Ok(n as usize)
+    }
+
     /// Everything we have kept for a channel, oldest first.
     ///
     /// Returns the decrypted body bytes; decoding them is the caller's job,
@@ -1167,6 +1184,47 @@ mod tests {
             theirs.key(&[7; 32], 1),
             Err(StoreError::Sealed(_))
         ));
+    }
+
+    #[test]
+    fn held_counts_entries_without_opening_them() {
+        // The guard that reports a stranded conversation asks this precisely
+        // when it can open nothing, so it must count sealed rows as held —
+        // a count that only saw opened messages would report zero exactly
+        // when the warning is needed, and the conversation would go back to
+        // rendering as empty.
+        let s = Store::open(&seed(1), None).unwrap();
+        assert_eq!(s.held(&[7; 32]).unwrap(), 0, "a channel with nothing in it");
+
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 1,
+                account: key(2),
+                posted: 100,
+                kind: 1,
+                plain: Some(b"readable"),
+            },
+        )
+        .unwrap();
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 2,
+                account: key(2),
+                posted: 101,
+                kind: 1,
+                plain: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(s.held(&[7; 32]).unwrap(), 2, "opened and unopened alike");
+        assert_eq!(
+            s.held(&[9; 32]).unwrap(),
+            0,
+            "a different channel is not counted"
+        );
     }
 
     #[test]
