@@ -35,6 +35,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha512};
+use sqex_proto::channel::KIND_MEMBER;
 use sqex_proto::channel_key::{ChannelKey, Replay};
 use sqex_proto::entry_sig::GENESIS;
 use sqex_proto::prekey::{KIND_FALLBACK, KIND_ONE_TIME, Pool, PoolState};
@@ -655,6 +656,58 @@ impl Store {
         Ok(())
     }
 
+    /// How many **member** entries are held for `channel`, opened or not.
+    ///
+    /// System entries are excluded deliberately, and the distinction is the
+    /// whole point. A direct message that has been created and never written
+    /// to still carries the system entries of its own creation, so counting
+    /// those would report a conversation as holding something unreadable when
+    /// what it holds is its own paperwork — and the reader would be warned
+    /// about missing messages that were never sent.
+    ///
+    /// A count rather than `messages().len()`, because the one caller asks
+    /// precisely when it cannot open any of them — loading every sealed body
+    /// to discover there is at least one would be work done to throw away.
+    pub fn held(&self, channel: &[u8; 32]) -> Result<usize> {
+        let n: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE channel = ?1 AND kind = ?2",
+                params![&channel[..], KIND_MEMBER],
+                |r| r.get(0),
+            )
+            .map_err(storage("count held"))?;
+        Ok(n as usize)
+    }
+
+    /// The member entries we hold and never opened, oldest first.
+    ///
+    /// `put_message` writes a NULL body for an entry it could not open, and
+    /// `redact_message` writes an empty one instead precisely so the two stay
+    /// apart across a restart — this is the query that distinction exists for.
+    ///
+    /// The caller has its own list of what the current fold could not open,
+    /// but that covers only entries this poll fetched. Anything stored by an
+    /// earlier run is never re-folded, so without this the report is empty on
+    /// every poll but the first.
+    pub fn unopened(&self, channel: &[u8; 32]) -> Result<Vec<u64>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT seq FROM message
+                 WHERE channel = ?1 AND kind = ?2 AND sealed IS NULL
+                 ORDER BY seq ASC",
+            )
+            .map_err(storage("prepare unopened"))?;
+        let rows = stmt
+            .query_map(params![&channel[..], KIND_MEMBER], |r| {
+                r.get::<_, i64>(0).map(|n| n as u64)
+            })
+            .map_err(storage("query unopened"))?;
+        rows.collect::<std::result::Result<Vec<u64>, _>>()
+            .map_err(storage("read unopened"))
+    }
+
     /// Everything we have kept for a channel, oldest first.
     ///
     /// Returns the decrypted body bytes; decoding them is the caller's job,
@@ -1167,6 +1220,117 @@ mod tests {
             theirs.key(&[7; 32], 1),
             Err(StoreError::Sealed(_))
         ));
+    }
+
+    #[test]
+    fn held_counts_entries_without_opening_them() {
+        // The guard that reports a stranded conversation asks this precisely
+        // when it can open nothing, so it must count sealed rows as held —
+        // a count that only saw opened messages would report zero exactly
+        // when the warning is needed, and the conversation would go back to
+        // rendering as empty.
+        let s = Store::open(&seed(1), None).unwrap();
+        assert_eq!(s.held(&[7; 32]).unwrap(), 0, "a channel with nothing in it");
+
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 1,
+                account: key(2),
+                posted: 100,
+                kind: 1,
+                plain: Some(b"readable"),
+            },
+        )
+        .unwrap();
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 2,
+                account: key(2),
+                posted: 101,
+                kind: 1,
+                plain: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(s.held(&[7; 32]).unwrap(), 2, "opened and unopened alike");
+
+        // A channel's own creation paperwork is not something the reader is
+        // missing. Counting it warns about messages that were never sent —
+        // which is exactly what the first version of this did, on a direct
+        // message that had been created and never written to.
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 3,
+                account: key(2),
+                posted: 102,
+                kind: 0,
+                plain: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.held(&[7; 32]).unwrap(),
+            2,
+            "a system entry is not held content"
+        );
+        assert_eq!(
+            s.held(&[9; 32]).unwrap(),
+            0,
+            "a different channel is not counted"
+        );
+    }
+
+    #[test]
+    fn unopened_reports_held_entries_that_never_opened() {
+        // The distinction this rests on: a NULL body means held and never
+        // opened, an empty body means redacted. `redact_message` writes the
+        // empty one on purpose so the two survive a restart apart, and a
+        // report that confused them would call deleted messages lost history.
+        let s = Store::open(&seed(1), None).unwrap();
+        assert!(s.unopened(&[7; 32]).unwrap().is_empty(), "nothing held");
+
+        let put = |seq: u64, kind: u8, plain: Option<&[u8]>| {
+            s.put_message(
+                &[7; 32],
+                Kept {
+                    seq,
+                    account: key(2),
+                    posted: 100 + seq,
+                    kind,
+                    plain,
+                },
+            )
+            .unwrap()
+        };
+        put(1, 1, Some(b"opened"));
+        put(2, 1, None);
+        put(3, 0, None);
+        put(4, 1, Some(b"also opened"));
+        put(5, 1, None);
+
+        assert_eq!(
+            s.unopened(&[7; 32]).unwrap(),
+            vec![2, 5],
+            "only member entries with no body, oldest first"
+        );
+
+        // A redaction empties the body rather than nulling it, so a deleted
+        // message must not surface as history nobody could read.
+        s.redact_message(&[7; 32], 4).unwrap();
+        assert_eq!(
+            s.unopened(&[7; 32]).unwrap(),
+            vec![2, 5],
+            "a redacted message is not unopened"
+        );
+
+        assert!(
+            s.unopened(&[9; 32]).unwrap().is_empty(),
+            "a different channel is not counted"
+        );
     }
 
     #[test]

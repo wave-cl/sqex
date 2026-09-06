@@ -1105,6 +1105,11 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             conv.timeline = got.timeline;
             conv.trouble.unreadable = got.unreadable.len();
             conv.trouble.lost = got.lost;
+            // Set on the success path too. Until now only `Err(NoKey)` set it,
+            // and that error comes from `ensure_epoch`, which runs when you
+            // *write*. A reader who never posts got a clean `Ok` with an empty
+            // timeline and was told nothing at all.
+            conv.trouble.no_key = got.no_key;
             conv.trouble.gap = got.gap;
             conv.trouble.restarted = got.restarted;
             // SIP-31 reports three states and not two, and until now only
