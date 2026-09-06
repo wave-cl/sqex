@@ -35,6 +35,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha512};
+use sqex_proto::channel::KIND_MEMBER;
 use sqex_proto::channel_key::{ChannelKey, Replay};
 use sqex_proto::entry_sig::GENESIS;
 use sqex_proto::prekey::{KIND_FALLBACK, KIND_ONE_TIME, Pool, PoolState};
@@ -655,7 +656,14 @@ impl Store {
         Ok(())
     }
 
-    /// How many entries are held for `channel`, opened or not.
+    /// How many **member** entries are held for `channel`, opened or not.
+    ///
+    /// System entries are excluded deliberately, and the distinction is the
+    /// whole point. A direct message that has been created and never written
+    /// to still carries the system entries of its own creation, so counting
+    /// those would report a conversation as holding something unreadable when
+    /// what it holds is its own paperwork — and the reader would be warned
+    /// about missing messages that were never sent.
     ///
     /// A count rather than `messages().len()`, because the one caller asks
     /// precisely when it cannot open any of them — loading every sealed body
@@ -664,8 +672,8 @@ impl Store {
         let n: i64 = self
             .db
             .query_row(
-                "SELECT COUNT(*) FROM message WHERE channel = ?1",
-                params![&channel[..]],
+                "SELECT COUNT(*) FROM message WHERE channel = ?1 AND kind = ?2",
+                params![&channel[..], KIND_MEMBER],
                 |r| r.get(0),
             )
             .map_err(storage("count held"))?;
@@ -1220,6 +1228,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(s.held(&[7; 32]).unwrap(), 2, "opened and unopened alike");
+
+        // A channel's own creation paperwork is not something the reader is
+        // missing. Counting it warns about messages that were never sent —
+        // which is exactly what the first version of this did, on a direct
+        // message that had been created and never written to.
+        s.put_message(
+            &[7; 32],
+            Kept {
+                seq: 3,
+                account: key(2),
+                posted: 102,
+                kind: 0,
+                plain: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.held(&[7; 32]).unwrap(),
+            2,
+            "a system entry is not held content"
+        );
         assert_eq!(
             s.held(&[9; 32]).unwrap(),
             0,
