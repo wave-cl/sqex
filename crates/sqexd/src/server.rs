@@ -597,6 +597,12 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 {
                     tracing::info!(pruned, closed, "swept channels");
                 }
+                // SIP-25: the rendezvous store is in-memory. `request` prunes
+                // expired `asked` opportunistically, but the per-pair `waiters`
+                // notifiers are only reclaimed here — without this sweep they
+                // accumulate one entry per distinct pair that ever long-polled,
+                // an unbounded leak. Cheap in-memory work, no spawn_blocking.
+                server.rendezvous.sweep();
             }
         }
     };
@@ -2149,6 +2155,7 @@ impl Server {
             "whitelist_enabled": state.enabled(),
             "whitelist_count": state.keys().len(),
             "beacons": self.beacons.len(),
+            "rendezvous_pending": self.rendezvous.len(),
             "requests": self.requests(),
             "event_streams": self.events.total(),
             "mail_waiting": self.mailbox.waiting(),
