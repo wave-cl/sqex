@@ -373,6 +373,10 @@ pub async fn bind(
     if let Some(versions) = &config.accepted_envelope_versions {
         squic_config.accepted_envelope_versions = versions.clone();
     }
+    // Bound concurrently-established connections when the operator set a cap.
+    if let Some(n) = config.max_connections {
+        squic_config.max_connections = Some(n);
+    }
 
     let accepted_envelope_versions = squic_config.accepted_envelope_versions.clone();
     let listener = Arc::new(
