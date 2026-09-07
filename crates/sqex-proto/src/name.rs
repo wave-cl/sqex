@@ -38,6 +38,10 @@ pub const CLAIM_TAKEN: u8 = 1;
 pub const CLAIM_AT_CAPACITY: u8 = 2;
 pub const CLAIM_CLOSED: u8 = 3;
 pub const CLAIM_RATE_LIMITED: u8 = 4;
+/// The exchange's global name store is full (operator's `max_names`). Distinct
+/// from `AT_CAPACITY` (the caller's own per-account limit): this is the whole
+/// directory, not just you.
+pub const CLAIM_FULL: u8 = 5;
 
 /// `flags` bit 0 in a [`Resolved`]: the lease has lapsed but no one has
 /// reclaimed the name. It still resolves; the flag says it is on notice.
@@ -477,6 +481,7 @@ mod tests {
             CLAIM_AT_CAPACITY,
             CLAIM_CLOSED,
             CLAIM_RATE_LIMITED,
+            CLAIM_FULL,
         ] {
             let a = ClaimAck {
                 outcome,
@@ -501,6 +506,72 @@ mod tests {
         let none = Resolved::none(1_700_000_000);
         assert_eq!(Resolved::decode(&none.encode()).unwrap(), none);
         assert!(!none.found);
+    }
+
+    /// Every `/name` decoder must reject adversarial bytes with an error, never
+    /// a panic — the wire is attacker-controlled on a public exchange. Reaching
+    /// the end of this test *is* the assertion (no unwind).
+    #[test]
+    fn decoders_reject_garbage_without_panicking() {
+        let mut inputs: Vec<Vec<u8>> = vec![vec![]];
+        for b in 0u8..=255 {
+            inputs.push(vec![b]); // type-byte space, and 1-byte truncations
+        }
+        for tb in [
+            TYPE_CLAIM,
+            TYPE_RELEASE,
+            TYPE_RESOLVE,
+            TYPE_REVERSE,
+            0x00,
+            0x7f,
+            0xff,
+        ] {
+            inputs.push(vec![tb, 255]); // length says 255, empty body
+            inputs.push(vec![tb, 3, b'a']); // length says 3, one byte
+            inputs.push(vec![tb, 2, b'a', b'b', b'c']); // length 2, trailing bytes
+            inputs.push(vec![tb, 4, 0xff, 0xfe, 0x00, 0x01]); // non-UTF-8 body
+            inputs.push(vec![tb, 1, b'@']); // valid frame, invalid name char
+            inputs.push(vec![tb, 0]); // zero-length name
+        }
+        // Truncations of well-formed messages.
+        for whole in [
+            Claim {
+                name: "colin".into(),
+            }
+            .encode(),
+            Reverse {
+                account: PubKey::new([9; 32]),
+            }
+            .encode(),
+            Resolved {
+                found: true,
+                now: 1,
+                account: PubKey::new([1; 32]),
+                registered_at: 1,
+                last_active: 1,
+                expires_at: 1,
+                stale: false,
+            }
+            .encode(),
+            Names {
+                now: 1,
+                names: vec!["a".into(), "b".into()],
+            }
+            .encode(),
+        ] {
+            for i in 0..=whole.len() {
+                inputs.push(whole[..i].to_vec());
+            }
+        }
+        for b in &inputs {
+            let _ = Claim::decode(b);
+            let _ = Release::decode(b);
+            let _ = Resolve::decode(b);
+            let _ = Reverse::decode(b);
+            let _ = ClaimAck::decode(b);
+            let _ = Resolved::decode(b);
+            let _ = Names::decode(b);
+        }
     }
 
     #[test]

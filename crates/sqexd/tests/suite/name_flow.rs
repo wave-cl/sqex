@@ -22,6 +22,7 @@ use squic::Config as SquicConfig;
 async fn spawn_server(
     mode: &str,
     admin: Option<&PubKey>,
+    max_names: Option<u64>,
 ) -> (SocketAddr, [u8; 32], tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("host_key");
@@ -31,10 +32,13 @@ async fn spawn_server(
         Some(a) => format!("admins = [\"{}\"]\n", a.to_base58()),
         None => "admins = []\n".to_string(),
     };
+    let cap = max_names
+        .map(|n| format!("max_names = {n}\n"))
+        .unwrap_or_default();
     let config_toml = format!(
         "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\n\
          welcome_channel = \"\"\nname_registration = \"{mode}\"\n\
-         max_names_per_account = 2\nname_lease_secs = 100000\n{admins}",
+         max_names_per_account = 2\nname_lease_secs = 100000\n{cap}{admins}",
         key_path.to_string_lossy(),
         dir.path().join("sqex.state").to_string_lossy(),
     );
@@ -173,7 +177,7 @@ impl Client {
 async fn open_registration_claim_resolve_release() {
     let (a_seed, a) = identity(1);
     let (b_seed, b) = identity(2);
-    let (addr, server_pub, _dir) = spawn_server("open", None).await;
+    let (addr, server_pub, _dir) = spawn_server("open", None, None).await;
 
     let mut alice = Client::connect(addr, &server_pub, &a_seed).await;
     let mut bob = Client::connect(addr, &server_pub, &b_seed).await;
@@ -225,7 +229,7 @@ async fn closed_registration_is_administrator_only() {
     let admin_signer = SoftwareSigner::new(admin_sk);
 
     let (a_seed, a) = identity(1);
-    let (addr, server_pub, _dir) = spawn_server("closed", Some(&admin_pub)).await;
+    let (addr, server_pub, _dir) = spawn_server("closed", Some(&admin_pub), None).await;
     let server_pub_key = PubKey::new(server_pub);
 
     let mut alice = Client::connect(addr, &server_pub, &a_seed).await;
@@ -277,7 +281,7 @@ async fn closed_registration_is_administrator_only() {
 #[tokio::test]
 async fn off_mode_does_not_offer_the_route() {
     let (a_seed, _a) = identity(1);
-    let (addr, server_pub, _dir) = spawn_server("off", None).await;
+    let (addr, server_pub, _dir) = spawn_server("off", None, None).await;
     let mut alice = Client::connect(addr, &server_pub, &a_seed).await;
     let (code, _) = alice
         .post(
@@ -289,4 +293,33 @@ async fn off_mode_does_not_offer_the_route() {
         )
         .await;
     assert_eq!(code, 404, "the name route is not offered when off");
+}
+
+/// Security pass: the global `max_names` cap bounds the whole directory, so a
+/// mint-flood (distinct identities each with room under the per-account cap)
+/// cannot fill it past the operator's limit. The third distinct account is
+/// refused with `CLAIM_FULL`; releasing frees a slot.
+#[tokio::test]
+async fn global_cap_bounds_a_mint_flood() {
+    use sqex_proto::name::CLAIM_FULL;
+    let (addr, server_pub, _dir) = spawn_server("open", None, Some(2)).await;
+
+    let mut clients = Vec::new();
+    for i in 1..=3u8 {
+        let (seed, _) = identity(i);
+        clients.push(Client::connect(addr, &server_pub, &seed).await);
+    }
+    assert_eq!(clients[0].claim("one").await.outcome, CLAIM_GRANTED);
+    assert_eq!(clients[1].claim("two").await.outcome, CLAIM_GRANTED);
+    // Directory full: a fresh identity is refused despite its own empty quota.
+    assert_eq!(clients[2].claim("three").await.outcome, CLAIM_FULL);
+    // Freeing a slot lets the flood's next identity in.
+    let (code, _) = clients[0]
+        .post(
+            "/name/release",
+            sqex_proto::name::Release { name: "one".into() }.encode(),
+        )
+        .await;
+    assert_eq!(code, 200);
+    assert_eq!(clients[2].claim("three").await.outcome, CLAIM_GRANTED);
 }

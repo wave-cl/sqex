@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::name::{
-    CLAIM_AT_CAPACITY, CLAIM_GRANTED, CLAIM_RATE_LIMITED, CLAIM_TAKEN, Resolved,
+    CLAIM_AT_CAPACITY, CLAIM_FULL, CLAIM_GRANTED, CLAIM_RATE_LIMITED, CLAIM_TAKEN, Resolved,
 };
 use sqnr_core::PubKey;
 
@@ -60,14 +60,24 @@ pub struct Names {
     db: Mutex<Connection>,
     /// How long a self-claim survives without renewal.
     lease_secs: u64,
+    /// Optional global cap on total bound names (operator's `max_names`). None
+    /// is unlimited. Bounds a mint-flood: the per-account cap and claim rate are
+    /// both per-account and so bypassable by minting identities, which this is
+    /// the backstop for — the same reasoning as squic's `max_connections`.
+    max_names: Option<u64>,
     /// Successful-claim timestamps per account, for the hourly rate limit. In
     /// memory: it bounds abuse over an hour, and a restart that forgot it costs
-    /// nothing worth protecting.
+    /// nothing worth protecting. Pruned by `sweep_rate_limiter` so it does not
+    /// grow one entry per account that ever claimed.
     claims: Mutex<HashMap<[u8; 32], Vec<u64>>>,
 }
 
 impl Names {
-    pub fn open(path: Option<&Path>, lease_secs: u64) -> rusqlite::Result<Names> {
+    pub fn open(
+        path: Option<&Path>,
+        lease_secs: u64,
+        max_names: Option<u64>,
+    ) -> rusqlite::Result<Names> {
         let db = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -78,6 +88,7 @@ impl Names {
         Ok(Names {
             db: Mutex::new(db),
             lease_secs,
+            max_names,
             claims: Mutex::new(HashMap::new()),
         })
     }
@@ -147,6 +158,20 @@ impl Names {
         // so the count (which does not include this name) is the right basis.
         if count as usize >= max_per_account {
             return CLAIM_AT_CAPACITY;
+        }
+        // Global cap (operator's `max_names`): only a brand-new row grows the
+        // store, so a reclaim of another account's lapsed name (an UPDATE, net
+        // rows unchanged) is exempt. This is the backstop for a mint-flood the
+        // per-account limits cannot bound.
+        if existing.is_none()
+            && let Some(cap) = self.max_names
+        {
+            let total: i64 = tx
+                .query_row("SELECT COUNT(*) FROM name", [], |r| r.get(0))
+                .unwrap_or(0);
+            if total as u64 >= cap {
+                return CLAIM_FULL;
+            }
         }
         if self.rate_limited(account, now) {
             return CLAIM_RATE_LIMITED;
@@ -334,7 +359,25 @@ impl Names {
         let mut claims = self.claims.lock().unwrap();
         let log = claims.entry(*account.as_bytes()).or_default();
         log.retain(|&t| now.saturating_sub(t) < 3600);
+        if log.is_empty() {
+            // Do not leave an empty vec behind for an account that pruned to
+            // nothing — it would otherwise linger until the next periodic sweep.
+            claims.remove(account.as_bytes());
+            return false;
+        }
         log.len() >= CLAIM_RATE_PER_HOUR
+    }
+
+    /// Evict rate-limiter entries with no claim in the last hour. Without this
+    /// the map grows one entry per account that ever claimed and never shrinks,
+    /// because a quiet account's stale entry is only pruned when *it* claims
+    /// again. Called from the periodic sweeper beside [`sweep`](Self::sweep).
+    pub fn sweep_rate_limiter(&self, now: u64) {
+        let mut claims = self.claims.lock().unwrap();
+        claims.retain(|_, log| {
+            log.retain(|&t| now.saturating_sub(t) < 3600);
+            !log.is_empty()
+        });
     }
 
     fn record_claim(&self, account: &PubKey, now: u64) {
@@ -353,7 +396,59 @@ mod tests {
     }
 
     fn names(lease: u64) -> Names {
-        Names::open(None, lease).unwrap()
+        Names::open(None, lease, None).unwrap()
+    }
+
+    fn names_capped(lease: u64, max: u64) -> Names {
+        Names::open(None, lease, Some(max)).unwrap()
+    }
+
+    /// The global cap (operator's `max_names`) backstops the mint-flood the
+    /// per-account cap and rate limit cannot: it bounds *total* names, counting
+    /// distinct accounts, and refuses a new binding once full with `CLAIM_FULL`.
+    #[test]
+    fn the_global_cap_bounds_the_whole_directory() {
+        let n = names_capped(3600, 2);
+        assert_eq!(n.claim("a", &pk(1), 100), CLAIM_GRANTED);
+        assert_eq!(n.claim("b", &pk(2), 100), CLAIM_GRANTED); // different account
+        // Full: a third distinct account cannot add a new row, even with room
+        // under its own per-account cap.
+        assert_eq!(n.claim("c", &pk(3), 100), CLAIM_FULL);
+        // A holder may still renew its own name at the cap (no new row).
+        assert_eq!(n.claim("a", &pk(1), 100), CLAIM_GRANTED);
+        // And releasing frees a slot.
+        assert!(n.release("a", &pk(1)));
+        assert_eq!(n.claim("c", &pk(3), 100), CLAIM_GRANTED);
+    }
+
+    /// Reclaiming another account's lapsed name is an UPDATE, not a new row, so
+    /// it is exempt from the global cap — the directory stays full but the name
+    /// changes hands.
+    #[test]
+    fn reclaim_is_exempt_from_the_global_cap() {
+        let n = names_capped(0, 1); // zero lease: names are stale at once
+        assert_eq!(n.claim("x", &pk(1), 100), CLAIM_GRANTED);
+        // Full (1 row), but pk(2) may reclaim x from pk(1) — no new row.
+        assert_eq!(n.claim("y", &pk(2), 100), CLAIM_FULL);
+        assert_eq!(n.claim("x", &pk(2), 100), CLAIM_GRANTED);
+        assert_eq!(n.resolve("x").account, pk(2));
+    }
+
+    /// The rate-limiter map is evicted by the sweep, so it does not grow one
+    /// entry per account that ever claimed (Finding B).
+    #[test]
+    fn the_rate_limiter_map_is_swept() {
+        let n = names(3600);
+        for i in 0..5u8 {
+            assert_eq!(n.claim(&format!("n{i}"), &pk(i), 100), CLAIM_GRANTED);
+        }
+        assert_eq!(n.claims.lock().unwrap().len(), 5, "one entry per claimer");
+        // Far in the future, every timestamp is stale → all entries evicted.
+        n.sweep_rate_limiter(now_unix() + 100_000);
+        assert!(
+            n.claims.lock().unwrap().is_empty(),
+            "stale rate-limiter entries must be reclaimed"
+        );
     }
 
     #[test]

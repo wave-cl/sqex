@@ -1379,6 +1379,9 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
                 name::CLAIM_RATE_LIMITED => {
                     println!("refused: too many claims this hour — try again later")
                 }
+                name::CLAIM_FULL => {
+                    println!("refused: this exchange's name directory is full")
+                }
                 other => println!("unexpected claim outcome: {other}"),
             }
             Ok(())

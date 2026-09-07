@@ -116,6 +116,13 @@ pub struct FileConfig {
     /// by default (30 days) — a name is not an address.
     #[serde(default = "default_name_lease_secs")]
     pub name_lease_secs: u64,
+    /// SIP-38: optional cap on the *total* number of bound names. Unset means
+    /// unlimited. The per-account cap and claim rate are per-account and so
+    /// bypassable by minting identities; this is the global backstop against a
+    /// mint-flood filling the directory (the same shape as `max_connections`).
+    /// Administrator assignments are exempt.
+    #[serde(default)]
+    pub max_names: Option<u64>,
 
     /// SIP-35: base58 Ed25519 identities of exchanges this one will serve
     /// replication to.
@@ -182,6 +189,7 @@ pub struct Config {
     pub name_registration: NameMode,
     pub max_names_per_account: usize,
     pub name_lease_secs: u64,
+    pub max_names: Option<u64>,
     pub replication_peers: Vec<PubKey>,
     pub replicate: Vec<OriginConfig>,
 }
@@ -278,6 +286,13 @@ impl FileConfig {
                 "max_names_per_account must be a positive value".into(),
             ));
         }
+        // A global cap of zero would refuse every claim — unlimited is None
+        // (the field left out), not 0. Same rule as max_connections.
+        if self.max_names == Some(0) {
+            return Err(Error::Malformed(
+                "max_names must be omitted (unlimited) or a positive value".into(),
+            ));
+        }
 
         Ok(Config {
             listen,
@@ -290,6 +305,7 @@ impl FileConfig {
             accepted_envelope_versions: self.accepted_envelope_versions,
             max_connections: self.max_connections,
             name_registration,
+            max_names: self.max_names,
             max_names_per_account: self.max_names_per_account as usize,
             name_lease_secs: self.name_lease_secs,
             replication_peers,
@@ -377,12 +393,18 @@ mod tests {
 
     #[test]
     fn name_registration_parses_and_defaults_off() {
-        // Default: off, cap 4, a long lease.
+        // Default: off, cap 4, a long lease, no global cap.
         let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
         let cfg = cfg.resolve().unwrap();
         assert_eq!(cfg.name_registration, NameMode::Off);
         assert_eq!(cfg.max_names_per_account, 4);
         assert_eq!(cfg.name_lease_secs, 30 * 24 * 3600);
+        assert_eq!(cfg.max_names, None);
+        // A global cap passes through; zero is refused at load.
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_names = 5000\n").unwrap();
+        assert_eq!(cfg.resolve().unwrap().max_names, Some(5000));
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_names = 0\n").unwrap();
+        assert!(cfg.resolve().is_err());
         // Open, with an operator-set cap and lease.
         let cfg: FileConfig = toml::from_str(
             "key_file = \"/x\"\nname_registration = \"open\"\nmax_names_per_account = 2\nname_lease_secs = 3600\n",

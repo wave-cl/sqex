@@ -474,7 +474,7 @@ pub async fn bind(
             .map_err(|e| Error::Malformed(format!("cannot open the device registry: {e}")))?,
         // Durable, beside the device registry — a name is the identity a person
         // keeps across address and device changes (SIP-38).
-        names: Names::open(name_db.as_deref(), config.name_lease_secs)
+        names: Names::open(name_db.as_deref(), config.name_lease_secs, config.max_names)
             .map_err(|e| Error::Malformed(format!("cannot open the name directory: {e}")))?,
         name_registration: config.name_registration,
         max_names_per_account: config.max_names_per_account,
@@ -639,6 +639,10 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 {
                     tracing::info!(dropped, "swept abandoned names");
                 }
+                // SIP-38: evict stale rate-limiter entries so the in-memory map
+                // does not grow one entry per account that ever claimed. Cheap
+                // in-memory work, no spawn_blocking.
+                server.names.sweep_rate_limiter(now_unix());
             }
         }
     };
