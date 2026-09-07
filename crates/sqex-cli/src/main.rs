@@ -31,6 +31,8 @@ use sqex_proto::session::{
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
+mod handles;
+
 #[derive(Parser)]
 #[command(
     name = "sqex",
@@ -85,6 +87,22 @@ enum Cmd {
     Name {
         #[command(subcommand)]
         cmd: NameCmd,
+    },
+    /// Show this identity's key and the names (SIP-38 handles) it holds, and
+    /// verify each still resolves to you.
+    ///
+    /// Handles are recorded locally beside the identity — a hint, not authority;
+    /// the exchange's directory is the source of truth. The primary handle's
+    /// domain is the default exchange, so a claimed name replaces a `server=`
+    /// line. `sqex name claim` records a handle; `--add`/`--forget` edit them by
+    /// hand (for a name claimed elsewhere, or held on another exchange).
+    Whoami {
+        /// Record a `name@domain` handle for this identity.
+        #[arg(long, value_name = "NAME@DOMAIN")]
+        add: Option<String>,
+        /// Forget a handle: a bare name (every domain), or a full name@domain.
+        #[arg(long, value_name = "NAME")]
+        forget: Option<String>,
     },
     /// Rendezvous: ask to be introduced to a peer, so the two of you can
     /// connect directly.
@@ -394,6 +412,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
         Cmd::Name { cmd } => names(&cli, &cfg, cmd).await,
+        Cmd::Whoami { add, forget } => whoami(&cli, &cfg, add.as_deref(), forget.as_deref()).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Meet {
@@ -1348,7 +1367,7 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
             }
             let name = name::canonical(name).map_err(|e| e.to_string())?;
             let signer = load_software_identity(cli, cfg)?;
-            let (addr, server) = endpoint(cli, cfg).await?;
+            let (addr, server, domain) = resolve_endpoint(cli, cfg).await?;
             let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
             let (code, body) = client
                 .post("/name/claim", name::Claim { name: name.clone() }.encode())
@@ -1359,7 +1378,22 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
             let ack = ClaimAck::decode(&body).map_err(|e| e.to_string())?;
             match ack.outcome {
                 name::CLAIM_GRANTED => {
-                    println!("{name} is yours ({})", PubKey::new(signer.public()))
+                    println!("{name} is yours ({})", PubKey::new(signer.public()));
+                    // Record it as a handle for this identity, so it becomes the
+                    // default exchange and shows in `sqex whoami`.
+                    match &domain {
+                        Some(d) => match identity_path(cli, cfg)
+                            .and_then(|id| handles::add(&id, &format!("{name}@{d}")))
+                        {
+                            Ok((h, true)) => println!("  recorded {h} as one of your handles"),
+                            Ok((_, false)) => {}
+                            Err(e) => eprintln!("  (could not record handle: {e})"),
+                        },
+                        None => println!(
+                            "  (reached by host+key, so no domain to record; add it with \
+                             `sqex whoami --add {name}@<domain>`)"
+                        ),
+                    }
                 }
                 name::CLAIM_TAKEN => println!("{name} is held by another account"),
                 name::CLAIM_AT_CAPACITY => {
@@ -1382,7 +1416,7 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
             }
             let name = name::canonical(name).map_err(|e| e.to_string())?;
             let signer = load_software_identity(cli, cfg)?;
-            let (addr, server) = endpoint(cli, cfg).await?;
+            let (addr, server, domain) = resolve_endpoint(cli, cfg).await?;
             let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
             let (code, body) = client
                 .post(
@@ -1394,6 +1428,13 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
                 return Err(format!("release refused ({code}): {}", said(&body)));
             }
             println!("released {name} (a no-op if your account did not hold it)");
+            // Drop the matching local handle too, so `whoami` stays honest.
+            if let Some(d) = &domain
+                && let Ok(id) = identity_path(cli, cfg)
+                && handles::remove(&id, &format!("{name}@{d}")).unwrap_or(false)
+            {
+                println!("  and forgot the {name}@{d} handle");
+            }
             Ok(())
         }
         NameCmd::Resolve { name } => {
@@ -1468,6 +1509,88 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+// ---- whoami (SIP-38 handles) ------------------------------------------------
+
+async fn whoami(
+    cli: &Cli,
+    cfg: &Config,
+    add: Option<&str>,
+    forget: Option<&str>,
+) -> Result<(), String> {
+    let id = identity_path(cli, cfg)?;
+    if let Some(h) = add {
+        let (h, added) = handles::add(&id, h)?;
+        println!(
+            "{}",
+            if added {
+                format!("added {h}")
+            } else {
+                format!("{h} was already recorded")
+            }
+        );
+    }
+    if let Some(h) = forget {
+        println!(
+            "{}",
+            if handles::remove(&id, h)? {
+                format!("forgot {h}")
+            } else {
+                format!("no handle matched {h:?}")
+            }
+        );
+    }
+
+    // Reads the public-key line only — no passphrase, even for an encrypted key.
+    let me = own_identity(cli, cfg)?;
+    println!("identity {me}");
+    let hs = handles::load(&id);
+    if hs.is_empty() {
+        println!("  no handles recorded — claim one, or `sqex whoami --add name@domain`");
+        return Ok(());
+    }
+    for (i, h) in hs.iter().enumerate() {
+        let role = if i == 0 { "primary" } else { "alias  " };
+        println!("  {role}  {h}  {}", verify_handle(h, &me).await);
+    }
+    Ok(())
+}
+
+/// Best-effort check that a `name@domain` handle still resolves to `me` on its
+/// domain's exchange. Returns a short status marker and never fails — a handle
+/// is a hint, and the exchange is the authority (SIP-38).
+async fn verify_handle(handle: &str, me: &PubKey) -> String {
+    let Some((local, domain)) = handle.split_once('@') else {
+        return "(malformed handle)".into();
+    };
+    let name = match name::canonical(local) {
+        Ok(n) => n,
+        Err(e) => return format!("(bad name: {e})"),
+    };
+    let (addr, server) = match resolve_domain(domain).await {
+        Ok(v) => v,
+        Err(e) => return format!("(unreachable: {e})"),
+    };
+    let mut client = match Client::connect(addr, server.as_bytes()).await {
+        Ok(c) => c,
+        Err(e) => return format!("(unreachable: {e})"),
+    };
+    let body = match client
+        .post("/name/resolve", name::Resolve { name }.encode())
+        .await
+    {
+        Ok((200, body)) => body,
+        Ok((code, body)) => return format!("(exchange said {code}: {})", said(&body)),
+        Err(e) => return format!("(unreachable: {e})"),
+    };
+    match name::Resolved::decode(&body) {
+        Ok(r) if !r.found => "✗ no longer registered".into(),
+        Ok(r) if &r.account != me => format!("✗ resolves to {} — NOT this identity", r.account),
+        Ok(r) if r.stale => "✓ STALE (lease lapsed, may be reclaimed)".into(),
+        Ok(_) => "✓".into(),
+        Err(e) => format!("(bad reply: {e})"),
     }
 }
 
@@ -1692,8 +1815,8 @@ fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
 /// The layers a caller can speak through, most specific first. Resolution is
 /// shared with the other clients in `sqex_discovery::target`, because three
 /// copies of it is what produced two bugs in a day.
-fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
-    [
+fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
+    let mut layers = vec![
         sqex_discovery::Layer {
             server: cli.server.clone(),
             host: cli.server_host.clone(),
@@ -1718,13 +1841,37 @@ fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
             },
             _ => sqex_discovery::Layer::default(),
         },
-    ]
+    ];
+    // Lowest priority: the active identity's primary handle domain (SIP-38), so
+    // a claimed name *is* the default exchange and no `server =` pointer is
+    // needed. Reading the sidecar is a cleartext file read — no passphrase.
+    if let Ok(id) = identity_path(cli, cfg)
+        && let Some(domain) = handles::primary_domain(&id)
+    {
+        layers.push(sqex_discovery::Layer {
+            server: Some(domain),
+            ..Default::default()
+        });
+    }
+    layers
 }
 
 /// Resolve the server address and pinned key without connecting.
 async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
+    let (addr, key, _domain) = resolve_endpoint(cli, cfg).await?;
+    Ok((addr, key))
+}
+
+/// Like [`endpoint`], but also returns the domain when the exchange was reached
+/// by SIP-33 discovery (`None` for a literal host+key). The domain is what a
+/// SIP-38 handle needs — the caller can record `name@domain` only when it is
+/// known.
+async fn resolve_endpoint(
+    cli: &Cli,
+    cfg: &Config,
+) -> Result<(SocketAddr, PubKey, Option<String>), String> {
     match sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())? {
-        sqex_discovery::Target::Direct { address, key } => Ok((resolve(&address)?, key)),
+        sqex_discovery::Target::Direct { address, key } => Ok((resolve(&address)?, key, None)),
         sqex_discovery::Target::Discover(domain) => {
             let found = sqex_discovery::discover(&domain)
                 .await
@@ -1736,7 +1883,7 @@ async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), Strin
                     found.key
                 );
             }
-            Ok((resolve(&found.address)?, found.key))
+            Ok((resolve(&found.address)?, found.key, Some(domain)))
         }
     }
 }
