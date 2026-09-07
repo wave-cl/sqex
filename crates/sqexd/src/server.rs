@@ -718,6 +718,10 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 // does not grow one entry per account that ever claimed. Cheap
                 // in-memory work, no spawn_blocking.
                 server.names.sweep_rate_limiter(now_unix());
+                // SIP-39: bridges have their own lifetime, and an exchange
+                // nobody is calling still has to tidy up the ones abandoned
+                // mid-ring.
+                server.relay.sweep(now_unix());
             }
         }
     };

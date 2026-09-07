@@ -1,0 +1,59 @@
+[Unit]
+Description=sqex exchange (HTTP/3 over sQUIC)
+Documentation=https://github.com/wave-cl/sips
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sqexd -c /etc/sqex/sqexd.toml
+Restart=on-failure
+RestartSec=2s
+
+# An unprivileged account that owns nothing but its own state. Created by
+# systemd itself, so there is no useradd step and no stale account left behind.
+DynamicUser=yes
+StateDirectory=sqex
+StateDirectoryMode=0700
+
+# SIP-33 discovery keeps a pin store of the exchange keys this one has seen, and
+# looks for it under $HOME. The sandbox below leaves the service no home to
+# write to, so without this it falls back to a relative path and fails against a
+# read-only filesystem — which is exactly how cross-exchange calling broke the
+# first time SIP-39 peer discovery was deployed. The state directory is the one
+# writable place the service has.
+Environment=HOME=%S/sqex
+
+# Port 443 is below 1024. This is the whole reason the service would otherwise
+# need root, and the capability is granted on its own rather than by running as
+# root and dropping privileges afterwards.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# The host key is the exchange's identity and the one thing here worth stealing.
+# It is read at startup and never written, so the service gets it read-only.
+LoadCredential=host_key:/etc/sqex/host_key
+
+# Nothing else on the filesystem is any of its business.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

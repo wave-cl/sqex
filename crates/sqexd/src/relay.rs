@@ -37,6 +37,16 @@ use crate::server::Server;
 /// the one datagram path can tell which subsystem a frame belongs to.
 pub const BRIDGE_BIT: u64 = 1 << 63;
 
+/// How long a bridge that has not connected is kept.
+///
+/// A caller that gives up leaves its bridge behind, and `place_call` is keyed by
+/// `(caller, target)` — so without an expiry the abandoned bridge answers every
+/// later call to that peer and the pair becomes **permanently uncallable**. That
+/// is not hypothetical: it is what a live call ran into. Two minutes covers a
+/// ring window with room to spare, and a call nobody has answered in that time
+/// is not going to be.
+pub const RINGING_TTL_SECS: u64 = 120;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Ringing,
@@ -70,6 +80,9 @@ struct BridgeRec {
     local: PubKey,
     /// Caller-side polling result. Unused on the callee side.
     outcome: Outcome,
+    /// When this bridge was made, so it can be expired. A live SIP-12 session
+    /// has a TTL and a sweep; a bridged one had neither.
+    created: u64,
     index: Index,
 }
 
@@ -167,6 +180,12 @@ impl Relay {
         self.max_bridges.is_some_and(|m| n >= m)
     }
 
+    /// Drop bridges that have outlived themselves. Called from the periodic
+    /// sweeper, so an exchange nobody is calling still tidies up.
+    pub fn sweep(&self, now: u64) {
+        expire(&mut self.inner.lock().unwrap(), now);
+    }
+
     /// Concurrent bridged calls, for `/status`.
     pub fn bridge_count(&self) -> usize {
         self.inner.lock().unwrap().bridges.len()
@@ -230,6 +249,39 @@ fn drop_bridge(inner: &mut RelayInner, bridge: &relay::Bridge) {
     }
 }
 
+/// Drop bridges that have outlived their usefulness, telling the far side so a
+/// phone that is still ringing stops.
+///
+/// A bridge that never connected goes after [`RINGING_TTL_SECS`]; one carrying a
+/// call follows SIP-12's own session TTL, because that is how long a call may
+/// legitimately last. Mirrors `Sessions::expire`, which bridged sessions had no
+/// equivalent of.
+fn expire(inner: &mut RelayInner, now: u64) {
+    let dead: Vec<(relay::Bridge, PubKey)> = inner
+        .bridges
+        .iter()
+        .filter(|(_, rec)| {
+            let age = now.saturating_sub(rec.created);
+            match rec.outcome {
+                Outcome::Established => age > sqex_proto::session::TTL_SECS,
+                _ => age > RINGING_TTL_SECS,
+            }
+        })
+        .map(|(bridge, rec)| (*bridge, rec.peer))
+        .collect();
+    for (bridge, peer) in dead {
+        send_control(
+            inner,
+            &peer,
+            Control::Close {
+                bridge,
+                reason: relay::REASON_ENDED,
+            },
+        );
+        drop_bridge(inner, &bridge);
+    }
+}
+
 /// Place, or re-poll, a cross-exchange call. Idempotent for a given
 /// `(caller, target)`: the first call resolves the far side and sends the
 /// invite; later ones report where it stands, so the client polls it like an
@@ -241,6 +293,12 @@ pub async fn place_call(
     target: String,
     now: u64,
 ) -> CallAck {
+    // Clear anything that has outlived itself first. The re-poll below answers
+    // from whatever is indexed under `(caller, target)`, so a bridge left
+    // behind by a caller that gave up would answer here for ever — which is
+    // exactly the way this failed in the field.
+    expire(&mut server.relay.inner.lock().unwrap(), now);
+
     // Already in flight? Report where it stands.
     //
     // A refusal is reported **once and then cleared**. Without that the bridge
@@ -318,6 +376,7 @@ pub async fn place_call(
             session_id: 0,
             local: caller,
             outcome: Outcome::Ringing,
+            created: now,
             index: Index::Caller {
                 caller,
                 target: target.clone(),
@@ -546,6 +605,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
                         session_id: 0,
                         local: PubKey::new([0u8; 32]),
                         outcome: Outcome::Ringing,
+                        created: crate::state::now_unix(),
                         index: Index::Callee { caller, account },
                     },
                 );
@@ -766,4 +826,103 @@ pub async fn serve_relay(server: &Arc<Server>, conn: Connection, identity: Optio
     // is discovered, because nothing is being dialled.
     let addr = conn.remote_address();
     register_link(server, who, addr, conn, send, recv);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    fn relay() -> Relay {
+        Relay::new([0u8; 32], vec![], None, Find::Fixed(HashMap::new()))
+    }
+
+    /// A bridge whose caller gave up mid-ring must not outlive its usefulness.
+    ///
+    /// This is the failure as it actually happened: `place_call` is keyed by
+    /// `(caller, target)`, so an abandoned bridge answered every later call to
+    /// that peer and the pair became permanently uncallable. A restart was the
+    /// only way out.
+    #[test]
+    fn a_bridge_abandoned_mid_ring_does_not_block_the_next_call() {
+        let r = relay();
+        let bridge = [1u8; 16];
+        let target = "bob@far.test".to_string();
+        {
+            let mut inner = r.inner.lock().unwrap();
+            inner.bridges.insert(
+                bridge,
+                BridgeRec {
+                    peer: key(9),
+                    account: key(2),
+                    caller: key(1),
+                    caller_eph: [0u8; 32],
+                    callee: None,
+                    callee_eph: [0u8; 32],
+                    session_id: 0,
+                    local: key(1),
+                    outcome: Outcome::Ringing,
+                    created: 1_000,
+                    index: Index::Caller {
+                        caller: key(1),
+                        target: target.clone(),
+                    },
+                },
+            );
+            inner.caller_index.insert((key(1), target.clone()), bridge);
+        }
+
+        // Still ringing, and still the answer to a re-poll.
+        r.sweep(1_000 + RINGING_TTL_SECS);
+        assert_eq!(r.bridge_count(), 1, "a ringing bridge is not swept early");
+
+        r.sweep(1_000 + RINGING_TTL_SECS + 1);
+        assert_eq!(r.bridge_count(), 0, "an abandoned ring must be swept");
+        // And the index goes with it, or the next call to that peer still finds
+        // a bridge that is no longer there.
+        assert!(
+            !r.inner
+                .lock()
+                .unwrap()
+                .caller_index
+                .contains_key(&(key(1), target)),
+            "the index outlived the bridge"
+        );
+    }
+
+    /// A call in progress is not a call to tidy away: it follows SIP-12's own
+    /// session lifetime, which is far longer than a ring.
+    #[test]
+    fn a_connected_bridge_lives_as_long_as_a_session_may() {
+        let r = relay();
+        {
+            let mut inner = r.inner.lock().unwrap();
+            inner.bridges.insert(
+                [2u8; 16],
+                BridgeRec {
+                    peer: key(9),
+                    account: key(2),
+                    caller: key(1),
+                    caller_eph: [0u8; 32],
+                    callee: Some(key(2)),
+                    callee_eph: [0u8; 32],
+                    session_id: BRIDGE_BIT | 1,
+                    local: key(1),
+                    outcome: Outcome::Established,
+                    created: 1_000,
+                    index: Index::Callee {
+                        caller: key(1),
+                        account: key(2),
+                    },
+                },
+            );
+        }
+        r.sweep(1_000 + RINGING_TTL_SECS + 1);
+        assert_eq!(r.bridge_count(), 1, "a live call is not an abandoned ring");
+        r.sweep(1_000 + sqex_proto::session::TTL_SECS + 1);
+        assert_eq!(r.bridge_count(), 0, "but it does not outlive a session");
+    }
 }
