@@ -39,14 +39,14 @@ use sqnr_core::{Operation, PubKey, Signer, Transaction};
 struct Cli {
     /// A domain that publishes an exchange (SIP-33). Its key is discovered over
     /// DNSSEC, pinned on first contact, and refused if it later changes.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server: Option<String>,
     /// A literal address, host:port, to dial. Requires --server-key.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server_host: Option<String>,
     /// The server's base58 public key. Goes with --server-host; a --server
     /// domain supplies its own.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server_key: Option<String>,
 
     /// Sign with a YubiKey instead of a file identity.
