@@ -70,6 +70,9 @@ pub const TYPE_CLOSE: u8 = 0x04;
 /// and resolve the far side rather than the caller naming a local key it cannot
 /// know. Distinct from [`TYPE_OPEN`], which names a bare local peer.
 pub const TYPE_CALL_OPEN: u8 = 0x05;
+/// Refuse a ringing cross-exchange call (SIP-39), so the caller is told rather
+/// than left polling until it gives up.
+pub const TYPE_CALL_DECLINE: u8 = 0x06;
 
 /// Which end of the session a peer is, fixed by lexicographic order of the two
 /// identities so that both ends agree without negotiating.
@@ -452,6 +455,53 @@ impl CallAck {
             peer: PubKey::new(b[10..42].try_into().unwrap()),
             peer_ephemeral: b[42..74].try_into().unwrap(),
             now: u64::from_be_bytes(b[74..82].try_into().unwrap()),
+        })
+    }
+}
+
+/// Refuse a ringing cross-exchange call (SIP-39).
+/// `| type=0x06 | bridge[16] | reason |`
+///
+/// `reason` is a [`crate::relay`] `REASON_*` — `declined` when the person said
+/// no, `busy` when the client is already in a call. **Busy is the client's
+/// assertion, not the exchange's inference**: somebody with several devices may
+/// legitimately take a second call, so nothing here decides that for them.
+///
+/// Only a device of the addressed account may decline a bridge, and the
+/// exchange answers every decline identically — accepted, unknown bridge, or
+/// somebody else's — so this is not an oracle for which calls are in flight or
+/// whom they are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallDecline {
+    pub bridge: [u8; 16],
+    pub reason: u8,
+}
+
+impl CallDecline {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(18);
+        out.push(TYPE_CALL_DECLINE);
+        out.extend_from_slice(&self.bridge);
+        out.push(self.reason);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<CallDecline> {
+        if b.len() != 18 {
+            return Err(Error::Malformed(format!(
+                "call decline is {} bytes, want 18",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_CALL_DECLINE {
+            return Err(Error::Malformed(format!(
+                "not a call decline (type {:#x})",
+                b[0]
+            )));
+        }
+        Ok(CallDecline {
+            bridge: b[1..17].try_into().unwrap(),
+            reason: b[17],
         })
     }
 }
@@ -893,5 +943,56 @@ mod tests {
         let r = BySession::recv(1);
         assert_eq!(BySession::decode(&r.encode(), TYPE_RECV).unwrap(), r);
         assert!(BySession::decode(&r.encode(), TYPE_CLOSE).is_err());
+    }
+
+    /// SIP-39's client-facing messages round-trip, and their decoders refuse
+    /// garbage rather than panicking.
+    #[test]
+    fn the_cross_exchange_call_messages_round_trip() {
+        let o = CallOpen {
+            ephemeral: [7u8; 32],
+            target: "bob@indra.org".into(),
+        };
+        assert_eq!(CallOpen::decode(&o.encode()).unwrap(), o);
+
+        let a = CallAck {
+            state: CallState::Established,
+            reason: 0,
+            session_id: 1 << 63 | 9,
+            peer: PubKey::new([3u8; 32]),
+            peer_ephemeral: [4u8; 32],
+            now: 1234,
+        };
+        assert_eq!(CallAck::decode(&a.encode()).unwrap(), a);
+
+        // A refusal carries its reason back to the caller verbatim.
+        let r = CallAck::rejected(crate::relay::REASON_DECLINED, 99);
+        let got = CallAck::decode(&r.encode()).unwrap();
+        assert_eq!(got.state, CallState::Rejected);
+        assert_eq!(got.reason, crate::relay::REASON_DECLINED);
+
+        let d = CallDecline {
+            bridge: [5u8; 16],
+            reason: crate::relay::REASON_BUSY,
+        };
+        assert_eq!(CallDecline::decode(&d.encode()).unwrap(), d);
+    }
+
+    #[test]
+    fn the_call_decoders_reject_garbage_without_panicking() {
+        for len in 0..90usize {
+            let junk = vec![0xffu8; len];
+            let _ = CallOpen::decode(&junk);
+            let _ = CallAck::decode(&junk);
+            let _ = CallDecline::decode(&junk);
+        }
+        // A declared target length that overruns the body is refused, not trusted.
+        let mut b = CallOpen {
+            ephemeral: [0u8; 32],
+            target: "a@b".into(),
+        }
+        .encode();
+        b[33] = 200;
+        assert!(CallOpen::decode(&b).is_err());
     }
 }

@@ -157,6 +157,11 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/session/recv", Cli("sqex session")),
     ("POST", "/session/close", Cli("sqex session")),
     ("POST", "/session/call", Voice("sqex-voice call")),
+    (
+        "POST",
+        "/session/decline",
+        Voice("sqex-voice answer --decline"),
+    ),
     ("GET", "/exchange/ping", Probe),
 ];
 

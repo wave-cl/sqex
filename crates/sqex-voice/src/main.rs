@@ -158,6 +158,17 @@ enum Cmd {
         /// ends or you interrupt it.
         #[arg(long)]
         seconds: Option<u64>,
+
+        /// Refuse the call instead of answering it. The caller is told it was
+        /// declined rather than left ringing until they give up.
+        #[arg(long)]
+        decline: bool,
+
+        /// Refuse as *busy* rather than declined. Implies `--decline`. Busy is
+        /// this client's assertion — the exchange never infers it, since
+        /// somebody with several devices may take a second call.
+        #[arg(long)]
+        busy: bool,
     },
 
     /// Join a room and talk to everyone in it (SIP-13).
@@ -321,15 +332,25 @@ async fn run(cli: Cli) -> Result<(), String> {
         jitter,
         bitrate,
         seconds,
+        decline,
+        busy,
     } = cmd
     {
         let signer = load_identity(&cli, &cfg)?;
         let endpoint = engine::resolve(&layers(&cli, &cfg), &mut report).await?;
+        // `--busy` implies a refusal; it only changes the reason the caller is
+        // given.
+        let decline_with = match (*busy, *decline) {
+            (true, _) => Some(sqex_proto::relay::REASON_BUSY),
+            (false, true) => Some(sqex_proto::relay::REASON_DECLINED),
+            (false, false) => None,
+        };
         return engine::answer(
             endpoint,
             &signer,
             cli.wait,
             opts(&cli, source, sink, *jitter, *bitrate, *seconds, false),
+            decline_with,
             &mut report,
         )
         .await;

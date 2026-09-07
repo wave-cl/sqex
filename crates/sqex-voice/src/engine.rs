@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use sqex_proto::events::{Event as WireEvent, Framer, Subscribe};
 use sqex_proto::room::{HEARTBEAT_SECS, RoomId};
 use sqex_proto::session::{
-    BySession, CallAck, CallOpen, CallState, DatagramFrame, MAX_DATAGRAM_FRAME, Open, OpenAck,
-    OpenState, Session,
+    BySession, CallAck, CallDecline, CallOpen, CallState, DatagramFrame, MAX_DATAGRAM_FRAME, Open,
+    OpenAck, OpenState, Session,
 };
 use sqnr::Client;
 use sqnr_core::{PubKey, Signer};
@@ -115,6 +115,9 @@ pub enum Event {
     Reflected(u64),
     /// The caller went quiet; back to waiting for the next one.
     CallerGone { after: Duration },
+    /// A ringing cross-exchange call was refused (SIP-39), and the caller's
+    /// exchange told rather than left to time out.
+    Declined { peer: PubKey },
     /// Something the audio layer wants said — a device substitution, a
     /// Bluetooth profile warning. These used to be `eprintln!` inside the
     /// library, where no frontend could reach them.
@@ -188,6 +191,7 @@ impl Event {
                 "(quiet for {}s — waiting for the next caller)",
                 after.as_secs()
             ),
+            Event::Declined { peer } => format!("declined the call from {peer}."),
             Event::Device(msg) => msg.clone(),
         }
     }
@@ -492,6 +496,7 @@ pub async fn answer(
     signer: &sqnr_core::SoftwareSigner,
     wait: u64,
     opts: CallOpts,
+    decline_with: Option<u8>,
     report: &mut dyn Report,
 ) -> Result<(), String> {
     let mut client = connect(endpoint, signer, report).await?;
@@ -510,19 +515,32 @@ pub async fn answer(
     }
 
     let mut framer = Framer::new();
-    let caller = loop {
+    let (bridge, caller) = loop {
         let Some(chunk) = stream.next().await? else {
             return Err("the event stream ended before a call arrived".into());
         };
         let events = framer.feed(&chunk).map_err(|e| e.to_string())?;
-        if let Some(caller) = events.into_iter().find_map(|e| match e {
-            WireEvent::CrossCall { caller, .. } => Some(caller),
+        if let Some(rung) = events.into_iter().find_map(|e| match e {
+            WireEvent::CrossCall { bridge, caller } => Some((bridge, caller)),
             _ => None,
         }) {
-            break caller;
+            break rung;
         }
     };
     drop(stream);
+
+    // Refusing is a message of its own (SIP-39): the caller is told, rather
+    // than left polling until it gives up.
+    if let Some(reason) = decline_with {
+        let (code, body) = client
+            .post("/session/decline", CallDecline { bridge, reason }.encode())
+            .await?;
+        if code != 200 {
+            return Err(format!("decline failed ({code}): {}", said(&body)));
+        }
+        report.event(Event::Declined { peer: caller });
+        return Ok(());
+    }
 
     // Open back toward the caller: our exchange matches this to the ringing
     // bridge and answers it, so a single open suffices.

@@ -72,7 +72,8 @@ use sqex_proto::resolve::{
 };
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave, Left};
 use sqex_proto::session::{
-    BySession, CallAck, CallOpen, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV,
+    BySession, CallAck, CallDecline, CallOpen, DatagramFrame, Open, SendFrame, TYPE_CLOSE,
+    TYPE_RECV,
 };
 
 /// The server's own version, reported in status. The protocol lives in
@@ -348,6 +349,13 @@ impl Server {
     pub(crate) fn ring_crosscall(&self, account: PubKey, bridge: [u8; 16], caller: PubKey) {
         self.events
             .publish(&[account], EventKind::CrossCall { bridge, caller });
+    }
+
+    /// How many of an account's devices could hear a ring — its open SIP-30
+    /// streams. Zero means a cross-exchange invite has nobody to reach, which
+    /// is worth answering rather than ringing into the void.
+    pub(crate) fn reachable(&self, account: &PubKey) -> usize {
+        self.events.count(account)
     }
 
     /// Send one already-framed session datagram to every connection a local
@@ -2298,6 +2306,19 @@ async fn route(
                     CallAck::rejected(sqex_proto::relay::REASON_REFUSED, now_unix())
                 };
                 (200, "application/octet-stream", ack.encode())
+            }
+        },
+        // SIP-39: refuse a ringing cross-exchange call, so the caller is told
+        // rather than left polling. Answered **identically** whatever happened —
+        // accepted, unknown bridge, or somebody else's call — because this is a
+        // route a stranger can reach and a reply that varied would make it an
+        // oracle for which calls are in flight and whom they are for.
+        ("POST", "/session/decline") => match (peer.identity, CallDecline::decode(body)) {
+            (None, _) => no_identity("declining a call"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(d)) => {
+                let _ = crate::relay::decline(server, me, d.bridge, d.reason);
+                (200, "application/octet-stream", vec![1u8])
             }
         },
         ("POST", "/session/send") => match (peer.identity, SendFrame::decode(body)) {

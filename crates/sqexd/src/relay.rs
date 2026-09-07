@@ -54,6 +54,9 @@ enum Index {
 struct BridgeRec {
     /// The peer exchange this bridge runs over (which link).
     peer: PubKey,
+    /// The addressed account (B). Read when authorizing a decline: only a
+    /// device of this account may refuse this bridge.
+    account: PubKey,
     /// The caller device (A).
     caller: PubKey,
     caller_eph: [u8; 32],
@@ -201,12 +204,21 @@ pub async fn place_call(
     now: u64,
 ) -> CallAck {
     // Already in flight? Report where it stands.
+    //
+    // A refusal is reported **once and then cleared**. Without that the bridge
+    // that carried the rejection stays indexed under `(caller, target)` and
+    // every later call to the same peer answers with the old refusal — one
+    // declined call would make that peer permanently uncallable.
     {
-        let inner = server.relay.inner.lock().unwrap();
-        if let Some(bridge) = inner.caller_index.get(&(caller, target.clone()))
-            && let Some(rec) = inner.bridges.get(bridge)
+        let mut inner = server.relay.inner.lock().unwrap();
+        if let Some(bridge) = inner.caller_index.get(&(caller, target.clone())).copied()
+            && let Some(rec) = inner.bridges.get(&bridge)
         {
-            return caller_ack(rec, now);
+            let ack = caller_ack(rec, now);
+            if ack.state == CallState::Rejected {
+                drop_bridge(&mut inner, &bridge);
+            }
+            return ack;
         }
     }
 
@@ -247,6 +259,7 @@ pub async fn place_call(
         bridge,
         BridgeRec {
             peer: peer.key,
+            account,
             caller,
             caller_eph: eph,
             callee: None,
@@ -327,6 +340,26 @@ pub fn try_answer(
         peer_ephemeral: caller_eph,
         now,
     })
+}
+
+/// A device refusing a ringing cross-exchange call: tell the caller's exchange
+/// why, and drop the bridge.
+///
+/// **Only a device of the bridge's addressed account may decline it.** Without
+/// that check anyone holding a bridge id could hang up somebody else's call, and
+/// anyone could probe for live bridges by guessing. The route answers every
+/// decline identically whatever this returns — accepted, unknown bridge, or
+/// somebody else's — so the refusal discloses nothing either.
+pub fn decline(server: &Server, device: PubKey, bridge: relay::Bridge, reason: u8) -> bool {
+    let account = server.account_of(&device);
+    let mut inner = server.relay.inner.lock().unwrap();
+    let peer = match inner.bridges.get(&bridge) {
+        Some(rec) if rec.account == account => rec.peer,
+        _ => return false,
+    };
+    send_control(&inner, &peer, Control::Reject { bridge, reason });
+    drop_bridge(&mut inner, &bridge);
+    true
 }
 
 /// Tear down a bridged session and tell the peer. Returns false if the id is
@@ -428,12 +461,33 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
                 );
                 return;
             }
+            // The ring is a SIP-30 event, so an account with no open stream on
+            // any device cannot hear it. Say so rather than ringing into the
+            // void and leaving the caller to poll until it gives up.
+            //
+            // This cannot be `no-account`: SIP-22 makes a device with no
+            // registered account its own account, so every 32-byte key is a
+            // potential account and there is nothing to look up. Unreachable is
+            // the honest answer, and the only one available here.
+            if server.reachable(&account) == 0 {
+                let inner = server.relay.inner.lock().unwrap();
+                send_control(
+                    &inner,
+                    &peer,
+                    Control::Reject {
+                        bridge,
+                        reason: relay::REASON_UNREACHABLE,
+                    },
+                );
+                return;
+            }
             {
                 let mut inner = server.relay.inner.lock().unwrap();
                 inner.bridges.insert(
                     bridge,
                     BridgeRec {
                         peer,
+                        account,
                         caller,
                         caller_eph,
                         callee: None,
