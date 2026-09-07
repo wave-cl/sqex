@@ -65,6 +65,11 @@ pub const TYPE_OPEN: u8 = 0x01;
 pub const TYPE_SEND: u8 = 0x02;
 pub const TYPE_RECV: u8 = 0x03;
 pub const TYPE_CLOSE: u8 = 0x04;
+/// The client-facing open for a cross-exchange call (SIP-39): the peer is named
+/// by `name@domain` or `key@domain`, so the caller's own exchange can discover
+/// and resolve the far side rather than the caller naming a local key it cannot
+/// know. Distinct from [`TYPE_OPEN`], which names a bare local peer.
+pub const TYPE_CALL_OPEN: u8 = 0x05;
 
 /// Which end of the session a peer is, fixed by lexicographic order of the two
 /// identities so that both ends agree without negotiating.
@@ -307,6 +312,146 @@ impl OpenAck {
             session_id: u64::from_be_bytes(b[1..9].try_into().unwrap()),
             peer_ephemeral: b[9..41].try_into().unwrap(),
             now: u64::from_be_bytes(b[41..49].try_into().unwrap()),
+        })
+    }
+}
+
+/// Ask this exchange (SIP-39) to place a call to a peer on another domain,
+/// offering an ephemeral public key. The caller's own exchange resolves and
+/// bridges; the caller never connects to the far exchange.
+/// `| type=0x05 | ephemeral[32] | tgt_len: u8 | target |`
+///
+/// `target` is `name@domain` (SIP-38) or `key@domain` — a peer qualified by its
+/// home domain, which is exactly what the plain [`Open`] cannot express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallOpen {
+    pub ephemeral: [u8; 32],
+    pub target: String,
+}
+
+impl CallOpen {
+    pub fn encode(&self) -> Vec<u8> {
+        let t = self.target.as_bytes();
+        let mut out = Vec::with_capacity(1 + 32 + 1 + t.len());
+        out.push(TYPE_CALL_OPEN);
+        out.extend_from_slice(&self.ephemeral);
+        out.push(t.len() as u8);
+        out.extend_from_slice(t);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<CallOpen> {
+        if b.len() < 34 {
+            return Err(Error::Malformed(format!(
+                "call open is {} bytes, want >= 34",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_CALL_OPEN {
+            return Err(Error::Malformed(format!(
+                "not a call open (type {:#x})",
+                b[0]
+            )));
+        }
+        let ephemeral: [u8; 32] = b[1..33].try_into().unwrap();
+        let tgt_len = b[33] as usize;
+        let tgt = &b[34..];
+        if tgt.len() != tgt_len {
+            return Err(Error::Malformed(format!(
+                "call target is {} bytes, header says {tgt_len}",
+                tgt.len()
+            )));
+        }
+        let target = String::from_utf8(tgt.to_vec())
+            .map_err(|_| Error::Malformed("call target is not UTF-8".into()))?;
+        Ok(CallOpen { ephemeral, target })
+    }
+}
+
+/// How a cross-exchange call open stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallState {
+    /// Recorded; the far side is ringing or not yet reached. `reason` is unset.
+    Ringing = 0,
+    /// The call connected: `peer` and `peer_ephemeral` carry the answering
+    /// device and its ephemeral, and the session is live.
+    Established = 1,
+    /// The call did not connect. `reason` is a [`crate::relay`] `REASON_*`.
+    Rejected = 2,
+}
+
+/// The exchange's answer to a [`CallOpen`]. Like [`OpenAck`] but with two fields
+/// more: `peer`, the answering device's identity, and a `Rejected` state with a
+/// `reason`. The caller addressed an account (or a name), so it could not have
+/// named the device that would answer — this is the account→device binding
+/// surfaced on answer, which a same-exchange caller never needs because it names
+/// the device in [`Open`]. It is pollable like an [`Open`]: `Ringing` means ask
+/// again.
+/// `| state | reason | session_id: u64 | peer[32] | peer_ephemeral[32] | now: u64 |`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallAck {
+    pub state: CallState,
+    pub reason: u8,
+    pub session_id: u64,
+    pub peer: PubKey,
+    pub peer_ephemeral: [u8; 32],
+    pub now: u64,
+}
+
+impl CallAck {
+    pub fn ringing(now: u64) -> CallAck {
+        CallAck {
+            state: CallState::Ringing,
+            reason: 0,
+            session_id: 0,
+            peer: PubKey::new([0u8; 32]),
+            peer_ephemeral: [0u8; 32],
+            now,
+        }
+    }
+
+    pub fn rejected(reason: u8, now: u64) -> CallAck {
+        CallAck {
+            state: CallState::Rejected,
+            reason,
+            session_id: 0,
+            peer: PubKey::new([0u8; 32]),
+            peer_ephemeral: [0u8; 32],
+            now,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(82);
+        out.push(self.state as u8);
+        out.push(self.reason);
+        out.extend_from_slice(&self.session_id.to_be_bytes());
+        out.extend_from_slice(self.peer.as_bytes());
+        out.extend_from_slice(&self.peer_ephemeral);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<CallAck> {
+        if b.len() != 82 {
+            return Err(Error::Malformed(format!(
+                "call ack is {} bytes, want 82",
+                b.len()
+            )));
+        }
+        let state = match b[0] {
+            0 => CallState::Ringing,
+            1 => CallState::Established,
+            2 => CallState::Rejected,
+            other => return Err(Error::Malformed(format!("unknown call state {other}"))),
+        };
+        Ok(CallAck {
+            state,
+            reason: b[1],
+            session_id: u64::from_be_bytes(b[2..10].try_into().unwrap()),
+            peer: PubKey::new(b[10..42].try_into().unwrap()),
+            peer_ephemeral: b[42..74].try_into().unwrap(),
+            now: u64::from_be_bytes(b[74..82].try_into().unwrap()),
         })
     }
 }

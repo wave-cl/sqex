@@ -71,7 +71,9 @@ use sqex_proto::resolve::{
     Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
 };
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave, Left};
-use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
+use sqex_proto::session::{
+    BySession, CallAck, CallOpen, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV,
+};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -220,6 +222,9 @@ pub struct Server {
     admissions: Admissions,
     sessions: Sessions,
     live_conns: Connections,
+    /// SIP-39: cross-exchange call relay — the peer allowlist, the bridge
+    /// ceiling, and the live links and bridges.
+    pub(crate) relay: crate::relay::Relay,
     /// SIP-30 event streams, by the identity that opened them.
     pub events: Subscribers,
     started: Instant,
@@ -328,6 +333,31 @@ impl Server {
         }
         self.events.publish(&to, event);
     }
+
+    // --- SIP-39: effects the relay module drives, kept here so it needs no
+    // access to the server's private innards. ---
+
+    /// The account a device belongs to (SIP-22); a device that belongs to no
+    /// account is its own account.
+    pub(crate) fn account_of(&self, device: &PubKey) -> PubKey {
+        self.devices.account_for(device)
+    }
+
+    /// Ring every device of `account` for an incoming cross-exchange call
+    /// (SIP-30, per device, as SIP-36 rings within a channel).
+    pub(crate) fn ring_crosscall(&self, account: PubKey, bridge: [u8; 16], caller: PubKey) {
+        self.events
+            .publish(&[account], EventKind::CrossCall { bridge, caller });
+    }
+
+    /// Send one already-framed session datagram to every connection a local
+    /// identity holds — the bridged-session end of what `forward_datagrams`
+    /// does for a local session.
+    pub(crate) fn deliver_local_datagram(&self, to: &PubKey, bytes: bytes::Bytes) {
+        for conn in self.live_conns.get(to) {
+            let _ = conn.send_datagram(bytes.clone());
+        }
+    }
 }
 
 /// A bound-but-not-yet-serving server, so a caller can read the assigned
@@ -380,7 +410,9 @@ pub async fn bind(
     // and the app decides per request. This keeps the signature-gated admin
     // surface reachable no matter the whitelist state.
     let squic_config = SquicConfig {
-        alpn_protocols: vec![ALPN.to_vec()],
+        // `h3` for clients; `sqex-relay` (SIP-39) for a peering exchange's link,
+        // which the accept loop tells apart by the negotiated ALPN.
+        alpn_protocols: vec![ALPN.to_vec(), sqex_proto::relay::ALPN.to_vec()],
         max_idle_timeout: std::time::Duration::from_secs(60),
         // Sessions may carry real-time media over datagrams (SIP-12). Costs
         // nothing for the connections that never send one.
@@ -486,6 +518,11 @@ pub async fn bind(
         admissions: Admissions::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
+        relay: crate::relay::Relay::new(
+            signing_key.to_bytes(),
+            config.relay_peers.clone(),
+            config.max_bridges,
+        ),
         events: Subscribers::default(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
@@ -593,7 +630,13 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 match incoming.await {
                     Ok(conn) => {
                         server.connections.fetch_add(1, Ordering::Relaxed);
-                        if let Err(e) = serve_h3(server, conn, peer).await {
+                        // SIP-39: a peering exchange's link negotiates the
+                        // `sqex-relay` ALPN and is driven by the relay protocol,
+                        // not HTTP/3.
+                        if crate::relay::alpn_of(&conn).as_deref() == Some(sqex_proto::relay::ALPN)
+                        {
+                            crate::relay::serve_relay(&server, conn, peer.identity).await;
+                        } else if let Err(e) = serve_h3(server, conn, peer).await {
                             tracing::debug!("connection ended: {e}");
                         }
                     }
@@ -712,6 +755,11 @@ async fn forward_datagrams(server: Arc<Server>, conn: quinn::Connection, from: P
         let Ok(frame) = DatagramFrame::decode(&bytes) else {
             continue; // malformed: drop it, say nothing
         };
+        // SIP-39: a bridged session's counterpart is on another exchange —
+        // divert the frame onto the relay link rather than a local connection.
+        if crate::relay::maybe_divert(&server, &from, &frame) {
+            continue;
+        }
         let Some(to) = server.sessions.counterpart(&from, frame.session_id) else {
             continue; // not a party, or no live session: drop it
         };
@@ -2225,11 +2273,32 @@ async fn route(
         ("POST", "/session/open") => match (peer.identity, Open::decode(body)) {
             (None, _) => no_identity("opening a session"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(open)) => (
-                200,
-                "application/octet-stream",
-                server.sessions.open(me, open.peer, open.ephemeral).encode(),
-            ),
+            (Some(me), Ok(open)) => {
+                // SIP-39: this open may be a device answering a cross-exchange
+                // call, whose caller is on another exchange and so has no local
+                // pending open to match. If so, the relay completes the bridge;
+                // otherwise it is an ordinary local open.
+                let ack =
+                    crate::relay::try_answer(server, me, open.peer, open.ephemeral, now_unix())
+                        .unwrap_or_else(|| server.sessions.open(me, open.peer, open.ephemeral));
+                (200, "application/octet-stream", ack.encode())
+            }
+        },
+        // SIP-39: place (or poll) a cross-exchange call. The target is
+        // name@domain or key@domain; this exchange resolves and bridges it.
+        ("POST", "/session/call") => match (peer.identity, CallOpen::decode(body)) {
+            (None, _) => no_identity("placing a call"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(call)) => {
+                let ack = if server.relay.configured() {
+                    crate::relay::place_call(server, me, call.ephemeral, call.target, now_unix())
+                        .await
+                } else {
+                    // Federated with nobody: refuse identically, no oracle.
+                    CallAck::rejected(sqex_proto::relay::REASON_REFUSED, now_unix())
+                };
+                (200, "application/octet-stream", ack.encode())
+            }
         },
         ("POST", "/session/send") => match (peer.identity, SendFrame::decode(body)) {
             (None, _) => no_identity("sending"),
@@ -2253,11 +2322,13 @@ async fn route(
         ("POST", "/session/close") => match (peer.identity, BySession::decode(body, TYPE_CLOSE)) {
             (None, _) => no_identity("closing"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(r)) => (
-                200,
-                "application/octet-stream",
-                vec![u8::from(server.sessions.close(&me, r.session_id))],
-            ),
+            (Some(me), Ok(r)) => {
+                // SIP-39: a bridged session id tears down across the link;
+                // anything else is an ordinary local close.
+                let closed = crate::relay::close_bridge(server, r.session_id)
+                    || server.sessions.close(&me, r.session_id);
+                (200, "application/octet-stream", vec![u8::from(closed)])
+            }
         },
 
         // A protected exchange endpoint, to demonstrate whitelist enforcement.

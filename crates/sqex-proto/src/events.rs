@@ -76,6 +76,11 @@ pub const KIND_RESYNC: u8 = 0x08;
 /// distinguishable kind is what lets it tell somebody typing from a phone
 /// ringing.
 pub const KIND_RINGING: u8 = 0x09;
+/// SIP-39: a cross-exchange call is ringing this device. Names the bridge and
+/// the caller and nothing else — a hint, per SIP-30, that the client acts on by
+/// opening a session toward the caller. The caller's domain travels on the
+/// exchange-to-exchange invite, not here, so this stays a fixed-size event.
+pub const KIND_CROSSCALL: u8 = 0x0A;
 
 /// What happened to a membership.
 pub const MEMBER_JOINED: u8 = 0x01;
@@ -154,6 +159,10 @@ pub enum Event {
     /// Subject to SIP-21's blocking rules like every other event, which is what
     /// stops this becoming a way to make a blocked person's phone ring.
     Ringing { channel: [u8; 32], seq: u64 },
+    /// SIP-39: a cross-exchange call is ringing, on this `bridge`, from
+    /// `caller`. The client opens a session toward `caller` to answer; the
+    /// caller's domain is display-only and does not ride the event.
+    CrossCall { bridge: [u8; 16], caller: PubKey },
     /// A kind this build does not know. Carried rather than rejected so that
     /// ignoring it is deliberate; see the module docs.
     Unknown(u8),
@@ -188,6 +197,13 @@ impl Event {
                 out.extend_from_slice(channel);
                 out.extend_from_slice(account.as_bytes());
                 out.push(*what);
+                out
+            }
+            Event::CrossCall { bridge, caller } => {
+                let mut out = Vec::with_capacity(49);
+                out.push(KIND_CROSSCALL);
+                out.extend_from_slice(bridge);
+                out.extend_from_slice(caller.as_bytes());
                 out
             }
             Event::Profile { account } => one(KIND_PROFILE, account.as_bytes()),
@@ -252,6 +268,13 @@ impl Event {
                     channel: body[0..32].try_into().unwrap(),
                     account: PubKey::new(body[32..64].try_into().unwrap()),
                     what: body[64],
+                }
+            }
+            KIND_CROSSCALL => {
+                want(48)?;
+                Event::CrossCall {
+                    bridge: body[0..16].try_into().unwrap(),
+                    caller: PubKey::new(body[16..48].try_into().unwrap()),
                 }
             }
             KIND_PROFILE => {

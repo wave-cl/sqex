@@ -145,6 +145,27 @@ pub struct FileConfig {
     /// signed a `0x0b` for each channel.
     #[serde(default)]
     pub replicate: Vec<FileOrigin>,
+
+    /// SIP-39: the exchanges this one will bridge cross-exchange calls to and
+    /// from, each a `{ key, addr }`.
+    ///
+    /// The federation boundary, and it is symmetric in effect: this exchange
+    /// rings one of its users for an incoming call only from a `key` on this
+    /// list, and dials `addr` to place a call only to a `key` on this list.
+    /// Empty — the default — means this exchange federates with nobody and its
+    /// relay routes refuse everyone identically. Like `replication_peers`,
+    /// membership is the whole gate at the link layer; per-call consent is the
+    /// callee's. The address is configured rather than discovered, as SIP-35's
+    /// origins are — the same pin-from-config, never-from-the-wire rule.
+    #[serde(default)]
+    pub relay_peers: Vec<FileRelayPeer>,
+
+    /// SIP-39: cap on concurrent bridged calls. Unset means unlimited. A relay
+    /// a peer can drive needs a ceiling a local SIP-12 session does not, since a
+    /// local session is already bounded by `max_connections` and a bridge is
+    /// its own quantity. A public federating exchange should set one.
+    #[serde(default)]
+    pub max_bridges: Option<u64>,
 }
 
 /// One origin to replicate from.
@@ -173,6 +194,24 @@ fn default_pull_interval() -> u64 {
     30
 }
 
+/// One exchange this one federates cross-exchange calls with (SIP-39).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRelayPeer {
+    /// The domain this peer serves. A call to `name@domain` is routed to the
+    /// peer whose `domain` matches. Configured rather than discovered (SIP-33)
+    /// for the reference implementation, as SIP-35's origins are.
+    pub domain: String,
+    /// The peer exchange's base58 Ed25519 identity — its SIP-9 key.
+    ///
+    /// **Pinned from here and never taken from the wire**, the same trap SIP-35
+    /// names: the key both admits the peer's link and is pinned when dialling
+    /// it, so it decides who this exchange will federate with.
+    pub key: String,
+    /// `host:port` to dial when placing a call to this peer.
+    pub addr: String,
+}
+
 /// Configuration with everything parsed and resolved.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -192,6 +231,16 @@ pub struct Config {
     pub max_names: Option<u64>,
     pub replication_peers: Vec<PubKey>,
     pub replicate: Vec<OriginConfig>,
+    pub relay_peers: Vec<RelayPeer>,
+    pub max_bridges: Option<u64>,
+}
+
+/// One resolved relay peer (SIP-39).
+#[derive(Debug, Clone)]
+pub struct RelayPeer {
+    pub domain: String,
+    pub key: PubKey,
+    pub addr: SocketAddr,
 }
 
 /// One resolved origin to replicate from.
@@ -219,6 +268,29 @@ impl FileConfig {
                 replication_peers.len(),
                 sqex_proto::peer::MAX_PEERS
             )));
+        }
+
+        // SIP-39 relay peers, capped the same way and for the same reason as
+        // replication peers — an over-long list is a mistake to hear at load.
+        if self.relay_peers.len() > sqex_proto::peer::MAX_PEERS {
+            return Err(Error::Malformed(format!(
+                "relay_peers holds {}, limit is {}",
+                self.relay_peers.len(),
+                sqex_proto::peer::MAX_PEERS
+            )));
+        }
+        let mut relay_peers = Vec::new();
+        for p in &self.relay_peers {
+            let key = p
+                .key
+                .parse::<PubKey>()
+                .map_err(|e| Error::Key(format!("relay_peers.key {}: {e}", p.key)))?;
+            let addr = parse_listen(&p.addr)?;
+            relay_peers.push(RelayPeer {
+                domain: p.domain.trim().to_ascii_lowercase(),
+                key,
+                addr,
+            });
         }
 
         // SIP-29 reserves version 0 and forbids emitting it, and an empty list
@@ -293,6 +365,13 @@ impl FileConfig {
                 "max_names must be omitted (unlimited) or a positive value".into(),
             ));
         }
+        // SIP-39. A ceiling of zero would refuse every bridge in silence —
+        // unlimited is None (the field left out), not 0.
+        if self.max_bridges == Some(0) {
+            return Err(Error::Malformed(
+                "max_bridges must be omitted (unlimited) or a positive value".into(),
+            ));
+        }
 
         Ok(Config {
             listen,
@@ -310,6 +389,8 @@ impl FileConfig {
             name_lease_secs: self.name_lease_secs,
             replication_peers,
             replicate,
+            relay_peers,
+            max_bridges: self.max_bridges,
         })
     }
 }

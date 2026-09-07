@@ -134,6 +134,32 @@ enum Cmd {
         peer: String,
     },
 
+    /// Answer the next incoming cross-exchange call (SIP-39): subscribe to this
+    /// exchange's events, wait for a call, and pick it up. No peer is named —
+    /// the ring says who is calling.
+    Answer {
+        /// Where the audio comes from: `mic`, `tone`, or a path to a 48 kHz WAV.
+        #[arg(long, default_value = "mic")]
+        source: Source,
+
+        /// Where the audio goes: `speaker`, `null`, or a path to write a WAV.
+        #[arg(long, default_value = "speaker")]
+        sink: Sink,
+
+        /// Frames to hold before playing.
+        #[arg(long, default_value_t = 3)]
+        jitter: u64,
+
+        /// Opus bitrate in bits per second.
+        #[arg(long, default_value_t = 24_000)]
+        bitrate: i32,
+
+        /// Hang up after N seconds. Without it the call runs until the source
+        /// ends or you interrupt it.
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
+
     /// Join a room and talk to everyone in it (SIP-13).
     ///
     /// A room is named by a secret, and holding the secret is what being in the
@@ -287,12 +313,60 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await;
     }
 
+    // A cross-exchange answerer has no peer to name either — the ring says who
+    // is calling (SIP-39).
+    if let Cmd::Answer {
+        source,
+        sink,
+        jitter,
+        bitrate,
+        seconds,
+    } = cmd
+    {
+        let signer = load_identity(&cli, &cfg)?;
+        let endpoint = engine::resolve(&layers(&cli, &cfg), &mut report).await?;
+        return engine::answer(
+            endpoint,
+            &signer,
+            cli.wait,
+            opts(&cli, source, sink, *jitter, *bitrate, *seconds, false),
+            &mut report,
+        )
+        .await;
+    }
+
     let peer_str = match cmd {
         Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer.as_str(),
-        Cmd::Room { .. } => unreachable!("handled above"),
+        Cmd::Room { .. } | Cmd::Answer { .. } => unreachable!("handled above"),
     };
     let signer = load_identity(&cli, &cfg)?;
     let endpoint = engine::resolve(&layers(&cli, &cfg), &mut report).await?;
+
+    // SIP-39: a Call whose target carries an explicit @domain is a
+    // cross-exchange call. Our own exchange resolves and bridges it, so we hand
+    // it the whole name@domain / key@domain rather than resolving here.
+    if let Cmd::Call {
+        peer,
+        source,
+        sink,
+        jitter,
+        bitrate,
+        seconds,
+        rtt,
+    } = cmd
+        && peer.contains('@')
+    {
+        let (client, session, id) =
+            engine::establish_cross(endpoint, &signer, peer, cli.wait, &mut report).await?;
+        return engine::call(
+            client,
+            session,
+            id,
+            opts(&cli, source, sink, *jitter, *bitrate, *seconds, *rtt),
+            &mut report,
+        )
+        .await;
+    }
     // A peer may be named: a base58 key is used as-is, a SIP-38 name@domain (or
     // a bare name on this exchange) is resolved through the directory first.
     let peer = match sqex_proto::name::classify(peer_str).map_err(|e| e.to_string())? {
@@ -331,7 +405,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .await
         }
         Cmd::Echo { .. } => unreachable!("handled above"),
-        Cmd::Room { .. } => unreachable!("handled above"),
+        Cmd::Room { .. } | Cmd::Answer { .. } => unreachable!("handled above"),
     }
 }
 
