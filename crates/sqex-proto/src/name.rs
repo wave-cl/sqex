@@ -86,6 +86,48 @@ pub fn canonical(name: &str) -> Result<String> {
     Ok(out)
 }
 
+/// A peer/target argument a client was given: a key typed directly, or a name
+/// to resolve through the directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Key(PubKey),
+    /// A `name@domain`, or a bare `name` (domain `None`) meaning "the exchange
+    /// this client is already talking to".
+    Named {
+        name: String,
+        domain: Option<String>,
+    },
+}
+
+/// Classify a peer/target string **without touching the network**, shared by
+/// every client (CLI, chat, voice). A base58 Ed25519 key is taken as itself;
+/// anything else is a name — `name@domain`, or a bare `name` — canonicalised
+/// per [`canonical`]. The key parse is tried first, so an explicit key is never
+/// reinterpreted as a name.
+pub fn classify(input: &str) -> Result<Target> {
+    let trimmed = input.trim();
+    if let Ok(key) = trimmed.parse::<PubKey>() {
+        return Ok(Target::Key(key));
+    }
+    match trimmed.split_once('@') {
+        Some((local, domain)) => {
+            if domain.is_empty() || domain.contains('@') || local.is_empty() {
+                return Err(Error::Malformed(format!(
+                    "{input:?} is not a valid name@domain"
+                )));
+            }
+            Ok(Target::Named {
+                name: canonical(local)?,
+                domain: Some(domain.to_string()),
+            })
+        }
+        None => Ok(Target::Named {
+            name: canonical(trimmed)?,
+            domain: None,
+        }),
+    }
+}
+
 fn read_name(b: &[u8]) -> Result<String> {
     // type byte, length byte, then the label.
     if b.len() < 2 {
@@ -459,6 +501,31 @@ mod tests {
         let none = Resolved::none(1_700_000_000);
         assert_eq!(Resolved::decode(&none.encode()).unwrap(), none);
         assert!(!none.found);
+    }
+
+    #[test]
+    fn classify_key_vs_name() {
+        // A real published key (ex's identity) classifies as a key — and it is
+        // also a valid *name* by grammar, so this proves key-parse wins first.
+        const KEY: &str = "2j68p8rZKXE6W1f6LerRGB2SPTH8JkbfMmZRFTzcLKyW";
+        assert!(matches!(classify(KEY).unwrap(), Target::Key(_)));
+        assert_eq!(
+            classify("colin").unwrap(),
+            Target::Named {
+                name: "colin".into(),
+                domain: None
+            }
+        );
+        assert_eq!(
+            classify("Colin@squic.org").unwrap(),
+            Target::Named {
+                name: "colin".into(),
+                domain: Some("squic.org".into())
+            }
+        );
+        for bad in ["a.b", "", "x@", "@squic.org", "a@b@c", "café"] {
+            assert!(classify(bad).is_err(), "{bad:?} should be refused");
+        }
     }
 
     #[test]

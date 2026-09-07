@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sqex_proto::room::RoomId;
 use sqnr::{config::Config, identity};
-use sqnr_core::PubKey;
 
 use sqex_voice::audio::{self, Sink, Source};
 use sqex_voice::engine::{self, CallOpts, Event, Report};
@@ -288,12 +287,20 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await;
     }
 
-    let peer = parse_key(match cmd {
-        Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer,
+    let peer_str = match cmd {
+        Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer.as_str(),
         Cmd::Room { .. } => unreachable!("handled above"),
-    })?;
+    };
     let signer = load_identity(&cli, &cfg)?;
     let endpoint = engine::resolve(&layers(&cli, &cfg), &mut report).await?;
+    // A peer may be named: a base58 key is used as-is, a SIP-38 name@domain (or
+    // a bare name on this exchange) is resolved through the directory first.
+    let peer = match sqex_proto::name::classify(peer_str).map_err(|e| e.to_string())? {
+        sqex_proto::name::Target::Key(k) => k,
+        sqex_proto::name::Target::Named { name, .. } => {
+            engine::resolve_name(endpoint, &signer, &name).await?
+        }
+    };
 
     // Echo rendezvouses inside its own loop, so that it can do so again when a
     // caller goes away; a call does it once.
@@ -411,10 +418,6 @@ fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
             _ => sqex_discovery::Layer::default(),
         },
     ]
-}
-
-fn parse_key(s: &str) -> Result<PubKey, String> {
-    s.trim().parse().map_err(|e| format!("bad key {s:?}: {e}"))
 }
 
 fn env_nonempty(key: &str) -> Option<String> {

@@ -215,11 +215,13 @@ async fn run(cli: Cli) -> Result<(), String> {
         _ => {}
     }
 
-    let (client, addr, server, pinned_notice) = connect(&cli, &cfg, &seed).await?;
+    let (client, addr, server, pinned_notice, domain) = connect(&cli, &cfg, &seed).await?;
     // The exchange we are talking to is bound into every SIP-31 signature, so
     // an entry signed here cannot be lifted into another exchange's copy of the
     // same conversation — which for a direct message is byte-identical.
     let mut chat = Chat::new(client, seed, me, server, store);
+    // The exchange's domain, for showing SIP-38 handles as name@domain.
+    chat.set_domain(domain);
     // Where to dial when this connection is lost — which, until now, was
     // nowhere: the client connected once here and a dropped connection meant
     // every request afterwards failed for as long as it stayed open.
@@ -779,7 +781,10 @@ async fn event_loop(
             // Ours arrives with everybody else's, on the profile poll: it is not
             // known at startup, so the header shows the key stub until the first
             // one comes back and the name after.
-            app.name = chat.display_name(&chat.me).unwrap_or_default();
+            app.name = chat
+                .display_name(&chat.me)
+                .or_else(|| chat.handle(&chat.me))
+                .unwrap_or_default();
             // Where each message ended up, kept from the frame that drew it: a
             // second copy of the layout could disagree with the first, and a
             // pointer that names the message above the one under it is worse than
@@ -1227,7 +1232,7 @@ async fn account_command(chat: &mut Chat, cmd: Command) -> std::result::Result<S
                 })
             })
         }
-        Command::Block(key) => match key.parse::<PubKey>() {
+        Command::Block(key) => match resolve_peer(chat, &key).await {
             Ok(who) if who == chat.me => Err(ChatError::Protocol("that is your own key".into())),
             Ok(who) => chat.set_block(&who, true).await.map(|()| {
                 Some(format!(
@@ -1236,21 +1241,27 @@ async fn account_command(chat: &mut Chat, cmd: Command) -> std::result::Result<S
                     short(&who)
                 ))
             }),
-            Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+            Err(e) => Err(e),
         },
-        Command::Unblock(key) => match key.parse::<PubKey>() {
+        Command::Unblock(key) => match resolve_peer(chat, &key).await {
             Ok(who) => chat
                 .set_block(&who, false)
                 .await
                 .map(|()| Some(format!("unblocked {}", short(&who)))),
-            Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+            Err(e) => Err(e),
         },
-        Command::Whoami => Ok(Some(format!(
-            "{} — your key in full. The header shows the first six, which \
+        Command::Whoami => {
+            let handle = chat
+                .handle(&chat.me)
+                .map(|h| format!("you are {h}\n"))
+                .unwrap_or_default();
+            Ok(Some(format!(
+                "{handle}{} — your key in full. The header shows the first six, which \
                  is for recognising yourself and not for comparing against \
                  anybody",
-            chat.me
-        ))),
+                chat.me
+            )))
+        }
         Command::Reconnect => {
             chat.reconnect_now();
             Ok(Some("trying the exchange again now".to_string()))
@@ -1861,7 +1872,7 @@ async fn handle_key(
                     set_avatar(chat, &channel, path.as_deref()).await.map(Some)
                 }
                 Command::SaveAvatar(path) => save_avatar(chat, &open[i], &path).await.map(Some),
-                Command::Invite(key) => match key.parse::<PubKey>() {
+                Command::Invite(key) => match resolve_peer(chat, &key).await {
                     Ok(who) => match chat.invite(&channel, &who).await {
                         // SIP-17 says to check after inviting: this is the one
                         // report of a member who can fetch entries and open
@@ -1883,16 +1894,16 @@ async fn handle_key(
                         }
                         Err(e) => Err(e),
                     },
-                    Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+                    Err(e) => Err(e),
                 },
-                Command::Kick(key) => match key.parse::<PubKey>() {
+                Command::Kick(key) => match resolve_peer(chat, &key).await {
                     Ok(who) => chat.remove(&channel, &who).await.map(|()| {
                         Some(format!(
                             "removed {} and rotated — what follows is not theirs",
                             short(&who)
                         ))
                     }),
-                    Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+                    Err(e) => Err(e),
                 },
                 // SIP-35 requires this to be presented as publication to
                 // another operator rather than as a setting, and the wording
@@ -2086,7 +2097,10 @@ async fn handle_key(
                             info.members
                                 .iter()
                                 .map(|m| {
-                                    let name = chat.display_name(&m.account).unwrap_or_default();
+                                    let name = chat
+                                        .display_name(&m.account)
+                                        .or_else(|| chat.handle(&m.account))
+                                        .unwrap_or_default();
                                     // The whole key, not a stub of it. Since
                                     // the transcript stopped showing keys this
                                     // is the list somebody runs to find one,
@@ -2652,11 +2666,36 @@ async fn settle(
 }
 
 async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed: &str) {
-    let Ok(account) = typed.parse::<PubKey>() else {
-        app.trouble.message = Some(format!("{typed:?} is not a base58 identity"));
-        return;
+    let account = match resolve_peer(chat, typed).await {
+        Ok(a) => a,
+        Err(e) => {
+            app.trouble.message = Some(format!("{typed:?}: {e}"));
+            return;
+        }
     };
     message_account(chat, open, app, account).await;
+}
+
+/// Resolve a typed peer to a key: a base58 key is taken as-is; a SIP-38 name
+/// (`name@domain`, or a bare name on the connected exchange) is resolved
+/// through the directory. A `name@domain` naming a *different* exchange than
+/// this client is connected to is refused rather than silently resolved against
+/// the wrong one.
+async fn resolve_peer(chat: &mut Chat, typed: &str) -> Result<PubKey, ChatError> {
+    match sqex_proto::name::classify(typed).map_err(|e| ChatError::Protocol(e.to_string()))? {
+        sqex_proto::name::Target::Key(k) => Ok(k),
+        sqex_proto::name::Target::Named { name, domain } => {
+            if let Some(d) = domain
+                && chat.domain() != Some(d.as_str())
+            {
+                return Err(ChatError::Protocol(format!(
+                    "connected to {}, so cannot resolve names at {d} — reconnect with --server {d}",
+                    chat.domain().unwrap_or("a literal address")
+                )));
+            }
+            chat.resolve_name(&name).await
+        }
+    }
 }
 
 /// Open a direct message with `account`, or go to the one that is already open.
@@ -2747,7 +2786,9 @@ fn name_map(chat: &Chat, open: &[Open], conv: Option<&Open>) -> HashMap<PubKey, 
     let mut out = HashMap::new();
     let want = |account: PubKey, out: &mut HashMap<PubKey, String>| {
         if let std::collections::hash_map::Entry::Vacant(e) = out.entry(account)
-            && let Some(name) = chat.display_name(&account)
+            && let Some(name) = chat
+                .display_name(&account)
+                .or_else(|| chat.handle(&account))
         {
             e.insert(name);
         }
@@ -3172,7 +3213,16 @@ async fn connect(
     cli: &Cli,
     cfg: &Config,
     seed: &[u8; 32],
-) -> Result<(Client, std::net::SocketAddr, PubKey, Option<String>), String> {
+) -> Result<
+    (
+        Client,
+        std::net::SocketAddr,
+        PubKey,
+        Option<String>,
+        Option<String>,
+    ),
+    String,
+> {
     let target = sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())?;
 
     let addr = match target {
@@ -3181,7 +3231,7 @@ async fn connect(
             let client = Client::connect_as(socket, key.as_bytes(), seed)
                 .await
                 .map_err(|e| format!("could not reach {socket}: {e}"))?;
-            return Ok((client, socket, key, None));
+            return Ok((client, socket, key, None, None));
         }
         sqex_discovery::Target::Discover(d) => d,
     };
@@ -3231,7 +3281,13 @@ async fn connect(
                     // time, so it is said once and not treated as fatal.
                     eprintln!("note: could not remember where {domain} answered: {e}");
                 }
-                return Ok((client, c.addr, server, pinned_notice));
+                return Ok((
+                    client,
+                    c.addr,
+                    server,
+                    pinned_notice,
+                    Some(domain.to_string()),
+                ));
             }
             Err(e) => {
                 // Quiet per candidate: a stale cached address is ordinary and

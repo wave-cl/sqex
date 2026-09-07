@@ -439,6 +439,10 @@ pub struct Chat {
     /// receipts mid-connection, and retrying every call would turn a settled
     /// answer into a request per fetch.
     receipts: AtomicBool,
+    /// The domain this exchange was discovered under (SIP-33), for rendering a
+    /// SIP-38 handle as `name@domain`. `None` when reached by a literal
+    /// host+key, where there is no domain to show.
+    domain: Option<String>,
     store: Store,
 }
 
@@ -475,6 +479,7 @@ impl Chat {
             seed,
             exchange,
             receipts: AtomicBool::new(true),
+            domain: None,
             endpoint: None,
             link: Link::Up,
             attempts: 0,
@@ -936,6 +941,62 @@ impl Chat {
     /// connection meant every request afterwards failed forever.
     pub fn dials(&mut self, addr: SocketAddr, server_pub: [u8; 32]) {
         self.endpoint = Some((addr, server_pub));
+    }
+
+    /// The domain this exchange was discovered under, so a SIP-38 handle can be
+    /// shown as `name@domain`. Set once, after connecting.
+    pub fn set_domain(&mut self, domain: Option<String>) {
+        self.domain = domain;
+    }
+
+    /// The domain this client is connected under, if it discovered one.
+    pub fn domain(&self) -> Option<&str> {
+        self.domain.as_deref()
+    }
+
+    /// Resolve a SIP-38 name to the account behind it (`POST /name/resolve`).
+    /// `name` is the bare local part; the exchange it is resolved against is the
+    /// one this client is connected to. Errors if no account holds the name.
+    pub async fn resolve_name(&mut self, name: &str) -> Result<PubKey> {
+        let name =
+            sqex_proto::name::canonical(name).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let body = self
+            .post(
+                "/name/resolve",
+                sqex_proto::name::Resolve { name: name.clone() }.encode(),
+            )
+            .await?;
+        let r = sqex_proto::name::Resolved::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        if !r.found {
+            return Err(ChatError::Protocol(format!("no account is named {name}")));
+        }
+        Ok(r.account)
+    }
+
+    /// The SIP-38 handles the exchange reports for an account
+    /// (`POST /name/reverse`), oldest first. The exchange's word — a hint for
+    /// display, never an authority.
+    pub async fn reverse_names(&mut self, account: &PubKey) -> Result<Vec<String>> {
+        let body = self
+            .post(
+                "/name/reverse",
+                sqex_proto::name::Reverse { account: *account }.encode(),
+            )
+            .await?;
+        Ok(sqex_proto::name::Names::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .names)
+    }
+
+    /// The cached handle for an account as `name@domain`, if one is known and a
+    /// domain is set. This is the exchange's reverse-lookup, shown *below* a
+    /// SIP-21 profile nickname — never in place of one (the display precedence
+    /// is profile name → handle → short key, composed by the interface).
+    pub fn handle(&self, account: &PubKey) -> Option<String> {
+        let (name, _) = self.store.handle(account).ok().flatten()?;
+        let domain = self.domain.as_deref()?;
+        (!name.is_empty()).then(|| format!("{name}@{domain}"))
     }
 
     /// Whether the exchange is reachable, as far as anything has been able to
@@ -2753,6 +2814,24 @@ impl Chat {
                 _ => (String::new(), String::new()),
             };
             self.store.put_profile(account, &name, &title, now)?;
+            // SIP-38: the account's handle, on the same cadence and the same
+            // "asked, told nothing" caching. The exchange's reverse-lookup is
+            // its word — a display hint under the profile nickname, never an
+            // authority — so a failure here is swallowed, not surfaced.
+            let handle_stale = force
+                || match self.store.handle(account)? {
+                    Some((n, at)) => now.saturating_sub(at) >= age(&n),
+                    None => true,
+                };
+            if handle_stale {
+                let primary = self
+                    .reverse_names(account)
+                    .await
+                    .ok()
+                    .and_then(|mut v| (!v.is_empty()).then(|| v.remove(0)));
+                self.store
+                    .put_handle(account, primary.as_deref().unwrap_or(""), now)?;
+            }
             asked += 1;
         }
         Ok(asked)

@@ -307,6 +307,34 @@ pub async fn connect(
     Ok(client)
 }
 
+/// Resolve a SIP-38 name to the account behind it, on this exchange
+/// (`POST /name/resolve`). A light connection — no session, no datagram
+/// requirement — so a name can be dialed like a key. The exchange is trusted
+/// for the binding (SIP-38), same as the CLI and chat client.
+pub async fn resolve_name(
+    endpoint: Endpoint,
+    signer: &sqnr_core::SoftwareSigner,
+    name: &str,
+) -> Result<PubKey, String> {
+    let name = sqex_proto::name::canonical(name).map_err(|e| e.to_string())?;
+    let mut client =
+        Client::connect_as(endpoint.address, endpoint.server.as_bytes(), &signer.seed()).await?;
+    let (code, body) = client
+        .post(
+            "/name/resolve",
+            sqex_proto::name::Resolve { name: name.clone() }.encode(),
+        )
+        .await?;
+    if code != 200 {
+        return Err(format!("resolving {name}: exchange said {code}"));
+    }
+    let r = sqex_proto::name::Resolved::decode(&body).map_err(|e| e.to_string())?;
+    if !r.found {
+        return Err(format!("no account is named {name}"));
+    }
+    Ok(r.account)
+}
+
 /// Connect, having first checked there is somebody else to connect *to*.
 pub async fn dial(
     endpoint: Endpoint,

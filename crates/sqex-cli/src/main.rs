@@ -1280,33 +1280,6 @@ async fn resolve_domain(domain: &str) -> Result<(SocketAddr, PubKey), String> {
     Ok((resolve(&found.address)?, found.key))
 }
 
-/// A CLI argument that names an account: a key given directly, or a name to
-/// resolve through the SIP-38 directory.
-#[derive(Debug, PartialEq, Eq)]
-enum Target {
-    Key(PubKey),
-    Named {
-        name: String,
-        domain: Option<String>,
-    },
-}
-
-/// Classify a peer/target argument **without touching the network**. A base58
-/// Ed25519 key is taken as itself; anything else is a name — `name@domain`, or
-/// a bare `name` for the configured exchange — canonicalised per SIP-38. The
-/// key parse is tried first, so an explicit key is never reinterpreted as a
-/// name.
-fn classify_target(input: &str) -> Result<Target, String> {
-    let trimmed = input.trim();
-    if let Ok(key) = trimmed.parse::<PubKey>() {
-        return Ok(Target::Key(key));
-    }
-    let (local, domain) = split_name(trimmed)?;
-    let name = name::canonical(&local)
-        .map_err(|e| format!("{input:?} is neither a key nor a valid name: {e}"))?;
-    Ok(Target::Named { name, domain })
-}
-
 /// Resolve a peer/target argument to a key. A key passes straight through; a
 /// name is resolved through the SIP-38 directory — `name@domain` against that
 /// domain's exchange (SIP-33), a bare name against the configured one.
@@ -1317,9 +1290,9 @@ fn classify_target(input: &str) -> Result<Target, String> {
 /// one it uses. Same-domain use (`alice@squic.org` with `squic.org` configured)
 /// is seamless; cross-exchange is resolve-only.
 async fn resolve_target(cli: &Cli, cfg: &Config, input: &str) -> Result<PubKey, String> {
-    match classify_target(input)? {
-        Target::Key(k) => Ok(k),
-        Target::Named { name, domain } => {
+    match name::classify(input).map_err(|e| e.to_string())? {
+        name::Target::Key(k) => Ok(k),
+        name::Target::Named { name, domain } => {
             let (addr, server) = match &domain {
                 Some(d) => resolve_domain(d).await?,
                 None => endpoint(cli, cfg).await?,
@@ -2224,49 +2197,5 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A real, published Ed25519 key (ex's exchange identity) — used because
-    /// key parsing may validate curve membership, which an arbitrary 32 bytes
-    /// would not satisfy.
-    const REAL_KEY: &str = "2j68p8rZKXE6W1f6LerRGB2SPTH8JkbfMmZRFTzcLKyW";
-
-    #[test]
-    fn a_base58_key_classifies_as_a_key_not_a_name() {
-        // REAL_KEY is also a valid *name* by grammar (44 lowercase-able
-        // alphanumerics), so this asserts the key parse wins by being tried
-        // first — an explicit key is never reinterpreted as a name.
-        match classify_target(REAL_KEY).unwrap() {
-            Target::Key(k) => assert_eq!(k, REAL_KEY.parse::<PubKey>().unwrap()),
-            other => panic!("expected a key, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_bare_name_and_a_name_at_domain_classify_and_fold() {
-        assert_eq!(
-            classify_target("colin").unwrap(),
-            Target::Named {
-                name: "colin".into(),
-                domain: None
-            }
-        );
-        // Case is folded on both halves' name; the domain is kept verbatim.
-        assert_eq!(
-            classify_target("Colin@squic.org").unwrap(),
-            Target::Named {
-                name: "colin".into(),
-                domain: Some("squic.org".into())
-            }
-        );
-    }
-
-    #[test]
-    fn neither_a_key_nor_a_valid_name_is_an_error() {
-        for bad in ["a.b", "", "x@", "@squic.org", "has space", "café"] {
-            assert!(classify_target(bad).is_err(), "{bad:?} should be refused");
-        }
-    }
-}
+// `name@domain` classification lives in `sqex_proto::name::classify`, shared by
+// the CLI, chat, and voice clients; its tests are there.
