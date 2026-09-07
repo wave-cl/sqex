@@ -361,6 +361,14 @@ pub struct App {
     pub has_avatar: bool,
     /// The command list is on screen, over the transcript.
     pub helping: bool,
+    /// How far down the command list the reader has scrolled, in lines.
+    ///
+    /// The list outgrew a screen — and until it scrolled, it simply clipped:
+    /// adding one command silently pushed the last one off the bottom, where
+    /// nothing said it had gone. Like [`scroll`](Self::scroll), this is a wish
+    /// that the renderer clamps and hands back, so a held key cannot wind it up
+    /// for ever against a short list.
+    pub help_scroll: usize,
     /// What a search turned up, and what was searched for. A view over the
     /// transcript, like the directory and the command list.
     pub hits: Vec<Hit>,
@@ -1321,8 +1329,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // The views that are not the conversation have nothing to hover: no rows
     // of theirs belong to a message.
     if app.helping {
-        help(f, area);
-        return Drawn::default();
+        return help(f, area, app.help_scroll);
     }
     if app.searching {
         results(f, app, area);
@@ -1684,9 +1691,19 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "/who  /read",
                 "who is here and their keys in full; how far each has read",
             ),
+            ("/rotate", "mint a new key for everyone currently here"),
+        ],
+    ),
+    (
+        "calls",
+        &[
             (
-                "/rotate  /call",
-                "mint a new key here; or ring everyone for a call",
+                "/call  /answer",
+                "ring everyone here; take it — sqex-voice joins the audio",
+            ),
+            (
+                "/decline  /busy  /hangup",
+                "refuse it, or end it — each one is recorded",
             ),
         ],
     ),
@@ -1724,7 +1741,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
 /// forty of these. It was the only list there was, and at eighty columns the
 /// end of it was simply cut off — so the commands that fell off were
 /// undiscoverable and nothing said so.
-fn help(f: &mut Frame, area: Rect) {
+fn help(f: &mut Frame, area: Rect, scroll: usize) -> Drawn {
     let dim = Style::default().fg(palette::MUTED);
     let key = Style::default().fg(palette::ATTENTION);
     let head = Style::default().fg(palette::ACCENT);
@@ -1792,8 +1809,38 @@ fn help(f: &mut Frame, area: Rect) {
         }
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled("  Esc to go back", dim)));
-    f.render_widget(Paragraph::new(lines), area);
+    // The footer sits outside the scrolled body, or the one line telling
+    // somebody how to scroll would be the first thing to scroll away.
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let (body, foot) = (split[0], split[1]);
+
+    let room = body.height as usize;
+    let total = lines.len();
+    // What the reader asked for, against what there is. Clamped here and handed
+    // back, the way the transcript's own scroll is.
+    let furthest = total.saturating_sub(room);
+    let at = scroll.min(furthest);
+    f.render_widget(Paragraph::new(lines).scroll((at as u16, 0)), body);
+
+    // Say that there is more, and how to reach it. A list that clipped in
+    // silence is what this replaced.
+    let hint = match furthest.saturating_sub(at) {
+        _ if furthest == 0 => "  Esc to go back".to_string(),
+        0 => "  ↑↓ ^U ^D to scroll    Esc to go back".to_string(),
+        more => format!("  ↑↓ ^U ^D to scroll    Esc to go back    {more} more below"),
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, dim))), foot);
+
+    Drawn {
+        pane: area,
+        rows: Vec::new(),
+        scroll: at,
+        total,
+        room,
+    }
 }
 
 /// The directory, numbered so `/join <n>` can act on it.
@@ -4330,7 +4377,10 @@ mod tests {
     fn help_lists_the_commands_and_the_keys() {
         let mut app = sample();
         app.helping = true;
-        let out = render(&app, 110, 40);
+        // Tall enough for the whole list: this asserts what the help *says*,
+        // not what one screenful of it shows. Whether it fits is the scrolling
+        // test's business, below.
+        let out = render(&app, 110, 80);
         // A sample from each section, and the keys that are not commands at
         // all — which were the least discoverable thing in the client.
         for want in [
@@ -4343,6 +4393,41 @@ mod tests {
         assert!(
             !out.contains("are you there?"),
             "the transcript showed through"
+        );
+    }
+
+    /// The list outgrew a screen, and until it scrolled it simply clipped:
+    /// adding a command pushed the last one off the bottom with nothing saying
+    /// so. Now the bottom is reachable, and the footer says it is there.
+    #[test]
+    fn help_scrolls_to_what_does_not_fit() {
+        let mut app = sample();
+        app.helping = true;
+
+        // Short enough that the end of the list is past the fold.
+        let top = render(&app, 110, 24);
+        assert!(top.contains("keys"), "the head should be visible:\n{top}");
+        assert!(
+            top.contains("more below"),
+            "a clipped list must say there is more:\n{top}"
+        );
+        let tail = "/whoami";
+        assert!(
+            !top.contains(tail),
+            "{tail} should be past the fold at this height:\n{top}"
+        );
+
+        // Asking for more than there is lands at the bottom, and the bottom is
+        // where the last of the list is.
+        app.help_scroll = usize::MAX;
+        let end = render(&app, 110, 24);
+        assert!(
+            end.contains(tail),
+            "scrolling to the end should reach {tail}:\n{end}"
+        );
+        assert!(
+            !end.contains("more below"),
+            "nothing is below the end:\n{end}"
         );
     }
 

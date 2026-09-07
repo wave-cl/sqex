@@ -804,7 +804,14 @@ async fn event_loop(
             // from winding the number past the top of a short conversation, and
             // what makes `Home` — which asks for `usize::MAX` — land exactly at
             // the oldest line rather than somewhere unrepresentable.
-            app.scroll = hover.scroll;
+            // The command list is drawn into the same pane and scrolls the same
+            // way, so the answer comes back on the same field — it just belongs
+            // to a different wish.
+            if app.helping {
+                app.help_scroll = hover.scroll;
+            } else {
+                app.scroll = hover.scroll;
+            }
             app.page = hover.room.saturating_sub(2).max(1);
             // Whether there is anything above the top of the pane, so the footer
             // can say how to reach it. Taken from the frame that drew, like
@@ -1533,8 +1540,24 @@ async fn handle_key(
             // expectation is unmet here either way — nothing was bound to it —
             // so meeting a different one costs nothing that was not already
             // being paid.
-            KeyCode::Char('u') => app.scroll += app.page,
-            KeyCode::Char('d') => app.scroll = app.scroll.saturating_sub(app.page),
+            // The command list is a document and the transcript is a
+            // conversation, so "back" is the opposite direction in each: its
+            // scroll counts down from the newest, and this one counts from the
+            // top.
+            KeyCode::Char('u') => {
+                if app.helping {
+                    app.help_scroll = app.help_scroll.saturating_sub(app.page);
+                } else {
+                    app.scroll += app.page;
+                }
+            }
+            KeyCode::Char('d') => {
+                if app.helping {
+                    app.help_scroll += app.page;
+                } else {
+                    app.scroll = app.scroll.saturating_sub(app.page);
+                }
+            }
             _ => {}
         }
         return;
@@ -1559,8 +1582,47 @@ async fn handle_key(
 
     // The directory and the command list are views over the transcript, so Esc
     // puts them away rather than leaving the reader stuck looking at one.
+    // The command list scrolls, and it is a modal view: a key that moves it is
+    // handled here and goes no further, or the transcript underneath would act
+    // on the same press.
+    if app.helping {
+        let moved = match code {
+            KeyCode::Down => {
+                app.help_scroll += 1;
+                true
+            }
+            KeyCode::Up => {
+                app.help_scroll = app.help_scroll.saturating_sub(1);
+                true
+            }
+            KeyCode::PageDown => {
+                app.help_scroll += app.page;
+                true
+            }
+            KeyCode::PageUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(app.page);
+                true
+            }
+            KeyCode::Home => {
+                app.help_scroll = 0;
+                true
+            }
+            // Asking for more than there is; the renderer clamps it and hands
+            // back where that landed, as it does for the transcript.
+            KeyCode::End => {
+                app.help_scroll = usize::MAX;
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            return;
+        }
+    }
     if code == KeyCode::Esc && app.helping {
         app.helping = false;
+        // Next time it opens at the top, rather than wherever it was left.
+        app.help_scroll = 0;
         return;
     }
     if code == KeyCode::Esc && app.searching {
