@@ -56,23 +56,24 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Install PC/SC (Linux)
+      - name: Install PC/SC and ALSA (Linux)
+        # libpcsclite for sqnr (YubiKey); libasound2 for sqex-voice (cpal).
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libasound2-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release -p sqexd -p sqex-cli -p sqex-chat --target ${{ matrix.target }}
+        run: cargo build --release -p sqexd -p sqex-cli -p sqex-chat -p sqex-voice --target ${{ matrix.target }}
 
       - name: Package
         run: |
           VERSION="${{ github.event.inputs.tag || github.ref_name }}"
           ARCHIVE="sqex-${VERSION}-${{ matrix.archive_target }}.tar.gz"
           BINDIR="target/${{ matrix.target }}/release"
-          tar -czf "${ARCHIVE}" -C "${BINDIR}" sqexd sqex sqex-chat
+          tar -czf "${ARCHIVE}" -C "${BINDIR}" sqexd sqex sqex-chat sqex-voice
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
