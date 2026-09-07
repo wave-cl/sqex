@@ -3307,8 +3307,8 @@ async fn connect(
 ///
 /// The resolution itself lives in `sqex_discovery::target`, shared with `sqex`
 /// and `sqex-voice` — three copies of it is what produced two bugs in a day.
-fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
-    [
+fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
+    let mut layers = vec![
         sqex_discovery::Layer {
             server: cli.server.clone(),
             host: cli.server_host.clone(),
@@ -3335,7 +3335,19 @@ fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
             },
             _ => sqex_discovery::Layer::default(),
         },
-    ]
+    ];
+    // Lowest priority: the active identity's primary SIP-38 handle domain, so a
+    // claimed name is the default exchange and no `--server` is needed — the
+    // same fallback the `sqex` CLI has. A cleartext sidecar read, no passphrase.
+    if let Ok(id) = identity_path(cli, cfg)
+        && let Some(domain) = sqex_proto::handles::primary_domain(&id)
+    {
+        layers.push(sqex_discovery::Layer {
+            server: Some(domain),
+            ..Default::default()
+        });
+    }
+    layers
 }
 
 /// `host:port` for the configured path, which may name a host.

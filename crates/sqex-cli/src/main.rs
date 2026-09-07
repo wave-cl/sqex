@@ -31,7 +31,7 @@ use sqex_proto::session::{
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
-mod handles;
+use sqex_proto::handles;
 
 #[derive(Parser)]
 #[command(

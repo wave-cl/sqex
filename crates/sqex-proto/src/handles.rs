@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sqex_proto::name;
+use crate::name;
 
 /// The sidecar path for an identity file: `<identity>.handles`.
 ///

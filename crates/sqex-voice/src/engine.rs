@@ -238,7 +238,7 @@ pub struct Endpoint {
 /// Resolution is shared with the other clients in `sqex_discovery::target`,
 /// because three copies of it is what produced two bugs in a day.
 pub async fn resolve(
-    layers: &[sqex_discovery::Layer; 3],
+    layers: &[sqex_discovery::Layer],
     report: &mut dyn Report,
 ) -> Result<Endpoint, String> {
     match sqex_discovery::target::resolve(layers).map_err(|e| e.to_string())? {

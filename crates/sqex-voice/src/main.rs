@@ -367,12 +367,18 @@ fn opts(
 /// Asking for a passphrase is why this stayed in the binary. A terminal prompts
 /// on stdin; something with a window opens a dialog; a library can do neither,
 /// so the engine takes an already-unlocked signer.
+/// The active identity file: `-i` flag, then config, then the default. Used
+/// both to load the signer and to find its SIP-38 handle sidecar.
+fn identity_path(cli: &Cli, cfg: &Config) -> Result<PathBuf, String> {
+    match (&cli.identity, &cfg.identity) {
+        (Some(p), _) => Ok(p.clone()),
+        (None, Some(p)) => Ok(p.clone()),
+        (None, None) => identity::default_identity_path(),
+    }
+}
+
 fn load_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::SoftwareSigner, String> {
-    let path = match (&cli.identity, &cfg.identity) {
-        (Some(p), _) => p.clone(),
-        (None, Some(p)) => p.clone(),
-        (None, None) => identity::default_identity_path()?,
-    };
+    let path = identity_path(cli, cfg)?;
     if !path.exists() {
         return Err(format!(
             "no identity at {} — run `sqnr keygen` first",
@@ -391,8 +397,8 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::SoftwareSigner, S
 /// The layers a caller can speak through, most specific first. Resolution is
 /// shared with the other clients in `sqex_discovery::target`, because three
 /// copies of it is what produced two bugs in a day.
-fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
-    [
+fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
+    let mut layers = vec![
         sqex_discovery::Layer {
             server: cli.server.clone(),
             host: cli.server_host.clone(),
@@ -417,7 +423,19 @@ fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
             },
             _ => sqex_discovery::Layer::default(),
         },
-    ]
+    ];
+    // Lowest priority: the active identity's primary SIP-38 handle domain, so a
+    // claimed name is the default exchange and no `--server` is needed — the
+    // same fallback the `sqex` CLI has. A cleartext sidecar read, no passphrase.
+    if let Ok(id) = identity_path(cli, cfg)
+        && let Some(domain) = sqex_proto::handles::primary_domain(&id)
+    {
+        layers.push(sqex_discovery::Layer {
+            server: Some(domain),
+            ..Default::default()
+        });
+    }
+    layers
 }
 
 fn env_nonempty(key: &str) -> Option<String> {

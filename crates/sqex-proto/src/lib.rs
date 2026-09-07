@@ -22,6 +22,7 @@ pub mod entry_sig;
 pub mod events;
 pub mod exchange;
 pub mod h3;
+pub mod handles;
 pub mod mailbox;
 pub mod message;
 pub mod name;
