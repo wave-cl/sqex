@@ -496,7 +496,7 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
         wait,
         datagram,
     } = cmd;
-    let peer = parse_key(peer)?;
+    let peer = resolve_target(cli, cfg, peer).await?;
     let (mut client, signer) = mail_client(cli, cfg).await?;
     let me = PubKey::new(signer.public());
     if me == peer {
@@ -698,7 +698,7 @@ async fn mail_client(
 async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
     match cmd {
         MailCmd::Send { recipient, message } => {
-            let to = parse_key(recipient)?;
+            let to = resolve_target(cli, cfg, recipient).await?;
             let plaintext = match message {
                 Some(m) => m.clone().into_bytes(),
                 None => {
@@ -882,7 +882,7 @@ fn pick_local_port() -> Result<SocketAddr, String> {
 
 async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> Result<(), String> {
     let signer = load_software_identity(cli, cfg)?;
-    let them = parse_key(peer)?;
+    let them = resolve_target(cli, cfg, peer).await?;
     let (addr, server) = endpoint(cli, cfg).await?;
 
     // **One port for both connections, and that is the whole mechanism.** The
@@ -1044,7 +1044,7 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
             days,
         } => {
             let signer = load_software_identity(cli, cfg)?;
-            let about = parse_key(subject)?;
+            let about = resolve_target(cli, cfg, subject).await?;
             let code = claim_code(claim)?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1082,7 +1082,7 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
         }
         AttestCmd::Withdraw { subject, digest } => {
             let signer = load_software_identity(cli, cfg)?;
-            let about = parse_key(subject)?;
+            let about = resolve_target(cli, cfg, subject).await?;
             let named = bs58::decode(digest)
                 .into_vec()
                 .map_err(|e| format!("bad digest: {e}"))?;
@@ -1112,11 +1112,11 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
         }
         AttestCmd::Read { subject, issuer } => {
             let about = match subject {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let from = match issuer {
-                Some(k) => Some(parse_key(k)?),
+                Some(k) => Some(resolve_target(cli, cfg, k).await?),
                 None => None,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -1261,6 +1261,81 @@ async fn resolve_domain(domain: &str) -> Result<(SocketAddr, PubKey), String> {
     Ok((resolve(&found.address)?, found.key))
 }
 
+/// A CLI argument that names an account: a key given directly, or a name to
+/// resolve through the SIP-38 directory.
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    Key(PubKey),
+    Named {
+        name: String,
+        domain: Option<String>,
+    },
+}
+
+/// Classify a peer/target argument **without touching the network**. A base58
+/// Ed25519 key is taken as itself; anything else is a name — `name@domain`, or
+/// a bare `name` for the configured exchange — canonicalised per SIP-38. The
+/// key parse is tried first, so an explicit key is never reinterpreted as a
+/// name.
+fn classify_target(input: &str) -> Result<Target, String> {
+    let trimmed = input.trim();
+    if let Ok(key) = trimmed.parse::<PubKey>() {
+        return Ok(Target::Key(key));
+    }
+    let (local, domain) = split_name(trimmed)?;
+    let name = name::canonical(&local)
+        .map_err(|e| format!("{input:?} is neither a key nor a valid name: {e}"))?;
+    Ok(Target::Named { name, domain })
+}
+
+/// Resolve a peer/target argument to a key. A key passes straight through; a
+/// name is resolved through the SIP-38 directory — `name@domain` against that
+/// domain's exchange (SIP-33), a bare name against the configured one.
+///
+/// Resolution is global (name → key), but the command that called this still
+/// runs against *its own* exchange, so a store-and-forward command handed
+/// `name@other.org` reaches the resolved key only if that exchange is also the
+/// one it uses. Same-domain use (`alice@squic.org` with `squic.org` configured)
+/// is seamless; cross-exchange is resolve-only.
+async fn resolve_target(cli: &Cli, cfg: &Config, input: &str) -> Result<PubKey, String> {
+    match classify_target(input)? {
+        Target::Key(k) => Ok(k),
+        Target::Named { name, domain } => {
+            let (addr, server) = match &domain {
+                Some(d) => resolve_domain(d).await?,
+                None => endpoint(cli, cfg).await?,
+            };
+            let label = match &domain {
+                Some(d) => format!("{name}@{d}"),
+                None => name.clone(),
+            };
+            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let (code, body) = client
+                .post(
+                    "/name/resolve",
+                    name::Resolve { name: name.clone() }.encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!(
+                    "resolving {label}: exchange said {code}: {}",
+                    said(&body)
+                ));
+            }
+            let r = name::Resolved::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                return Err(format!("no account is named {label}"));
+            }
+            if r.stale {
+                eprintln!(
+                    "warning: {label} is on notice — its lease has lapsed and it may be reclaimed"
+                );
+            }
+            Ok(r.account)
+        }
+    }
+}
+
 async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
     match cmd {
         NameCmd::Claim { name } => {
@@ -1372,7 +1447,7 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
         }
         NameCmd::Reverse { key } => {
             let target = match key {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -1439,7 +1514,7 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
         }
         ResolveCmd::Get { key } => {
             let target = match key {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -1485,7 +1560,7 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
                 return Err("a YubiKey cannot be a transport identity".into());
             }
             let signer = load_software_identity(cli, cfg)?;
-            let to = parse_key(successor)?;
+            let to = resolve_target(cli, cfg, successor).await?;
             let (addr, server) = endpoint(cli, cfg).await?;
             let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
             let req = ResolveSuccessor {
@@ -1548,7 +1623,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             // Reading is open, but connecting as ourselves is what lets the
             // exchange disclose our own withheld record.
             let target = match key {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -2000,4 +2075,51 @@ fn parse_key(s: &str) -> Result<PubKey, String> {
 /// An environment variable's value, or None if unset or empty.
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real, published Ed25519 key (ex's exchange identity) — used because
+    /// key parsing may validate curve membership, which an arbitrary 32 bytes
+    /// would not satisfy.
+    const REAL_KEY: &str = "2j68p8rZKXE6W1f6LerRGB2SPTH8JkbfMmZRFTzcLKyW";
+
+    #[test]
+    fn a_base58_key_classifies_as_a_key_not_a_name() {
+        // REAL_KEY is also a valid *name* by grammar (44 lowercase-able
+        // alphanumerics), so this asserts the key parse wins by being tried
+        // first — an explicit key is never reinterpreted as a name.
+        match classify_target(REAL_KEY).unwrap() {
+            Target::Key(k) => assert_eq!(k, REAL_KEY.parse::<PubKey>().unwrap()),
+            other => panic!("expected a key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_name_and_a_name_at_domain_classify_and_fold() {
+        assert_eq!(
+            classify_target("colin").unwrap(),
+            Target::Named {
+                name: "colin".into(),
+                domain: None
+            }
+        );
+        // Case is folded on both halves' name; the domain is kept verbatim.
+        assert_eq!(
+            classify_target("Colin@squic.org").unwrap(),
+            Target::Named {
+                name: "colin".into(),
+                domain: Some("squic.org".into())
+            }
+        );
+    }
+
+    #[test]
+    fn neither_a_key_nor_a_valid_name_is_an_error() {
+        for bad in ["a.b", "", "x@", "@squic.org", "has space", "café"] {
+            assert!(classify_target(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
 }
