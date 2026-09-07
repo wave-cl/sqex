@@ -24,6 +24,7 @@ pub mod exchange;
 pub mod h3;
 pub mod mailbox;
 pub mod message;
+pub mod name;
 pub mod peer;
 pub mod prekey;
 pub mod profile;
@@ -74,6 +75,15 @@ pub enum Op {
     },
     /// Decline one, and remember the decision so it does not requeue.
     AdmissionDeny(PubKey),
+    /// SIP-38: bind a name to an account, in any registration mode. The
+    /// administrator's override — how names are handed out in a closed
+    /// deployment, and how a squatted one is corrected in an open one. It
+    /// reassigns an existing binding and is not subject to the per-account cap.
+    NameAssign { name: String, account: PubKey },
+    /// SIP-38: free a name, open- or administrator-bound.
+    NameRelease(String),
+    /// SIP-38: read the directory of bound names.
+    NameList,
 }
 
 impl Op {
@@ -90,6 +100,9 @@ impl Op {
             Op::AdmissionList => 0x09,
             Op::AdmissionApprove { .. } => 0x0a,
             Op::AdmissionDeny(_) => 0x0b,
+            Op::NameAssign { .. } => 0x0c,
+            Op::NameRelease(_) => 0x0d,
+            Op::NameList => 0x0e,
         }
     }
 
@@ -122,6 +135,17 @@ impl Op {
             }
             Op::WhitelistRemove(k) | Op::AdmissionDeny(k) => out.extend_from_slice(k.as_bytes()),
             Op::AuditTail(n) => out.extend_from_slice(&n.to_be_bytes()),
+            // Fixed-width account first, then the variable-length name — the
+            // same layout AdmissionApprove uses for its key-then-label.
+            Op::NameAssign { name, account } => {
+                out.extend_from_slice(account.as_bytes());
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
+            Op::NameRelease(name) => {
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
             _ => {}
         }
         out
@@ -145,6 +169,9 @@ impl Op {
             0x09 => Op::AdmissionList,
             0x0a => decode_approve(rest)?,
             0x0b => Op::AdmissionDeny(key(rest)?),
+            0x0c => decode_name_assign(rest)?,
+            0x0d => Op::NameRelease(decode_name(rest)?),
+            0x0e => Op::NameList,
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
         // Every op consumes its payload exactly; reject trailing bytes.
@@ -168,6 +195,9 @@ impl Op {
             Op::AdmissionList => "admission-list",
             Op::AdmissionApprove { .. } => "admission-approve",
             Op::AdmissionDeny(_) => "admission-deny",
+            Op::NameAssign { .. } => "name-assign",
+            Op::NameRelease(_) => "name-release",
+            Op::NameList => "name-list",
         }
     }
 
@@ -185,6 +215,9 @@ impl Op {
             Op::AdmissionList => "Read pending admission requests".into(),
             Op::AdmissionApprove { .. } => "Admit a device to the whitelist".into(),
             Op::AdmissionDeny(_) => "Decline an admission request".into(),
+            Op::NameAssign { name, .. } => format!("Assign the name '{name}' to an account"),
+            Op::NameRelease(name) => format!("Release the name '{name}'"),
+            Op::NameList => "Read the directory of names".into(),
         }
     }
 
@@ -210,6 +243,13 @@ impl Op {
                 d
             }
             Op::AdmissionDeny(k) => vec![format!("device: {}", k.to_base58())],
+            Op::NameAssign { name, account } => {
+                vec![
+                    format!("name: {name}"),
+                    format!("account: {}", account.to_base58()),
+                ]
+            }
+            Op::NameRelease(name) => vec![format!("name: {name}")],
             _ => vec![],
         }
     }
@@ -223,6 +263,8 @@ impl Op {
                 | Op::WhitelistAdd { .. }
                 | Op::WhitelistRemove(_)
                 | Op::ReloadAdmins
+                | Op::NameAssign { .. }
+                | Op::NameRelease(_)
         )
     }
 
@@ -233,6 +275,8 @@ impl Op {
             Op::WhitelistRemove(k) => Some(k.to_base58()),
             Op::AdmissionApprove { device, .. } => Some(device.to_base58()),
             Op::AdmissionDeny(k) => Some(k.to_base58()),
+            Op::NameAssign { name, .. } => Some(name.clone()),
+            Op::NameRelease(name) => Some(name.clone()),
             _ => None,
         }
     }
@@ -302,6 +346,29 @@ fn u32_arg(rest: &[u8]) -> Result<u32> {
     Ok(u32::from_be_bytes(arr))
 }
 
+/// A length-prefixed name argument, canonicalised (SIP-38). Shared by
+/// `NameRelease` and the tail of `NameAssign`.
+fn decode_name(rest: &[u8]) -> Result<String> {
+    let len = *rest
+        .first()
+        .ok_or_else(|| Error::Malformed("name op: missing length".into()))? as usize;
+    if rest.len() != 1 + len {
+        return Err(Error::Malformed("name op: length disagrees".into()));
+    }
+    let raw = std::str::from_utf8(&rest[1..])
+        .map_err(|_| Error::Malformed("name op: not UTF-8".into()))?;
+    name::canonical(raw)
+}
+
+fn decode_name_assign(rest: &[u8]) -> Result<Op> {
+    if rest.len() < 33 {
+        return Err(Error::Malformed("name-assign: too short".into()));
+    }
+    let account = PubKey::new(rest[0..32].try_into().unwrap());
+    let name = decode_name(&rest[32..])?;
+    Ok(Op::NameAssign { name, account })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +390,17 @@ mod tests {
             Op::Status,
             Op::ReloadAdmins,
             Op::AuditTail(42),
+            Op::AdmissionApprove {
+                device: PubKey::new([9u8; 32]),
+                label: Some("phone".into()),
+            },
+            Op::AdmissionDeny(PubKey::new([8u8; 32])),
+            Op::NameAssign {
+                name: "colin".into(),
+                account: PubKey::new([4u8; 32]),
+            },
+            Op::NameRelease("carl".into()),
+            Op::NameList,
         ]
     }
 

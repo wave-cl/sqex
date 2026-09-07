@@ -27,6 +27,29 @@ fn default_welcome_channel() -> String {
     "general".to_string()
 }
 
+fn default_name_registration() -> String {
+    "off".to_string()
+}
+
+fn default_max_names_per_account() -> u64 {
+    4
+}
+
+fn default_name_lease_secs() -> u64 {
+    30 * 24 * 3600 // 30 days
+}
+
+/// SIP-38 registration policy for the name route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameMode {
+    /// The route is disabled entirely — no claims, no administration.
+    Off,
+    /// Anyone may claim a free or lapsed name; administrators may also assign.
+    Open,
+    /// Only an administrator's SIP-10 assignment binds a name.
+    Closed,
+}
+
 /// The TOML file's shape. Every field except `key_file` has a default.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +100,22 @@ pub struct FileConfig {
     /// window); on this host, 256 ≈ 2.5 GB worst case.
     #[serde(default)]
     pub max_connections: Option<u64>,
+
+    /// SIP-38 name registration mode: `"off"` (default, route disabled),
+    /// `"open"` (anyone may claim a free or lapsed name), or `"closed"` (only an
+    /// administrator's assignment binds one). Off by default, like every other
+    /// outward-facing surface here — an operator turns it on deliberately.
+    #[serde(default = "default_name_registration")]
+    pub name_registration: String,
+    /// SIP-38: how many names one account may self-claim (open mode). Bounds a
+    /// land-grab; an administrator's assignments are not counted against it.
+    #[serde(default = "default_max_names_per_account")]
+    pub max_names_per_account: u64,
+    /// SIP-38: how long a self-claimed name survives without renewal, in
+    /// seconds. A beat (SIP-4), a re-claim, or a SIP-28 publish renews it. Long
+    /// by default (30 days) — a name is not an address.
+    #[serde(default = "default_name_lease_secs")]
+    pub name_lease_secs: u64,
 
     /// SIP-35: base58 Ed25519 identities of exchanges this one will serve
     /// replication to.
@@ -140,6 +179,9 @@ pub struct Config {
     pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
     pub max_connections: Option<u64>,
+    pub name_registration: NameMode,
+    pub max_names_per_account: usize,
+    pub name_lease_secs: u64,
     pub replication_peers: Vec<PubKey>,
     pub replicate: Vec<OriginConfig>,
 }
@@ -218,6 +260,25 @@ impl FileConfig {
             ));
         }
 
+        // SIP-38. An unknown mode is a configuration mistake worth naming at
+        // load, not a silent fallback to off.
+        let name_registration = match self.name_registration.trim().to_ascii_lowercase().as_str() {
+            "off" => NameMode::Off,
+            "open" => NameMode::Open,
+            "closed" => NameMode::Closed,
+            other => {
+                return Err(Error::Malformed(format!(
+                    "name_registration must be \"off\", \"open\" or \"closed\", not {other:?}"
+                )));
+            }
+        };
+        // A per-account cap of zero would refuse every self-claim in silence.
+        if self.max_names_per_account == 0 {
+            return Err(Error::Malformed(
+                "max_names_per_account must be a positive value".into(),
+            ));
+        }
+
         Ok(Config {
             listen,
             key_file: self.key_file,
@@ -228,6 +289,9 @@ impl FileConfig {
             welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
             max_connections: self.max_connections,
+            name_registration,
+            max_names_per_account: self.max_names_per_account as usize,
+            name_lease_secs: self.name_lease_secs,
             replication_peers,
             replicate,
         })
@@ -308,6 +372,37 @@ mod tests {
         assert_eq!(cfg.resolve().unwrap().max_connections, Some(256));
         // Zero is refused at load rather than silently refusing every caller.
         let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_connections = 0\n").unwrap();
+        assert!(cfg.resolve().is_err());
+    }
+
+    #[test]
+    fn name_registration_parses_and_defaults_off() {
+        // Default: off, cap 4, a long lease.
+        let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
+        let cfg = cfg.resolve().unwrap();
+        assert_eq!(cfg.name_registration, NameMode::Off);
+        assert_eq!(cfg.max_names_per_account, 4);
+        assert_eq!(cfg.name_lease_secs, 30 * 24 * 3600);
+        // Open, with an operator-set cap and lease.
+        let cfg: FileConfig = toml::from_str(
+            "key_file = \"/x\"\nname_registration = \"open\"\nmax_names_per_account = 2\nname_lease_secs = 3600\n",
+        )
+        .unwrap();
+        let cfg = cfg.resolve().unwrap();
+        assert_eq!(cfg.name_registration, NameMode::Open);
+        assert_eq!(cfg.max_names_per_account, 2);
+        assert_eq!(cfg.name_lease_secs, 3600);
+        // Closed is accepted; case and whitespace do not matter.
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\nname_registration = \" Closed \"\n").unwrap();
+        assert_eq!(cfg.resolve().unwrap().name_registration, NameMode::Closed);
+        // An unknown mode is refused at load rather than silently off.
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\nname_registration = \"maybe\"\n").unwrap();
+        assert!(cfg.resolve().is_err());
+        // A zero cap is refused.
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\nmax_names_per_account = 0\n").unwrap();
         assert!(cfg.resolve().is_err());
     }
 

@@ -37,6 +37,7 @@ mod channel_flow;
 mod device_flow;
 mod mailbox_flow;
 mod migration_flow;
+mod name_flow;
 mod private_channel_flow;
 mod profile_flow;
 mod receipt_flow;

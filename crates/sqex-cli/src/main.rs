@@ -18,6 +18,7 @@ use sqex_proto::attest::{
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::h3::H3Client;
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
+use sqex_proto::name::{self, ClaimAck};
 use sqex_proto::refusal::Refusal;
 use sqex_proto::rendezvous::{Introduce, Introduced};
 use sqex_proto::resolve::{
@@ -74,6 +75,16 @@ enum Cmd {
     Beacon {
         #[command(subcommand)]
         cmd: BeaconCmd,
+    },
+    /// Names (SIP-38): claim a name for your account, or resolve one.
+    ///
+    /// A name binds to your account, so once resolved the account's devices
+    /// (SIP-22) and endpoints (SIP-28) follow. Resolve accepts `name@domain` or
+    /// a bare `name` against the configured exchange. Whether you may claim a
+    /// name depends on the exchange's policy (open, closed, or off).
+    Name {
+        #[command(subcommand)]
+        cmd: NameCmd,
     },
     /// Rendezvous: ask to be introduced to a peer, so the two of you can
     /// connect directly.
@@ -194,6 +205,32 @@ enum BeaconCmd {
 }
 
 #[derive(Subcommand)]
+enum NameCmd {
+    /// Claim a name for your account (open registration only). Connects *as*
+    /// your identity — the connection is the proof, so nothing is signed.
+    Claim {
+        /// The name to claim. Canonicalised to lowercase; `[a-z0-9-]` only.
+        name: String,
+    },
+    /// Give up a name your account holds.
+    Release {
+        /// The name to release.
+        name: String,
+    },
+    /// Resolve a name to the account behind it.
+    Resolve {
+        /// `name` or `name@domain`. A bare name is looked up on the configured
+        /// exchange.
+        name: String,
+    },
+    /// List the names an account holds.
+    Reverse {
+        /// The account to ask about, base58. Defaults to your own.
+        key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AttestCmd {
     /// Sign a statement about another identity and lodge it.
     ///
@@ -296,6 +333,31 @@ enum AdminCmd {
     },
     /// Re-read the server's admin list from its config file.
     ReloadAdmins,
+    /// Administer names (SIP-38): assign, release, or list them. The
+    /// administrator's authority over the name directory.
+    Name {
+        #[command(subcommand)]
+        cmd: AdminNameCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminNameCmd {
+    /// Bind a name to an account, in any registration mode. Reassigns an
+    /// existing binding; not subject to the per-account cap.
+    Assign {
+        /// The name to assign.
+        name: String,
+        /// The account (base58) to bind it to.
+        account: String,
+    },
+    /// Free a name, whoever holds it.
+    Release {
+        /// The name to release.
+        name: String,
+    },
+    /// Read the whole directory of bound names.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -331,6 +393,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Status => status(&cli, &cfg).await,
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
+        Cmd::Name { cmd } => names(&cli, &cfg, cmd).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Meet {
@@ -1168,6 +1231,171 @@ fn show_endpoint(e: &Endpoint) -> String {
     }
 }
 
+// ---- names (SIP-38) ---------------------------------------------------------
+
+/// Split `name@domain` into its parts. A bare `name` has no domain.
+fn split_name(input: &str) -> Result<(String, Option<String>), String> {
+    match input.split_once('@') {
+        None => Ok((input.to_string(), None)),
+        Some((local, domain)) => {
+            if domain.contains('@') || domain.is_empty() || local.is_empty() {
+                return Err(format!("{input:?} is not a valid name@domain"));
+            }
+            Ok((local.to_string(), Some(domain.to_string())))
+        }
+    }
+}
+
+/// Discover a domain's exchange over DNSSEC (SIP-33), pinning on first contact.
+async fn resolve_domain(domain: &str) -> Result<(SocketAddr, PubKey), String> {
+    let found = sqex_discovery::discover(domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    if found.newly_pinned {
+        eprintln!(
+            "{domain}: discovered {} over DNSSEC and pinned it. \
+             Forget it with `sqex discover --forget {domain}`.",
+            found.key
+        );
+    }
+    Ok((resolve(&found.address)?, found.key))
+}
+
+async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
+    match cmd {
+        NameCmd::Claim { name } => {
+            // Claiming means connecting *as* the account, so the transport
+            // carries the identity (SIP-3) — a YubiKey cannot be a transport key.
+            if cli.yubikey {
+                return Err("a YubiKey cannot claim a name: it signs, but cannot be a \
+                            transport identity. Claim with a software identity."
+                    .into());
+            }
+            let name = name::canonical(name).map_err(|e| e.to_string())?;
+            let signer = load_software_identity(cli, cfg)?;
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code, body) = client
+                .post("/name/claim", name::Claim { name: name.clone() }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("claim refused ({code}): {}", said(&body)));
+            }
+            let ack = ClaimAck::decode(&body).map_err(|e| e.to_string())?;
+            match ack.outcome {
+                name::CLAIM_GRANTED => {
+                    println!("{name} is yours ({})", PubKey::new(signer.public()))
+                }
+                name::CLAIM_TAKEN => println!("{name} is held by another account"),
+                name::CLAIM_AT_CAPACITY => {
+                    println!("refused: you already hold the maximum number of names")
+                }
+                name::CLAIM_CLOSED => println!(
+                    "this exchange does not allow self-claimed names \
+                     (registration is closed or off)"
+                ),
+                name::CLAIM_RATE_LIMITED => {
+                    println!("refused: too many claims this hour — try again later")
+                }
+                other => println!("unexpected claim outcome: {other}"),
+            }
+            Ok(())
+        }
+        NameCmd::Release { name } => {
+            if cli.yubikey {
+                return Err("a YubiKey cannot be a transport identity".into());
+            }
+            let name = name::canonical(name).map_err(|e| e.to_string())?;
+            let signer = load_software_identity(cli, cfg)?;
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code, body) = client
+                .post(
+                    "/name/release",
+                    name::Release { name: name.clone() }.encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("release refused ({code}): {}", said(&body)));
+            }
+            println!("released {name} (a no-op if your account did not hold it)");
+            Ok(())
+        }
+        NameCmd::Resolve { name } => {
+            let (local, domain) = split_name(name)?;
+            let local = name::canonical(&local).map_err(|e| e.to_string())?;
+            // A `name@domain` selects that domain's exchange (SIP-33); a bare
+            // name uses the configured one.
+            let (addr, server) = match &domain {
+                Some(d) => resolve_domain(d).await?,
+                None => endpoint(cli, cfg).await?,
+            };
+            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let (code, body) = client
+                .post(
+                    "/name/resolve",
+                    name::Resolve {
+                        name: local.clone(),
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("resolve failed ({code}): {}", said(&body)));
+            }
+            let r = name::Resolved::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                println!("{local}: no such name");
+                return Ok(());
+            }
+            println!("{local} → {}", r.account);
+            // The provenance, so a consumer can judge the answer. Ages against
+            // the exchange's clock, per SIP-4.
+            if r.stale {
+                println!(
+                    "  STALE: the lease lapsed; this name may be reclaimed by another account"
+                );
+            } else if r.expires_at == 0 {
+                println!("  assigned by an administrator (no lease)");
+            } else {
+                println!(
+                    "  lease renews on activity; expires in {}s if idle",
+                    r.expires_at.saturating_sub(r.now)
+                );
+            }
+            println!(
+                "  Resolve the account's devices with `sqex` (SIP-22) and its address with \
+                 `sqex resolve get {}`.",
+                r.account
+            );
+            Ok(())
+        }
+        NameCmd::Reverse { key } => {
+            let target = match key {
+                Some(k) => parse_key(k)?,
+                None => own_identity(cli, cfg)?,
+            };
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let (code, body) = client
+                .post("/name/reverse", name::Reverse { account: target }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("reverse failed ({code}): {}", said(&body)));
+            }
+            let n = name::Names::decode(&body).map_err(|e| e.to_string())?;
+            if n.names.is_empty() {
+                println!("{target}: holds no names");
+                return Ok(());
+            }
+            for name in n.names {
+                println!("{name}");
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), String> {
     match cmd {
         ResolveCmd::Publish {
@@ -1480,7 +1708,56 @@ async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
             println!("{}", result(&v, 0));
             Ok(())
         }
+        AdminCmd::Name { cmd } => admin_name(cli, cfg, cmd).await,
     }
+}
+
+async fn admin_name(cli: &Cli, cfg: &Config, cmd: &AdminNameCmd) -> Result<(), String> {
+    let op = match cmd {
+        AdminNameCmd::Assign { name, account } => {
+            // Canonicalise before signing, so the summary the operator sees and
+            // signs is the name that will be stored.
+            let name = name::canonical(name).map_err(|e| e.to_string())?;
+            Op::NameAssign {
+                name,
+                account: parse_key(account)?,
+            }
+        }
+        AdminNameCmd::Release { name } => {
+            Op::NameRelease(name::canonical(name).map_err(|e| e.to_string())?)
+        }
+        AdminNameCmd::List => Op::NameList,
+    };
+    let v = submit(cli, cfg, vec![op.to_operation()]).await?;
+    match cmd {
+        AdminNameCmd::List => {
+            let r = result(&v, 0);
+            let names = r["names"].as_array().cloned().unwrap_or_default();
+            if names.is_empty() {
+                println!("no names bound");
+            }
+            for n in names {
+                let expires = n["expires_at"].as_u64().unwrap_or(0);
+                println!(
+                    "{}\t{}\t{}{}",
+                    n["name"].as_str().unwrap_or("?"),
+                    n["account"].as_str().unwrap_or("?"),
+                    if n["admin_set"].as_bool().unwrap_or(false) {
+                        "assigned"
+                    } else {
+                        "claimed"
+                    },
+                    if expires == 0 {
+                        String::new()
+                    } else {
+                        format!(" (expires_at {expires})")
+                    },
+                );
+            }
+        }
+        _ => println!("ok: {}", v["results"]),
+    }
+    Ok(())
 }
 
 async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {

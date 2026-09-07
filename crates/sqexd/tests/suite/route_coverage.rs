@@ -75,6 +75,11 @@ const ROUTES: &[(&str, &str, By)] = &[
     ("POST", "/device/register", Chat("Chat::register_self")),
     ("POST", "/device/revoke", Chat("Chat::revoke_device")),
     ("POST", "/device/list", Chat("Chat::my_devices")),
+    // SIP-38 names.
+    ("POST", "/name/claim", Cli("sqex name claim")),
+    ("POST", "/name/release", Cli("sqex name release")),
+    ("POST", "/name/resolve", Cli("sqex name resolve")),
+    ("POST", "/name/reverse", Cli("sqex name reverse")),
     ("POST", "/blob/limits", Chat("Chat::send_file")),
     ("POST", "/blob/begin", Chat("Chat::send_file")),
     ("POST", "/blob/put", Chat("Chat::send_file")),

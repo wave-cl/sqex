@@ -21,10 +21,11 @@ use crate::attest::{Attestations, LodgeError};
 use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
-use crate::config::{Config, OriginConfig};
+use crate::config::{Config, NameMode, OriginConfig};
 use crate::device::Registry;
 use crate::events::Subscribers;
 use crate::mailbox::Mailbox;
+use crate::name::Names;
 use crate::prekey::Prekeys;
 use crate::profile::Profiles;
 use crate::rendezvous::Rendezvous;
@@ -57,6 +58,7 @@ use sqex_proto::mailbox::{
     ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS,
 };
 use sqex_proto::message::{RING_RINGING, Signal};
+use sqex_proto::name;
 use sqex_proto::peer::{
     Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull, PullBlob, PullEnvelopes, PullRecord,
 };
@@ -105,6 +107,9 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Largest admin-command body we will read.
 const MAX_BODY: usize = 64 * 1024;
+
+/// Said when the SIP-38 name route is disabled (`name_registration = "off"`).
+const NAME_ROUTE_OFF: &str = "this exchange does not offer names";
 
 /// What the transport established about the caller on one connection.
 ///
@@ -202,6 +207,15 @@ pub struct Server {
     channels: Channels,
     prekeys: Prekeys,
     devices: Registry,
+    /// SIP-38: the per-domain name directory. Durable, unlike the SIP-28
+    /// endpoint store beside it — a name is the identity a person keeps, not an
+    /// address that is only interesting while fresh.
+    names: Names,
+    /// SIP-38 registration policy: whether names may be self-claimed, only
+    /// administrator-assigned, or the route is off entirely.
+    name_registration: NameMode,
+    /// SIP-38: how many names one account may self-claim (open mode).
+    max_names_per_account: usize,
     profiles: Profiles,
     admissions: Admissions,
     sessions: Sessions,
@@ -353,6 +367,13 @@ pub async fn bind(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("prekeys.db"));
+    // Durable like the device registry, for the same reason: a name is the
+    // identity a person keeps, and one that vanished on a restart would be
+    // worse than none.
+    let name_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("names.db"));
 
     // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
     // transport whitelist stays off: anyone holding the server key may connect,
@@ -451,6 +472,12 @@ pub async fn bind(
         // restart would be worse than none at all.
         devices: Registry::open(device_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the device registry: {e}")))?,
+        // Durable, beside the device registry — a name is the identity a person
+        // keeps across address and device changes (SIP-38).
+        names: Names::open(name_db.as_deref(), config.name_lease_secs)
+            .map_err(|e| Error::Malformed(format!("cannot open the name directory: {e}")))?,
+        name_registration: config.name_registration,
+        max_names_per_account: config.max_names_per_account,
         profiles: Profiles::open(profile_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open profiles: {e}")))?,
         // In memory: a pending request is a question somebody asked once, and
@@ -603,6 +630,15 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 // accumulate one entry per distinct pair that ever long-polled,
                 // an unbounded leak. Cheap in-memory work, no spawn_blocking.
                 server.rendezvous.sweep();
+                // SIP-38: drop names abandoned well past their lease. A single
+                // SQLite DELETE, so spawn_blocking like the channel sweep above.
+                let names = Arc::clone(&server);
+                if let Ok(dropped) =
+                    tokio::task::spawn_blocking(move || names.names.sweep(now_unix())).await
+                    && dropped > 0
+                {
+                    tracing::info!(dropped, "swept abandoned names");
+                }
             }
         }
     };
@@ -915,6 +951,10 @@ async fn route(
                     server
                         .endpoints
                         .refresh(&id, beat.interval_secs.saturating_mul(2));
+                    // SIP-38: a beat is activity attributable to the account, so
+                    // it renews the account's self-claimed names — a name in use
+                    // does not lapse on its lease.
+                    server.names.renew(&server.devices.account_for(&id));
                     tracing::debug!(identity = %id.short(), interval = beat.interval_secs, "beat");
                     (200, "application/octet-stream", BeatAck { now }.encode())
                 }
@@ -1006,11 +1046,16 @@ async fn route(
                     .endpoints
                     .publish(id, req.ttl_secs, req.endpoints, req.capabilities)
                 {
-                    Ok(_) => (
-                        200,
-                        "application/octet-stream",
-                        ChannelAck { now: now_unix() }.encode(),
-                    ),
+                    Ok(_) => {
+                        // SIP-38: publishing an address is activity attributable
+                        // to the account, so it renews the account's names too.
+                        server.names.renew(&server.devices.account_for(&id));
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
                     Err(_) => refuse(
                         507,
                         Code::TooManyEndpoints,
@@ -1225,6 +1270,91 @@ async fn route(
                 Ok(list) => (200, "application/octet-stream", list.encode()),
                 Err(e) => refuse(e.status(), e.code(), None),
             },
+        },
+
+        // SIP-38 names. A name binds to an **account**, so the account's devices
+        // (SIP-22) and endpoints (SIP-28) follow once a name resolves — this is
+        // only the hop in the middle. Registration mode is the operator's
+        // policy: `open` (self-claim), `closed` (administrator-assigned only),
+        // or `off` (the route is not offered). The binding is exchange-asserted;
+        // see the trust boundary in SIP-38.
+        ("POST", "/name/claim") => match (account, name::Claim::decode(body)) {
+            (None, _) => no_identity("claiming a name"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            // Self-claim is open-mode only. Closed answers `CLOSED` in the
+            // reply's own vocabulary rather than a transport refusal, because
+            // the namespace is public and a caller has earned a real answer;
+            // off does not offer the route at all.
+            (Some(me), Ok(req)) => match server.name_registration {
+                NameMode::Open => {
+                    let outcome = server
+                        .names
+                        .claim(&req.name, &me, server.max_names_per_account);
+                    (
+                        200,
+                        "application/octet-stream",
+                        name::ClaimAck {
+                            outcome,
+                            now: now_unix(),
+                        }
+                        .encode(),
+                    )
+                }
+                NameMode::Closed => (
+                    200,
+                    "application/octet-stream",
+                    name::ClaimAck {
+                        outcome: name::CLAIM_CLOSED,
+                        now: now_unix(),
+                    }
+                    .encode(),
+                ),
+                NameMode::Off => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
+            },
+        },
+        ("POST", "/name/release") => match (account, name::Release::decode(body)) {
+            (None, _) => no_identity("releasing a name"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) if server.name_registration != NameMode::Off => {
+                // A no-op unless the caller's account holds it; either way an
+                // Ack, since resolution already discloses the holder.
+                server.names.release(&req.name, &me);
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
+            }
+            // Off: the route is not offered. Spelled as the concrete
+            // (identity, decoded) case rather than a bare wildcard arm, so the
+            // route-coverage scan's end-of-dispatch sentinel keeps marking the
+            // real wildcard and nothing before it.
+            (Some(_), Ok(_)) => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
+        },
+        // Answerable to anyone: the namespace is public by construction. A name
+        // exists to be found, and a directory that would not say whether one is
+        // taken would not be a directory.
+        ("POST", "/name/resolve") => match name::Resolve::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(req) if server.name_registration != NameMode::Off => (
+                200,
+                "application/octet-stream",
+                server.names.resolve(&req.name).encode(),
+            ),
+            Ok(_) => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
+        },
+        ("POST", "/name/reverse") => match name::Reverse::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(req) if server.name_registration != NameMode::Off => (
+                200,
+                "application/octet-stream",
+                name::Names {
+                    now: now_unix(),
+                    names: server.names.names_for(&req.account),
+                }
+                .encode(),
+            ),
+            Ok(_) => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
         },
 
         // SIP-18 blobs. The exchange holds sealed chunks and no key that
@@ -2156,6 +2286,7 @@ impl Server {
             "whitelist_count": state.keys().len(),
             "beacons": self.beacons.len(),
             "rendezvous_pending": self.rendezvous.len(),
+            "names": self.names.count(),
             "requests": self.requests(),
             "event_streams": self.events.total(),
             "mail_waiting": self.mailbox.waiting(),
@@ -2346,6 +2477,39 @@ impl Server {
             Op::AdmissionDeny(device) => {
                 self.admissions.deny(device);
                 json!({ "ok": true })
+            }
+            // SIP-38 administration. The administrator's override: binds or
+            // frees a name in any registration mode. `NameAssign` reassigns an
+            // existing binding and is exempt from the per-account cap — the cap
+            // governs self-service, and an administrator's decision is not that.
+            Op::NameAssign { name, account } => {
+                let changed = self.names.assign(name, account);
+                json!({ "ok": changed, "name": name, "account": account.to_base58() })
+            }
+            Op::NameRelease(name) => {
+                let changed = self.names.release_admin(name);
+                json!({ "ok": true, "changed": changed })
+            }
+            Op::NameList => {
+                let names: Vec<serde_json::Value> = self
+                    .names
+                    .list()
+                    .into_iter()
+                    .map(|r| {
+                        json!({
+                            "name": r.name,
+                            "account": r.account.to_base58(),
+                            // Whether it is an administrator's assignment (no
+                            // lease) or an open self-claim.
+                            "admin_set": r.admin_set,
+                            "registered_at": r.registered_at,
+                            "last_active": r.last_active,
+                            // Zero for an administrator's assignment.
+                            "expires_at": r.expires_at,
+                        })
+                    })
+                    .collect();
+                json!({ "names": names })
             }
         }
     }

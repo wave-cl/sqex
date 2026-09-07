@@ -9,6 +9,7 @@ pub mod config;
 pub mod device;
 pub mod events;
 pub mod mailbox;
+pub mod name;
 pub mod prekey;
 pub mod profile;
 pub mod rendezvous;
