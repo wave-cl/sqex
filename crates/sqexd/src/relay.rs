@@ -122,6 +122,10 @@ impl Find {
 }
 
 struct Link {
+    /// Which connection this entry is for. A peer that reconnects replaces the
+    /// entry, and the old connection's cleanup must not then remove the new
+    /// one — so teardown checks this before removing anything.
+    id: usize,
     conn: Connection,
     /// Where this peer was found. Kept so a later call to the same domain is
     /// answered from the link rather than another DNS round trip.
@@ -231,6 +235,24 @@ fn send_control(inner: &RelayInner, peer: &PubKey, ctrl: Control) {
     if let Some(link) = inner.links.get(peer) {
         let _ = link.control.send(ctrl.frame());
     }
+}
+
+/// Forget a link, but only if it is still *this* link.
+///
+/// Two ways this went wrong in the field, and both are the same root: the entry
+/// was keyed by peer alone. A peer that reconnected replaced the entry, and the
+/// old connection's cleanup then removed the **new** one — leaving an exchange
+/// that rang a phone and had nowhere to send the answer. And teardown hung off
+/// the writer alone, so a dead reader left a link that could send and never
+/// receive: invites went out, accepts were never read, and every call over it
+/// hung until a restart.
+fn forget_link(server: &Server, peer: PubKey, id: usize) {
+    let mut inner = server.relay.inner.lock().unwrap();
+    if inner.links.get(&peer).map(|l| l.id) != Some(id) {
+        return; // already replaced by a newer connection
+    }
+    inner.links.remove(&peer);
+    inner.domains.retain(|_, k| *k != peer);
 }
 
 fn drop_bridge(inner: &mut RelayInner, bridge: &relay::Bridge) {
@@ -736,35 +758,44 @@ fn register_link(
     recv: quinn::RecvStream,
 ) {
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let id = conn.stable_id();
     {
         let mut inner = server.relay.inner.lock().unwrap();
         inner.links.insert(
             peer,
             Link {
+                id,
                 conn: conn.clone(),
                 addr,
                 control: tx,
             },
         );
     }
+    // Every way this link can end removes it, and each checks that the entry is
+    // still this one. Hanging teardown off the writer alone left links that
+    // could send and never receive.
     let server_w = Arc::clone(server);
     tokio::spawn(async move {
         writer(send, rx).await;
-        // Link's write half is gone: drop the link so a later call redials.
-        // The domain that found this peer goes with it, so the next call
-        // discovers afresh rather than dialling an address that stopped
-        // answering.
-        let mut inner = server_w.relay.inner.lock().unwrap();
-        inner.links.remove(&peer);
-        inner.domains.retain(|_, k| *k != peer);
+        forget_link(&server_w, peer, id);
     });
     let server_c = Arc::clone(server);
     tokio::spawn(async move {
         control_reader(&server_c, peer, recv).await;
+        forget_link(&server_c, peer, id);
     });
     let server_d = Arc::clone(server);
+    let conn_d = conn.clone();
     tokio::spawn(async move {
-        datagram_reader(&server_d, conn).await;
+        datagram_reader(&server_d, conn_d).await;
+        forget_link(&server_d, peer, id);
+    });
+    // And the connection itself, which is what notices an idle death that no
+    // read or write is waiting on.
+    let server_x = Arc::clone(server);
+    tokio::spawn(async move {
+        conn.closed().await;
+        forget_link(&server_x, peer, id);
     });
 }
 
