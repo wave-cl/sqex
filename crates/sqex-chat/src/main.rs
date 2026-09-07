@@ -32,7 +32,10 @@ const NOTE_LINGER: Duration = Duration::from_secs(8);
 use sqex_proto::channel::{Role, Visibility};
 use sqex_proto::credential::Credential;
 use sqex_proto::events::Event as ChatEvent;
-use sqex_proto::message::Post as SipPost;
+use sqex_proto::message::{
+    CALL_ANSWERED, CALL_CANCELLED, CALL_DECLINED, CALL_FAILED, CALL_MISSED, MEDIA_AUDIO,
+    Post as SipPost, RING_ACCEPTED, RING_BUSY, RING_DECLINED, RING_ENDED, RING_RINGING,
+};
 use sqex_proto::refusal::Code as RefusalCode;
 use sqex_proto::timeline::{Deletion, Timeline, Verdict};
 use sqnr::{Client, config::Config, identity};
@@ -1940,6 +1943,80 @@ async fn handle_key(
                          and what came before is unchanged"
                     ))
                 }),
+                // SIP-36 calls. Each of these does the signalling half and,
+                // where there is something durable to say, the entry half —
+                // they are different things: the signal stops a screen ringing
+                // now, the entry is the only account that survives.
+                Command::Call => match chat.call(&channel, MEDIA_AUDIO, RING_SECS).await {
+                    Ok((posted, secret)) => {
+                        chat.ring_state(&channel, posted.seq, RING_RINGING).await;
+                        Ok(Some(format!(
+                            "calling — every device here is ringing. This client carries no \
+                             audio; join it with:\n  sqex-voice room {}",
+                            bs58::encode(secret).into_string()
+                        )))
+                    }
+                    Err(e) => Err(e),
+                },
+                Command::Answer => match ringing(&open[i], now()).map(|c| (c.seq, c.secret)) {
+                    Some((seq, secret)) => {
+                        chat.ring_state(&channel, seq, RING_ACCEPTED).await;
+                        Ok(Some(format!(
+                            "answering — your other devices stop ringing. Join the audio \
+                             with:\n  sqex-voice room {}",
+                            bs58::encode(secret).into_string()
+                        )))
+                    }
+                    None => Ok(Some("nothing is ringing here".into())),
+                },
+                Command::Decline => match ringing(&open[i], now()).map(|c| c.seq) {
+                    Some(seq) => {
+                        chat.ring_state(&channel, seq, RING_DECLINED).await;
+                        chat.end_call(&channel, seq, CALL_DECLINED, 0)
+                            .await
+                            .map(|_| Some("declined the call".to_string()))
+                    }
+                    None => Ok(Some("nothing is ringing here".into())),
+                },
+                Command::Busy => match ringing(&open[i], now()).map(|c| c.seq) {
+                    Some(seq) => {
+                        // The signal says *why*; the durable outcome is still
+                        // "declined", because SIP-36 registers no busy outcome
+                        // and inventing one would be a claim no reader could
+                        // check against the log.
+                        chat.ring_state(&channel, seq, RING_BUSY).await;
+                        chat.end_call(&channel, seq, CALL_DECLINED, 0)
+                            .await
+                            .map(|_| Some("declined the call — busy".to_string()))
+                    }
+                    None => Ok(Some("nothing is ringing here".into())),
+                },
+                Command::Hangup => {
+                    let live = ringing(&open[i], now()).map(|c| (c.seq, c.posted, c.account));
+                    match live {
+                        Some((seq, posted, caller)) => {
+                            chat.ring_state(&channel, seq, RING_ENDED).await;
+                            // Cancelled if we are the one who called and are
+                            // giving up before anybody took it; ended
+                            // otherwise. The duration is wall clock since the
+                            // invitation, which is the most this client can
+                            // honestly say — it never carried the media, so it
+                            // is not counting seconds of audio.
+                            let (outcome, said) = if caller == chat.me {
+                                (CALL_CANCELLED, "cancelled the call")
+                            } else {
+                                (CALL_ANSWERED, "ended the call")
+                            };
+                            let secs =
+                                u32::try_from(now().saturating_sub(posted)).unwrap_or(u32::MAX);
+                            let duration = if outcome == CALL_ANSWERED { secs } else { 0 };
+                            chat.end_call(&channel, seq, outcome, duration)
+                                .await
+                                .map(|_| Some(said.to_string()))
+                        }
+                        None => Ok(Some("no call to hang up".into())),
+                    }
+                }
                 Command::Redact(target) => {
                     chat.redact(&channel, target).await.map(|r| {
                         // Say which of the two halves happened. "Deleted" when
@@ -2260,6 +2337,22 @@ enum Command {
     /// `/forward <n> <m>` — send message `n`'s file into conversation `m` from
     /// the sidebar, without uploading it again.
     Forward(u64, usize),
+    /// `/call` — start a call here (SIP-36): post the invitation, ring
+    /// everybody's devices, and print the room secret to join the audio with.
+    ///
+    /// This client carries no media. SIP-36 is signalling, the call itself is a
+    /// SIP-13 room, and `sqex-voice` is what joins it — so every command here
+    /// says what happened and hands over a secret, and none of them make a
+    /// sound.
+    Call,
+    /// `/answer` — say this device is taking the call, and print the join line.
+    Answer,
+    /// `/decline` — refuse the ringing call, and record that it was declined.
+    Decline,
+    /// `/busy` — refuse it, saying why.
+    Busy,
+    /// `/hangup` — end the call, and record how it ended.
+    Hangup,
     Unknown(String),
 }
 
@@ -2336,6 +2429,13 @@ impl Command {
                 Command::Unknown("/unreplicate needs an exchange's public key".into())
             }
             "/rotate" => Command::Rotate,
+            // SIP-36 calls. Signalling only; the audio is a room joined with
+            // sqex-voice, and these say so rather than pretending otherwise.
+            "/call" => Command::Call,
+            "/answer" => Command::Answer,
+            "/decline" => Command::Decline,
+            "/busy" => Command::Busy,
+            "/hangup" => Command::Hangup,
             "/leave" => Command::Leave,
             "/redact" => match first.parse::<u64>() {
                 Ok(n) if n > 0 => Command::Redact(n),
@@ -3019,6 +3119,57 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
             }
         })
         .collect();
+    // SIP-36 calls are entries too, and the transcript drew none of them: a
+    // call arrived, rang, and left no visible trace whatever. They are folded
+    // in here rather than inside `messages()`, which is deliberately only
+    // messages, and sorted back into sequence so a call sits where it happened.
+    //
+    // What is shown comes from `CallRecord::outcome`, which derives "missed"
+    // from the ring window rather than waiting for an entry that the party
+    // whose client died was never going to post.
+    let at = now();
+    let calls: Vec<Said> = conv
+        .timeline
+        .calls()
+        .map(|c| {
+            let text = match c.outcome(at) {
+                None => "call — ringing. /answer, /decline or /busy".to_string(),
+                Some(CALL_ANSWERED) => match c.ended {
+                    Some((_, secs, _)) if secs > 0 => format!("call — answered, {secs}s"),
+                    _ => "call — answered".to_string(),
+                },
+                Some(CALL_DECLINED) => "call — declined".to_string(),
+                Some(CALL_MISSED) => "call — missed".to_string(),
+                Some(CALL_CANCELLED) => "call — cancelled".to_string(),
+                Some(CALL_FAILED) => "call — failed".to_string(),
+                // An outcome from a newer client. Shown rather than dropped:
+                // that a call ended is worth saying even when the word for how
+                // is one this build does not know.
+                Some(_) => "call — ended".to_string(),
+            };
+            Said {
+                who: names
+                    .get(&c.account)
+                    .cloned()
+                    .or_else(|| conv.peer.map(|_| conv.label.clone()))
+                    .unwrap_or_default(),
+                key: c.account.to_string(),
+                mine: c.account == *me,
+                text,
+                seq: c.seq,
+                has_file: false,
+                at: c.posted,
+                edited: false,
+                redacted: false,
+                receipt: None,
+                reply_to: None,
+                reactions: Vec::new(),
+                mentions: Vec::new(),
+            }
+        })
+        .collect();
+    app.said.extend(calls);
+    app.said.sort_by_key(|s| s.seq);
     app.peer_typing = conv.typing;
     app.members = conv.members;
     app.topic = conv.timeline.topic.clone();
@@ -3183,6 +3334,26 @@ fn set_mouse(on: bool) -> io::Result<()> {
     } else {
         crossterm::execute!(out, DisableMouseCapture)
     }
+}
+
+/// How long a call rings before a reader derives that it was missed — SIP-36's
+/// `ring_secs`, which is advisory and states what the caller intends to wait.
+const RING_SECS: u16 = 45;
+
+/// The call still ringing in this conversation: the newest one the timeline has
+/// no outcome for.
+///
+/// Read from the timeline rather than tracked beside it, so there is exactly one
+/// answer to "which call is live". A second notion of that is the thing that
+/// would drift, and SIP-36 is explicit that the durable account comes from
+/// entries and never from a signal. `CallRecord::outcome` is `None` only for a
+/// call that has not ended and whose ring window has not passed, which is
+/// precisely "still ringing".
+fn ringing(conv: &Open, at: u64) -> Option<&sqex_proto::timeline::CallRecord> {
+    conv.timeline
+        .calls()
+        .filter(|c| c.outcome(at).is_none())
+        .last()
 }
 
 fn now() -> u64 {

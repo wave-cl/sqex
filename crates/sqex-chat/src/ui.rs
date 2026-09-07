@@ -1684,7 +1684,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "/who  /read",
                 "who is here and their keys in full; how far each has read",
             ),
-            ("/rotate", "mint a new key for everyone currently here"),
+            (
+                "/rotate  /call",
+                "mint a new key here; or ring everyone for a call",
+            ),
         ],
     ),
     (
