@@ -146,19 +146,20 @@ pub struct FileConfig {
     #[serde(default)]
     pub replicate: Vec<FileOrigin>,
 
-    /// SIP-39: the exchanges this one will bridge cross-exchange calls to and
-    /// from, each a `{ key, addr }`.
+    /// SIP-39: base58 Ed25519 identities of the exchanges this one will bridge
+    /// cross-exchange calls to and from.
     ///
-    /// The federation boundary, and it is symmetric in effect: this exchange
-    /// rings one of its users for an incoming call only from a `key` on this
-    /// list, and dials `addr` to place a call only to a `key` on this list.
-    /// Empty — the default — means this exchange federates with nobody and its
-    /// relay routes refuse everyone identically. Like `replication_peers`,
-    /// membership is the whole gate at the link layer; per-call consent is the
-    /// callee's. The address is configured rather than discovered, as SIP-35's
-    /// origins are — the same pin-from-config, never-from-the-wire rule.
+    /// The federation boundary, and symmetric in effect: this exchange rings one
+    /// of its users for an incoming call only from a key on this list, and dials
+    /// out only to a key on this list. Empty — the default — means it federates
+    /// with nobody and its relay routes refuse everyone identically.
+    ///
+    /// **Keys only, no addresses.** Where a peer actually is comes from SIP-33
+    /// discovery of the domain a call names, so a peer that moves is followed
+    /// rather than re-configured, and there is nothing here to keep in step
+    /// with DNS. Same shape as `replication_peers`.
     #[serde(default)]
-    pub relay_peers: Vec<FileRelayPeer>,
+    pub relay_peers: Vec<String>,
 
     /// SIP-39: cap on concurrent bridged calls. Unset means unlimited. A relay
     /// a peer can drive needs a ceiling a local SIP-12 session does not, since a
@@ -194,24 +195,6 @@ fn default_pull_interval() -> u64 {
     30
 }
 
-/// One exchange this one federates cross-exchange calls with (SIP-39).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FileRelayPeer {
-    /// The domain this peer serves. A call to `name@domain` is routed to the
-    /// peer whose `domain` matches. Configured rather than discovered (SIP-33)
-    /// for the reference implementation, as SIP-35's origins are.
-    pub domain: String,
-    /// The peer exchange's base58 Ed25519 identity — its SIP-9 key.
-    ///
-    /// **Pinned from here and never taken from the wire**, the same trap SIP-35
-    /// names: the key both admits the peer's link and is pinned when dialling
-    /// it, so it decides who this exchange will federate with.
-    pub key: String,
-    /// `host:port` to dial when placing a call to this peer.
-    pub addr: String,
-}
-
 /// Configuration with everything parsed and resolved.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -231,16 +214,8 @@ pub struct Config {
     pub max_names: Option<u64>,
     pub replication_peers: Vec<PubKey>,
     pub replicate: Vec<OriginConfig>,
-    pub relay_peers: Vec<RelayPeer>,
+    pub relay_peers: Vec<PubKey>,
     pub max_bridges: Option<u64>,
-}
-
-/// One resolved relay peer (SIP-39).
-#[derive(Debug, Clone)]
-pub struct RelayPeer {
-    pub domain: String,
-    pub key: PubKey,
-    pub addr: SocketAddr,
 }
 
 /// One resolved origin to replicate from.
@@ -272,25 +247,13 @@ impl FileConfig {
 
         // SIP-39 relay peers, capped the same way and for the same reason as
         // replication peers — an over-long list is a mistake to hear at load.
-        if self.relay_peers.len() > sqex_proto::peer::MAX_PEERS {
+        let relay_peers = parse_keys(&self.relay_peers, "relay_peers")?;
+        if relay_peers.len() > sqex_proto::peer::MAX_PEERS {
             return Err(Error::Malformed(format!(
                 "relay_peers holds {}, limit is {}",
-                self.relay_peers.len(),
+                relay_peers.len(),
                 sqex_proto::peer::MAX_PEERS
             )));
-        }
-        let mut relay_peers = Vec::new();
-        for p in &self.relay_peers {
-            let key = p
-                .key
-                .parse::<PubKey>()
-                .map_err(|e| Error::Key(format!("relay_peers.key {}: {e}", p.key)))?;
-            let addr = parse_listen(&p.addr)?;
-            relay_peers.push(RelayPeer {
-                domain: p.domain.trim().to_ascii_lowercase(),
-                key,
-                addr,
-            });
         }
 
         // SIP-29 reserves version 0 and forbids emitting it, and an empty list

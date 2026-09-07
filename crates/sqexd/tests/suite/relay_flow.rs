@@ -18,17 +18,27 @@ use sqexd::config::FileConfig;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
-/// Bring up an exchange whose config names the given relay peers (a TOML
-/// fragment of `[[relay_peers]]` tables). Returns its address and public key.
+/// Bring up an exchange that federates with `peers` (base58 keys) and finds
+/// them through `found` rather than DNS.
+///
+/// There is no DNS here: two exchanges on loopback with invented domains cannot
+/// discover each other, which is exactly why `bind_with` takes a finder.
 async fn relay_server(
     dir: &std::path::Path,
     host_key: &SigningKey,
-    relay_peers: &str,
+    peers: &[PubKey],
+    found: &[(&str, PubKey, SocketAddr)],
 ) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     std::fs::write(&key_path, hex::encode(host_key.to_bytes())).unwrap();
+    let listed = peers
+        .iter()
+        .map(|k| format!("\"{k}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n{relay_peers}",
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         relay_peers = [{listed}]\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );
@@ -36,7 +46,13 @@ async fn relay_server(
     let config = file.resolve().unwrap();
     let (signing_key, _pub) =
         squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
-    let bound = sqexd::bind(config, None, signing_key).await.unwrap();
+    let map = found
+        .iter()
+        .map(|(d, k, a)| ((*d).to_string(), (*k, *a)))
+        .collect();
+    let bound = sqexd::bind_with(config, None, signing_key, sqexd::relay::Find::Fixed(map))
+        .await
+        .unwrap();
     let addr = bound.local_addr;
     let server_pub = bound.public_key.to_bytes();
     let handle = tokio::spawn(async move {
@@ -157,19 +173,12 @@ async fn a_call_bridges_two_exchanges_and_neither_can_read_it() {
         (SigningKey::from_bytes(&sk), pk)
     };
 
-    // Y must be up first so X can be told its address; X dials Y. Each names the
-    // other's key on its allowlist — Y to accept X's link, X to dial Y's.
-    let y_peers = format!(
-        "[[relay_peers]]\ndomain = \"x.test\"\nkey = \"{}\"\naddr = \"127.0.0.1:1\"\n",
-        x_pub,
-    );
-    let (y_addr, y_server_pub, y_h) = relay_server(dir_y.path(), &y_key, &y_peers).await;
-
-    let x_peers = format!(
-        "[[relay_peers]]\ndomain = \"y.test\"\nkey = \"{}\"\naddr = \"{}\"\n",
-        y_pub, y_addr,
-    );
-    let (x_addr, x_server_pub, x_h) = relay_server(dir_x.path(), &x_key, &x_peers).await;
+    // Y must be up first so X can be told where it is; X dials Y. Each names
+    // the other's key — Y to accept X's link, X to dial Y's — and X is told how
+    // to find "y.test", which no DNS here could tell it.
+    let (y_addr, y_server_pub, y_h) = relay_server(dir_y.path(), &y_key, &[x_pub], &[]).await;
+    let (x_addr, x_server_pub, x_h) =
+        relay_server(dir_x.path(), &x_key, &[y_pub], &[("y.test", y_pub, y_addr)]).await;
 
     let (a_seed, a_id) = identity(1);
     let (b_seed, b_id) = identity(2);
@@ -289,7 +298,7 @@ async fn a_call_to_an_unfederated_domain_is_refused() {
         (SigningKey::from_bytes(&sk), pk)
     };
     // No relay peers at all: this exchange federates with nobody.
-    let (addr, server_pub, h) = relay_server(dir.path(), &x_key, "").await;
+    let (addr, server_pub, h) = relay_server(dir.path(), &x_key, &[], &[]).await;
 
     let (a_seed, _) = identity(3);
     let (_, target_id) = identity(4);
@@ -329,13 +338,9 @@ async fn federated_pair(seed_base: u8) -> Pair {
     let (yk, y_pub) = identity(seed_base + 1);
     let (x_key, y_key) = (SigningKey::from_bytes(&xk), SigningKey::from_bytes(&yk));
 
-    let y_peers = format!(
-        "[[relay_peers]]\ndomain = \"x.test\"\nkey = \"{x_pub}\"\naddr = \"127.0.0.1:1\"\n"
-    );
-    let (y_addr, y_server_pub, y_h) = relay_server(dir_y.path(), &y_key, &y_peers).await;
-    let x_peers =
-        format!("[[relay_peers]]\ndomain = \"y.test\"\nkey = \"{y_pub}\"\naddr = \"{y_addr}\"\n");
-    let (x_addr, x_server_pub, x_h) = relay_server(dir_x.path(), &x_key, &x_peers).await;
+    let (y_addr, y_server_pub, y_h) = relay_server(dir_y.path(), &y_key, &[x_pub], &[]).await;
+    let (x_addr, x_server_pub, x_h) =
+        relay_server(dir_x.path(), &x_key, &[y_pub], &[("y.test", y_pub, y_addr)]).await;
 
     let (a_seed, _) = identity(seed_base + 2);
     let (b_seed, b_id) = identity(seed_base + 3);
@@ -526,4 +531,56 @@ async fn only_the_addressed_account_may_decline() {
 
     p.handles.0.abort();
     p.handles.1.abort();
+}
+
+/// Discovery finds a peer; the allowlist decides whether to federate with it.
+/// Those are two steps and the second is the gate — so a peer this exchange can
+/// *find* but has not been told to federate with must still be refused.
+///
+/// This is the case the discover-then-check ordering could quietly drop: the
+/// domain resolves, a link would dial, and nothing else stands in the way.
+#[tokio::test]
+async fn a_findable_peer_that_is_not_allowlisted_is_still_refused() {
+    let dir_x = tempfile::tempdir().unwrap();
+    let dir_y = tempfile::tempdir().unwrap();
+    let (xk, x_pub) = identity(150);
+    let (yk, y_pub) = identity(151);
+    let (x_key, y_key) = (SigningKey::from_bytes(&xk), SigningKey::from_bytes(&yk));
+
+    let (y_addr, _y_pub_bytes, y_h) = relay_server(dir_y.path(), &y_key, &[x_pub], &[]).await;
+    // X federates with *somebody* — a third exchange it will never call — so
+    // the route's "federates with nobody" short circuit does not fire and the
+    // allowlist check itself is what has to refuse this. Without a peer here
+    // the call never reaches `place_call` at all, and this test would pass
+    // while proving nothing.
+    let (_, stranger) = identity(159);
+    let (x_addr, x_server_pub, x_h) = relay_server(
+        dir_x.path(),
+        &x_key,
+        &[stranger],
+        &[("y.test", y_pub, y_addr)],
+    )
+    .await;
+
+    let (a_seed, _) = identity(152);
+    let (_, b_id) = identity(153);
+    let (_, eph) = ephemeral();
+    let mut alice = Client::connect_as(x_addr, &x_server_pub, &a_seed)
+        .await
+        .unwrap();
+
+    let ack = call(&mut alice, &format!("{b_id}@y.test"), eph).await;
+    assert_eq!(
+        ack.state,
+        CallState::Rejected,
+        "a peer that is found but not allowlisted must be refused"
+    );
+    assert_eq!(
+        ack.reason,
+        relay::REASON_REFUSED,
+        "refused for not being federated with, not for being unreachable"
+    );
+
+    x_h.abort();
+    y_h.abort();
 }

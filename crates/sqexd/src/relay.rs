@@ -15,6 +15,7 @@
 //! resolve a device to its account — are `pub(crate)` methods on the server.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,7 +30,6 @@ use sqex_proto::relay::{self, Control, RelayData};
 use sqex_proto::session::{CallAck, CallState, DatagramFrame, OpenAck, OpenState};
 use squic::Config as SquicConfig;
 
-use crate::config::RelayPeer;
 use crate::server::Server;
 
 /// The high bit of a session id marks a bridged session, keeping bridged ids
@@ -73,8 +73,46 @@ struct BridgeRec {
     index: Index,
 }
 
+/// How the relay turns a domain into an exchange to dial.
+pub enum Find {
+    /// SIP-33: the domain's DNSSEC-signed `_sqex` record, pinned on first
+    /// contact. What a deployment uses, and why `relay_peers` carries no
+    /// addresses — where a peer is, is DNS's business.
+    Discover,
+    /// A fixed map, for **tests only**: two exchanges on loopback have no DNS
+    /// to find each other through. Deliberately unreachable from configuration
+    /// — an operator able to pin an address by hand would be back to the thing
+    /// discovery replaced.
+    Fixed(HashMap<String, (PubKey, SocketAddr)>),
+}
+
+impl Find {
+    async fn find(&self, domain: &str) -> Result<(PubKey, SocketAddr), String> {
+        match self {
+            Find::Fixed(map) => map
+                .get(domain)
+                .copied()
+                .ok_or_else(|| format!("no peer for {domain}")),
+            Find::Discover => {
+                let found = sqex_discovery::discover(domain)
+                    .await
+                    .map_err(|e| format!("discover {domain}: {e}"))?;
+                // Worth saying once: a first contact is when the key this
+                // exchange will hold a peer to gets fixed.
+                if found.newly_pinned {
+                    tracing::info!(domain, key = %found.key, "pinned a peer exchange");
+                }
+                Ok((found.key, sqex_discovery::resolve_addr(&found.address)?))
+            }
+        }
+    }
+}
+
 struct Link {
     conn: Connection,
+    /// Where this peer was found. Kept so a later call to the same domain is
+    /// answered from the link rather than another DNS round trip.
+    addr: SocketAddr,
     /// Pre-framed control bytes to write to the shared control stream.
     control: mpsc::UnboundedSender<Vec<u8>>,
 }
@@ -86,6 +124,9 @@ struct RelayInner {
     by_session: HashMap<u64, relay::Bridge>,
     caller_index: HashMap<(PubKey, String), relay::Bridge>,
     callee_index: HashMap<(PubKey, PubKey), relay::Bridge>,
+    /// What a domain resolved to, for as long as its link lives. Dropped with
+    /// the link, so it cannot go stale on its own.
+    domains: HashMap<String, PubKey>,
     next_seq: u64,
 }
 
@@ -93,16 +134,18 @@ struct RelayInner {
 /// links and bridges.
 pub struct Relay {
     seed: [u8; 32],
-    peers: Vec<RelayPeer>,
+    peers: Vec<PubKey>,
+    find: Find,
     max_bridges: Option<u64>,
     inner: Mutex<RelayInner>,
 }
 
 impl Relay {
-    pub fn new(seed: [u8; 32], peers: Vec<RelayPeer>, max_bridges: Option<u64>) -> Relay {
+    pub fn new(seed: [u8; 32], peers: Vec<PubKey>, max_bridges: Option<u64>, find: Find) -> Relay {
         Relay {
             seed,
             peers,
+            find,
             max_bridges,
             inner: Mutex::new(RelayInner::default()),
         }
@@ -113,15 +156,10 @@ impl Relay {
         !self.peers.is_empty()
     }
 
-    /// The peer serving a domain, if this exchange federates with it.
-    fn peer_for_domain(&self, domain: &str) -> Option<RelayPeer> {
-        self.peers.iter().find(|p| p.domain == domain).cloned()
-    }
-
     /// Whether an incoming link's SIP-9 identity is on the allowlist. This is
     /// the whole gate at the link layer.
     pub fn allowed(&self, key: &PubKey) -> bool {
-        self.peers.iter().any(|p| &p.key == key)
+        self.peers.contains(key)
     }
 
     fn at_capacity(&self) -> bool {
@@ -227,23 +265,36 @@ pub async fn place_call(
         return CallAck::rejected(relay::REASON_REFUSED, now);
     };
     let domain = domain.to_ascii_lowercase();
-    let Some(peer) = server.relay.peer_for_domain(&domain) else {
-        // Not federated with that domain.
-        return CallAck::rejected(relay::REASON_REFUSED, now);
+    // Discover first, then judge the key. The allowlist is a judgement about a
+    // *key*, and discovery is what produces one — so the order is fixed by what
+    // each step knows, not by preference (SIP-39).
+    let (peer_key, peer_addr) = match find_peer(server, &domain).await {
+        Ok(found) => found,
+        Err(e) => {
+            // A pinned key that has changed lands here too, and that is a thing
+            // an operator must be able to find afterwards rather than a call
+            // that quietly did not connect.
+            tracing::warn!(%domain, %e, "no peer exchange for this domain");
+            return CallAck::rejected(relay::REASON_UNREACHABLE, now);
+        }
     };
+    if !server.relay.allowed(&peer_key) {
+        // Found, but not somebody this operator federates with.
+        return CallAck::rejected(relay::REASON_REFUSED, now);
+    }
     if server.relay.at_capacity() {
         return CallAck::rejected(relay::REASON_REFUSED, now);
     }
 
     let account = match label.parse::<PubKey>() {
         Ok(k) => k,
-        Err(_) => match resolve_name_at(&peer, &server.relay.seed, label).await {
+        Err(_) => match resolve_name_at(peer_addr, &peer_key, &server.relay.seed, label).await {
             Some(a) => a,
             None => return CallAck::rejected(relay::REASON_NO_ACCOUNT, now),
         },
     };
 
-    if ensure_link(server, &peer).await.is_err() {
+    if ensure_link(server, peer_key, peer_addr).await.is_err() {
         return CallAck::rejected(relay::REASON_UNREACHABLE, now);
     }
 
@@ -258,7 +309,7 @@ pub async fn place_call(
     inner.bridges.insert(
         bridge,
         BridgeRec {
-            peer: peer.key,
+            peer: peer_key,
             account,
             caller,
             caller_eph: eph,
@@ -276,7 +327,7 @@ pub async fn place_call(
     inner.caller_index.insert((caller, target), bridge);
     send_control(
         &inner,
-        &peer.key,
+        &peer_key,
         Control::Invite {
             bridge,
             caller,
@@ -536,10 +587,13 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
     }
 }
 
-async fn resolve_name_at(peer: &RelayPeer, seed: &[u8; 32], name: &str) -> Option<PubKey> {
-    let mut client = H3Client::connect(peer.addr, peer.key.as_bytes(), seed)
-        .await
-        .ok()?;
+async fn resolve_name_at(
+    addr: SocketAddr,
+    key: &PubKey,
+    seed: &[u8; 32],
+    name: &str,
+) -> Option<PubKey> {
+    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
     let (status, body) = client
         .post(
             "/name/resolve",
@@ -569,30 +623,45 @@ fn dial_config(seed: &[u8; 32]) -> SquicConfig {
     }
 }
 
-/// Bring up a link to `peer` if one is not already open.
-async fn ensure_link(server: &Arc<Server>, peer: &RelayPeer) -> Result<(), String> {
-    if server
+/// The exchange serving `domain`, from the live link if there already is one.
+///
+/// Discovery is a DNS round trip, and a link that is up means the peer has
+/// already been found — so this runs at link setup rather than once per call.
+/// The cached answer is dropped with the link, which is what keeps it from
+/// going stale on its own.
+async fn find_peer(server: &Arc<Server>, domain: &str) -> Result<(PubKey, SocketAddr), String> {
+    {
+        let inner = server.relay.inner.lock().unwrap();
+        if let Some(key) = inner.domains.get(domain)
+            && let Some(link) = inner.links.get(key)
+        {
+            return Ok((*key, link.addr));
+        }
+    }
+    let (key, addr) = server.relay.find.find(domain).await?;
+    server
         .relay
         .inner
         .lock()
         .unwrap()
-        .links
-        .contains_key(&peer.key)
-    {
+        .domains
+        .insert(domain.to_string(), key);
+    Ok((key, addr))
+}
+
+/// Bring up a link to a peer exchange if one is not already open.
+async fn ensure_link(server: &Arc<Server>, key: PubKey, addr: SocketAddr) -> Result<(), String> {
+    if server.relay.inner.lock().unwrap().links.contains_key(&key) {
         return Ok(());
     }
-    let conn = squic::dial(
-        peer.addr,
-        peer.key.as_bytes(),
-        dial_config(&server.relay.seed),
-    )
-    .await
-    .map_err(|e| format!("relay dial {}: {e}", peer.addr))?;
+    let conn = squic::dial(addr, key.as_bytes(), dial_config(&server.relay.seed))
+        .await
+        .map_err(|e| format!("relay dial {addr}: {e}"))?;
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| format!("relay open_bi: {e}"))?;
-    register_link(server, peer.key, conn, send, recv);
+    register_link(server, key, addr, conn, send, recv);
     Ok(())
 }
 
@@ -601,6 +670,7 @@ async fn ensure_link(server: &Arc<Server>, peer: &RelayPeer) -> Result<(), Strin
 fn register_link(
     server: &Arc<Server>,
     peer: PubKey,
+    addr: SocketAddr,
     conn: Connection,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -612,6 +682,7 @@ fn register_link(
             peer,
             Link {
                 conn: conn.clone(),
+                addr,
                 control: tx,
             },
         );
@@ -620,7 +691,12 @@ fn register_link(
     tokio::spawn(async move {
         writer(send, rx).await;
         // Link's write half is gone: drop the link so a later call redials.
-        server_w.relay.inner.lock().unwrap().links.remove(&peer);
+        // The domain that found this peer goes with it, so the next call
+        // discovers afresh rather than dialling an address that stopped
+        // answering.
+        let mut inner = server_w.relay.inner.lock().unwrap();
+        inner.links.remove(&peer);
+        inner.domains.retain(|_, k| *k != peer);
     });
     let server_c = Arc::clone(server);
     tokio::spawn(async move {
@@ -686,5 +762,8 @@ pub async fn serve_relay(server: &Arc<Server>, conn: Connection, identity: Optio
         Ok(s) => s,
         Err(_) => return,
     };
-    register_link(server, who, conn, send, recv);
+    // On this side the address is simply where the peer dialled from; nothing
+    // is discovered, because nothing is being dialled.
+    let addr = conn.remote_address();
+    register_link(server, who, addr, conn, send, recv);
 }

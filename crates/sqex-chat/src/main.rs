@@ -3589,19 +3589,10 @@ fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
 }
 
 /// `host:port` for the configured path, which may name a host.
+/// Turn a `host:port` into something dialable. One copy of this lives in
+/// `sqex-discovery`, which owns addresses and the default port.
 fn resolve_one_sync(address: &str) -> Result<std::net::SocketAddr, String> {
-    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
-        return Ok(socket);
-    }
-    let (_, port) = split_port(address);
-    let with_port = match port {
-        Some(_) => address.to_string(),
-        None => format!("{address}:{}", sqex_discovery::DEFAULT_PORT),
-    };
-    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
-        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
+    sqex_discovery::resolve_addr(address)
 }
 
 /// Split a trailing `:port`, leaving an IPv6 literal alone.

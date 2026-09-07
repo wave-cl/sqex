@@ -22,4 +22,4 @@ pub mod session;
 pub mod state;
 
 pub use config::Config;
-pub use server::{Bound, Server, bind, serve};
+pub use server::{Bound, Server, bind, bind_with, serve};

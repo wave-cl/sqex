@@ -272,24 +272,13 @@ pub async fn resolve(
 
 /// `host:port`, `host`, or an IP literal. This used to parse straight to a
 /// `SocketAddr`, which accepts only an IP.
-pub fn resolve_addr(address: &str) -> Result<SocketAddr, String> {
-    if let Ok(socket) = address.parse::<SocketAddr>() {
-        return Ok(socket);
-    }
-    let has_port = !address.starts_with('[')
-        && address
-            .rsplit_once(':')
-            .is_some_and(|(_, p)| p.parse::<u16>().is_ok());
-    let with_port = if has_port {
-        address.to_string()
-    } else {
-        format!("{address}:{}", sqex_discovery::DEFAULT_PORT)
-    };
-    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
-        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
-}
+/// Turn a `host:port` into something dialable.
+///
+/// Re-exported from `sqex-discovery`, which owns addresses and the default
+/// port. It used to live here, and had been copied into the CLI and the chat
+/// client besides — three copies of one conversion, with `sqexd` about to add a
+/// fourth.
+pub use sqex_discovery::resolve_addr;
 
 /// Connect to the exchange as this identity. No peer, no session.
 ///

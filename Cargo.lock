@@ -2874,6 +2874,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqex-discovery",
  "sqex-proto",
  "sqnr",
  "sqnr-core",

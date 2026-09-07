@@ -378,10 +378,33 @@ pub struct Bound {
 }
 
 /// Bind the UDP socket and construct server state. Does not accept yet.
+/// Bind, finding relay peers the way a deployment does: SIP-33 discovery.
 pub async fn bind(
     config: Config,
     config_path: Option<PathBuf>,
     signing_key: SigningKey,
+) -> Result<Bound> {
+    bind_with(
+        config,
+        config_path,
+        signing_key,
+        crate::relay::Find::Discover,
+    )
+    .await
+}
+
+/// The same, told how to find a relay peer.
+///
+/// Exists for the end-to-end tests, which run two exchanges on loopback with
+/// invented domains and so have no DNS to discover each other through. The seam
+/// is an argument rather than a configuration key on purpose: an operator able
+/// to pin a peer's address by hand would be back to the thing SIP-33 discovery
+/// replaced.
+pub async fn bind_with(
+    config: Config,
+    config_path: Option<PathBuf>,
+    signing_key: SigningKey,
+    find: crate::relay::Find,
 ) -> Result<Bound> {
     let public_key = PubKey::new(signing_key.verifying_key().to_bytes());
     let state = State::load(config.state_file.clone(), &config.seed_whitelist)?;
@@ -530,6 +553,7 @@ pub async fn bind(
             signing_key.to_bytes(),
             config.relay_peers.clone(),
             config.max_bridges,
+            find,
         ),
         events: Subscribers::default(),
         started: Instant::now(),

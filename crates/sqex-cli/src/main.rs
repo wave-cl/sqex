@@ -1870,27 +1870,10 @@ async fn resolve_endpoint(
 /// is not one either: this used to parse straight to a `SocketAddr`, which
 /// accepts only an IP, so `sqex --server ex.example.com` failed with a message
 /// about the address being bad when it was perfectly good.
+/// Turn a `host:port` into something dialable. One copy of this lives in
+/// `sqex-discovery`, which owns addresses and the default port.
 fn resolve(address: &str) -> Result<SocketAddr, String> {
-    if let Ok(socket) = address.parse::<SocketAddr>() {
-        return Ok(socket);
-    }
-    let with_port = if address.starts_with('[') || !has_port(address) {
-        format!("{address}:{}", sqex_discovery::DEFAULT_PORT)
-    } else {
-        address.to_string()
-    };
-    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
-        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
-}
-
-/// Whether a trailing `:port` is present, leaving IPv6 literals alone.
-fn has_port(address: &str) -> bool {
-    !address.starts_with('[')
-        && address
-            .rsplit_once(':')
-            .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
+    sqex_discovery::resolve_addr(address)
 }
 
 async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
