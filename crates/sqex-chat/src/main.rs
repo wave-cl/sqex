@@ -1092,6 +1092,11 @@ impl Dirty {
             // silent exchange, and that is read where the stream is drained.
             // An admission request needs an admin tool this client is not.
             ChatEvent::Admission | ChatEvent::Heartbeat => {}
+            // SIP-39: a cross-exchange call is ringing a device of this account,
+            // but this is a terminal chat client with no media and no way to
+            // answer one — and the event names a bridge, not a channel, so there
+            // is nothing to fetch either. sqex-voice is what answers these.
+            ChatEvent::CrossCall { .. } => {}
             // Everything, because we do not know what we missed.
             ChatEvent::Resync => self.everything(open),
             // SIP-19's rule, and the reason a later kind of event needs no flag
