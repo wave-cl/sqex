@@ -450,7 +450,9 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 403);
+    // A removed member is refused as though the channel were gone. They know
+    // better, having been in it; the uniform answer is for everybody else.
+    assert_eq!(code, 404);
 
     let epoch2 = ChannelKey::generate();
     let p = alice.take_prekey_for(alice.key).await;
@@ -490,7 +492,9 @@ async fn a_removed_member_is_refused_and_the_next_epoch_is_not_theirs() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 403);
+    // The key route answers uniformly as well: closing the oracle on `fetch`
+    // and leaving it open on `/channel/key/get` would not have closed it.
+    assert_eq!(code, 404);
 }
 
 #[tokio::test]
@@ -581,6 +585,143 @@ async fn an_envelope_is_served_only_to_the_recipient_it_names() {
     assert!(absent.devices[0].has_prekeys, "Bob is waiting on an admin");
 }
 
+/// **A private channel and a channel that is not here answer identically.**
+///
+/// A direct message's identifier is `SHA256` over its two account keys, so
+/// anybody holding two public keys can compute it. While "not a member" and "no
+/// such channel" were different answers, one request per pair asked *do these
+/// two people have a conversation on this exchange?* — and SIP-16's security
+/// section admitted the probe rather than closing it.
+///
+/// Byte-identical, not merely same-status: a code, a detail or a body length
+/// that differed would answer the question just as well.
+#[tokio::test]
+async fn a_private_channel_is_indistinguishable_from_one_that_does_not_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 61).await;
+    let mut chain = Chain::default();
+    let mut mallory = Peer::new(addr, pubkey, 62).await;
+
+    let real = [9u8; 32];
+    let absent = [10u8; 32];
+    alice
+        .client
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut chain,
+                real,
+                instance_for(real, 0),
+                vec![],
+            )
+            .encode(),
+        )
+        .await
+        .unwrap();
+
+    // Every route that takes a channel id and refuses a non-member. Closing the
+    // oracle on `fetch` alone would not close it: `/channel/key/get` and
+    // `/channel/join` answered the same question.
+    type Probe = (&'static str, Box<dyn Fn([u8; 32]) -> Vec<u8>>);
+    let probes: Vec<Probe> = vec![
+        (
+            "/channel/fetch",
+            Box::new(|c| {
+                Fetch {
+                    channel: c,
+                    since: 0,
+                    wait_secs: 0,
+                    receipts: false,
+                }
+                .encode()
+            }),
+        ),
+        (
+            "/channel/info",
+            Box::new(|c| ByChannel { channel: c }.encode(sqex_proto::channel::TYPE_INFO)),
+        ),
+        (
+            "/channel/key/get",
+            Box::new(|c| {
+                KeyGet {
+                    channel: c,
+                    since_epoch: 0,
+                }
+                .encode()
+            }),
+        ),
+        (
+            "/channel/join",
+            Box::new(|c| {
+                ByChannelSigned {
+                    channel: c,
+                    action: Action {
+                        chain_seq: 0,
+                        prev: [0; 32],
+                        sig: [0; 64],
+                    },
+                }
+                .encode(sqex_proto::channel::TYPE_JOIN)
+            }),
+        ),
+    ];
+
+    for (route, body) in &probes {
+        let here = mallory.client.post(route, body(real)).await.unwrap();
+        let nowhere = mallory.client.post(route, body(absent)).await.unwrap();
+        assert_eq!(
+            here, nowhere,
+            "{route} distinguishes a private channel from one that is not here"
+        );
+        assert_eq!(here.0, 404, "{route} should answer as absent");
+    }
+
+    // The other half of the rule: a public channel still refuses explicitly.
+    // Its existence, name and topic are in the directory to anybody who asks,
+    // so there is nothing left to conceal and a clear answer is worth more.
+    let open = [11u8; 32];
+    let mut open_chain = Chain::default();
+    alice
+        .client
+        .post(
+            "/channel/create",
+            alice
+                .signer
+                .create_chained(
+                    &mut open_chain,
+                    open,
+                    instance_for(open, 0),
+                    Visibility::Public,
+                    3600,
+                    "lobby",
+                    vec![],
+                )
+                .encode(),
+        )
+        .await
+        .unwrap();
+    let (code, _) = mallory
+        .client
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel: open,
+                since: 0,
+                wait_secs: 0,
+                receipts: false,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code, 403,
+        "a public channel says plainly that you are not in it"
+    );
+}
+
 #[tokio::test]
 async fn a_private_channel_refuses_a_join_and_hides_from_a_stranger() {
     let dir = tempfile::tempdir().unwrap();
@@ -626,7 +767,9 @@ async fn a_private_channel_refuses_a_join_and_hides_from_a_stranger() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 403);
+    // Not `not_public`, which would have told a stranger the channel is there
+    // and merely private — the same question by another route.
+    assert_eq!(code, 404);
 
     let (code, _) = mallory
         .client
@@ -640,7 +783,9 @@ async fn a_private_channel_refuses_a_join_and_hides_from_a_stranger() {
         )
         .await
         .unwrap();
-    assert_eq!(code, 403);
+    // Nothing at all: the same answer as for a channel that does not exist,
+    // which is what "hides from a stranger" now means.
+    assert_eq!(code, 404);
 }
 
 #[tokio::test]
@@ -1523,8 +1668,12 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
             .await
             .unwrap()
             .0,
-        403,
-        "she is no longer a member"
+        // 404, not 403: a private channel refuses a non-member exactly as one
+        // that is not here. A direct message's id is SHA256 over its two
+        // account keys, so a distinguishable refusal answered the question
+        // "do these two people have a conversation on this exchange?"
+        404,
+        "she is no longer a member, and is told no more than a stranger"
     );
 
     // Returning is a create, permitted because the derivation proves she is

@@ -383,6 +383,92 @@ async fn a_stranger_cannot_fetch_a_blob_and_absence_looks_the_same() {
     assert!(!Headed::decode(&body).unwrap().found);
 }
 
+/// **Attaching does not widen an audience.**
+///
+/// `may_fetch` granted access if *any* attached channel was public, so a member
+/// of a private channel could attach its file to any public one and make the
+/// bytes fetchable by every identity on the exchange — permanently, because
+/// `detach` answers to the uploader or an admin *of the channel holding the
+/// attachment*, and the uploader has no standing in a public channel they were
+/// forwarded into.
+#[tokio::test]
+async fn a_private_blob_cannot_be_published_by_attaching_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (mut alice, _) = client_for(addr, pubkey, 71).await;
+    let (mut mallory, _) = client_for(addr, pubkey, 72).await;
+    let private = [7u8; 32];
+    let open = [8u8; 32];
+
+    let req = signer(pubkey, 71).create(
+        private,
+        instance_for(private, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
+    alice.post("/channel/create", req.encode()).await.unwrap();
+    alice
+        .post(
+            "/channel/create",
+            public(&signer(pubkey, 71), open, "lobby").encode(),
+        )
+        .await
+        .unwrap();
+
+    let (_, sealed, id) = seal_file(b"a private photograph", 1024);
+    assert!(upload(&mut alice, private, &sealed, id, 20, 0).await);
+
+    // Alice is a member of both, and may fetch her own blob — but attaching it
+    // to the public channel is refused.
+    let (code, body) = alice
+        .post(
+            "/blob/attach",
+            ByChannelBlob {
+                channel: open,
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(TYPE_ATTACH),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 409, "publishing a private blob is refused");
+    assert_eq!(
+        sqex_proto::refusal::Refusal::decode(&body).unwrap().code,
+        sqex_proto::refusal::Code::WouldPublish,
+        "and the refusal says why"
+    );
+
+    // The stranger still cannot reach it, and cannot tell it from absent.
+    let (_, body) = mallory
+        .post("/blob/get", GetChunk { blob: id, index: 0 }.encode())
+        .await
+        .unwrap();
+    assert!(!Chunk::decode(&body).unwrap().found);
+
+    // The control: a blob that really does live in a public channel is
+    // fetchable by anyone, which is what SIP-18 says and must keep working.
+    let (_, open_sealed, open_id) = seal_file(b"a poster on the wall", 1024);
+    assert!(upload(&mut alice, open, &open_sealed, open_id, 20, 0).await);
+    let (_, body) = mallory
+        .post(
+            "/blob/get",
+            GetChunk {
+                blob: open_id,
+                index: 0,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        Chunk::decode(&body).unwrap().found,
+        "a public channel's blob stays public"
+    );
+}
+
 #[tokio::test]
 async fn forwarding_costs_the_reference_and_not_the_file() {
     let dir = tempfile::tempdir().unwrap();

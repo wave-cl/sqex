@@ -124,17 +124,41 @@ pub struct FileConfig {
     #[serde(default)]
     pub max_names: Option<u64>,
 
-    /// SIP-35: base58 Ed25519 identities of exchanges this one will serve
-    /// replication to.
+    /// SIP-35: exchanges this one will serve replication to.
     ///
-    /// The **operational** half of the gate, and only that half. Being on this
-    /// list lets a peer speak the peering routes at all; it does not give it a
-    /// single channel, which takes a signed authorisation by one of that
-    /// channel's admins. Empty — the default — means this exchange serves
-    /// replication to nobody and its peering routes refuse everyone
-    /// identically.
+    /// The **operational** half of the gate. Being on this list lets a peer
+    /// speak the peering routes at all; what it may then pull depends on the
+    /// kind. Empty — the default — means this exchange serves replication to
+    /// nobody and its peering routes refuse everyone identically.
+    ///
+    /// Two forms, and a bare string is the first:
+    ///
+    /// ```toml
+    /// replication_peers = [
+    ///     "Base58PeerKey",                                  # a full replica
+    ///     { key = "Base58PeerKey", for = ["Base58Account"] } # acts for accounts
+    /// ]
+    /// ```
+    ///
+    /// A **full replica** serves other people's clients, so each channel it
+    /// carries takes a per-channel authorisation signed into the log by one of
+    /// that channel's admins. That is a real disclosure — a second operator
+    /// holding the membership graph — and SIP-35 puts the decision with the
+    /// members rather than the operator.
+    ///
+    /// A peer named `for` some accounts is the other case: **a read replica, or
+    /// somebody's own exchange syncing their own conversations.** It may pull
+    /// exactly the channels those accounts are present members of, and needs no
+    /// per-channel signature, because those accounts can already fetch every one
+    /// of those entries as clients. Copying them to their own box is not a new
+    /// disclosure; it is the same disclosure arriving somewhere else.
+    ///
+    /// The two are one rule with different scale, and the code cannot tell them
+    /// apart — a read replica and a personal exchange are both "may pull what
+    /// these accounts may read". Naming them differently in configuration would
+    /// be a distinction the enforcement does not make.
     #[serde(default)]
-    pub replication_peers: Vec<String>,
+    pub replication_peers: Vec<FilePeer>,
 
     /// SIP-35: origins this exchange replicates *from*.
     ///
@@ -181,6 +205,33 @@ pub struct FileConfig {
     pub max_bridges: Option<u64>,
 }
 
+/// A peer in `replication_peers`: a bare key, or a key with the accounts it
+/// acts for.
+///
+/// Untagged so a bare string keeps working, the same shape the state file uses
+/// for a whitelisted key.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum FilePeer {
+    /// A full replica: per-channel signed authorisation decides what it gets.
+    Full(String),
+    /// A replica acting for particular accounts.
+    For {
+        key: String,
+        #[serde(rename = "for")]
+        accounts: Vec<String>,
+    },
+}
+
+/// A peer this exchange serves replication to, and what it may pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationPeer {
+    pub key: PubKey,
+    /// Accounts this peer acts for. **Empty means a full replica**, whose
+    /// channels come from per-channel signed authorisations instead.
+    pub acts_for: Vec<PubKey>,
+}
+
 /// One origin to replicate from.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,7 +275,7 @@ pub struct Config {
     pub max_names_per_account: usize,
     pub name_lease_secs: u64,
     pub max_names: Option<u64>,
-    pub replication_peers: Vec<PubKey>,
+    pub replication_peers: Vec<ReplicationPeer>,
     pub replicate: Vec<OriginConfig>,
     /// SIP-39: peers to seed the managed allowlist with, on a first run that
     /// has no peer list yet. Not the live list — that is in [`crate::state`],
@@ -248,7 +299,28 @@ impl FileConfig {
         let listen = parse_listen(&self.listen)?;
         let admins = parse_keys(&self.admins, "admins")?;
         let seed_whitelist = parse_keys(&self.seed_whitelist, "seed_whitelist")?;
-        let replication_peers = parse_keys(&self.replication_peers, "replication_peers")?;
+        let mut replication_peers = Vec::with_capacity(self.replication_peers.len());
+        for p in &self.replication_peers {
+            replication_peers.push(match p {
+                FilePeer::Full(k) => ReplicationPeer {
+                    key: parse_key(k, "replication_peers")?,
+                    acts_for: Vec::new(),
+                },
+                FilePeer::For { key, accounts } => {
+                    if accounts.is_empty() {
+                        return Err(Error::Malformed(format!(
+                            "replication_peers: {key} names `for` with no accounts. A peer that \
+                             acts for nobody may pull nothing, which is what leaving it off the \
+                             list already says — so this is a mistake worth hearing at load."
+                        )));
+                    }
+                    ReplicationPeer {
+                        key: parse_key(key, "replication_peers")?,
+                        acts_for: parse_keys(accounts, "replication_peers `for`")?,
+                    }
+                }
+            });
+        }
         // SIP-35 caps the peers an origin will serve, and an operator who set
         // more should hear so at load rather than discover that some of them
         // are silently ignored.
@@ -396,6 +468,11 @@ impl Config {
     }
 }
 
+fn parse_key(raw: &str, field: &str) -> Result<PubKey> {
+    raw.parse::<PubKey>()
+        .map_err(|e| Error::Key(format!("{field}: {raw} is not a valid key: {e}")))
+}
+
 fn parse_keys(raw: &[String], field: &str) -> Result<Vec<PubKey>> {
     raw.iter()
         .map(|s| {
@@ -432,6 +509,44 @@ mod tests {
     /// this, so a typo in it — or a key renamed in the code and not in the
     /// file — would first be discovered by an operator whose exchange refused
     /// to start.
+    /// A peer that acts for accounts is the other half of SIP-35's gate: it
+    /// pulls what those accounts may read, with no per-channel signature,
+    /// because they can already fetch every one of those entries as clients.
+    #[test]
+    fn a_peer_may_be_named_with_the_accounts_it_acts_for() {
+        let peer = PubKey::new([3u8; 32]).to_base58();
+        let acct = PubKey::new([4u8; 32]).to_base58();
+        let toml_text = format!(
+            r#"
+            listen = "127.0.0.1:5400"
+            key_file = "/tmp/k"
+            replication_peers = [{{ key = "{peer}", for = ["{acct}"] }}]
+            "#
+        );
+        let file: FileConfig = toml::from_str(&toml_text).unwrap();
+        let cfg = file.resolve().unwrap();
+        assert_eq!(cfg.replication_peers.len(), 1);
+        assert_eq!(
+            cfg.replication_peers[0].acts_for,
+            vec![PubKey::new([4u8; 32])]
+        );
+
+        // Acting for nobody may pull nothing, which leaving it off the list
+        // already says — so it is a mistake worth hearing at load.
+        let empty = format!(
+            r#"
+            listen = "127.0.0.1:5400"
+            key_file = "/tmp/k"
+            replication_peers = [{{ key = "{peer}", for = [] }}]
+            "#
+        );
+        let file: FileConfig = toml::from_str(&empty).unwrap();
+        let err = file
+            .resolve()
+            .expect_err("a peer acting for nobody is refused");
+        assert!(err.to_string().contains("acts for nobody"), "{err}");
+    }
+
     #[test]
     fn the_shipped_config_loads() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../etc/sqexd.toml");
@@ -638,7 +753,14 @@ interval_secs = 120
             .unwrap()
             .resolve()
             .unwrap();
-        assert_eq!(config.replication_peers, vec![PubKey::new([1u8; 32])]);
+        assert_eq!(
+            config.replication_peers,
+            vec![ReplicationPeer {
+                key: PubKey::new([1u8; 32]),
+                acts_for: Vec::new(),
+            }],
+            "a bare key is a full replica"
+        );
         assert_eq!(config.replicate.len(), 1);
         assert_eq!(config.replicate[0].origin, PubKey::new([2u8; 32]));
         assert_eq!(config.replicate[0].channels, vec![[3u8; 32]]);

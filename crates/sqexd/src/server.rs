@@ -262,7 +262,7 @@ pub struct Server {
     /// The operational half of the gate. Being here lets a peer speak the
     /// peering routes; it gives it no channel, which takes a signed
     /// authorisation from one of that channel's admins.
-    replication_peers: Vec<PubKey>,
+    replication_peers: Vec<crate::config::ReplicationPeer>,
     /// SIP-35: the origins this one replicates *from*, and the seed it dials
     /// them with — its own SIP-9 identity, because a peering connection is an
     /// ordinary SIP-3 one and an exchange's identity is that key.
@@ -298,6 +298,43 @@ impl Server {
     /// so `sqex admin peer add` takes effect on the next call rather than the
     /// next restart. Neither caller holds the state lock, and this takes it for
     /// the length of a map lookup.
+    /// Whether `who` may speak the SIP-35 peering routes at all.
+    ///
+    /// The operational half of the gate, and only that half — what a peer may
+    /// then *pull* is [`Self::may_pull`].
+    fn peering(&self, who: &PubKey) -> Option<&crate::config::ReplicationPeer> {
+        self.replication_peers.iter().find(|p| p.key == *who)
+    }
+
+    /// Whether an admitted peer may pull this channel.
+    ///
+    /// Two ways to be entitled, and they are different kinds of consent:
+    ///
+    /// - A **full replica** carries a channel only where one of its admins has
+    ///   signed a `0x0b` into the log. It serves other people's clients, so a
+    ///   second operator ends up holding the membership graph — SIP-35 puts
+    ///   that decision with the members rather than with either operator.
+    /// - A peer that **acts for accounts** — a read replica, or somebody's own
+    ///   exchange syncing their own conversations — carries a channel where one
+    ///   of those accounts is a present member. No per-channel signature,
+    ///   because those accounts can already fetch every one of those entries as
+    ///   clients; the entries arriving on their own box is the same disclosure
+    ///   in a different place.
+    ///
+    /// **What this does not establish is that the peer really is theirs.** That
+    /// is the origin operator's assertion, made in its config, and a private
+    /// group's other members did not agree to it. The stronger form is an
+    /// authorisation signed by the account itself, which SIP-35 now names as
+    /// the upgrade for a deployment that will not trust its operator this far.
+    fn may_pull(&self, peer: &crate::config::ReplicationPeer, channel: &[u8; 32]) -> bool {
+        if peer.acts_for.is_empty() {
+            return self.channels.replicates_to(channel, &peer.key);
+        }
+        peer.acts_for
+            .iter()
+            .any(|a| self.channels.is_member(channel, a))
+    }
+
     pub(crate) fn peers_with(&self, key: &PubKey) -> bool {
         self.state.lock().unwrap().peers_with(key)
     }
@@ -1610,13 +1647,19 @@ async fn route(
                 Err(e) => refuse(e.status(), e.code(), None),
             },
         },
-        // Unauthenticated by necessity: anybody who may seal to a device has
-        // to be able to fetch one. Draining a pool is therefore a denial of
-        // service anyone can cause, which the fallback turns into a loss of
-        // forward secrecy rather than a failure to rotate.
-        ("POST", "/prekey/take") => match PrekeyTake::decode(body) {
-            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            Ok(req) => (
+        // **Unauthorised by necessity, but not unidentified.** Anybody who may
+        // seal to a device has to be able to fetch a prekey for it, so there is
+        // no membership or ownership test to apply here — SIP-23 is explicit
+        // about that. What there is no reason to allow is doing it *namelessly*:
+        // every caller with a legitimate use already advertises an identity, and
+        // each call spends a one-time prekey, so an anonymous caller could drain
+        // a pool with nothing to attribute it to and nothing to rate-limit
+        // against. Requiring an identity costs a legitimate caller nothing and
+        // gives the drain a name.
+        ("POST", "/prekey/take") => match (device, PrekeyTake::decode(body)) {
+            (None, _) => no_identity("taking a prekey"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(_), Ok(req)) => (
                 200,
                 "application/octet-stream",
                 server.prekeys.take(&req.device).encode(),
@@ -2150,7 +2193,7 @@ async fn route(
         // not replicated to this peer, and an origin that cannot receipt all
         // produce one 404 with nothing in it.
         ("POST", "/peer/hello") => match (peer.identity, PeerHello::decode(body)) {
-            (Some(who), Ok(hello)) if server.replication_peers.contains(&who) => {
+            (Some(who), Ok(hello)) if server.peering(&who).is_some() => {
                 let hi = Hi {
                     now: now_unix(),
                     version: hello.version.min(PEER_VERSION),
@@ -2163,8 +2206,9 @@ async fn route(
         },
         ("POST", "/peer/pull") => match (peer.identity, PeerPull::decode(body)) {
             (Some(who), Ok(req))
-                if server.replication_peers.contains(&who)
-                    && server.channels.replicates_to(&req.channel, &who) =>
+                if server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
             {
                 match server.channels.pull(&req.channel, req.since, req.max) {
                     Ok(pulled) => (200, "application/octet-stream", pulled.encode()),
@@ -2188,7 +2232,16 @@ async fn route(
             match (account, ByChannel::decode(body, CH_EQUIVOCATION)) {
                 (None, _) => no_identity("reading an equivocation"),
                 (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-                (Some(_), Ok(req)) => match server.channels.equivocation_for(&req.channel) {
+                // Membership, which the comment above always claimed and the
+                // code did not check: `Some(_)` bound the account and discarded
+                // it, so any identity naming a channel id — including a direct
+                // message's, computable from two public keys — learned whether
+                // this exchange holds a replica of it, its `instance`, and two
+                // timestamps. A non-member is refused exactly as for a channel
+                // that is not here, which is also the answer when there is no
+                // equivocation, so the three are one answer.
+                (Some(who), Ok(req)) => match server.channels.equivocation_seen(&who, &req.channel)
+                {
                     Some(proof) => (200, "application/octet-stream", proof),
                     None => refuse(404, Code::NoSuchChannel, None),
                 },
@@ -2197,8 +2250,9 @@ async fn route(
 
         ("POST", "/peer/envelopes") => match (peer.identity, PullEnvelopes::decode(body)) {
             (Some(who), Ok(req))
-                if server.replication_peers.contains(&who)
-                    && server.channels.replicates_to(&req.channel, &who) =>
+                if server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
             {
                 match server
                     .channels
@@ -2212,8 +2266,9 @@ async fn route(
         },
         ("POST", "/peer/blobs") => match (peer.identity, PullBlob::decode(body)) {
             (Some(who), Ok(req))
-                if server.replication_peers.contains(&who)
-                    && server.channels.replicates_to(&req.channel, &who) =>
+                if server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
             {
                 match server
                     .channels
@@ -2231,7 +2286,7 @@ async fn route(
         // in one of those channels, which is SIP-21's "shares a channel" rule
         // read through the authorisation.
         ("POST", "/peer/records") => match (peer.identity, PullRecord::decode(body)) {
-            (Some(who), Ok(req)) if server.replication_peers.contains(&who) => {
+            (Some(who), Ok(req)) if server.peering(&who).is_some() => {
                 match server.profiles.get(&who, &req.account, &|_, subject| {
                     server.channels.shares_replicated(&who, subject)
                 }) {

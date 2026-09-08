@@ -98,6 +98,12 @@ pub enum Code {
     /// SIP-35: a read of a replicated channel whose membership the replica
     /// cannot derive. The detail carries the origin's key.
     Underived,
+    /// SIP-18: attaching this blob here would make it readable by everyone,
+    /// and nothing could undo that. A blob attached to a private channel is
+    /// refused an attachment to a public one — sharing it publicly means
+    /// uploading it again, which gives the public copy its own key and leaves
+    /// the private one's audience alone.
+    WouldPublish,
     /// SIP-35: this exchange holds two receipts for one position from the
     /// channel's origin, and will present neither branch as the conversation.
     Equivocated,
@@ -189,6 +195,7 @@ impl Code {
             Code::Underived => 58,
             Code::Equivocated => 59,
             Code::TooManyEndpoints => 60,
+            Code::WouldPublish => 61,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -268,6 +275,7 @@ impl Code {
             58 => Code::Underived,
             59 => Code::Equivocated,
             60 => Code::TooManyEndpoints,
+            61 => Code::WouldPublish,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -372,6 +380,7 @@ impl Code {
             Code::RoomFull => "room_full",
 
             Code::Storage => "storage",
+            Code::WouldPublish => "would_publish",
 
             Code::Unknown(_) => "unknown",
         }
@@ -440,6 +449,7 @@ impl Code {
         Code::Backpressure,
         Code::RoomFull,
         Code::Storage,
+        Code::WouldPublish,
     ];
 }
 

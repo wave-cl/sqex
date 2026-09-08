@@ -32,6 +32,37 @@ seed_whitelist = [
 challenge_ttl_secs = 30
 
 # ---------------------------------------------------------------------------
+# SIP-35: replication.
+# ---------------------------------------------------------------------------
+
+# Exchanges this one will serve replication to. Empty means nobody, and the
+# peering routes then refuse everyone identically.
+#
+# Being on this list admits a peer to the routes; what it may pull depends on
+# how it is named:
+#
+#   replication_peers = [
+#       "Base58PeerKey",                                    # a full replica
+#       { key = "Base58PeerKey", for = ["Base58Account"] },  # acts for accounts
+#   ]
+#
+# A bare key is a **full replica** — one that serves other people's clients. It
+# gets a channel only where one of that channel's admins has signed an
+# authorisation into the log, because a second operator holding the membership
+# graph is a real disclosure and SIP-35 puts that decision with the members.
+#
+# A peer named with `for` is a **read replica, or somebody's own exchange**
+# syncing conversations they are already in. It may pull the channels those
+# accounts are present members of, with no per-channel signature — those
+# accounts can already fetch every one of those entries as clients, so the copy
+# is the same disclosure in a different place.
+#
+# Note what `for` does not establish: that the peer really is theirs. That is
+# this operator's assertion, and a private group's other members did not agree
+# to it. See SIP-35 for the account-signed form, which is the stronger one.
+# replication_peers = []
+
+# ---------------------------------------------------------------------------
 # SIP-39: cross-exchange calls.
 # ---------------------------------------------------------------------------
 
