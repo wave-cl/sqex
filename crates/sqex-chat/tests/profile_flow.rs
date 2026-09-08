@@ -521,3 +521,41 @@ async fn a_closed_exchange_says_it_is_closed_rather_than_erroring() {
         "a closed namespace is a policy, and the caller has earned a real answer"
     );
 }
+
+/// A claimed name becomes the handle everybody is shown.
+///
+/// The claim is only half of it: the handle a client displays comes from the
+/// exchange's own reverse lookup, cached on the profile refresh, and composed
+/// with the exchange's domain. A client that wrote its own would be showing a
+/// name nobody else can see — and one that never learned the domain shows
+/// nothing at all, however well the claim went.
+#[tokio::test]
+async fn a_claimed_name_becomes_a_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+
+    // Nothing yet, and not because the domain is missing: that is the other
+    // way this can read as unregistered, and the two have to be told apart.
+    alice.set_domain(Some("squic.org".into()));
+    assert_eq!(alice.handle(&alice_key), None);
+
+    assert_eq!(
+        alice.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    // Read back rather than assumed. `force`, because "we asked and were told
+    // nothing" is exactly the state a fresh account is in and caching it would
+    // hide the name that was just claimed.
+    alice
+        .refetch_profiles(&[alice_key], 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(alice.handle(&alice_key).as_deref(), Some("ada@squic.org"));
+
+    // And without a domain there is no handle to compose, which is a different
+    // failure from having no name.
+    alice.set_domain(None);
+    assert_eq!(alice.handle(&alice_key), None);
+}
