@@ -2888,8 +2888,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr"
-version = "0.10.5"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.5#ac45f7096fbbd56c462435ee834ae8679f790918"
+version = "0.10.7"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.7#20ceb8ab4747f56f690efa467802acbcfda49327"
 dependencies = [
  "argon2",
  "bs58",
@@ -2920,8 +2920,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr-core"
-version = "0.10.5"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.5#ac45f7096fbbd56c462435ee834ae8679f790918"
+version = "0.10.7"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.7#20ceb8ab4747f56f690efa467802acbcfda49327"
 dependencies = [
  "bs58",
  "ed25519-dalek",
@@ -2932,8 +2932,8 @@ dependencies = [
 
 [[package]]
 name = "squic"
-version = "0.26.0"
-source = "git+https://github.com/wave-cl/squic-rust?tag=v0.26.0#e519e7782ed3ab9907784b6fdbd6327b318ed4e3"
+version = "0.27.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.27.0#0f14cb03f20a3a48972c7434e6a226afaa426c18"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
