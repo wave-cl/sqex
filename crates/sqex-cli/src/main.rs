@@ -357,6 +357,33 @@ enum AdminCmd {
         #[command(subcommand)]
         cmd: AdminNameCmd,
     },
+    /// Manage the relay peers (SIP-39): which other exchanges this one will
+    /// bridge calls to and from. Takes effect immediately — no restart.
+    Peer {
+        #[command(subcommand)]
+        action: PeerCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// List the relay peers and their provenance.
+    List,
+    /// Add one or more peer exchange keys (signed as a single batch).
+    ///
+    /// The key is the exchange's SIP-9 host key, not an address: where a peer
+    /// is comes from SIP-33 discovery of the domain a call names, so a peer
+    /// that moves is followed rather than reconfigured.
+    Add {
+        keys: Vec<String>,
+        /// Optional human label recorded as provenance for each key.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove one or more peer exchange keys (signed as a single batch).
+    ///
+    /// Stops the next call. Bridges already open are not torn down.
+    Remove { keys: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -1879,6 +1906,7 @@ fn resolve(address: &str) -> Result<SocketAddr, String> {
 async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
     match cmd {
         AdminCmd::Whitelist { action } => whitelist(cli, cfg, action).await,
+        AdminCmd::Peer { action } => peer(cli, cfg, action).await,
         AdminCmd::Audit { count } => {
             let v = submit(cli, cfg, vec![Op::AuditTail(*count).to_operation()]).await?;
             print_audit(&result(&v, 0));
@@ -2021,6 +2049,55 @@ async fn whitelist(cli: &Cli, cfg: &Config, action: &WhitelistCmd) -> Result<(),
         _ => println!("ok: {}", v["results"]),
     }
     Ok(())
+}
+
+async fn peer(cli: &Cli, cfg: &Config, action: &PeerCmd) -> Result<(), String> {
+    let ops: Vec<Operation> = match action {
+        PeerCmd::List => vec![Op::PeerList.to_operation()],
+        PeerCmd::Add { keys, label } => keyed_ops(keys, |key| Op::PeerAdd {
+            key,
+            label: label.clone(),
+        })?,
+        PeerCmd::Remove { keys } => keyed_ops(keys, Op::PeerRemove)?,
+    };
+    let v = submit(cli, cfg, ops).await?;
+    match action {
+        PeerCmd::List => print_peers(&result(&v, 0)),
+        _ => println!("ok: {}", v["results"]),
+    }
+    Ok(())
+}
+
+fn print_peers(v: &serde_json::Value) {
+    let peers = v["peers"].as_array().cloned().unwrap_or_default();
+    if peers.is_empty() {
+        // Said rather than shown as an empty list: an exchange with no peers
+        // refuses every cross-exchange call, and that is worth stating.
+        println!("no relay peers — this exchange federates with nobody");
+        return;
+    }
+    println!("{} relay peer(s):", peers.len());
+    for p in &peers {
+        let key = p["key"].as_str().unwrap_or("?");
+        let label = p["label"].as_str().unwrap_or("");
+        let by = p["added_by"].as_str().unwrap_or("seed");
+        let label = if label.is_empty() {
+            String::new()
+        } else {
+            format!("  {label}")
+        };
+        println!("  {key}{label}  (added by {by})");
+    }
+}
+
+/// Build one op per key, for the batches that are just a list of keys.
+fn keyed_ops(keys: &[String], make: impl Fn(PubKey) -> Op) -> Result<Vec<Operation>, String> {
+    if keys.is_empty() {
+        return Err("give at least one key".into());
+    }
+    keys.iter()
+        .map(|k| Ok(make(parse_key(k)?).to_operation()))
+        .collect()
 }
 
 fn add_ops(keys: &[String], label: &Option<String>) -> Result<Vec<Operation>, String> {

@@ -292,6 +292,21 @@ impl Server {
         self.admins.read().unwrap().iter().any(|a| a == key)
     }
 
+    /// SIP-39: whether this exchange federates with `key`.
+    ///
+    /// Read from the managed state on every check rather than from a snapshot,
+    /// so `sqex admin peer add` takes effect on the next call rather than the
+    /// next restart. Neither caller holds the state lock, and this takes it for
+    /// the length of a map lookup.
+    pub(crate) fn peers_with(&self, key: &PubKey) -> bool {
+        self.state.lock().unwrap().peers_with(key)
+    }
+
+    /// Whether this exchange federates with anybody at all.
+    pub(crate) fn peering_enabled(&self) -> bool {
+        self.state.lock().unwrap().peering_enabled()
+    }
+
     /// Requests served since boot, event streams included — one per stream
     /// opened, not one per frame written, which is the distinction that makes
     /// this number mean anything.
@@ -407,7 +422,11 @@ pub async fn bind_with(
     find: crate::relay::Find,
 ) -> Result<Bound> {
     let public_key = PubKey::new(signing_key.verifying_key().to_bytes());
-    let state = State::load(config.state_file.clone(), &config.seed_whitelist)?;
+    let state = State::load(
+        config.state_file.clone(),
+        &config.seed_whitelist,
+        &config.seed_relay_peers,
+    )?;
     let channel_db = config
         .state_file
         .as_ref()
@@ -549,12 +568,9 @@ pub async fn bind_with(
         admissions: Admissions::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
-        relay: crate::relay::Relay::new(
-            signing_key.to_bytes(),
-            config.relay_peers.clone(),
-            config.max_bridges,
-            find,
-        ),
+        // No peer list here. The relay used to hold a snapshot taken at
+        // startup, which is exactly what made adding a peer a restart.
+        relay: crate::relay::Relay::new(signing_key.to_bytes(), config.max_bridges, find),
         events: Subscribers::default(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
@@ -2326,7 +2342,7 @@ async fn route(
             (None, _) => no_identity("placing a call"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(call)) => {
-                let ack = if server.relay.configured() {
+                let ack = if server.peering_enabled() {
                     crate::relay::place_call(server, me, call.ephemeral, call.target, now_unix())
                         .await
                 } else {
@@ -2549,6 +2565,69 @@ impl Server {
                     })
                     .collect();
                 json!({ "enabled": state.enabled(), "keys": keys })
+            }
+            // SIP-39. Deliberately the same shape as the whitelist arms above:
+            // an operator administering "who may connect" and "who we federate
+            // with" is doing one kind of thing, and the two should not need
+            // different habits.
+            Op::PeerAdd { key, label } => {
+                // The cap is the same one the config used to enforce at load.
+                // It has to be enforced here too now, or a list that could not
+                // be configured could still be assembled one op at a time.
+                if !state.peers_with(key) && state.peer_count() >= sqex_proto::peer::MAX_PEERS {
+                    return json!({
+                        "ok": false,
+                        "error": format!(
+                            "already peering with {}, limit is {}",
+                            state.peer_count(),
+                            sqex_proto::peer::MAX_PEERS
+                        ),
+                    });
+                }
+                // Refusing to peer with ourselves: a self-bridge is a loop with
+                // no second party, and the failure it produces later is much
+                // harder to read than this sentence.
+                if *key == self.public_key {
+                    return json!({
+                        "ok": false,
+                        "error": "an exchange cannot be its own relay peer",
+                    });
+                }
+                let changed = state.add_peer(
+                    *key,
+                    WhitelistEntry {
+                        added_by: Some(admin.to_base58()),
+                        label: label.clone(),
+                        added_at: now_unix(),
+                    },
+                );
+                json!({ "ok": true, "added": changed, "peers": state.peer_count() })
+            }
+            Op::PeerRemove(key) => {
+                let changed = state.remove_peer(key);
+                // Said plainly, because it is the question an operator asks
+                // next: this stops the next call, not one already up.
+                json!({
+                    "ok": true,
+                    "removed": changed,
+                    "peers": state.peer_count(),
+                    "note": "bridges already open are not torn down",
+                })
+            }
+            Op::PeerList => {
+                let peers: Vec<serde_json::Value> = state
+                    .peer_list()
+                    .into_iter()
+                    .map(|(k, e)| {
+                        json!({
+                            "key": k.to_base58(),
+                            "added_by": e.added_by,
+                            "label": e.label,
+                            "added_at": e.added_at,
+                        })
+                    })
+                    .collect();
+                json!({ "peering": state.peering_enabled(), "peers": peers })
             }
             Op::Status => self.status_value(state),
             Op::ReloadAdmins => match self.reload_admins() {

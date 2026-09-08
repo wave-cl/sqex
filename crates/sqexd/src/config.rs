@@ -159,7 +159,19 @@ pub struct FileConfig {
     /// rather than re-configured, and there is nothing here to keep in step
     /// with DNS. Same shape as `replication_peers`.
     #[serde(default)]
-    pub relay_peers: Vec<String>,
+    pub seed_relay_peers: Vec<String>,
+
+    /// Retired in favour of `seed_relay_peers`, and kept only so that a config
+    /// carrying it is refused with an explanation instead of serde's "unknown
+    /// field".
+    ///
+    /// Peers are administered at runtime now, so a list here no longer means
+    /// what it used to: it would be read once on the first run and ignored
+    /// afterwards. An operator who left it in place and expected edits to take
+    /// effect would be wrong in a way nothing would report, which is worse than
+    /// refusing to start.
+    #[serde(default)]
+    pub relay_peers: Option<Vec<String>>,
 
     /// SIP-39: cap on concurrent bridged calls. Unset means unlimited. A relay
     /// a peer can drive needs a ceiling a local SIP-12 session does not, since a
@@ -214,7 +226,10 @@ pub struct Config {
     pub max_names: Option<u64>,
     pub replication_peers: Vec<PubKey>,
     pub replicate: Vec<OriginConfig>,
-    pub relay_peers: Vec<PubKey>,
+    /// SIP-39: peers to seed the managed allowlist with, on a first run that
+    /// has no peer list yet. Not the live list — that is in [`crate::state`],
+    /// and is what the relay actually consults.
+    pub seed_relay_peers: Vec<PubKey>,
     pub max_bridges: Option<u64>,
 }
 
@@ -247,10 +262,23 @@ impl FileConfig {
 
         // SIP-39 relay peers, capped the same way and for the same reason as
         // replication peers — an over-long list is a mistake to hear at load.
-        let relay_peers = parse_keys(&self.relay_peers, "relay_peers")?;
+        // Refuse rather than migrate silently. The rename is the signal that
+        // the model changed underneath, and an exchange that started anyway
+        // would leave the operator believing this file still governs peering.
+        if self.relay_peers.is_some() {
+            return Err(Error::Malformed(
+                "`relay_peers` has been replaced by `seed_relay_peers`. Peers are administered \
+                 at runtime now — `sqex admin peer add/remove/list` — and the config key only \
+                 seeds the very first run, exactly as `seed_whitelist` does. Rename the key to \
+                 `seed_relay_peers` to keep the peers you have; the existing state file carries \
+                 them across the upgrade either way."
+                    .into(),
+            ));
+        }
+        let relay_peers = parse_keys(&self.seed_relay_peers, "seed_relay_peers")?;
         if relay_peers.len() > sqex_proto::peer::MAX_PEERS {
             return Err(Error::Malformed(format!(
-                "relay_peers holds {}, limit is {}",
+                "seed_relay_peers holds {}, limit is {}",
                 relay_peers.len(),
                 sqex_proto::peer::MAX_PEERS
             )));
@@ -352,7 +380,7 @@ impl FileConfig {
             name_lease_secs: self.name_lease_secs,
             replication_peers,
             replicate,
-            relay_peers,
+            seed_relay_peers: relay_peers,
             max_bridges: self.max_bridges,
         })
     }
@@ -399,6 +427,68 @@ fn parse_listen(s: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file we ship must load through the parser we ship. Nothing checked
+    /// this, so a typo in it — or a key renamed in the code and not in the
+    /// file — would first be discovered by an operator whose exchange refused
+    /// to start.
+    #[test]
+    fn the_shipped_config_loads() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../etc/sqexd.toml");
+        let text = std::fs::read_to_string(path).expect("etc/sqexd.toml is missing");
+        let file: FileConfig =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("etc/sqexd.toml does not parse: {e}"));
+        let cfg = file
+            .resolve()
+            .unwrap_or_else(|e| panic!("etc/sqexd.toml does not resolve: {e}"));
+        // The commented-out examples mean these are empty; what matters is
+        // that the keys are spelled the way the parser expects.
+        assert!(cfg.seed_relay_peers.is_empty());
+        assert!(cfg.max_bridges.is_none());
+    }
+
+    /// The retired key is refused, and the refusal says what to do about it —
+    /// this is what an operator sees on the restart after the upgrade, so a
+    /// bare "unknown field" would not be good enough.
+    #[test]
+    fn the_retired_relay_peers_key_is_refused_with_instructions() {
+        let peer = PubKey::new([3u8; 32]).to_base58();
+        let toml_text = format!(
+            r#"
+            listen = "127.0.0.1:5400"
+            key_file = "/tmp/sqex.key"
+            relay_peers = ["{peer}"]
+            "#
+        );
+        let file: FileConfig = toml::from_str(&toml_text).expect("the key is still accepted");
+        let err = file.resolve().expect_err("it must not resolve");
+        let msg = err.to_string();
+        for want in ["seed_relay_peers", "sqex admin peer", "state file"] {
+            assert!(msg.contains(want), "refusal should mention {want:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn seed_relay_peers_is_capped() {
+        let keys: Vec<String> = (0..=sqex_proto::peer::MAX_PEERS)
+            .map(|i| PubKey::new([i as u8; 32]).to_base58())
+            .collect();
+        let list = keys
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml_text = format!(
+            r#"
+            listen = "127.0.0.1:5400"
+            key_file = "/tmp/sqex.key"
+            seed_relay_peers = [{list}]
+            "#
+        );
+        let file: FileConfig = toml::from_str(&toml_text).unwrap();
+        let err = file.resolve().expect_err("over the cap must not resolve");
+        assert!(err.to_string().contains("seed_relay_peers"), "{err}");
+    }
 
     #[test]
     fn parses_a_full_config() {

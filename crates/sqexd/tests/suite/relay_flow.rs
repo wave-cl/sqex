@@ -16,7 +16,7 @@ use sqex_proto::session::{
 };
 use sqexd::config::FileConfig;
 use sqnr::Client;
-use sqnr_core::PubKey;
+use sqnr_core::{PubKey, SignedTransaction, SoftwareSigner, Transaction};
 
 /// Bring up an exchange that federates with `peers` (base58 keys) and finds
 /// them through `found` rather than DNS.
@@ -29,6 +29,18 @@ async fn relay_server(
     peers: &[PubKey],
     found: &[(&str, PubKey, SocketAddr)],
 ) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    relay_server_with_admin(dir, host_key, peers, found, None).await
+}
+
+/// As [`relay_server`], with an administrator who may change the peer list
+/// while it runs.
+async fn relay_server_with_admin(
+    dir: &std::path::Path,
+    host_key: &SigningKey,
+    peers: &[PubKey],
+    found: &[(&str, PubKey, SocketAddr)],
+    admin: Option<PubKey>,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     std::fs::write(&key_path, hex::encode(host_key.to_bytes())).unwrap();
     let listed = peers
@@ -36,9 +48,13 @@ async fn relay_server(
         .map(|k| format!("\"{k}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let admins = match admin {
+        Some(a) => format!("\"{a}\""),
+        None => String::new(),
+    };
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
-         relay_peers = [{listed}]\n",
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{admins}]\n\
+         seed_relay_peers = [{listed}]\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );
@@ -539,6 +555,132 @@ async fn only_the_addressed_account_may_decline() {
 ///
 /// This is the case the discover-then-check ordering could quietly drop: the
 /// domain resolves, a link would dial, and nothing else stands in the way.
+/// Issue one signed admin op against a running exchange.
+async fn admin_op(
+    client: &mut Client,
+    op: sqex_proto::Op,
+    server_pub: &PubKey,
+    signer: &SoftwareSigner,
+) -> (u16, Vec<u8>) {
+    let (cs, nonce_bytes) = client.get("/admin/challenge").await.unwrap();
+    assert_eq!(cs, 200);
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&nonce_bytes);
+    let txn = Transaction {
+        server: *server_pub,
+        nonce,
+        ops: vec![op.to_operation()],
+    };
+    let signed = SignedTransaction::create(txn, signer);
+    client
+        .post("/admin/command", signed.encode())
+        .await
+        .unwrap()
+}
+
+/// **The point of the whole change**: an administrator adds a peer to a running
+/// exchange and the very next call goes through. Nothing is restarted between
+/// the refusal and the success — same process, same connection, same client.
+///
+/// Before this, the peer list was a snapshot the relay took at startup, so the
+/// only way to federate with somebody new was to take the exchange down on
+/// everybody already using it.
+#[tokio::test]
+async fn a_peer_added_by_an_administrator_works_without_a_restart() {
+    let dir_x = tempfile::tempdir().unwrap();
+    let dir_y = tempfile::tempdir().unwrap();
+    let (xk, x_pub) = identity(170);
+    let (yk, y_pub) = identity(171);
+    let (x_key, y_key) = (SigningKey::from_bytes(&xk), SigningKey::from_bytes(&yk));
+
+    // Y already federates with X. X federates with a stranger it will never
+    // call — so the "federates with nobody" short circuit does not fire and
+    // the allowlist itself is what refuses. Without this the first call would
+    // never reach the peer check and the test would prove nothing.
+    let (y_addr, _y_bytes, y_h) = relay_server(dir_y.path(), &y_key, &[x_pub], &[]).await;
+    let (_, stranger) = identity(179);
+    let admin_sk = SigningKey::from_bytes(&[181u8; 32]);
+    let admin_pub = PubKey::new(admin_sk.verifying_key().to_bytes());
+    let admin_signer = SoftwareSigner::new(admin_sk);
+    let (x_addr, x_server_pub, x_h) = relay_server_with_admin(
+        dir_x.path(),
+        &x_key,
+        &[stranger],
+        &[("y.test", y_pub, y_addr)],
+        Some(admin_pub),
+    )
+    .await;
+
+    let (a_seed, _) = identity(172);
+    let (_, b_id) = identity(173);
+    let mut alice = Client::connect_as(x_addr, &x_server_pub, &a_seed)
+        .await
+        .unwrap();
+
+    // Refused: Y is findable, but not somebody X federates with.
+    let (_, eph1) = ephemeral();
+    let ack = call(&mut alice, &format!("{b_id}@y.test"), eph1).await;
+    assert_eq!(ack.state, CallState::Rejected, "not yet peered");
+    assert_eq!(ack.reason, relay::REASON_REFUSED);
+
+    // The administrator adds Y. No restart, no reload, no config file.
+    let mut admin_client = Client::connect_as(x_addr, &x_server_pub, &[181u8; 32])
+        .await
+        .unwrap();
+    let (code, body) = admin_op(
+        &mut admin_client,
+        sqex_proto::Op::PeerAdd {
+            key: y_pub,
+            label: Some("y.test".into()),
+        },
+        &PubKey::new(x_server_pub),
+        &admin_signer,
+    )
+    .await;
+    assert_eq!(code, 200, "peer-add should be accepted");
+    assert!(
+        String::from_utf8_lossy(&body).contains("\"added\":true"),
+        "peer-add should report the change: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // The same client, on the same connection, now gets through. A different
+    // callee than the refused attempt: `place_call` is idempotent per
+    // `(caller, target)` and would otherwise re-poll the refusal rather than
+    // place anything.
+    let (_, b2) = identity(174);
+    let (_, eph2) = ephemeral();
+    let ack = call(&mut alice, &format!("{b2}@y.test"), eph2).await;
+    assert_eq!(
+        ack.state,
+        CallState::Ringing,
+        "once peered, the call must reach the far exchange and ring"
+    );
+
+    // And removing the peer closes it again, without a restart either.
+    let (code, _) = admin_op(
+        &mut admin_client,
+        sqex_proto::Op::PeerRemove(y_pub),
+        &PubKey::new(x_server_pub),
+        &admin_signer,
+    )
+    .await;
+    assert_eq!(code, 200);
+    // A third, fresh target for the same reason.
+    let (_, b3) = identity(175);
+    let (_, eph3) = ephemeral();
+    let ack = call(&mut alice, &format!("{b3}@y.test"), eph3).await;
+    assert_eq!(
+        ack.state,
+        CallState::Rejected,
+        "a removed peer must be refused again"
+    );
+    assert_eq!(ack.reason, relay::REASON_REFUSED);
+
+    x_h.abort();
+    y_h.abort();
+}
+
 #[tokio::test]
 async fn a_findable_peer_that_is_not_allowlisted_is_still_refused() {
     let dir_x = tempfile::tempdir().unwrap();

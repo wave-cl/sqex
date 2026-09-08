@@ -151,32 +151,19 @@ struct RelayInner {
 /// links and bridges.
 pub struct Relay {
     seed: [u8; 32],
-    peers: Vec<PubKey>,
     find: Find,
     max_bridges: Option<u64>,
     inner: Mutex<RelayInner>,
 }
 
 impl Relay {
-    pub fn new(seed: [u8; 32], peers: Vec<PubKey>, max_bridges: Option<u64>, find: Find) -> Relay {
+    pub fn new(seed: [u8; 32], max_bridges: Option<u64>, find: Find) -> Relay {
         Relay {
             seed,
-            peers,
             find,
             max_bridges,
             inner: Mutex::new(RelayInner::default()),
         }
-    }
-
-    /// True if this exchange federates with anybody at all.
-    pub fn configured(&self) -> bool {
-        !self.peers.is_empty()
-    }
-
-    /// Whether an incoming link's SIP-9 identity is on the allowlist. This is
-    /// the whole gate at the link layer.
-    pub fn allowed(&self, key: &PubKey) -> bool {
-        self.peers.contains(key)
     }
 
     fn at_capacity(&self) -> bool {
@@ -358,7 +345,7 @@ pub async fn place_call(
             return CallAck::rejected(relay::REASON_UNREACHABLE, now);
         }
     };
-    if !server.relay.allowed(&peer_key) {
+    if !server.peers_with(&peer_key) {
         // Found, but not somebody this operator federates with.
         return CallAck::rejected(relay::REASON_REFUSED, now);
     }
@@ -845,7 +832,7 @@ pub async fn serve_relay(server: &Arc<Server>, conn: Connection, identity: Optio
         conn.close(0u32.into(), b"");
         return;
     };
-    if !server.relay.allowed(&who) {
+    if !server.peers_with(&who) {
         conn.close(0u32.into(), b"");
         return;
     }
@@ -868,7 +855,7 @@ mod tests {
     }
 
     fn relay() -> Relay {
-        Relay::new([0u8; 32], vec![], None, Find::Fixed(HashMap::new()))
+        Relay::new([0u8; 32], None, Find::Fixed(HashMap::new()))
     }
 
     /// A bridge whose caller gave up mid-ring must not outlive its usefulness.
