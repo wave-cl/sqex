@@ -372,6 +372,18 @@ pub struct Conversation {
     pub no_key: Option<u32>,
     /// Somebody is typing (SIP-19's only signal).
     pub typing: bool,
+    /// A call somebody has just said they are taking, by the `seq` of its
+    /// invitation (SIP-36 `RING_ACCEPTED`).
+    ///
+    /// Reported because the log cannot report it. Answering posts no entry —
+    /// SIP-36 is right that a durable record must not be derived from a signal
+    /// — so a caller watching only the timeline never learns the callee picked
+    /// up, goes on showing "ringing", and then derives **missed** when the ring
+    /// window passes, of a call that is up and being spoken on.
+    ///
+    /// Ephemeral, forgeable and best-effort, like every signal: it drives what
+    /// is on screen and nothing that is written down.
+    pub accepted: Option<u64>,
     pub last: u64,
     /// Who may redact and rename, as of this fetch. Returned so a caller can
     /// keep its own copy current: the next start may be offline, and folding a
@@ -3428,6 +3440,21 @@ impl Chat {
             s.kind == SIGNAL_TYPING
                 && matches!(Signal::decode(&s.body), Ok(Some(Signal::Typing(true))))
         });
+        // The other signal SIP-36 defines, and the one nothing here read. Only
+        // acceptance is taken: a decline and a hangup both post a `CallEnd`, so
+        // the log already carries them, and taking those from a signal as well
+        // would be believing a forgeable message about something durable.
+        let accepted = entries.signals.iter().rev().find_map(|s| {
+            use sqex_proto::message::{RING_ACCEPTED, SIGNAL_CALL_STATE, Signal};
+            match (s.kind, Signal::decode(&s.body)) {
+                (SIGNAL_CALL_STATE, Ok(Some(Signal::CallState { target, state, .. })))
+                    if state == RING_ACCEPTED =>
+                {
+                    Some(target)
+                }
+                _ => None,
+            }
+        });
 
         // Everything the timeline could not open, minus what is gone for good:
         // the two are counted apart because they deserve different words, and
@@ -3498,6 +3525,7 @@ impl Chat {
             gap,
             restarted,
             typing,
+            accepted,
             last,
             admins,
         })

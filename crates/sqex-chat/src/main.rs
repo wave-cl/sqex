@@ -439,6 +439,20 @@ struct Open {
     /// than a second, which is to say it was never read.
     note: Option<(String, std::time::Instant)>,
     typing: bool,
+    /// The call this device has seen taken, by the `seq` of its invitation.
+    ///
+    /// **A second notion of what a call is doing, deliberately.** `ringing`
+    /// reads the timeline, and the comment there used to argue that one answer
+    /// was the whole point. It conflated two questions. The timeline is the
+    /// only authority on *what happened* — SIP-36 forbids deriving that from a
+    /// signal, and it is right — but it structurally cannot say *what is
+    /// happening*, because answering a call posts no entry at all. With
+    /// nowhere to put the fact, the client showed an answered call as still
+    /// ringing, offered `/answer` and `/decline` on it, then derived **missed**
+    /// forty-five seconds later of a call two people were talking on, and
+    /// refused to hang it up. This is where that fact lives: ephemeral, never
+    /// stored, and never allowed to contradict an entry.
+    answered: Option<u64>,
     /// Where everybody's cursor is, as of the last time we asked. Fetched
     /// only for the conversation on screen, and not on every poll: it is one
     /// more round trip and nobody is reading a receipt in a channel they are
@@ -573,12 +587,8 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             .map_err(ChatError::Store)?;
 
         let timeline = chat.history(&m.channel, &admins).unwrap_or_default();
-        let timeline_len = timeline.messages().count();
-        let last_at = timeline
-            .messages()
-            .map(|msg| msg.posted)
-            .max()
-            .unwrap_or(m.joined);
+        let timeline_len = activity(&timeline);
+        let last_at = newest_at(&timeline).unwrap_or(m.joined);
         // The exchange's record of our own read mark. Seeding from it is what
         // lets the client be closed and reopened and still say where you were.
         let read_to = m.read;
@@ -594,6 +604,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            answered: None,
             marks: Vec::new(),
             marks_at: None,
             read_to,
@@ -623,6 +634,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            answered: None,
             marks: Vec::new(),
             marks_at: None,
             read_to: 0,
@@ -658,6 +670,7 @@ fn carry_over(old: &[Open], fresh: &mut [Open]) {
         o.marks = was.marks.clone();
         o.marks_at = was.marks_at;
         o.typing = was.typing;
+        o.answered = was.answered;
         o.waiting = was.waiting;
         o.members = o.members.max(was.members);
         // The read mark only ever moves forward, and the exchange's copy can
@@ -807,7 +820,7 @@ async fn event_loop(
             // The command list is drawn into the same pane and scrolls the same
             // way, so the answer comes back on the same field — it just belongs
             // to a different wish.
-            if app.helping {
+            if app.overlay() {
                 app.help_scroll = hover.scroll;
             } else {
                 app.scroll = hover.scroll;
@@ -1151,7 +1164,17 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
                 .count();
             conv.trouble.message = None;
             conv.typing = got.typing;
-            let after = conv.timeline.messages().count();
+            // Somebody said they are taking a call. Kept only while the log
+            // has not settled it: an entry outranks a signal, always.
+            if let Some(seq) = got.accepted {
+                conv.answered = Some(seq);
+            }
+            if let Some(seq) = conv.answered
+                && conv.timeline.call(seq).is_none_or(|c| c.ended.is_some())
+            {
+                conv.answered = None;
+            }
+            let after = activity(&conv.timeline);
             let selected = app
                 .selected_row()
                 .map(|r| r.channel == conv.channel)
@@ -1161,7 +1184,7 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             }
             conv.timeline_len = after;
             conv.waiting = false;
-            if let Some(newest) = conv.timeline.messages().map(|m| m.posted).max() {
+            if let Some(newest) = newest_at(&conv.timeline) {
                 conv.last_at = conv.last_at.max(newest);
             }
             // A group's name lives in a sealed entry, so it is only known once
@@ -1206,7 +1229,30 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
 /// Split out because they must work with nothing open: somebody being written
 /// to by a stranger should not have to open the conversation in order to stop
 /// it.
-async fn account_command(chat: &mut Chat, cmd: Command) -> std::result::Result<String, ChatError> {
+/// What a command answered with.
+///
+/// Two shapes, because a status line can hold one of them and not the other. A
+/// list joined into a sentence is what `/who` did, and in a channel of
+/// twenty-two it drew one row and dropped twenty-one without a mark.
+enum Answer {
+    Note(String),
+    List(String, Vec<String>),
+}
+
+async fn account_command(chat: &mut Chat, cmd: Command) -> std::result::Result<Answer, ChatError> {
+    // Settled before the rest, because it is the one answer here that is a
+    // list rather than a sentence.
+    if matches!(cmd, Command::Blocked) {
+        let who = chat.blocked().await?;
+        return Ok(if who.is_empty() {
+            Answer::Note("you have blocked nobody".into())
+        } else {
+            Answer::List(
+                format!("blocked — {}", who.len()),
+                who.iter().map(|k| k.to_string()).collect(),
+            )
+        });
+    }
     let note = match cmd {
         Command::Profile(None) => {
             let me = chat.me;
@@ -1281,16 +1327,9 @@ async fn account_command(chat: &mut Chat, cmd: Command) -> std::result::Result<S
             chat.reconnect_now();
             Ok(Some("trying the exchange again now".to_string()))
         }
-        Command::Blocked => chat.blocked().await.map(|who| {
-            Some(if who.is_empty() {
-                "you have blocked nobody".to_string()
-            } else {
-                who.iter().map(short).collect::<Vec<_>>().join(" ")
-            })
-        }),
         _ => Ok(None),
     }?;
-    Ok(note.unwrap_or_default())
+    Ok(Answer::Note(note.unwrap_or_default()))
 }
 
 /// Decide where the unread divider sits in `conv`.
@@ -1545,14 +1584,14 @@ async fn handle_key(
             // scroll counts down from the newest, and this one counts from the
             // top.
             KeyCode::Char('u') => {
-                if app.helping {
+                if app.overlay() {
                     app.help_scroll = app.help_scroll.saturating_sub(app.page);
                 } else {
                     app.scroll += app.page;
                 }
             }
             KeyCode::Char('d') => {
-                if app.helping {
+                if app.overlay() {
                     app.help_scroll += app.page;
                 } else {
                     app.scroll = app.scroll.saturating_sub(app.page);
@@ -1585,7 +1624,7 @@ async fn handle_key(
     // The command list scrolls, and it is a modal view: a key that moves it is
     // handled here and goes no further, or the transcript underneath would act
     // on the same press.
-    if app.helping {
+    if app.overlay() {
         let moved = match code {
             KeyCode::Down => {
                 app.help_scroll += 1;
@@ -1619,10 +1658,8 @@ async fn handle_key(
             return;
         }
     }
-    if code == KeyCode::Esc && app.helping {
-        app.helping = false;
-        // Next time it opens at the top, rather than wherever it was left.
-        app.help_scroll = 0;
+    if code == KeyCode::Esc && app.overlay() {
+        app.close_overlay();
         return;
     }
     if code == KeyCode::Esc && app.searching {
@@ -1834,6 +1871,7 @@ async fn handle_key(
             // when there is nothing open: somebody being written to by a
             // stranger should not have to open the conversation to stop it.
             if matches!(cmd, Command::Help) {
+                app.close_overlay();
                 app.helping = true;
                 return;
             }
@@ -1878,9 +1916,16 @@ async fn handle_key(
                     | Command::Whoami
                     | Command::Reconnect
             ) {
-                let note = match account_command(chat, cmd).await {
-                    Ok(note) => note,
-                    Err(e) => e.to_string(),
+                let answer = match account_command(chat, cmd).await {
+                    Ok(answer) => answer,
+                    Err(e) => Answer::Note(e.to_string()),
+                };
+                let note = match answer {
+                    Answer::List(title, lines) => {
+                        show(app, title, lines);
+                        return;
+                    }
+                    Answer::Note(note) => note,
                 };
                 // On the conversation when there is one: the next redraw
                 // rebuilds `app.trouble` from the selected conversation, so a
@@ -2012,22 +2057,33 @@ async fn handle_key(
                 Command::Call => match chat.call(&channel, MEDIA_AUDIO, RING_SECS).await {
                     Ok((posted, secret)) => {
                         chat.ring_state(&channel, posted.seq, RING_RINGING).await;
-                        Ok(Some(format!(
+                        // One line: the note area is a single row, so a second
+                        // line is simply destroyed — which is how the room
+                        // secret, the one thing needed to join, was lost. It
+                        // lives in the transcript now, where it wraps and stays.
+                        let _ = secret;
+                        Ok(Some(
                             "calling — every device here is ringing. This client carries no \
-                             audio; join it with:\n  sqex-voice room {}",
-                            bs58::encode(secret).into_string()
-                        )))
+                             audio; the join command is on the call in the transcript"
+                                .to_string(),
+                        ))
                     }
                     Err(e) => Err(e),
                 },
                 Command::Answer => match ringing(&open[i], now()).map(|c| (c.seq, c.secret)) {
                     Some((seq, secret)) => {
                         chat.ring_state(&channel, seq, RING_ACCEPTED).await;
-                        Ok(Some(format!(
-                            "answering — your other devices stop ringing. Join the audio \
-                             with:\n  sqex-voice room {}",
-                            bs58::encode(secret).into_string()
-                        )))
+                        let _ = secret;
+                        // Before anything else: this is the only record that
+                        // the call was taken. Without it the transcript went
+                        // on saying "ringing" at the person who had just
+                        // answered, and called it missed a minute later.
+                        open[i].answered = Some(seq);
+                        Ok(Some(
+                            "answering — your other devices stop ringing. The join command is \
+                             on the call in the transcript"
+                                .to_string(),
+                        ))
                     }
                     None => Ok(Some("nothing is ringing here".into())),
                 },
@@ -2054,7 +2110,11 @@ async fn handle_key(
                     None => Ok(Some("nothing is ringing here".into())),
                 },
                 Command::Hangup => {
-                    let live = ringing(&open[i], now()).map(|c| (c.seq, c.posted, c.account));
+                    // `live`, not `ringing`: a call that has been answered is
+                    // no longer ringing and is exactly the one somebody means
+                    // by "hang up". Reading the timeline alone, this said "no
+                    // call to hang up" about a call that was up.
+                    let live = live(&open[i], now()).map(|c| (c.seq, c.posted, c.account));
                     match live {
                         Some((seq, posted, caller)) => {
                             chat.ring_state(&channel, seq, RING_ENDED).await;
@@ -2072,6 +2132,7 @@ async fn handle_key(
                             let secs =
                                 u32::try_from(now().saturating_sub(posted)).unwrap_or(u32::MAX);
                             let duration = if outcome == CALL_ANSWERED { secs } else { 0 };
+                            open[i].answered = None;
                             chat.end_call(&channel, seq, outcome, duration)
                                 .await
                                 .map(|_| Some(said.to_string()))
@@ -2170,7 +2231,15 @@ async fn handle_key(
                     Err(e) => Err(e),
                 },
                 Command::Read => match chat.marks(&channel).await {
-                    Ok(marks) => Ok(Some(read_marks(&marks, &chat.me, &open[i]))),
+                    Ok(marks) => match read_marks(&marks, &chat.me, &open[i]) {
+                        // One line for "nobody else here yet"; a view for a
+                        // channel's worth of them.
+                        rows if rows.len() == 1 => Ok(Some(rows[0].clone())),
+                        rows => {
+                            show(app, format!("read to — {}", rows.len()), rows);
+                            return;
+                        }
+                    },
                     Err(e) => Err(e),
                 },
                 Command::Forward(seq, to) => {
@@ -2237,28 +2306,33 @@ async fn handle_key(
                         // putting the question, and answering it out of an
                         // hour-old note is refusing to answer it.
                         let _ = chat.refetch_profiles(&members, now()).await;
-                        Ok(Some(
-                            info.members
-                                .iter()
-                                .map(|m| {
-                                    let name = chat
-                                        .display_name(&m.account)
-                                        .or_else(|| chat.handle(&m.account))
-                                        .unwrap_or_default();
-                                    // The whole key, not a stub of it. Since
-                                    // the transcript stopped showing keys this
-                                    // is the list somebody runs to find one,
-                                    // and half a key answers nothing.
-                                    format!(
-                                        "{}{} {}",
-                                        ui::author(&name, &m.account.to_string(), false),
-                                        if m.role == Role::Admin { "*" } else { "" },
-                                        m.account
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("   "),
-                        ))
+                        let rows: Vec<String> = info
+                            .members
+                            .iter()
+                            .map(|m| {
+                                let name = chat
+                                    .display_name(&m.account)
+                                    .or_else(|| chat.handle(&m.account))
+                                    .unwrap_or_default();
+                                // The whole key, not a stub of it. Since
+                                // the transcript stopped showing keys this
+                                // is the list somebody runs to find one,
+                                // and half a key answers nothing.
+                                format!(
+                                    "{}{} {}",
+                                    ui::author(&name, &m.account.to_string(), false),
+                                    if m.role == Role::Admin { "*" } else { "" },
+                                    m.account
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        // A list, and it goes where a list can be read. Joined
+                        // onto the status line it was one row wide: twenty-two
+                        // members drew as one and a half of them, and the pane
+                        // had to be widened to two and a half thousand columns
+                        // before the last name appeared.
+                        show(app, format!("who is here — {}", rows.len()), rows);
+                        return;
                     }
                     Err(e) => Err(e),
                 },
@@ -2622,11 +2696,11 @@ async fn send_file(
 /// `delivered`: the exchange withholds their reading, not their existence, and
 /// saying "has not read any of it" of somebody who simply declined to say
 /// would be inventing a fact.
-fn read_marks(marks: &[sqex_proto::channel::Mark], me: &PubKey, conv: &Open) -> String {
+fn read_marks(marks: &[sqex_proto::channel::Mark], me: &PubKey, conv: &Open) -> Vec<String> {
     let others: Vec<&sqex_proto::channel::Mark> =
         marks.iter().filter(|m| m.account != *me).collect();
     if others.is_empty() {
-        return "nobody else here yet".into();
+        return vec!["nobody else here yet".into()];
     }
     others
         .iter()
@@ -2647,8 +2721,7 @@ fn read_marks(marks: &[sqex_proto::channel::Mark], me: &PubKey, conv: &Open) -> 
                 (r, _) => format!("{who}: read to {r}"),
             }
         })
-        .collect::<Vec<_>>()
-        .join(" · ")
+        .collect()
 }
 
 /// Set or remove the channel's picture.
@@ -2917,6 +2990,7 @@ async fn message_account(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, a
         trouble: Trouble::default(),
         note: None,
         typing: false,
+        answered: None,
         unread: 0,
         waiting: false,
     };
@@ -3194,20 +3268,41 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         .timeline
         .calls()
         .map(|c| {
-            let text = match c.outcome(at) {
-                None => "call — ringing. /answer, /decline or /busy".to_string(),
-                Some(CALL_ANSWERED) => match c.ended {
-                    Some((_, secs, _)) if secs > 0 => format!("call — answered, {secs}s"),
-                    _ => "call — answered".to_string(),
-                },
-                Some(CALL_DECLINED) => "call — declined".to_string(),
-                Some(CALL_MISSED) => "call — missed".to_string(),
-                Some(CALL_CANCELLED) => "call — cancelled".to_string(),
-                Some(CALL_FAILED) => "call — failed".to_string(),
-                // An outcome from a newer client. Shown rather than dropped:
-                // that a call ended is worth saying even when the word for how
-                // is one this build does not know.
-                Some(_) => "call — ended".to_string(),
+            // An answered call, before the log has anything to say about it.
+            // This case comes first because `outcome` cannot represent it and
+            // must not be asked: with no `CallEnd` it reports "ringing" until
+            // the window passes and "missed" ever after, and both are false of
+            // a call somebody is speaking on.
+            let text = if conv.answered == Some(c.seq) && c.ended.is_none() {
+                format!(
+                    "call — in progress. /hangup to end it · join the audio: \
+                     sqex-voice room {}",
+                    bs58::encode(c.secret).into_string()
+                )
+            } else {
+                match c.outcome(at) {
+                    // The secret goes here rather than in the one-line note: this
+                    // row lasts exactly as long as the call is joinable, it wraps,
+                    // and everyone who may join can read it — they all hold the
+                    // sealed entry it came from.
+                    None => format!(
+                        "call — ringing. /answer, /decline or /busy · join the audio: \
+                     sqex-voice room {}",
+                        bs58::encode(c.secret).into_string()
+                    ),
+                    Some(CALL_ANSWERED) => match c.ended {
+                        Some((_, secs, _)) if secs > 0 => format!("call — answered, {secs}s"),
+                        _ => "call — answered".to_string(),
+                    },
+                    Some(CALL_DECLINED) => "call — declined".to_string(),
+                    Some(CALL_MISSED) => "call — missed".to_string(),
+                    Some(CALL_CANCELLED) => "call — cancelled".to_string(),
+                    Some(CALL_FAILED) => "call — failed".to_string(),
+                    // An outcome from a newer client. Shown rather than dropped:
+                    // that a call ended is worth saying even when the word for how
+                    // is one this build does not know.
+                    Some(_) => "call — ended".to_string(),
+                }
             };
             Said {
                 who: names
@@ -3405,17 +3500,67 @@ const RING_SECS: u16 = 45;
 /// The call still ringing in this conversation: the newest one the timeline has
 /// no outcome for.
 ///
-/// Read from the timeline rather than tracked beside it, so there is exactly one
-/// answer to "which call is live". A second notion of that is the thing that
-/// would drift, and SIP-36 is explicit that the durable account comes from
-/// entries and never from a signal. `CallRecord::outcome` is `None` only for a
-/// call that has not ended and whose ring window has not passed, which is
-/// precisely "still ringing".
+/// Read from the timeline, which is the authority on what has happened.
+/// `CallRecord::outcome` is `None` only for a call that has not ended and whose
+/// ring window has not passed — that, minus one this device has seen taken, is
+/// "still ringing".
+///
+/// This used to argue that reading the timeline gave "exactly one answer to
+/// which call is live", and that a second notion of it would only drift. That
+/// was wrong, and cost the whole of `/answer`: SIP-36 keeps the *durable*
+/// account in entries, and answering deliberately posts none, so the timeline
+/// can say what happened and cannot say what is happening. Both are needed, and
+/// they are not the same question. [`Open::answered`] holds the second, and
+/// [`live`] is what to ask when the question is "which call is up".
 fn ringing(conv: &Open, at: u64) -> Option<&sqex_proto::timeline::CallRecord> {
     conv.timeline
         .calls()
-        .filter(|c| c.outcome(at).is_none())
+        .filter(|c| c.outcome(at).is_none() && conv.answered != Some(c.seq))
         .last()
+}
+
+/// The call that is up here: ringing, or answered and not yet ended.
+///
+/// What `/hangup` acts on, and the reason it is separate from [`ringing`]:
+/// answering takes a call out of the ringing set, and every way of ending one
+/// has to keep working after that. `answered` is checked against the timeline
+/// so a call the log has settled cannot be resurrected by a stale signal.
+fn live(conv: &Open, at: u64) -> Option<&sqex_proto::timeline::CallRecord> {
+    ringing(conv, at).or_else(|| {
+        conv.answered
+            .and_then(|seq| conv.timeline.call(seq))
+            .filter(|c| c.ended.is_none())
+    })
+}
+
+/// Put a multi-item answer on screen, in the view that can hold one.
+///
+/// Every list this client produces goes through here, so there is one place
+/// that decides how a list is shown — and no way to answer a question with a
+/// list by writing it onto a line that holds one row.
+fn show(app: &mut ui::App, title: String, lines: Vec<String>) {
+    app.helping = false;
+    app.listing = Some(ui::Listing { title, lines });
+    app.help_scroll = 0;
+}
+
+/// How much has happened in a conversation, for unread counting.
+///
+/// Messages **and calls**. Counting only messages meant a call arrived, rang
+/// nobody, moved no conversation up the list and showed no unread mark — the
+/// only way to find out you were being called was to already be looking at that
+/// conversation, which is the one thing SIP-36 exists to avoid.
+fn activity(timeline: &Timeline) -> usize {
+    timeline.messages().count() + timeline.calls().count()
+}
+
+/// The most recent thing that happened, likewise counting calls.
+fn newest_at(timeline: &Timeline) -> Option<u64> {
+    timeline
+        .messages()
+        .map(|m| m.posted)
+        .chain(timeline.calls().map(|c| c.posted))
+        .max()
 }
 
 fn now() -> u64 {
@@ -3698,6 +3843,7 @@ mod tests {
             trouble: Trouble::default(),
             note: None,
             typing: false,
+            answered: None,
             unread: 0,
             waiting: false,
         }
@@ -3717,6 +3863,110 @@ mod tests {
             },
             &[],
         );
+    }
+
+    /// Post a SIP-36 invitation into the timeline.
+    fn rang(conv: &mut Open, from: u8, seq: u64, posted: u64) {
+        conv.timeline.apply(
+            &Received {
+                seq,
+                account: PubKey::new([from; 32]),
+                posted,
+                kind: sqex_proto::channel::KIND_MEMBER,
+                tombstone: false,
+                standing: Standing::Unclaimed,
+                body: Some(Body::Call {
+                    media: MEDIA_AUDIO,
+                    ring_secs: RING_SECS,
+                    secret: [9; 32],
+                }),
+                verdict: Verdict::Valid,
+            },
+            &[],
+        );
+    }
+
+    /// The defect this state exists for: nothing is written down when a call is
+    /// answered, so a client reading only the log calls it missed a minute
+    /// later — of a call two people are still speaking on.
+    #[test]
+    fn an_answered_call_does_not_decay_to_missed() {
+        let mut bob = conv(2, "bob");
+        rang(&mut bob, 2, 1, 1_000);
+        bob.answered = Some(1);
+
+        // Well past the ring window, and with no `CallEnd`: exactly the state
+        // the timeline reads as missed.
+        let at = 1_000 + u64::from(RING_SECS) + 60;
+        assert_eq!(
+            bob.timeline.call(1).unwrap().outcome(at),
+            Some(CALL_MISSED),
+            "the log alone still has to say missed — that part is correct"
+        );
+
+        let open = vec![bob];
+        let mut app = App {
+            rows: vec![Row {
+                channel: [7; 32],
+                label: "bob".into(),
+                key: Some("8qbHbw2B".into()),
+                group: false,
+                public: false,
+                unread: 0,
+                preview: String::new(),
+                at: 0,
+                waiting: false,
+            }],
+            ..Default::default()
+        };
+        refresh(&mut app, &open, &PubKey::new([1; 32]), &HashMap::new());
+        let row = app
+            .said
+            .last()
+            .expect("the call should be in the transcript");
+        assert!(
+            row.text.contains("in progress"),
+            "an answered call must read as in progress, not {:?}",
+            row.text
+        );
+        assert!(
+            !row.text.contains("missed"),
+            "an answered call must never read as missed: {:?}",
+            row.text
+        );
+        assert!(
+            row.text.contains("sqex-voice room"),
+            "the way to join has to stay on screen while the call is up: {:?}",
+            row.text
+        );
+    }
+
+    /// And it stays hangupable. Reading the timeline alone, `/hangup` answered
+    /// "no call to hang up" once the window passed, which left the call with no
+    /// way to end.
+    #[test]
+    fn an_answered_call_can_still_be_hung_up_after_the_ring_window() {
+        let mut bob = conv(2, "bob");
+        rang(&mut bob, 2, 1, 1_000);
+        let at = 1_000 + u64::from(RING_SECS) + 60;
+
+        bob.answered = Some(1);
+        assert!(
+            ringing(&bob, at).is_none(),
+            "an answered call is not ringing, and /answer must not offer it again"
+        );
+        assert_eq!(
+            live(&bob, at).map(|c| c.seq),
+            Some(1),
+            "/hangup has to find the call that is up"
+        );
+
+        // A call nobody took is the other way round: still ringing inside the
+        // window, and gone from both once it has passed.
+        let mut eve = conv(3, "eve");
+        rang(&mut eve, 3, 1, 1_000);
+        assert_eq!(ringing(&eve, 1_010).map(|c| c.seq), Some(1));
+        assert!(live(&eve, at).is_none(), "a missed call is not up");
     }
 
     #[test]
