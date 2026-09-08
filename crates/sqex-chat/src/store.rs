@@ -1475,10 +1475,22 @@ pub struct Lock {
 /// idea of the next SIP-17 counter. A one-shot `sqex-chat list` or `add` is
 /// none of that, and SQLite's own locking is enough for it; refusing those
 /// while a client is up would be paying for a problem they do not have.
-pub fn lock(path: &std::path::Path) -> Result<Lock> {
+/// The lock is per **account and exchange**, not per account.
+///
+/// What it protects is the SIP-17 counter, and since the store began scoping
+/// rows by exchange there is one counter per pair — two clients on one account
+/// at *different* exchanges no longer share anything they could disagree
+/// about. Keeping one lock per account would refuse a second exchange for a
+/// conflict that does not exist.
+pub fn lock(path: &std::path::Path, exchange: &PubKey) -> Result<Lock> {
     use std::io::{Read, Seek, Write};
 
-    let at = path.with_extension("lock");
+    // Named for the exchange as well as the account. The first eight
+    // characters of its key are plenty to tell two apart and keep the name
+    // readable, which matters because a refusal quotes this path.
+    let mut which: String = bs58::encode(exchange.as_bytes()).into_string();
+    which.truncate(8);
+    let at = path.with_extension(format!("{which}.lock"));
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1534,8 +1546,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chat.db");
 
-        let first = lock(&path).unwrap();
-        let second = lock(&path);
+        let first = lock(&path, &an_exchange()).unwrap();
+        let second = lock(&path, &an_exchange());
         let Err(StoreError::InUse(who)) = &second else {
             panic!("a second client was allowed in: {:?}", second.is_ok());
         };
@@ -1552,7 +1564,7 @@ mod tests {
 
         // And it is a hold, not a record: closing the first hands it over.
         drop(first);
-        lock(&path).expect("the lock outlived the client that took it");
+        lock(&path, &an_exchange()).expect("the lock outlived the client that took it");
     }
 
     fn key(b: u8) -> PubKey {
@@ -2311,5 +2323,45 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
             s.scope_to(&PubKey::new([9; 32])).unwrap();
             assert_eq!(s.highest_epoch(&[7; 32]).unwrap(), 3);
         }
+    }
+}
+
+#[cfg(test)]
+mod locking {
+    use super::*;
+
+    fn an_exchange(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    /// Two clients on one account **at one exchange** still conflict.
+    ///
+    /// That is what the lock is for: they would each keep their own idea of
+    /// the next SIP-17 counter, and reusing one costs the confidentiality of
+    /// two messages.
+    #[test]
+    fn one_account_at_one_exchange_is_still_one_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let first = lock(&path, &an_exchange(9)).unwrap();
+        assert!(lock(&path, &an_exchange(9)).is_err());
+        drop(first);
+        assert!(lock(&path, &an_exchange(9)).is_ok());
+    }
+
+    /// One account at **two** exchanges is two clients, and always was.
+    ///
+    /// Since the store scopes rows by exchange there is a counter per pair, so
+    /// there is nothing here for them to disagree about. A lock per account
+    /// would refuse the second for a conflict that does not exist.
+    #[test]
+    fn one_account_at_two_exchanges_is_not_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let _first = lock(&path, &an_exchange(9)).unwrap();
+        assert!(
+            lock(&path, &an_exchange(10)).is_ok(),
+            "a second exchange shares no counter with the first"
+        );
     }
 }

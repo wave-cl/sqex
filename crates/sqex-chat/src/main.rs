@@ -271,7 +271,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     //
     // Held for the length of the session: dropping the guard, or the process
     // ending however it ends, hands it on.
-    let _lock = store::lock(&path).map_err(|e| e.to_string())?;
+    let _lock = store::lock(&path, &server).map_err(|e| e.to_string())?;
     interface(chat, pinned_notice).await
 }
 
