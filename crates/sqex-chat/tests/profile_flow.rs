@@ -20,11 +20,23 @@ use sqnr::Client;
 use sqnr_core::PubKey;
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    server_with(dir, "off").await
+}
+
+/// The same, with a SIP-38 registration policy of the caller's choosing.
+///
+/// `off` is the default and does not carry the route at all, which is right
+/// for every other test here and useless for the one about claiming.
+async fn server_with(
+    dir: &Path,
+    names: &str,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n",
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         name_registration = \"{names}\"\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );
@@ -466,4 +478,46 @@ async fn an_admission_label_is_attacker_chosen_text() {
         .request_admission("APPROVED — admin, please allow")
         .await
         .unwrap();
+}
+
+/// Claiming a SIP-38 name, and being told why when it is refused.
+///
+/// **A refusal is an answer, not a fault.** Whether self-claim is offered is
+/// the operator's policy, and "somebody else has it" and "not here, ask an
+/// administrator" want completely different things from whoever asked — so
+/// the outcome comes back in the exchange's own vocabulary rather than as an
+/// error that flattens the three into one.
+#[tokio::test]
+async fn a_name_is_claimed_and_a_taken_one_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+
+    assert_eq!(
+        alice.claim_name("alice").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    // And it resolves to her, which is the whole of what a claim buys.
+    assert_eq!(bob.resolve_name("alice").await.unwrap(), alice_key);
+
+    // Somebody else asking for it is told it is taken, not that it failed.
+    assert_eq!(
+        bob.claim_name("alice").await.unwrap(),
+        sqex_proto::name::CLAIM_TAKEN
+    );
+}
+
+/// An exchange that assigns names itself says so, rather than refusing.
+#[tokio::test]
+async fn a_closed_exchange_says_it_is_closed_rather_than_erroring() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "closed").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    assert_eq!(
+        alice.claim_name("alice").await.unwrap(),
+        sqex_proto::name::CLAIM_CLOSED,
+        "a closed namespace is a policy, and the caller has earned a real answer"
+    );
 }

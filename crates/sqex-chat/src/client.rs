@@ -1009,6 +1009,31 @@ impl Chat {
         Ok(r.account)
     }
 
+    /// Claim a SIP-38 name for this account (`POST /name/claim`).
+    ///
+    /// Returns the exchange's own outcome — `CLAIM_GRANTED`, `CLAIM_TAKEN`,
+    /// `CLAIM_CLOSED` and the rest — rather than an error, because **a refusal
+    /// here is an answer and not a fault**. Whether self-claim is offered at
+    /// all is the operator's policy: `open` lets anybody take a free name,
+    /// `closed` answers `CLAIM_CLOSED` in the reply's own vocabulary, and
+    /// `off` does not carry the route. Collapsing those into "it failed" would
+    /// leave a caller unable to tell "somebody else has it" from "not here,
+    /// ask an administrator".
+    ///
+    /// The binding is **exchange-asserted**. A name resolving to an account is
+    /// that exchange's word for it, and is not evidence of anything about the
+    /// account itself; see SIP-38's trust boundary.
+    pub async fn claim_name(&mut self, name: &str) -> Result<u8> {
+        let name =
+            sqex_proto::name::canonical(name).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let body = self
+            .post("/name/claim", sqex_proto::name::Claim { name }.encode())
+            .await?;
+        Ok(sqex_proto::name::ClaimAck::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .outcome)
+    }
+
     /// The SIP-38 handles the exchange reports for an account
     /// (`POST /name/reverse`), oldest first. The exchange's word — a hint for
     /// display, never an authority.
