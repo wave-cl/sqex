@@ -627,10 +627,19 @@ pub async fn serve(bound: Bound) -> Result<()> {
         public_key,
     } = bound;
 
+    // The peer count belongs on the startup line now that peering is state
+    // rather than configuration. An operator who restarts can no longer read
+    // the config to find out who this exchange federates with, and a peer list
+    // that came back empty — a state file that failed to load, a seed that did
+    // not apply — would otherwise look exactly like a healthy start until the
+    // first cross-exchange call failed. Count only: which exchanges these are
+    // is not something to put where anyone can read it, since SIP-39 refuses
+    // uniformly on purpose and a public list would be the oracle that avoids.
     tracing::info!(
         listen = %local_addr,
         key = %public_key,
         admins = server.admins.read().unwrap().len(),
+        relay_peers = server.state.lock().unwrap().peer_count(),
         "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");
