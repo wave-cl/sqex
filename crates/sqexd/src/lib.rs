@@ -9,8 +9,10 @@ pub mod config;
 pub mod device;
 pub mod events;
 pub mod mailbox;
+pub mod name;
 pub mod prekey;
 pub mod profile;
+pub mod relay;
 pub mod rendezvous;
 pub mod replica;
 pub mod resolve;
@@ -20,4 +22,4 @@ pub mod session;
 pub mod state;
 
 pub use config::Config;
-pub use server::{Bound, Server, bind, serve};
+pub use server::{Bound, Server, bind, bind_with, serve};

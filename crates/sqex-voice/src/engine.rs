@@ -26,9 +26,11 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use sqex_proto::events::{Event as WireEvent, Framer, Subscribe};
 use sqex_proto::room::{HEARTBEAT_SECS, RoomId};
 use sqex_proto::session::{
-    BySession, DatagramFrame, MAX_DATAGRAM_FRAME, Open, OpenAck, OpenState, Session,
+    BySession, CallAck, CallDecline, CallOpen, CallState, DatagramFrame, MAX_DATAGRAM_FRAME, Open,
+    OpenAck, OpenState, Session,
 };
 use sqnr::Client;
 use sqnr_core::{PubKey, Signer};
@@ -151,6 +153,9 @@ pub enum Event {
     Reflected(u64),
     /// The caller went quiet; back to waiting for the next one.
     CallerGone { after: Duration },
+    /// A ringing cross-exchange call was refused (SIP-39), and the caller's
+    /// exchange told rather than left to time out.
+    Declined { peer: PubKey },
     /// Something the audio layer wants said — a device substitution, a
     /// Bluetooth profile warning. These used to be `eprintln!` inside the
     /// library, where no frontend could reach them.
@@ -230,6 +235,7 @@ impl Event {
                 "(quiet for {}s — waiting for the next caller)",
                 after.as_secs()
             ),
+            Event::Declined { peer } => format!("declined the call from {peer}."),
             Event::Device(msg) => msg.clone(),
         }
     }
@@ -289,7 +295,7 @@ pub struct Endpoint {
 /// Resolution is shared with the other clients in `sqex_discovery::target`,
 /// because three copies of it is what produced two bugs in a day.
 pub async fn resolve(
-    layers: &[sqex_discovery::Layer; 3],
+    layers: &[sqex_discovery::Layer],
     report: &mut dyn Report,
 ) -> Result<Endpoint, String> {
     match sqex_discovery::target::resolve(layers).map_err(|e| e.to_string())? {
@@ -317,24 +323,13 @@ pub async fn resolve(
 
 /// `host:port`, `host`, or an IP literal. This used to parse straight to a
 /// `SocketAddr`, which accepts only an IP.
-pub fn resolve_addr(address: &str) -> Result<SocketAddr, String> {
-    if let Ok(socket) = address.parse::<SocketAddr>() {
-        return Ok(socket);
-    }
-    let has_port = !address.starts_with('[')
-        && address
-            .rsplit_once(':')
-            .is_some_and(|(_, p)| p.parse::<u16>().is_ok());
-    let with_port = if has_port {
-        address.to_string()
-    } else {
-        format!("{address}:{}", sqex_discovery::DEFAULT_PORT)
-    };
-    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
-        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
-}
+/// Turn a `host:port` into something dialable.
+///
+/// Re-exported from `sqex-discovery`, which owns addresses and the default
+/// port. It used to live here, and had been copied into the CLI and the chat
+/// client besides — three copies of one conversion, with `sqexd` about to add a
+/// fourth.
+pub use sqex_discovery::resolve_addr;
 
 /// Connect to the exchange as this identity. No peer, no session.
 ///
@@ -356,6 +351,34 @@ pub async fn connect(
     }
     report.event(Event::Identity(me));
     Ok(client)
+}
+
+/// Resolve a SIP-38 name to the account behind it, on this exchange
+/// (`POST /name/resolve`). A light connection — no session, no datagram
+/// requirement — so a name can be dialed like a key. The exchange is trusted
+/// for the binding (SIP-38), same as the CLI and chat client.
+pub async fn resolve_name(
+    endpoint: Endpoint,
+    signer: &sqnr_core::SoftwareSigner,
+    name: &str,
+) -> Result<PubKey, String> {
+    let name = sqex_proto::name::canonical(name).map_err(|e| e.to_string())?;
+    let mut client =
+        Client::connect_as(endpoint.address, endpoint.server.as_bytes(), &signer.seed()).await?;
+    let (code, body) = client
+        .post(
+            "/name/resolve",
+            sqex_proto::name::Resolve { name: name.clone() }.encode(),
+        )
+        .await?;
+    if code != 200 {
+        return Err(format!("resolving {name}: exchange said {code}"));
+    }
+    let r = sqex_proto::name::Resolved::decode(&body).map_err(|e| e.to_string())?;
+    if !r.found {
+        return Err(format!("no account is named {name}"));
+    }
+    Ok(r.account)
 }
 
 /// Connect, having first checked there is somebody else to connect *to*.
@@ -437,6 +460,132 @@ pub async fn establish(
     let mut client = dial(endpoint, signer, peer, report).await?;
     let (session, id) = rendezvous(&mut client, signer, peer, wait, report).await?;
     Ok((client, session, id))
+}
+
+/// Place a cross-exchange call (SIP-39). The target is `name@domain` or
+/// `key@domain`; this client's own exchange resolves and bridges it. We poll
+/// `/session/call` until it connects, then derive the same session key any
+/// SIP-12 call would — over the two identities and the two ephemerals, which no
+/// exchange on the path, near or far, ever holds.
+pub async fn establish_cross(
+    endpoint: Endpoint,
+    signer: &sqnr_core::SoftwareSigner,
+    target: &str,
+    wait: u64,
+    report: &mut dyn Report,
+) -> Result<(Client, Session, u64), String> {
+    let mut client = connect(endpoint, signer, report).await?;
+    let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let request = CallOpen {
+        ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
+        target: target.to_string(),
+    };
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(wait);
+    let mut hinted = false;
+    let ack = loop {
+        let (code, body) = client.post("/session/call", request.encode()).await?;
+        if code != 200 {
+            return Err(format!("call failed ({code}): {}", said(&body)));
+        }
+        let ack = CallAck::decode(&body).map_err(|e| e.to_string())?;
+        match ack.state {
+            CallState::Established => break ack,
+            CallState::Rejected => {
+                return Err(format!(
+                    "the call was refused ({})",
+                    reason_word(ack.reason)
+                ));
+            }
+            CallState::Ringing => {}
+        }
+        if !hinted && started.elapsed() > PATIENCE {
+            report.event(Event::StillWaiting {
+                me: PubKey::new(signer.public()),
+            });
+            hinted = true;
+        }
+        if Instant::now() >= deadline {
+            return Err("the peer did not answer in time".into());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+
+    let session = Session::derive(&signer.seed(), &eph, &ack.peer, &ack.peer_ephemeral)
+        .map_err(|e| e.to_string())?;
+    Ok((client, session, ack.session_id))
+}
+
+fn reason_word(reason: u8) -> &'static str {
+    match reason {
+        sqex_proto::relay::REASON_NO_ACCOUNT => "no such account",
+        sqex_proto::relay::REASON_UNREACHABLE => "unreachable",
+        sqex_proto::relay::REASON_DECLINED => "declined",
+        sqex_proto::relay::REASON_BUSY => "busy",
+        _ => "refused",
+    }
+}
+
+/// Answer the next incoming cross-exchange call (SIP-39). Subscribe to this
+/// exchange's event stream, wait for a `CrossCall` ring, then open a session
+/// back toward the caller — which this exchange matches to the bridge — and run
+/// the call. One call, then return; a supervisor loops it for a standing line.
+pub async fn answer(
+    endpoint: Endpoint,
+    signer: &sqnr_core::SoftwareSigner,
+    wait: u64,
+    opts: CallOpts,
+    decline_with: Option<u8>,
+    report: &mut dyn Report,
+) -> Result<(), String> {
+    let mut client = connect(endpoint, signer, report).await?;
+    let mut stream = client
+        .stream(
+            "POST",
+            "/events",
+            Subscribe {
+                version: sqex_proto::events::VERSION,
+            }
+            .encode(),
+        )
+        .await?;
+    if stream.status() != 200 {
+        return Err(format!("cannot subscribe to events ({})", stream.status()));
+    }
+
+    let mut framer = Framer::new();
+    let (bridge, caller) = loop {
+        let Some(chunk) = stream.next().await? else {
+            return Err("the event stream ended before a call arrived".into());
+        };
+        let events = framer.feed(&chunk).map_err(|e| e.to_string())?;
+        if let Some(rung) = events.into_iter().find_map(|e| match e {
+            WireEvent::CrossCall { bridge, caller } => Some((bridge, caller)),
+            _ => None,
+        }) {
+            break rung;
+        }
+    };
+    drop(stream);
+
+    // Refusing is a message of its own (SIP-39): the caller is told, rather
+    // than left polling until it gives up.
+    if let Some(reason) = decline_with {
+        let (code, body) = client
+            .post("/session/decline", CallDecline { bridge, reason }.encode())
+            .await?;
+        if code != 200 {
+            return Err(format!("decline failed ({code}): {}", said(&body)));
+        }
+        report.event(Event::Declined { peer: caller });
+        return Ok(());
+    }
+
+    // Open back toward the caller: our exchange matches this to the ringing
+    // bridge and answers it, so a single open suffices.
+    let (session, id) = rendezvous(&mut client, signer, caller, wait, report).await?;
+    call(client, session, id, opts, report).await
 }
 
 // ---- the call ---------------------------------------------------------------

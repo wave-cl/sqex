@@ -7,8 +7,12 @@ listen = "[::]:5400"
 # run if absent (unless the path was given explicitly on the command line).
 key_file = "/etc/sqex/host_key"
 
-# Where the managed whitelist and audit log are snapshotted. Omit to run
-# memory-only (state is lost on restart).
+# Where the managed whitelist, the relay peers and the audit log are
+# snapshotted. Omit to run memory-only (state is lost on restart).
+#
+# This file is the authority for everything an administrator changes at
+# runtime. Both lists below only seed it, and only on a run that finds nothing
+# already recorded for them.
 state_file = "/var/lib/sqex/sqex.state"
 
 # Administrators: base58 Ed25519 public keys permitted to issue signed admin
@@ -26,3 +30,45 @@ seed_whitelist = [
 
 # How long an issued challenge nonce stays valid, in seconds.
 challenge_ttl_secs = 30
+
+# ---------------------------------------------------------------------------
+# SIP-39: cross-exchange calls.
+# ---------------------------------------------------------------------------
+
+# Exchanges this one will bridge calls to and from, seeded on first run only.
+#
+# This is the federation boundary, and it is symmetric: this exchange rings a
+# local user for an incoming call only from a key on this list, and dials out
+# only to a key on this list. Empty means it federates with nobody, brings up
+# no relay listener, and refuses every cross-exchange call identically.
+#
+# **Keys only, no addresses.** Where a peer actually is comes from SIP-33
+# discovery of the domain a call names, so a peer that moves is followed rather
+# than reconfigured, and there is nothing here to keep in step with DNS.
+#
+# Like seed_whitelist, this seeds the state file and nothing more. Peers are
+# administered at runtime:
+#
+#     sqex admin peer list
+#     sqex admin peer add <base58 exchange key> --label "indra.org"
+#     sqex admin peer remove <base58 exchange key>
+#
+# Those take effect on the next call — no restart, and no interruption to calls
+# already bridged. Removing a peer stops the next call; it does not tear down a
+# bridge already open.
+#
+# Renamed from `relay_peers`, which the server now refuses, because a list that
+# looked like configuration but was read once and ignored afterwards was worse
+# than an error at startup.
+seed_relay_peers = [
+    # "Base58ExchangeKey1...",
+]
+
+# Cap on concurrent bridged calls. Omit for unlimited.
+#
+# A relay a peer can drive needs a ceiling that a local SIP-12 session does
+# not: a local session is already bounded by max_connections, and a bridge is
+# its own quantity. A public federating exchange should set one.
+#
+# Unlike the peer list this is read at startup, so changing it needs a restart.
+# max_bridges = 64

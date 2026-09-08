@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 sqnr-core = { workspace = true }
 sqex-proto = { workspace = true }
+sqex-discovery = { workspace = true }
 squic = { workspace = true }
 quinn = { workspace = true }
 h3 = { workspace = true }

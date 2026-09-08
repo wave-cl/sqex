@@ -21,10 +21,11 @@ use crate::attest::{Attestations, LodgeError};
 use crate::beacon::Beacons;
 use crate::challenge::Challenges;
 use crate::channel::{ChannelError, Channels};
-use crate::config::{Config, OriginConfig};
+use crate::config::{Config, NameMode, OriginConfig};
 use crate::device::Registry;
 use crate::events::Subscribers;
 use crate::mailbox::Mailbox;
+use crate::name::Names;
 use crate::prekey::Prekeys;
 use crate::profile::Profiles;
 use crate::rendezvous::Rendezvous;
@@ -57,6 +58,7 @@ use sqex_proto::mailbox::{
     ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS,
 };
 use sqex_proto::message::{RING_RINGING, Signal};
+use sqex_proto::name;
 use sqex_proto::peer::{
     Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull, PullBlob, PullEnvelopes, PullRecord,
 };
@@ -69,7 +71,10 @@ use sqex_proto::resolve::{
     Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
 };
 use sqex_proto::room::{Join as RoomJoin, Leave as RoomLeave, Left};
-use sqex_proto::session::{BySession, DatagramFrame, Open, SendFrame, TYPE_CLOSE, TYPE_RECV};
+use sqex_proto::session::{
+    BySession, CallAck, CallDecline, CallOpen, DatagramFrame, Open, SendFrame, TYPE_CLOSE,
+    TYPE_RECV,
+};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -105,6 +110,9 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Largest admin-command body we will read.
 const MAX_BODY: usize = 64 * 1024;
+
+/// Said when the SIP-38 name route is disabled (`name_registration = "off"`).
+const NAME_ROUTE_OFF: &str = "this exchange does not offer names";
 
 /// What the transport established about the caller on one connection.
 ///
@@ -202,10 +210,22 @@ pub struct Server {
     channels: Channels,
     prekeys: Prekeys,
     devices: Registry,
+    /// SIP-38: the per-domain name directory. Durable, unlike the SIP-28
+    /// endpoint store beside it — a name is the identity a person keeps, not an
+    /// address that is only interesting while fresh.
+    names: Names,
+    /// SIP-38 registration policy: whether names may be self-claimed, only
+    /// administrator-assigned, or the route is off entirely.
+    name_registration: NameMode,
+    /// SIP-38: how many names one account may self-claim (open mode).
+    max_names_per_account: usize,
     profiles: Profiles,
     admissions: Admissions,
     sessions: Sessions,
     live_conns: Connections,
+    /// SIP-39: cross-exchange call relay — the peer allowlist, the bridge
+    /// ceiling, and the live links and bridges.
+    pub(crate) relay: crate::relay::Relay,
     /// SIP-30 event streams, by the identity that opened them.
     pub events: Subscribers,
     started: Instant,
@@ -272,6 +292,21 @@ impl Server {
         self.admins.read().unwrap().iter().any(|a| a == key)
     }
 
+    /// SIP-39: whether this exchange federates with `key`.
+    ///
+    /// Read from the managed state on every check rather than from a snapshot,
+    /// so `sqex admin peer add` takes effect on the next call rather than the
+    /// next restart. Neither caller holds the state lock, and this takes it for
+    /// the length of a map lookup.
+    pub(crate) fn peers_with(&self, key: &PubKey) -> bool {
+        self.state.lock().unwrap().peers_with(key)
+    }
+
+    /// Whether this exchange federates with anybody at all.
+    pub(crate) fn peering_enabled(&self) -> bool {
+        self.state.lock().unwrap().peering_enabled()
+    }
+
     /// Requests served since boot, event streams included — one per stream
     /// opened, not one per frame written, which is the distinction that makes
     /// this number mean anything.
@@ -314,6 +349,38 @@ impl Server {
         }
         self.events.publish(&to, event);
     }
+
+    // --- SIP-39: effects the relay module drives, kept here so it needs no
+    // access to the server's private innards. ---
+
+    /// The account a device belongs to (SIP-22); a device that belongs to no
+    /// account is its own account.
+    pub(crate) fn account_of(&self, device: &PubKey) -> PubKey {
+        self.devices.account_for(device)
+    }
+
+    /// Ring every device of `account` for an incoming cross-exchange call
+    /// (SIP-30, per device, as SIP-36 rings within a channel).
+    pub(crate) fn ring_crosscall(&self, account: PubKey, bridge: [u8; 16], caller: PubKey) {
+        self.events
+            .publish(&[account], EventKind::CrossCall { bridge, caller });
+    }
+
+    /// How many of an account's devices could hear a ring — its open SIP-30
+    /// streams. Zero means a cross-exchange invite has nobody to reach, which
+    /// is worth answering rather than ringing into the void.
+    pub(crate) fn reachable(&self, account: &PubKey) -> usize {
+        self.events.count(account)
+    }
+
+    /// Send one already-framed session datagram to every connection a local
+    /// identity holds — the bridged-session end of what `forward_datagrams`
+    /// does for a local session.
+    pub(crate) fn deliver_local_datagram(&self, to: &PubKey, bytes: bytes::Bytes) {
+        for conn in self.live_conns.get(to) {
+            let _ = conn.send_datagram(bytes.clone());
+        }
+    }
 }
 
 /// A bound-but-not-yet-serving server, so a caller can read the assigned
@@ -326,13 +393,40 @@ pub struct Bound {
 }
 
 /// Bind the UDP socket and construct server state. Does not accept yet.
+/// Bind, finding relay peers the way a deployment does: SIP-33 discovery.
 pub async fn bind(
     config: Config,
     config_path: Option<PathBuf>,
     signing_key: SigningKey,
 ) -> Result<Bound> {
+    bind_with(
+        config,
+        config_path,
+        signing_key,
+        crate::relay::Find::Discover,
+    )
+    .await
+}
+
+/// The same, told how to find a relay peer.
+///
+/// Exists for the end-to-end tests, which run two exchanges on loopback with
+/// invented domains and so have no DNS to discover each other through. The seam
+/// is an argument rather than a configuration key on purpose: an operator able
+/// to pin a peer's address by hand would be back to the thing SIP-33 discovery
+/// replaced.
+pub async fn bind_with(
+    config: Config,
+    config_path: Option<PathBuf>,
+    signing_key: SigningKey,
+    find: crate::relay::Find,
+) -> Result<Bound> {
     let public_key = PubKey::new(signing_key.verifying_key().to_bytes());
-    let state = State::load(config.state_file.clone(), &config.seed_whitelist)?;
+    let state = State::load(
+        config.state_file.clone(),
+        &config.seed_whitelist,
+        &config.seed_relay_peers,
+    )?;
     let channel_db = config
         .state_file
         .as_ref()
@@ -353,13 +447,22 @@ pub async fn bind(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("prekeys.db"));
+    // Durable like the device registry, for the same reason: a name is the
+    // identity a person keeps, and one that vanished on a restart would be
+    // worse than none.
+    let name_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("names.db"));
 
     // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
     // transport whitelist stays off: anyone holding the server key may connect,
     // and the app decides per request. This keeps the signature-gated admin
     // surface reachable no matter the whitelist state.
     let squic_config = SquicConfig {
-        alpn_protocols: vec![ALPN.to_vec()],
+        // `h3` for clients; `sqex-relay` (SIP-39) for a peering exchange's link,
+        // which the accept loop tells apart by the negotiated ALPN.
+        alpn_protocols: vec![ALPN.to_vec(), sqex_proto::relay::ALPN.to_vec()],
         max_idle_timeout: std::time::Duration::from_secs(60),
         // Sessions may carry real-time media over datagrams (SIP-12). Costs
         // nothing for the connections that never send one.
@@ -372,6 +475,10 @@ pub async fn bind(
     let mut squic_config = squic_config;
     if let Some(versions) = &config.accepted_envelope_versions {
         squic_config.accepted_envelope_versions = versions.clone();
+    }
+    // Bound concurrently-established connections when the operator set a cap.
+    if let Some(n) = config.max_connections {
+        squic_config.max_connections = Some(n);
     }
 
     let accepted_envelope_versions = squic_config.accepted_envelope_versions.clone();
@@ -447,6 +554,12 @@ pub async fn bind(
         // restart would be worse than none at all.
         devices: Registry::open(device_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the device registry: {e}")))?,
+        // Durable, beside the device registry — a name is the identity a person
+        // keeps across address and device changes (SIP-38).
+        names: Names::open(name_db.as_deref(), config.name_lease_secs, config.max_names)
+            .map_err(|e| Error::Malformed(format!("cannot open the name directory: {e}")))?,
+        name_registration: config.name_registration,
+        max_names_per_account: config.max_names_per_account,
         profiles: Profiles::open(profile_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open profiles: {e}")))?,
         // In memory: a pending request is a question somebody asked once, and
@@ -455,6 +568,9 @@ pub async fn bind(
         admissions: Admissions::new(),
         sessions: Sessions::new(),
         live_conns: Connections::default(),
+        // No peer list here. The relay used to hold a snapshot taken at
+        // startup, which is exactly what made adding a peer a restart.
+        relay: crate::relay::Relay::new(signing_key.to_bytes(), config.max_bridges, find),
         events: Subscribers::default(),
         started: Instant::now(),
         connections: AtomicU64::new(0),
@@ -511,10 +627,19 @@ pub async fn serve(bound: Bound) -> Result<()> {
         public_key,
     } = bound;
 
+    // The peer count belongs on the startup line now that peering is state
+    // rather than configuration. An operator who restarts can no longer read
+    // the config to find out who this exchange federates with, and a peer list
+    // that came back empty — a state file that failed to load, a seed that did
+    // not apply — would otherwise look exactly like a healthy start until the
+    // first cross-exchange call failed. Count only: which exchanges these are
+    // is not something to put where anyone can read it, since SIP-39 refuses
+    // uniformly on purpose and a public list would be the oracle that avoids.
     tracing::info!(
         listen = %local_addr,
         key = %public_key,
         admins = server.admins.read().unwrap().len(),
+        relay_peers = server.state.lock().unwrap().peer_count(),
         "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");
@@ -562,7 +687,13 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 match incoming.await {
                     Ok(conn) => {
                         server.connections.fetch_add(1, Ordering::Relaxed);
-                        if let Err(e) = serve_h3(server, conn, peer).await {
+                        // SIP-39: a peering exchange's link negotiates the
+                        // `sqex-relay` ALPN and is driven by the relay protocol,
+                        // not HTTP/3.
+                        if crate::relay::alpn_of(&conn).as_deref() == Some(sqex_proto::relay::ALPN)
+                        {
+                            crate::relay::serve_relay(&server, conn, peer.identity).await;
+                        } else if let Err(e) = serve_h3(server, conn, peer).await {
                             tracing::debug!("connection ended: {e}");
                         }
                     }
@@ -593,6 +724,29 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 {
                     tracing::info!(pruned, closed, "swept channels");
                 }
+                // SIP-25: the rendezvous store is in-memory. `request` prunes
+                // expired `asked` opportunistically, but the per-pair `waiters`
+                // notifiers are only reclaimed here — without this sweep they
+                // accumulate one entry per distinct pair that ever long-polled,
+                // an unbounded leak. Cheap in-memory work, no spawn_blocking.
+                server.rendezvous.sweep();
+                // SIP-38: drop names abandoned well past their lease. A single
+                // SQLite DELETE, so spawn_blocking like the channel sweep above.
+                let names = Arc::clone(&server);
+                if let Ok(dropped) =
+                    tokio::task::spawn_blocking(move || names.names.sweep(now_unix())).await
+                    && dropped > 0
+                {
+                    tracing::info!(dropped, "swept abandoned names");
+                }
+                // SIP-38: evict stale rate-limiter entries so the in-memory map
+                // does not grow one entry per account that ever claimed. Cheap
+                // in-memory work, no spawn_blocking.
+                server.names.sweep_rate_limiter(now_unix());
+                // SIP-39: bridges have their own lifetime, and an exchange
+                // nobody is calling still has to tidy up the ones abandoned
+                // mid-ring.
+                server.relay.sweep(now_unix());
             }
         }
     };
@@ -662,6 +816,11 @@ async fn forward_datagrams(server: Arc<Server>, conn: quinn::Connection, from: P
         let Ok(frame) = DatagramFrame::decode(&bytes) else {
             continue; // malformed: drop it, say nothing
         };
+        // SIP-39: a bridged session's counterpart is on another exchange —
+        // divert the frame onto the relay link rather than a local connection.
+        if crate::relay::maybe_divert(&server, &from, &frame) {
+            continue;
+        }
         let Some(to) = server.sessions.counterpart(&from, frame.session_id) else {
             continue; // not a party, or no live session: drop it
         };
@@ -905,6 +1064,10 @@ async fn route(
                     server
                         .endpoints
                         .refresh(&id, beat.interval_secs.saturating_mul(2));
+                    // SIP-38: a beat is activity attributable to the account, so
+                    // it renews the account's self-claimed names — a name in use
+                    // does not lapse on its lease.
+                    server.names.renew(&server.devices.account_for(&id));
                     tracing::debug!(identity = %id.short(), interval = beat.interval_secs, "beat");
                     (200, "application/octet-stream", BeatAck { now }.encode())
                 }
@@ -996,11 +1159,16 @@ async fn route(
                     .endpoints
                     .publish(id, req.ttl_secs, req.endpoints, req.capabilities)
                 {
-                    Ok(_) => (
-                        200,
-                        "application/octet-stream",
-                        ChannelAck { now: now_unix() }.encode(),
-                    ),
+                    Ok(_) => {
+                        // SIP-38: publishing an address is activity attributable
+                        // to the account, so it renews the account's names too.
+                        server.names.renew(&server.devices.account_for(&id));
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
                     Err(_) => refuse(
                         507,
                         Code::TooManyEndpoints,
@@ -1215,6 +1383,91 @@ async fn route(
                 Ok(list) => (200, "application/octet-stream", list.encode()),
                 Err(e) => refuse(e.status(), e.code(), None),
             },
+        },
+
+        // SIP-38 names. A name binds to an **account**, so the account's devices
+        // (SIP-22) and endpoints (SIP-28) follow once a name resolves — this is
+        // only the hop in the middle. Registration mode is the operator's
+        // policy: `open` (self-claim), `closed` (administrator-assigned only),
+        // or `off` (the route is not offered). The binding is exchange-asserted;
+        // see the trust boundary in SIP-38.
+        ("POST", "/name/claim") => match (account, name::Claim::decode(body)) {
+            (None, _) => no_identity("claiming a name"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            // Self-claim is open-mode only. Closed answers `CLOSED` in the
+            // reply's own vocabulary rather than a transport refusal, because
+            // the namespace is public and a caller has earned a real answer;
+            // off does not offer the route at all.
+            (Some(me), Ok(req)) => match server.name_registration {
+                NameMode::Open => {
+                    let outcome = server
+                        .names
+                        .claim(&req.name, &me, server.max_names_per_account);
+                    (
+                        200,
+                        "application/octet-stream",
+                        name::ClaimAck {
+                            outcome,
+                            now: now_unix(),
+                        }
+                        .encode(),
+                    )
+                }
+                NameMode::Closed => (
+                    200,
+                    "application/octet-stream",
+                    name::ClaimAck {
+                        outcome: name::CLAIM_CLOSED,
+                        now: now_unix(),
+                    }
+                    .encode(),
+                ),
+                NameMode::Off => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
+            },
+        },
+        ("POST", "/name/release") => match (account, name::Release::decode(body)) {
+            (None, _) => no_identity("releasing a name"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) if server.name_registration != NameMode::Off => {
+                // A no-op unless the caller's account holds it; either way an
+                // Ack, since resolution already discloses the holder.
+                server.names.release(&req.name, &me);
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
+            }
+            // Off: the route is not offered. Spelled as the concrete
+            // (identity, decoded) case rather than a bare wildcard arm, so the
+            // route-coverage scan's end-of-dispatch sentinel keeps marking the
+            // real wildcard and nothing before it.
+            (Some(_), Ok(_)) => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
+        },
+        // Answerable to anyone: the namespace is public by construction. A name
+        // exists to be found, and a directory that would not say whether one is
+        // taken would not be a directory.
+        ("POST", "/name/resolve") => match name::Resolve::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(req) if server.name_registration != NameMode::Off => (
+                200,
+                "application/octet-stream",
+                server.names.resolve(&req.name).encode(),
+            ),
+            Ok(_) => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
+        },
+        ("POST", "/name/reverse") => match name::Reverse::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(req) if server.name_registration != NameMode::Off => (
+                200,
+                "application/octet-stream",
+                name::Names {
+                    now: now_unix(),
+                    names: server.names.names_for(&req.account),
+                }
+                .encode(),
+            ),
+            Ok(_) => refuse(404, Code::NoSuchEntry, Some(NAME_ROUTE_OFF)),
         },
 
         // SIP-18 blobs. The exchange holds sealed chunks and no key that
@@ -2081,11 +2334,45 @@ async fn route(
         ("POST", "/session/open") => match (peer.identity, Open::decode(body)) {
             (None, _) => no_identity("opening a session"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(open)) => (
-                200,
-                "application/octet-stream",
-                server.sessions.open(me, open.peer, open.ephemeral).encode(),
-            ),
+            (Some(me), Ok(open)) => {
+                // SIP-39: this open may be a device answering a cross-exchange
+                // call, whose caller is on another exchange and so has no local
+                // pending open to match. If so, the relay completes the bridge;
+                // otherwise it is an ordinary local open.
+                let ack =
+                    crate::relay::try_answer(server, me, open.peer, open.ephemeral, now_unix())
+                        .unwrap_or_else(|| server.sessions.open(me, open.peer, open.ephemeral));
+                (200, "application/octet-stream", ack.encode())
+            }
+        },
+        // SIP-39: place (or poll) a cross-exchange call. The target is
+        // name@domain or key@domain; this exchange resolves and bridges it.
+        ("POST", "/session/call") => match (peer.identity, CallOpen::decode(body)) {
+            (None, _) => no_identity("placing a call"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(call)) => {
+                let ack = if server.peering_enabled() {
+                    crate::relay::place_call(server, me, call.ephemeral, call.target, now_unix())
+                        .await
+                } else {
+                    // Federated with nobody: refuse identically, no oracle.
+                    CallAck::rejected(sqex_proto::relay::REASON_REFUSED, now_unix())
+                };
+                (200, "application/octet-stream", ack.encode())
+            }
+        },
+        // SIP-39: refuse a ringing cross-exchange call, so the caller is told
+        // rather than left polling. Answered **identically** whatever happened —
+        // accepted, unknown bridge, or somebody else's call — because this is a
+        // route a stranger can reach and a reply that varied would make it an
+        // oracle for which calls are in flight and whom they are for.
+        ("POST", "/session/decline") => match (peer.identity, CallDecline::decode(body)) {
+            (None, _) => no_identity("declining a call"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(d)) => {
+                let _ = crate::relay::decline(server, me, d.bridge, d.reason);
+                (200, "application/octet-stream", vec![1u8])
+            }
         },
         ("POST", "/session/send") => match (peer.identity, SendFrame::decode(body)) {
             (None, _) => no_identity("sending"),
@@ -2109,11 +2396,13 @@ async fn route(
         ("POST", "/session/close") => match (peer.identity, BySession::decode(body, TYPE_CLOSE)) {
             (None, _) => no_identity("closing"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(r)) => (
-                200,
-                "application/octet-stream",
-                vec![u8::from(server.sessions.close(&me, r.session_id))],
-            ),
+            (Some(me), Ok(r)) => {
+                // SIP-39: a bridged session id tears down across the link;
+                // anything else is an ordinary local close.
+                let closed = crate::relay::close_bridge(server, me, r.session_id)
+                    || server.sessions.close(&me, r.session_id);
+                (200, "application/octet-stream", vec![u8::from(closed)])
+            }
         },
 
         // A protected exchange endpoint, to demonstrate whitelist enforcement.
@@ -2145,6 +2434,8 @@ impl Server {
             "whitelist_enabled": state.enabled(),
             "whitelist_count": state.keys().len(),
             "beacons": self.beacons.len(),
+            "rendezvous_pending": self.rendezvous.len(),
+            "names": self.names.count(),
             "requests": self.requests(),
             "event_streams": self.events.total(),
             "mail_waiting": self.mailbox.waiting(),
@@ -2284,6 +2575,69 @@ impl Server {
                     .collect();
                 json!({ "enabled": state.enabled(), "keys": keys })
             }
+            // SIP-39. Deliberately the same shape as the whitelist arms above:
+            // an operator administering "who may connect" and "who we federate
+            // with" is doing one kind of thing, and the two should not need
+            // different habits.
+            Op::PeerAdd { key, label } => {
+                // The cap is the same one the config used to enforce at load.
+                // It has to be enforced here too now, or a list that could not
+                // be configured could still be assembled one op at a time.
+                if !state.peers_with(key) && state.peer_count() >= sqex_proto::peer::MAX_PEERS {
+                    return json!({
+                        "ok": false,
+                        "error": format!(
+                            "already peering with {}, limit is {}",
+                            state.peer_count(),
+                            sqex_proto::peer::MAX_PEERS
+                        ),
+                    });
+                }
+                // Refusing to peer with ourselves: a self-bridge is a loop with
+                // no second party, and the failure it produces later is much
+                // harder to read than this sentence.
+                if *key == self.public_key {
+                    return json!({
+                        "ok": false,
+                        "error": "an exchange cannot be its own relay peer",
+                    });
+                }
+                let changed = state.add_peer(
+                    *key,
+                    WhitelistEntry {
+                        added_by: Some(admin.to_base58()),
+                        label: label.clone(),
+                        added_at: now_unix(),
+                    },
+                );
+                json!({ "ok": true, "added": changed, "peers": state.peer_count() })
+            }
+            Op::PeerRemove(key) => {
+                let changed = state.remove_peer(key);
+                // Said plainly, because it is the question an operator asks
+                // next: this stops the next call, not one already up.
+                json!({
+                    "ok": true,
+                    "removed": changed,
+                    "peers": state.peer_count(),
+                    "note": "bridges already open are not torn down",
+                })
+            }
+            Op::PeerList => {
+                let peers: Vec<serde_json::Value> = state
+                    .peer_list()
+                    .into_iter()
+                    .map(|(k, e)| {
+                        json!({
+                            "key": k.to_base58(),
+                            "added_by": e.added_by,
+                            "label": e.label,
+                            "added_at": e.added_at,
+                        })
+                    })
+                    .collect();
+                json!({ "peering": state.peering_enabled(), "peers": peers })
+            }
             Op::Status => self.status_value(state),
             Op::ReloadAdmins => match self.reload_admins() {
                 Ok(n) => json!({ "ok": true, "admins": n }),
@@ -2335,6 +2689,39 @@ impl Server {
             Op::AdmissionDeny(device) => {
                 self.admissions.deny(device);
                 json!({ "ok": true })
+            }
+            // SIP-38 administration. The administrator's override: binds or
+            // frees a name in any registration mode. `NameAssign` reassigns an
+            // existing binding and is exempt from the per-account cap — the cap
+            // governs self-service, and an administrator's decision is not that.
+            Op::NameAssign { name, account } => {
+                let changed = self.names.assign(name, account);
+                json!({ "ok": changed, "name": name, "account": account.to_base58() })
+            }
+            Op::NameRelease(name) => {
+                let changed = self.names.release_admin(name);
+                json!({ "ok": true, "changed": changed })
+            }
+            Op::NameList => {
+                let names: Vec<serde_json::Value> = self
+                    .names
+                    .list()
+                    .into_iter()
+                    .map(|r| {
+                        json!({
+                            "name": r.name,
+                            "account": r.account.to_base58(),
+                            // Whether it is an administrator's assignment (no
+                            // lease) or an open self-claim.
+                            "admin_set": r.admin_set,
+                            "registered_at": r.registered_at,
+                            "last_active": r.last_active,
+                            // Zero for an administrator's assignment.
+                            "expires_at": r.expires_at,
+                        })
+                    })
+                    .collect();
+                json!({ "names": names })
             }
         }
     }

@@ -23,7 +23,6 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sqex_proto::room::RoomId;
 use sqnr::{config::Config, identity};
-use sqnr_core::PubKey;
 
 use sqex_voice::audio::{self, Sink, Source};
 use sqex_voice::engine::{self, CallOpts, Event, Report};
@@ -133,6 +132,43 @@ enum Cmd {
     Echo {
         /// The peer's Ed25519 identity, base58.
         peer: String,
+    },
+
+    /// Answer the next incoming cross-exchange call (SIP-39): subscribe to this
+    /// exchange's events, wait for a call, and pick it up. No peer is named —
+    /// the ring says who is calling.
+    Answer {
+        /// Where the audio comes from: `mic`, `tone`, or a path to a 48 kHz WAV.
+        #[arg(long, default_value = "mic")]
+        source: Source,
+
+        /// Where the audio goes: `speaker`, `null`, or a path to write a WAV.
+        #[arg(long, default_value = "speaker")]
+        sink: Sink,
+
+        /// Frames to hold before playing.
+        #[arg(long, default_value_t = 3)]
+        jitter: u64,
+
+        /// Opus bitrate in bits per second.
+        #[arg(long, default_value_t = 24_000)]
+        bitrate: i32,
+
+        /// Hang up after N seconds. Without it the call runs until the source
+        /// ends or you interrupt it.
+        #[arg(long)]
+        seconds: Option<u64>,
+
+        /// Refuse the call instead of answering it. The caller is told it was
+        /// declined rather than left ringing until they give up.
+        #[arg(long)]
+        decline: bool,
+
+        /// Refuse as *busy* rather than declined. Implies `--decline`. Busy is
+        /// this client's assertion — the exchange never infers it, since
+        /// somebody with several devices may take a second call.
+        #[arg(long)]
+        busy: bool,
     },
 
     /// Join a room and talk to everyone in it (SIP-13).
@@ -288,12 +324,78 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await;
     }
 
-    let peer = parse_key(match cmd {
-        Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer,
-        Cmd::Room { .. } => unreachable!("handled above"),
-    })?;
+    // A cross-exchange answerer has no peer to name either — the ring says who
+    // is calling (SIP-39).
+    if let Cmd::Answer {
+        source,
+        sink,
+        jitter,
+        bitrate,
+        seconds,
+        decline,
+        busy,
+    } = cmd
+    {
+        let signer = load_identity(&cli, &cfg)?;
+        let endpoint = engine::resolve(&layers(&cli, &cfg), &mut report).await?;
+        // `--busy` implies a refusal; it only changes the reason the caller is
+        // given.
+        let decline_with = match (*busy, *decline) {
+            (true, _) => Some(sqex_proto::relay::REASON_BUSY),
+            (false, true) => Some(sqex_proto::relay::REASON_DECLINED),
+            (false, false) => None,
+        };
+        return engine::answer(
+            endpoint,
+            &signer,
+            cli.wait,
+            opts(&cli, source, sink, *jitter, *bitrate, *seconds, false),
+            decline_with,
+            &mut report,
+        )
+        .await;
+    }
+
+    let peer_str = match cmd {
+        Cmd::Call { peer, .. } | Cmd::Echo { peer } => peer.as_str(),
+        Cmd::Room { .. } | Cmd::Answer { .. } => unreachable!("handled above"),
+    };
     let signer = load_identity(&cli, &cfg)?;
     let endpoint = engine::resolve(&layers(&cli, &cfg), &mut report).await?;
+
+    // SIP-39: a Call whose target carries an explicit @domain is a
+    // cross-exchange call. Our own exchange resolves and bridges it, so we hand
+    // it the whole name@domain / key@domain rather than resolving here.
+    if let Cmd::Call {
+        peer,
+        source,
+        sink,
+        jitter,
+        bitrate,
+        seconds,
+        rtt,
+    } = cmd
+        && peer.contains('@')
+    {
+        let (client, session, id) =
+            engine::establish_cross(endpoint, &signer, peer, cli.wait, &mut report).await?;
+        return engine::call(
+            client,
+            session,
+            id,
+            opts(&cli, source, sink, *jitter, *bitrate, *seconds, *rtt),
+            &mut report,
+        )
+        .await;
+    }
+    // A peer may be named: a base58 key is used as-is, a SIP-38 name@domain (or
+    // a bare name on this exchange) is resolved through the directory first.
+    let peer = match sqex_proto::name::classify(peer_str).map_err(|e| e.to_string())? {
+        sqex_proto::name::Target::Key(k) => k,
+        sqex_proto::name::Target::Named { name, .. } => {
+            engine::resolve_name(endpoint, &signer, &name).await?
+        }
+    };
 
     // Echo rendezvouses inside its own loop, so that it can do so again when a
     // caller goes away; a call does it once.
@@ -324,7 +426,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             .await
         }
         Cmd::Echo { .. } => unreachable!("handled above"),
-        Cmd::Room { .. } => unreachable!("handled above"),
+        Cmd::Room { .. } | Cmd::Answer { .. } => unreachable!("handled above"),
     }
 }
 
@@ -360,12 +462,18 @@ fn opts(
 /// Asking for a passphrase is why this stayed in the binary. A terminal prompts
 /// on stdin; something with a window opens a dialog; a library can do neither,
 /// so the engine takes an already-unlocked signer.
+/// The active identity file: `-i` flag, then config, then the default. Used
+/// both to load the signer and to find its SIP-38 handle sidecar.
+fn identity_path(cli: &Cli, cfg: &Config) -> Result<PathBuf, String> {
+    match (&cli.identity, &cfg.identity) {
+        (Some(p), _) => Ok(p.clone()),
+        (None, Some(p)) => Ok(p.clone()),
+        (None, None) => identity::default_identity_path(),
+    }
+}
+
 fn load_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::SoftwareSigner, String> {
-    let path = match (&cli.identity, &cfg.identity) {
-        (Some(p), _) => p.clone(),
-        (None, Some(p)) => p.clone(),
-        (None, None) => identity::default_identity_path()?,
-    };
+    let path = identity_path(cli, cfg)?;
     if !path.exists() {
         return Err(format!(
             "no identity at {} — run `sqnr keygen` first",
@@ -384,8 +492,8 @@ fn load_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::SoftwareSigner, S
 /// The layers a caller can speak through, most specific first. Resolution is
 /// shared with the other clients in `sqex_discovery::target`, because three
 /// copies of it is what produced two bugs in a day.
-fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
-    [
+fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
+    let mut layers = vec![
         sqex_discovery::Layer {
             server: cli.server.clone(),
             host: cli.server_host.clone(),
@@ -410,11 +518,19 @@ fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
             },
             _ => sqex_discovery::Layer::default(),
         },
-    ]
-}
-
-fn parse_key(s: &str) -> Result<PubKey, String> {
-    s.trim().parse().map_err(|e| format!("bad key {s:?}: {e}"))
+    ];
+    // Lowest priority: the active identity's primary SIP-38 handle domain, so a
+    // claimed name is the default exchange and no `--server` is needed — the
+    // same fallback the `sqex` CLI has. A cleartext sidecar read, no passphrase.
+    if let Ok(id) = identity_path(cli, cfg)
+        && let Some(domain) = sqex_proto::handles::primary_domain(&id)
+    {
+        layers.push(sqex_discovery::Layer {
+            server: Some(domain),
+            ..Default::default()
+        });
+    }
+    layers
 }
 
 fn env_nonempty(key: &str) -> Option<String> {

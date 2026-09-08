@@ -717,3 +717,61 @@ async fn a_call_rings_as_its_own_event_and_typing_does_not() {
         "and nobody answered"
     );
 }
+
+/// SIP-36's refusal, which had no implementation at all until now: `/decline`
+/// does **two** things and both matter. The signal stops the caller's screen
+/// ringing at once; the entry is the only durable account of what happened, and
+/// it is what stops the call being derived as *missed* once the ring window
+/// passes.
+#[tokio::test]
+async fn declining_rings_off_and_records_that_it_was_declined() {
+    use sqex_proto::message::{CALL_DECLINED, MEDIA_AUDIO, RING_DECLINED, RING_RINGING};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _srv, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 41, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 42, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(41);
+    let (_, bob_key) = identity(42);
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    // The caller is the one who has to hear the refusal.
+    assert!(alice.subscribe().await.unwrap(), "alice did not subscribe");
+
+    let (posted, _secret) = alice.call(&channel, MEDIA_AUDIO, 30).await.unwrap();
+    alice.ring_state(&channel, posted.seq, RING_RINGING).await;
+
+    // Bob refuses. The signal first, so the caller stops ringing now...
+    bob.ring_state(&channel, posted.seq, RING_DECLINED).await;
+    assert!(
+        wait_for(&mut alice, |e| matches!(e, ChatEvent::Signal { .. }), SOON)
+            .await
+            .is_some(),
+        "the decline never reached the caller"
+    );
+
+    // ...then the entry, which is the half that survives.
+    bob.end_call(&channel, posted.seq, CALL_DECLINED, 0)
+        .await
+        .unwrap();
+
+    let mut timeline = sqex_proto::timeline::Timeline::new();
+    alice.poll(&channel, &mut timeline, 0).await.unwrap();
+    let call = timeline
+        .call(posted.seq)
+        .expect("the call is not in the caller's timeline");
+    assert_eq!(
+        call.outcome(call.posted),
+        Some(CALL_DECLINED),
+        "a declined call must read as declined, not as still ringing"
+    );
+    // And it *stays* declined after the ring window, rather than being derived
+    // as missed. This is the assertion the entry exists for: without it the
+    // caller's record of a refusal decays into "nobody picked up".
+    assert_eq!(
+        call.outcome(call.posted + 31),
+        Some(CALL_DECLINED),
+        "the entry must beat the missed-call derivation"
+    );
+}

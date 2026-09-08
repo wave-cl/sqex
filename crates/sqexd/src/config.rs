@@ -27,6 +27,29 @@ fn default_welcome_channel() -> String {
     "general".to_string()
 }
 
+fn default_name_registration() -> String {
+    "off".to_string()
+}
+
+fn default_max_names_per_account() -> u64 {
+    4
+}
+
+fn default_name_lease_secs() -> u64 {
+    30 * 24 * 3600 // 30 days
+}
+
+/// SIP-38 registration policy for the name route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameMode {
+    /// The route is disabled entirely — no claims, no administration.
+    Off,
+    /// Anyone may claim a free or lapsed name; administrators may also assign.
+    Open,
+    /// Only an administrator's SIP-10 assignment binds a name.
+    Closed,
+}
+
 /// The TOML file's shape. Every field except `key_file` has a default.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,6 +94,36 @@ pub struct FileConfig {
     #[serde(default)]
     pub accepted_envelope_versions: Option<Vec<u8>>,
 
+    /// Cap on concurrently-established connections (squic Config.max_connections).
+    /// Unset means unlimited. A public, whitelist-off exchange should set a
+    /// finite value sized to its memory budget (cap × the ~10 MB receive
+    /// window); on this host, 256 ≈ 2.5 GB worst case.
+    #[serde(default)]
+    pub max_connections: Option<u64>,
+
+    /// SIP-38 name registration mode: `"off"` (default, route disabled),
+    /// `"open"` (anyone may claim a free or lapsed name), or `"closed"` (only an
+    /// administrator's assignment binds one). Off by default, like every other
+    /// outward-facing surface here — an operator turns it on deliberately.
+    #[serde(default = "default_name_registration")]
+    pub name_registration: String,
+    /// SIP-38: how many names one account may self-claim (open mode). Bounds a
+    /// land-grab; an administrator's assignments are not counted against it.
+    #[serde(default = "default_max_names_per_account")]
+    pub max_names_per_account: u64,
+    /// SIP-38: how long a self-claimed name survives without renewal, in
+    /// seconds. A beat (SIP-4), a re-claim, or a SIP-28 publish renews it. Long
+    /// by default (30 days) — a name is not an address.
+    #[serde(default = "default_name_lease_secs")]
+    pub name_lease_secs: u64,
+    /// SIP-38: optional cap on the *total* number of bound names. Unset means
+    /// unlimited. The per-account cap and claim rate are per-account and so
+    /// bypassable by minting identities; this is the global backstop against a
+    /// mint-flood filling the directory (the same shape as `max_connections`).
+    /// Administrator assignments are exempt.
+    #[serde(default)]
+    pub max_names: Option<u64>,
+
     /// SIP-35: base58 Ed25519 identities of exchanges this one will serve
     /// replication to.
     ///
@@ -92,6 +145,40 @@ pub struct FileConfig {
     /// signed a `0x0b` for each channel.
     #[serde(default)]
     pub replicate: Vec<FileOrigin>,
+
+    /// SIP-39: base58 Ed25519 identities of the exchanges this one will bridge
+    /// cross-exchange calls to and from.
+    ///
+    /// The federation boundary, and symmetric in effect: this exchange rings one
+    /// of its users for an incoming call only from a key on this list, and dials
+    /// out only to a key on this list. Empty — the default — means it federates
+    /// with nobody and its relay routes refuse everyone identically.
+    ///
+    /// **Keys only, no addresses.** Where a peer actually is comes from SIP-33
+    /// discovery of the domain a call names, so a peer that moves is followed
+    /// rather than re-configured, and there is nothing here to keep in step
+    /// with DNS. Same shape as `replication_peers`.
+    #[serde(default)]
+    pub seed_relay_peers: Vec<String>,
+
+    /// Retired in favour of `seed_relay_peers`, and kept only so that a config
+    /// carrying it is refused with an explanation instead of serde's "unknown
+    /// field".
+    ///
+    /// Peers are administered at runtime now, so a list here no longer means
+    /// what it used to: it would be read once on the first run and ignored
+    /// afterwards. An operator who left it in place and expected edits to take
+    /// effect would be wrong in a way nothing would report, which is worse than
+    /// refusing to start.
+    #[serde(default)]
+    pub relay_peers: Option<Vec<String>>,
+
+    /// SIP-39: cap on concurrent bridged calls. Unset means unlimited. A relay
+    /// a peer can drive needs a ceiling a local SIP-12 session does not, since a
+    /// local session is already bounded by `max_connections` and a bridge is
+    /// its own quantity. A public federating exchange should set one.
+    #[serde(default)]
+    pub max_bridges: Option<u64>,
 }
 
 /// One origin to replicate from.
@@ -132,8 +219,18 @@ pub struct Config {
     /// The channel every account joins on first sight. Empty is off.
     pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
+    pub max_connections: Option<u64>,
+    pub name_registration: NameMode,
+    pub max_names_per_account: usize,
+    pub name_lease_secs: u64,
+    pub max_names: Option<u64>,
     pub replication_peers: Vec<PubKey>,
     pub replicate: Vec<OriginConfig>,
+    /// SIP-39: peers to seed the managed allowlist with, on a first run that
+    /// has no peer list yet. Not the live list — that is in [`crate::state`],
+    /// and is what the relay actually consults.
+    pub seed_relay_peers: Vec<PubKey>,
+    pub max_bridges: Option<u64>,
 }
 
 /// One resolved origin to replicate from.
@@ -159,6 +256,30 @@ impl FileConfig {
             return Err(Error::Malformed(format!(
                 "replication_peers holds {}, limit is {}",
                 replication_peers.len(),
+                sqex_proto::peer::MAX_PEERS
+            )));
+        }
+
+        // SIP-39 relay peers, capped the same way and for the same reason as
+        // replication peers — an over-long list is a mistake to hear at load.
+        // Refuse rather than migrate silently. The rename is the signal that
+        // the model changed underneath, and an exchange that started anyway
+        // would leave the operator believing this file still governs peering.
+        if self.relay_peers.is_some() {
+            return Err(Error::Malformed(
+                "`relay_peers` has been replaced by `seed_relay_peers`. Peers are administered \
+                 at runtime now — `sqex admin peer add/remove/list` — and the config key only \
+                 seeds the very first run, exactly as `seed_whitelist` does. Rename the key to \
+                 `seed_relay_peers` to keep the peers you have; the existing state file carries \
+                 them across the upgrade either way."
+                    .into(),
+            ));
+        }
+        let relay_peers = parse_keys(&self.seed_relay_peers, "seed_relay_peers")?;
+        if relay_peers.len() > sqex_proto::peer::MAX_PEERS {
+            return Err(Error::Malformed(format!(
+                "seed_relay_peers holds {}, limit is {}",
+                relay_peers.len(),
                 sqex_proto::peer::MAX_PEERS
             )));
         }
@@ -202,6 +323,47 @@ impl FileConfig {
             });
         }
 
+        // A cap of zero would refuse every caller in silence — an unlimited
+        // exchange is None (the field left out), not 0.
+        if self.max_connections == Some(0) {
+            return Err(Error::Malformed(
+                "max_connections must be omitted (unlimited) or a positive value".into(),
+            ));
+        }
+
+        // SIP-38. An unknown mode is a configuration mistake worth naming at
+        // load, not a silent fallback to off.
+        let name_registration = match self.name_registration.trim().to_ascii_lowercase().as_str() {
+            "off" => NameMode::Off,
+            "open" => NameMode::Open,
+            "closed" => NameMode::Closed,
+            other => {
+                return Err(Error::Malformed(format!(
+                    "name_registration must be \"off\", \"open\" or \"closed\", not {other:?}"
+                )));
+            }
+        };
+        // A per-account cap of zero would refuse every self-claim in silence.
+        if self.max_names_per_account == 0 {
+            return Err(Error::Malformed(
+                "max_names_per_account must be a positive value".into(),
+            ));
+        }
+        // A global cap of zero would refuse every claim — unlimited is None
+        // (the field left out), not 0. Same rule as max_connections.
+        if self.max_names == Some(0) {
+            return Err(Error::Malformed(
+                "max_names must be omitted (unlimited) or a positive value".into(),
+            ));
+        }
+        // SIP-39. A ceiling of zero would refuse every bridge in silence —
+        // unlimited is None (the field left out), not 0.
+        if self.max_bridges == Some(0) {
+            return Err(Error::Malformed(
+                "max_bridges must be omitted (unlimited) or a positive value".into(),
+            ));
+        }
+
         Ok(Config {
             listen,
             key_file: self.key_file,
@@ -211,8 +373,15 @@ impl FileConfig {
             challenge_ttl: std::time::Duration::from_secs(self.challenge_ttl_secs.max(1)),
             welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
+            max_connections: self.max_connections,
+            name_registration,
+            max_names: self.max_names,
+            max_names_per_account: self.max_names_per_account as usize,
+            name_lease_secs: self.name_lease_secs,
             replication_peers,
             replicate,
+            seed_relay_peers: relay_peers,
+            max_bridges: self.max_bridges,
         })
     }
 }
@@ -259,6 +428,68 @@ fn parse_listen(s: &str) -> Result<SocketAddr> {
 mod tests {
     use super::*;
 
+    /// The file we ship must load through the parser we ship. Nothing checked
+    /// this, so a typo in it — or a key renamed in the code and not in the
+    /// file — would first be discovered by an operator whose exchange refused
+    /// to start.
+    #[test]
+    fn the_shipped_config_loads() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../etc/sqexd.toml");
+        let text = std::fs::read_to_string(path).expect("etc/sqexd.toml is missing");
+        let file: FileConfig =
+            toml::from_str(&text).unwrap_or_else(|e| panic!("etc/sqexd.toml does not parse: {e}"));
+        let cfg = file
+            .resolve()
+            .unwrap_or_else(|e| panic!("etc/sqexd.toml does not resolve: {e}"));
+        // The commented-out examples mean these are empty; what matters is
+        // that the keys are spelled the way the parser expects.
+        assert!(cfg.seed_relay_peers.is_empty());
+        assert!(cfg.max_bridges.is_none());
+    }
+
+    /// The retired key is refused, and the refusal says what to do about it —
+    /// this is what an operator sees on the restart after the upgrade, so a
+    /// bare "unknown field" would not be good enough.
+    #[test]
+    fn the_retired_relay_peers_key_is_refused_with_instructions() {
+        let peer = PubKey::new([3u8; 32]).to_base58();
+        let toml_text = format!(
+            r#"
+            listen = "127.0.0.1:5400"
+            key_file = "/tmp/sqex.key"
+            relay_peers = ["{peer}"]
+            "#
+        );
+        let file: FileConfig = toml::from_str(&toml_text).expect("the key is still accepted");
+        let err = file.resolve().expect_err("it must not resolve");
+        let msg = err.to_string();
+        for want in ["seed_relay_peers", "sqex admin peer", "state file"] {
+            assert!(msg.contains(want), "refusal should mention {want:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn seed_relay_peers_is_capped() {
+        let keys: Vec<String> = (0..=sqex_proto::peer::MAX_PEERS)
+            .map(|i| PubKey::new([i as u8; 32]).to_base58())
+            .collect();
+        let list = keys
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let toml_text = format!(
+            r#"
+            listen = "127.0.0.1:5400"
+            key_file = "/tmp/sqex.key"
+            seed_relay_peers = [{list}]
+            "#
+        );
+        let file: FileConfig = toml::from_str(&toml_text).unwrap();
+        let err = file.resolve().expect_err("over the cap must not resolve");
+        assert!(err.to_string().contains("seed_relay_peers"), "{err}");
+    }
+
     #[test]
     fn parses_a_full_config() {
         let admin = PubKey::new([1u8; 32]).to_base58();
@@ -279,6 +510,56 @@ mod tests {
         assert_eq!(cfg.seed_whitelist, vec![PubKey::new([2u8; 32])]);
         assert_eq!(cfg.challenge_ttl.as_secs(), 15);
         assert_eq!(cfg.listen.port(), 5400);
+    }
+
+    #[test]
+    fn max_connections_parses_and_rejects_zero() {
+        // Unset ⇒ None (unlimited).
+        let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
+        assert_eq!(cfg.resolve().unwrap().max_connections, None);
+        // A positive value passes through.
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_connections = 256\n").unwrap();
+        assert_eq!(cfg.resolve().unwrap().max_connections, Some(256));
+        // Zero is refused at load rather than silently refusing every caller.
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_connections = 0\n").unwrap();
+        assert!(cfg.resolve().is_err());
+    }
+
+    #[test]
+    fn name_registration_parses_and_defaults_off() {
+        // Default: off, cap 4, a long lease, no global cap.
+        let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
+        let cfg = cfg.resolve().unwrap();
+        assert_eq!(cfg.name_registration, NameMode::Off);
+        assert_eq!(cfg.max_names_per_account, 4);
+        assert_eq!(cfg.name_lease_secs, 30 * 24 * 3600);
+        assert_eq!(cfg.max_names, None);
+        // A global cap passes through; zero is refused at load.
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_names = 5000\n").unwrap();
+        assert_eq!(cfg.resolve().unwrap().max_names, Some(5000));
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_names = 0\n").unwrap();
+        assert!(cfg.resolve().is_err());
+        // Open, with an operator-set cap and lease.
+        let cfg: FileConfig = toml::from_str(
+            "key_file = \"/x\"\nname_registration = \"open\"\nmax_names_per_account = 2\nname_lease_secs = 3600\n",
+        )
+        .unwrap();
+        let cfg = cfg.resolve().unwrap();
+        assert_eq!(cfg.name_registration, NameMode::Open);
+        assert_eq!(cfg.max_names_per_account, 2);
+        assert_eq!(cfg.name_lease_secs, 3600);
+        // Closed is accepted; case and whitespace do not matter.
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\nname_registration = \" Closed \"\n").unwrap();
+        assert_eq!(cfg.resolve().unwrap().name_registration, NameMode::Closed);
+        // An unknown mode is refused at load rather than silently off.
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\nname_registration = \"maybe\"\n").unwrap();
+        assert!(cfg.resolve().is_err());
+        // A zero cap is refused.
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\nmax_names_per_account = 0\n").unwrap();
+        assert!(cfg.resolve().is_err());
     }
 
     #[test]

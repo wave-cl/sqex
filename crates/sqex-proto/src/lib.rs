@@ -22,13 +22,16 @@ pub mod entry_sig;
 pub mod events;
 pub mod exchange;
 pub mod h3;
+pub mod handles;
 pub mod mailbox;
 pub mod message;
+pub mod name;
 pub mod peer;
 pub mod prekey;
 pub mod profile;
 pub mod receipt;
 pub mod refusal;
+pub mod relay;
 pub mod rendezvous;
 pub mod resolve;
 pub mod room;
@@ -74,6 +77,32 @@ pub enum Op {
     },
     /// Decline one, and remember the decision so it does not requeue.
     AdmissionDeny(PubKey),
+    /// SIP-38: bind a name to an account, in any registration mode. The
+    /// administrator's override — how names are handed out in a closed
+    /// deployment, and how a squatted one is corrected in an open one. It
+    /// reassigns an existing binding and is not subject to the per-account cap.
+    NameAssign { name: String, account: PubKey },
+    /// SIP-38: free a name, open- or administrator-bound.
+    NameRelease(String),
+    /// SIP-38: read the directory of bound names.
+    NameList,
+    /// SIP-39: add an exchange to the relay-peer allowlist, with an optional
+    /// human label recorded as provenance.
+    ///
+    /// Peering is a standing decision about which other exchanges this one will
+    /// bridge calls to, and it used to be reachable only by editing the config
+    /// file and restarting — which means an operator adding a peer took the
+    /// exchange down for everybody already using it. It is administered now,
+    /// like the whitelist it sits beside.
+    PeerAdd { key: PubKey, label: Option<String> },
+    /// SIP-39: remove an exchange from the relay-peer allowlist.
+    ///
+    /// Existing bridges are not torn down by this: the allowlist gates opening
+    /// a bridge, and a call in progress is not reopened. Removing a peer stops
+    /// the next call, not the current one.
+    PeerRemove(PubKey),
+    /// SIP-39: read the relay-peer allowlist.
+    PeerList,
 }
 
 impl Op {
@@ -90,6 +119,12 @@ impl Op {
             Op::AdmissionList => 0x09,
             Op::AdmissionApprove { .. } => 0x0a,
             Op::AdmissionDeny(_) => 0x0b,
+            Op::NameAssign { .. } => 0x0c,
+            Op::NameRelease(_) => 0x0d,
+            Op::NameList => 0x0e,
+            Op::PeerAdd { .. } => 0x0f,
+            Op::PeerRemove(_) => 0x10,
+            Op::PeerList => 0x11,
         }
     }
 
@@ -120,8 +155,32 @@ impl Op {
                     None => out.push(0),
                 }
             }
-            Op::WhitelistRemove(k) | Op::AdmissionDeny(k) => out.extend_from_slice(k.as_bytes()),
+            Op::PeerAdd { key, label } => {
+                out.extend_from_slice(key.as_bytes());
+                match label {
+                    Some(s) => {
+                        out.push(1);
+                        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                        out.extend_from_slice(s.as_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
+            Op::WhitelistRemove(k) | Op::AdmissionDeny(k) | Op::PeerRemove(k) => {
+                out.extend_from_slice(k.as_bytes())
+            }
             Op::AuditTail(n) => out.extend_from_slice(&n.to_be_bytes()),
+            // Fixed-width account first, then the variable-length name — the
+            // same layout AdmissionApprove uses for its key-then-label.
+            Op::NameAssign { name, account } => {
+                out.extend_from_slice(account.as_bytes());
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
+            Op::NameRelease(name) => {
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+            }
             _ => {}
         }
         out
@@ -145,6 +204,15 @@ impl Op {
             0x09 => Op::AdmissionList,
             0x0a => decode_approve(rest)?,
             0x0b => Op::AdmissionDeny(key(rest)?),
+            0x0c => decode_name_assign(rest)?,
+            0x0d => Op::NameRelease(decode_name(rest)?),
+            0x0e => Op::NameList,
+            0x0f => {
+                let (key, label) = decode_key_label(rest)?;
+                Op::PeerAdd { key, label }
+            }
+            0x10 => Op::PeerRemove(key(rest)?),
+            0x11 => Op::PeerList,
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
         // Every op consumes its payload exactly; reject trailing bytes.
@@ -168,6 +236,12 @@ impl Op {
             Op::AdmissionList => "admission-list",
             Op::AdmissionApprove { .. } => "admission-approve",
             Op::AdmissionDeny(_) => "admission-deny",
+            Op::NameAssign { .. } => "name-assign",
+            Op::NameRelease(_) => "name-release",
+            Op::NameList => "name-list",
+            Op::PeerAdd { .. } => "peer-add",
+            Op::PeerRemove(_) => "peer-remove",
+            Op::PeerList => "peer-list",
         }
     }
 
@@ -185,6 +259,12 @@ impl Op {
             Op::AdmissionList => "Read pending admission requests".into(),
             Op::AdmissionApprove { .. } => "Admit a device to the whitelist".into(),
             Op::AdmissionDeny(_) => "Decline an admission request".into(),
+            Op::NameAssign { name, .. } => format!("Assign the name '{name}' to an account"),
+            Op::NameRelease(name) => format!("Release the name '{name}'"),
+            Op::NameList => "Read the directory of names".into(),
+            Op::PeerAdd { .. } => "Add a relay peer".into(),
+            Op::PeerRemove(_) => "Remove a relay peer".into(),
+            Op::PeerList => "Read the relay peers".into(),
         }
     }
 
@@ -210,6 +290,21 @@ impl Op {
                 d
             }
             Op::AdmissionDeny(k) => vec![format!("device: {}", k.to_base58())],
+            Op::NameAssign { name, account } => {
+                vec![
+                    format!("name: {name}"),
+                    format!("account: {}", account.to_base58()),
+                ]
+            }
+            Op::NameRelease(name) => vec![format!("name: {name}")],
+            Op::PeerAdd { key, label } => {
+                let mut d = vec![format!("exchange: {}", key.to_base58())];
+                if let Some(s) = label {
+                    d.push(format!("label: {s}"));
+                }
+                d
+            }
+            Op::PeerRemove(k) => vec![format!("exchange: {}", k.to_base58())],
             _ => vec![],
         }
     }
@@ -223,6 +318,10 @@ impl Op {
                 | Op::WhitelistAdd { .. }
                 | Op::WhitelistRemove(_)
                 | Op::ReloadAdmins
+                | Op::NameAssign { .. }
+                | Op::NameRelease(_)
+                | Op::PeerAdd { .. }
+                | Op::PeerRemove(_)
         )
     }
 
@@ -233,6 +332,10 @@ impl Op {
             Op::WhitelistRemove(k) => Some(k.to_base58()),
             Op::AdmissionApprove { device, .. } => Some(device.to_base58()),
             Op::AdmissionDeny(k) => Some(k.to_base58()),
+            Op::NameAssign { name, .. } => Some(name.clone()),
+            Op::NameRelease(name) => Some(name.clone()),
+            Op::PeerAdd { key, .. } => Some(key.to_base58()),
+            Op::PeerRemove(k) => Some(k.to_base58()),
             _ => None,
         }
     }
@@ -248,15 +351,24 @@ impl Op {
 }
 
 fn decode_approve(rest: &[u8]) -> Result<Op> {
-    match decode_add(rest)? {
-        Op::WhitelistAdd { key, label } => Ok(Op::AdmissionApprove { device: key, label }),
-        _ => unreachable!("decode_add returns a whitelist add"),
-    }
+    let (device, label) = decode_key_label(rest)?;
+    Ok(Op::AdmissionApprove { device, label })
 }
 
 fn decode_add(rest: &[u8]) -> Result<Op> {
+    let (key, label) = decode_key_label(rest)?;
+    Ok(Op::WhitelistAdd { key, label })
+}
+
+/// A 32-byte key followed by an optional length-prefixed label.
+///
+/// Three ops carry exactly this — whitelist-add, admission-approve and
+/// peer-add — so it is decoded in one place. It used to be `decode_add`, with
+/// `decode_approve` calling it and unwrapping a `WhitelistAdd` it did not want
+/// through an `unreachable!`; a third caller made that shape untenable.
+fn decode_key_label(rest: &[u8]) -> Result<(PubKey, Option<String>)> {
     if rest.len() < 33 {
-        return Err(Error::Malformed("whitelist-add: too short".into()));
+        return Err(Error::Malformed("key+label op: too short".into()));
     }
     let key = PubKey::new(rest[0..32].try_into().unwrap());
     let tail = &rest[32..];
@@ -264,7 +376,7 @@ fn decode_add(rest: &[u8]) -> Result<Op> {
         0 if tail.len() == 1 => None,
         1 => {
             if tail.len() < 5 {
-                return Err(Error::Malformed("whitelist-add: truncated label".into()));
+                return Err(Error::Malformed("key+label op: truncated label".into()));
             }
             let len = u32::from_be_bytes(tail[1..5].try_into().unwrap()) as usize;
             if len > MAX_LABEL {
@@ -275,7 +387,7 @@ fn decode_add(rest: &[u8]) -> Result<Op> {
             let body = &tail[5..];
             if body.len() != len {
                 return Err(Error::Malformed(
-                    "whitelist-add: label length mismatch".into(),
+                    "key+label op: label length mismatch".into(),
                 ));
             }
             Some(
@@ -283,9 +395,9 @@ fn decode_add(rest: &[u8]) -> Result<Op> {
                     .map_err(|_| Error::Malformed("label is not utf-8".into()))?,
             )
         }
-        _ => return Err(Error::Malformed("whitelist-add: bad label marker".into())),
+        _ => return Err(Error::Malformed("key+label op: bad label marker".into())),
     };
-    Ok(Op::WhitelistAdd { key, label })
+    Ok((key, label))
 }
 
 fn key(rest: &[u8]) -> Result<PubKey> {
@@ -300,6 +412,29 @@ fn u32_arg(rest: &[u8]) -> Result<u32> {
         .try_into()
         .map_err(|_| Error::Malformed("op expects a 4-byte count".into()))?;
     Ok(u32::from_be_bytes(arr))
+}
+
+/// A length-prefixed name argument, canonicalised (SIP-38). Shared by
+/// `NameRelease` and the tail of `NameAssign`.
+fn decode_name(rest: &[u8]) -> Result<String> {
+    let len = *rest
+        .first()
+        .ok_or_else(|| Error::Malformed("name op: missing length".into()))? as usize;
+    if rest.len() != 1 + len {
+        return Err(Error::Malformed("name op: length disagrees".into()));
+    }
+    let raw = std::str::from_utf8(&rest[1..])
+        .map_err(|_| Error::Malformed("name op: not UTF-8".into()))?;
+    name::canonical(raw)
+}
+
+fn decode_name_assign(rest: &[u8]) -> Result<Op> {
+    if rest.len() < 33 {
+        return Err(Error::Malformed("name-assign: too short".into()));
+    }
+    let account = PubKey::new(rest[0..32].try_into().unwrap());
+    let name = decode_name(&rest[32..])?;
+    Ok(Op::NameAssign { name, account })
 }
 
 #[cfg(test)]
@@ -323,6 +458,27 @@ mod tests {
             Op::Status,
             Op::ReloadAdmins,
             Op::AuditTail(42),
+            Op::AdmissionApprove {
+                device: PubKey::new([9u8; 32]),
+                label: Some("phone".into()),
+            },
+            Op::AdmissionDeny(PubKey::new([8u8; 32])),
+            Op::NameAssign {
+                name: "colin".into(),
+                account: PubKey::new([4u8; 32]),
+            },
+            Op::NameRelease("carl".into()),
+            Op::NameList,
+            Op::PeerAdd {
+                key: PubKey::new([7u8; 32]),
+                label: None,
+            },
+            Op::PeerAdd {
+                key: PubKey::new([7u8; 32]),
+                label: Some("indra.org".into()),
+            },
+            Op::PeerRemove(PubKey::new([3u8; 32])),
+            Op::PeerList,
         ]
     }
 

@@ -168,6 +168,16 @@ CREATE TABLE IF NOT EXISTS profile (
     title   TEXT    NOT NULL DEFAULT '',
     fetched INTEGER NOT NULL DEFAULT 0
 );
+-- SIP-38 handles, cached. The exchange's reverse-lookup of an account's names;
+-- `name` is the bare local part (the domain is the connected exchange's, added
+-- at display). A hint shown to a human and never used to look anyone up — the
+-- account key is the identity, and a handle is the exchange's word, leased and
+-- reclaimable. Empty = asked and told nothing, like `profile`.
+CREATE TABLE IF NOT EXISTS handle (
+    account BLOB PRIMARY KEY,
+    name    TEXT    NOT NULL DEFAULT '',
+    fetched INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 pub struct Store {
@@ -782,6 +792,35 @@ impl Store {
             )
             .optional()
             .map_err(storage("read profile"))
+    }
+
+    // ---- handles (SIP-38) -----------------------------------------------
+
+    /// Remember the primary handle (bare local name) the exchange reports for
+    /// an account. Empty means asked-and-told-nothing, so the client does not
+    /// re-ask on every poll — the same convention `put_profile` uses.
+    pub fn put_handle(&self, account: &PubKey, name: &str, now: u64) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO handle (account, name, fetched)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (account) DO UPDATE SET name = ?2, fetched = ?3",
+                params![account.as_bytes(), name, now as i64],
+            )
+            .map_err(storage("store handle"))?;
+        Ok(())
+    }
+
+    /// The handle (bare name) we hold for an account, and when we asked.
+    pub fn handle(&self, account: &PubKey) -> Result<Option<(String, u64)>> {
+        self.db
+            .query_row(
+                "SELECT name, fetched FROM handle WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()
+            .map_err(storage("read handle"))
     }
 
     // ---- who this client is ---------------------------------------------

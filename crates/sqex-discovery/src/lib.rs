@@ -187,6 +187,36 @@ pub fn remember(domain: &str, host: Option<&str>, addr: std::net::SocketAddr) ->
     store.save(&path).map_err(Error::Store)
 }
 
+/// Turn a `host:port` — or a bare host, or an address already in that form —
+/// into something dialable, defaulting the port to [`DEFAULT_PORT`].
+///
+/// [`Found::address`] is a string and every dialer needs a `SocketAddr`, so
+/// this conversion had grown **four** times over: in `sqex-voice`'s engine, and
+/// open-coded again in the CLI and the chat client, with `sqexd` about to make a
+/// fourth for SIP-39. It lives here because this is the crate that owns
+/// addresses and the default port, and is the one all of them already depend
+/// on.
+pub fn resolve_addr(address: &str) -> std::result::Result<std::net::SocketAddr, String> {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Ok(socket);
+    }
+    // A bracketed literal is IPv6 and carries its own colons, so the "is there
+    // a port" test cannot simply look for the last one.
+    let has_port = !address.starts_with('[')
+        && address
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| p.parse::<u16>().is_ok());
+    let with_port = if has_port {
+        address.to_string()
+    } else {
+        format!("{address}:{DEFAULT_PORT}")
+    };
+    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
+        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
+}
+
 async fn resolve_host(host: &str, port: u16) -> Vec<std::net::SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return vec![std::net::SocketAddr::new(ip, port)];

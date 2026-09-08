@@ -204,3 +204,46 @@ impl Rendezvous {
         self.len() == 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn pk(b: u8) -> PubKey {
+        PubKey::new(SigningKey::from_bytes(&[b; 32]).verifying_key().to_bytes())
+    }
+    fn addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 5400))
+    }
+
+    /// The bug this fixes: `waiters` gained one `Notify` per distinct pair that
+    /// ever long-polled and nothing reclaimed them, because `sweep()` had no
+    /// caller. With no live `asked` entries, a sweep must drop them all.
+    #[test]
+    fn stale_waiters_are_reclaimed_by_sweep() {
+        let r = Rendezvous::new();
+        let a = pk(1);
+        for i in 2..12u8 {
+            // What `wait()` does when the first ask does not complete.
+            r.notifier(&a, &pk(i));
+        }
+        assert_eq!(r.waiters.lock().unwrap().len(), 10);
+        r.sweep(); // no matching asks were recorded, so every waiter is stale
+        assert!(r.waiters.lock().unwrap().is_empty());
+        assert!(r.is_empty());
+    }
+
+    /// A sweep must not disturb a pair that is still within its window — an
+    /// in-flight wait keeps both its `asked` entry and its notifier.
+    #[test]
+    fn a_live_pair_survives_a_sweep() {
+        let r = Rendezvous::new();
+        let (a, b) = (pk(1), pk(2));
+        let _ = r.request(&a, addr(), &b); // records a fresh `asked` entry
+        r.notifier(&a, &b); // and its waiter
+        r.sweep();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.waiters.lock().unwrap().len(), 1);
+    }
+}

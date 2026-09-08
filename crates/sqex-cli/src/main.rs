@@ -18,6 +18,7 @@ use sqex_proto::attest::{
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::h3::H3Client;
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
+use sqex_proto::name::{self, ClaimAck};
 use sqex_proto::refusal::Refusal;
 use sqex_proto::rendezvous::{Introduce, Introduced};
 use sqex_proto::resolve::{
@@ -30,6 +31,8 @@ use sqex_proto::session::{
 use sqnr::{Backend, Card, Client, config::Config, flow, identity};
 use sqnr_core::{Operation, PubKey, Signer, Transaction};
 
+use sqex_proto::handles;
+
 #[derive(Parser)]
 #[command(
     name = "sqex",
@@ -39,14 +42,14 @@ use sqnr_core::{Operation, PubKey, Signer, Transaction};
 struct Cli {
     /// A domain that publishes an exchange (SIP-33). Its key is discovered over
     /// DNSSEC, pinned on first contact, and refused if it later changes.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server: Option<String>,
     /// A literal address, host:port, to dial. Requires --server-key.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server_host: Option<String>,
     /// The server's base58 public key. Goes with --server-host; a --server
     /// domain supplies its own.
-    #[arg(long)]
+    #[arg(long, global = true)]
     server_key: Option<String>,
 
     /// Sign with a YubiKey instead of a file identity.
@@ -74,6 +77,32 @@ enum Cmd {
     Beacon {
         #[command(subcommand)]
         cmd: BeaconCmd,
+    },
+    /// Names (SIP-38): claim a name for your account, or resolve one.
+    ///
+    /// A name binds to your account, so once resolved the account's devices
+    /// (SIP-22) and endpoints (SIP-28) follow. Resolve accepts `name@domain` or
+    /// a bare `name` against the configured exchange. Whether you may claim a
+    /// name depends on the exchange's policy (open, closed, or off).
+    Name {
+        #[command(subcommand)]
+        cmd: NameCmd,
+    },
+    /// Show this identity's key and the names (SIP-38 handles) it holds, and
+    /// verify each still resolves to you.
+    ///
+    /// Handles are recorded locally beside the identity — a hint, not authority;
+    /// the exchange's directory is the source of truth. The primary handle's
+    /// domain is the default exchange, so a claimed name replaces a `server=`
+    /// line. `sqex name claim` records a handle; `--add`/`--forget` edit them by
+    /// hand (for a name claimed elsewhere, or held on another exchange).
+    Whoami {
+        /// Record a `name@domain` handle for this identity.
+        #[arg(long, value_name = "NAME@DOMAIN")]
+        add: Option<String>,
+        /// Forget a handle: a bare name (every domain), or a full name@domain.
+        #[arg(long, value_name = "NAME")]
+        forget: Option<String>,
     },
     /// Rendezvous: ask to be introduced to a peer, so the two of you can
     /// connect directly.
@@ -194,6 +223,32 @@ enum BeaconCmd {
 }
 
 #[derive(Subcommand)]
+enum NameCmd {
+    /// Claim a name for your account (open registration only). Connects *as*
+    /// your identity — the connection is the proof, so nothing is signed.
+    Claim {
+        /// The name to claim. Canonicalised to lowercase; `[a-z0-9-]` only.
+        name: String,
+    },
+    /// Give up a name your account holds.
+    Release {
+        /// The name to release.
+        name: String,
+    },
+    /// Resolve a name to the account behind it.
+    Resolve {
+        /// `name` or `name@domain`. A bare name is looked up on the configured
+        /// exchange.
+        name: String,
+    },
+    /// List the names an account holds.
+    Reverse {
+        /// The account to ask about, base58. Defaults to your own.
+        key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AttestCmd {
     /// Sign a statement about another identity and lodge it.
     ///
@@ -296,6 +351,58 @@ enum AdminCmd {
     },
     /// Re-read the server's admin list from its config file.
     ReloadAdmins,
+    /// Administer names (SIP-38): assign, release, or list them. The
+    /// administrator's authority over the name directory.
+    Name {
+        #[command(subcommand)]
+        cmd: AdminNameCmd,
+    },
+    /// Manage the relay peers (SIP-39): which other exchanges this one will
+    /// bridge calls to and from. Takes effect immediately — no restart.
+    Peer {
+        #[command(subcommand)]
+        action: PeerCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PeerCmd {
+    /// List the relay peers and their provenance.
+    List,
+    /// Add one or more peer exchange keys (signed as a single batch).
+    ///
+    /// The key is the exchange's SIP-9 host key, not an address: where a peer
+    /// is comes from SIP-33 discovery of the domain a call names, so a peer
+    /// that moves is followed rather than reconfigured.
+    Add {
+        keys: Vec<String>,
+        /// Optional human label recorded as provenance for each key.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove one or more peer exchange keys (signed as a single batch).
+    ///
+    /// Stops the next call. Bridges already open are not torn down.
+    Remove { keys: Vec<String> },
+}
+
+#[derive(Subcommand)]
+enum AdminNameCmd {
+    /// Bind a name to an account, in any registration mode. Reassigns an
+    /// existing binding; not subject to the per-account cap.
+    Assign {
+        /// The name to assign.
+        name: String,
+        /// The account (base58) to bind it to.
+        account: String,
+    },
+    /// Free a name, whoever holds it.
+    Release {
+        /// The name to release.
+        name: String,
+    },
+    /// Read the whole directory of bound names.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -331,6 +438,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Status => status(&cli, &cfg).await,
         Cmd::Admin { cmd } => admin(&cli, &cfg, cmd).await,
         Cmd::Beacon { cmd } => beacon(&cli, &cfg, cmd).await,
+        Cmd::Name { cmd } => names(&cli, &cfg, cmd).await,
+        Cmd::Whoami { add, forget } => whoami(&cli, &cfg, add.as_deref(), forget.as_deref()).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Meet {
@@ -433,7 +542,7 @@ async fn session(cli: &Cli, cfg: &Config, cmd: &SessionCmd) -> Result<(), String
         wait,
         datagram,
     } = cmd;
-    let peer = parse_key(peer)?;
+    let peer = resolve_target(cli, cfg, peer).await?;
     let (mut client, signer) = mail_client(cli, cfg).await?;
     let me = PubKey::new(signer.public());
     if me == peer {
@@ -635,7 +744,7 @@ async fn mail_client(
 async fn mail(cli: &Cli, cfg: &Config, cmd: &MailCmd) -> Result<(), String> {
     match cmd {
         MailCmd::Send { recipient, message } => {
-            let to = parse_key(recipient)?;
+            let to = resolve_target(cli, cfg, recipient).await?;
             let plaintext = match message {
                 Some(m) => m.clone().into_bytes(),
                 None => {
@@ -819,7 +928,7 @@ fn pick_local_port() -> Result<SocketAddr, String> {
 
 async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> Result<(), String> {
     let signer = load_software_identity(cli, cfg)?;
-    let them = parse_key(peer)?;
+    let them = resolve_target(cli, cfg, peer).await?;
     let (addr, server) = endpoint(cli, cfg).await?;
 
     // **One port for both connections, and that is the whole mechanism.** The
@@ -981,7 +1090,7 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
             days,
         } => {
             let signer = load_software_identity(cli, cfg)?;
-            let about = parse_key(subject)?;
+            let about = resolve_target(cli, cfg, subject).await?;
             let code = claim_code(claim)?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1019,7 +1128,7 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
         }
         AttestCmd::Withdraw { subject, digest } => {
             let signer = load_software_identity(cli, cfg)?;
-            let about = parse_key(subject)?;
+            let about = resolve_target(cli, cfg, subject).await?;
             let named = bs58::decode(digest)
                 .into_vec()
                 .map_err(|e| format!("bad digest: {e}"))?;
@@ -1049,11 +1158,11 @@ async fn attest(cli: &Cli, cfg: &Config, cmd: &AttestCmd) -> Result<(), String> 
         }
         AttestCmd::Read { subject, issuer } => {
             let about = match subject {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let from = match issuer {
-                Some(k) => Some(parse_key(k)?),
+                Some(k) => Some(resolve_target(cli, cfg, k).await?),
                 None => None,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -1168,6 +1277,326 @@ fn show_endpoint(e: &Endpoint) -> String {
     }
 }
 
+// ---- names (SIP-38) ---------------------------------------------------------
+
+/// Split `name@domain` into its parts. A bare `name` has no domain.
+fn split_name(input: &str) -> Result<(String, Option<String>), String> {
+    match input.split_once('@') {
+        None => Ok((input.to_string(), None)),
+        Some((local, domain)) => {
+            if domain.contains('@') || domain.is_empty() || local.is_empty() {
+                return Err(format!("{input:?} is not a valid name@domain"));
+            }
+            Ok((local.to_string(), Some(domain.to_string())))
+        }
+    }
+}
+
+/// Discover a domain's exchange over DNSSEC (SIP-33), pinning on first contact.
+async fn resolve_domain(domain: &str) -> Result<(SocketAddr, PubKey), String> {
+    let found = sqex_discovery::discover(domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    if found.newly_pinned {
+        eprintln!(
+            "{domain}: discovered {} over DNSSEC and pinned it. \
+             Forget it with `sqex discover --forget {domain}`.",
+            found.key
+        );
+    }
+    Ok((resolve(&found.address)?, found.key))
+}
+
+/// Resolve a peer/target argument to a key. A key passes straight through; a
+/// name is resolved through the SIP-38 directory — `name@domain` against that
+/// domain's exchange (SIP-33), a bare name against the configured one.
+///
+/// Resolution is global (name → key), but the command that called this still
+/// runs against *its own* exchange, so a store-and-forward command handed
+/// `name@other.org` reaches the resolved key only if that exchange is also the
+/// one it uses. Same-domain use (`alice@squic.org` with `squic.org` configured)
+/// is seamless; cross-exchange is resolve-only.
+async fn resolve_target(cli: &Cli, cfg: &Config, input: &str) -> Result<PubKey, String> {
+    match name::classify(input).map_err(|e| e.to_string())? {
+        name::Target::Key(k) => Ok(k),
+        name::Target::Named { name, domain } => {
+            let (addr, server) = match &domain {
+                Some(d) => resolve_domain(d).await?,
+                None => endpoint(cli, cfg).await?,
+            };
+            let label = match &domain {
+                Some(d) => format!("{name}@{d}"),
+                None => name.clone(),
+            };
+            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let (code, body) = client
+                .post(
+                    "/name/resolve",
+                    name::Resolve { name: name.clone() }.encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!(
+                    "resolving {label}: exchange said {code}: {}",
+                    said(&body)
+                ));
+            }
+            let r = name::Resolved::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                return Err(format!("no account is named {label}"));
+            }
+            if r.stale {
+                eprintln!(
+                    "warning: {label} is on notice — its lease has lapsed and it may be reclaimed"
+                );
+            }
+            Ok(r.account)
+        }
+    }
+}
+
+async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
+    match cmd {
+        NameCmd::Claim { name } => {
+            // Claiming means connecting *as* the account, so the transport
+            // carries the identity (SIP-3) — a YubiKey cannot be a transport key.
+            if cli.yubikey {
+                return Err("a YubiKey cannot claim a name: it signs, but cannot be a \
+                            transport identity. Claim with a software identity."
+                    .into());
+            }
+            let name = name::canonical(name).map_err(|e| e.to_string())?;
+            let signer = load_software_identity(cli, cfg)?;
+            let (addr, server, domain) = resolve_endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code, body) = client
+                .post("/name/claim", name::Claim { name: name.clone() }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("claim refused ({code}): {}", said(&body)));
+            }
+            let ack = ClaimAck::decode(&body).map_err(|e| e.to_string())?;
+            match ack.outcome {
+                name::CLAIM_GRANTED => {
+                    println!("{name} is yours ({})", PubKey::new(signer.public()));
+                    // Record it as a handle for this identity, so it becomes the
+                    // default exchange and shows in `sqex whoami`.
+                    match &domain {
+                        Some(d) => match identity_path(cli, cfg)
+                            .and_then(|id| handles::add(&id, &format!("{name}@{d}")))
+                        {
+                            Ok((h, true)) => println!("  recorded {h} as one of your handles"),
+                            Ok((_, false)) => {}
+                            Err(e) => eprintln!("  (could not record handle: {e})"),
+                        },
+                        None => println!(
+                            "  (reached by host+key, so no domain to record; add it with \
+                             `sqex whoami --add {name}@<domain>`)"
+                        ),
+                    }
+                }
+                name::CLAIM_TAKEN => println!("{name} is held by another account"),
+                name::CLAIM_AT_CAPACITY => {
+                    println!("refused: you already hold the maximum number of names")
+                }
+                name::CLAIM_CLOSED => println!(
+                    "this exchange does not allow self-claimed names \
+                     (registration is closed or off)"
+                ),
+                name::CLAIM_RATE_LIMITED => {
+                    println!("refused: too many claims this hour — try again later")
+                }
+                name::CLAIM_FULL => {
+                    println!("refused: this exchange's name directory is full")
+                }
+                other => println!("unexpected claim outcome: {other}"),
+            }
+            Ok(())
+        }
+        NameCmd::Release { name } => {
+            if cli.yubikey {
+                return Err("a YubiKey cannot be a transport identity".into());
+            }
+            let name = name::canonical(name).map_err(|e| e.to_string())?;
+            let signer = load_software_identity(cli, cfg)?;
+            let (addr, server, domain) = resolve_endpoint(cli, cfg).await?;
+            let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+            let (code, body) = client
+                .post(
+                    "/name/release",
+                    name::Release { name: name.clone() }.encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("release refused ({code}): {}", said(&body)));
+            }
+            println!("released {name} (a no-op if your account did not hold it)");
+            // Drop the matching local handle too, so `whoami` stays honest.
+            if let Some(d) = &domain
+                && let Ok(id) = identity_path(cli, cfg)
+                && handles::remove(&id, &format!("{name}@{d}")).unwrap_or(false)
+            {
+                println!("  and forgot the {name}@{d} handle");
+            }
+            Ok(())
+        }
+        NameCmd::Resolve { name } => {
+            let (local, domain) = split_name(name)?;
+            let local = name::canonical(&local).map_err(|e| e.to_string())?;
+            // A `name@domain` selects that domain's exchange (SIP-33); a bare
+            // name uses the configured one.
+            let (addr, server) = match &domain {
+                Some(d) => resolve_domain(d).await?,
+                None => endpoint(cli, cfg).await?,
+            };
+            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let (code, body) = client
+                .post(
+                    "/name/resolve",
+                    name::Resolve {
+                        name: local.clone(),
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("resolve failed ({code}): {}", said(&body)));
+            }
+            let r = name::Resolved::decode(&body).map_err(|e| e.to_string())?;
+            if !r.found {
+                println!("{local}: no such name");
+                return Ok(());
+            }
+            println!("{local} → {}", r.account);
+            // The provenance, so a consumer can judge the answer. Ages against
+            // the exchange's clock, per SIP-4.
+            if r.stale {
+                println!(
+                    "  STALE: the lease lapsed; this name may be reclaimed by another account"
+                );
+            } else if r.expires_at == 0 {
+                println!("  assigned by an administrator (no lease)");
+            } else {
+                println!(
+                    "  lease renews on activity; expires in {}s if idle",
+                    r.expires_at.saturating_sub(r.now)
+                );
+            }
+            println!(
+                "  Resolve the account's devices with `sqex` (SIP-22) and its address with \
+                 `sqex resolve get {}`.",
+                r.account
+            );
+            Ok(())
+        }
+        NameCmd::Reverse { key } => {
+            let target = match key {
+                Some(k) => resolve_target(cli, cfg, k).await?,
+                None => own_identity(cli, cfg)?,
+            };
+            let (addr, server) = endpoint(cli, cfg).await?;
+            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let (code, body) = client
+                .post("/name/reverse", name::Reverse { account: target }.encode())
+                .await?;
+            if code != 200 {
+                return Err(format!("reverse failed ({code}): {}", said(&body)));
+            }
+            let n = name::Names::decode(&body).map_err(|e| e.to_string())?;
+            if n.names.is_empty() {
+                println!("{target}: holds no names");
+                return Ok(());
+            }
+            for name in n.names {
+                println!("{name}");
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---- whoami (SIP-38 handles) ------------------------------------------------
+
+async fn whoami(
+    cli: &Cli,
+    cfg: &Config,
+    add: Option<&str>,
+    forget: Option<&str>,
+) -> Result<(), String> {
+    let id = identity_path(cli, cfg)?;
+    if let Some(h) = add {
+        let (h, added) = handles::add(&id, h)?;
+        println!(
+            "{}",
+            if added {
+                format!("added {h}")
+            } else {
+                format!("{h} was already recorded")
+            }
+        );
+    }
+    if let Some(h) = forget {
+        println!(
+            "{}",
+            if handles::remove(&id, h)? {
+                format!("forgot {h}")
+            } else {
+                format!("no handle matched {h:?}")
+            }
+        );
+    }
+
+    // Reads the public-key line only — no passphrase, even for an encrypted key.
+    let me = own_identity(cli, cfg)?;
+    println!("identity {me}");
+    let hs = handles::load(&id);
+    if hs.is_empty() {
+        println!("  no handles recorded — claim one, or `sqex whoami --add name@domain`");
+        return Ok(());
+    }
+    for (i, h) in hs.iter().enumerate() {
+        let role = if i == 0 { "primary" } else { "alias  " };
+        println!("  {role}  {h}  {}", verify_handle(h, &me).await);
+    }
+    Ok(())
+}
+
+/// Best-effort check that a `name@domain` handle still resolves to `me` on its
+/// domain's exchange. Returns a short status marker and never fails — a handle
+/// is a hint, and the exchange is the authority (SIP-38).
+async fn verify_handle(handle: &str, me: &PubKey) -> String {
+    let Some((local, domain)) = handle.split_once('@') else {
+        return "(malformed handle)".into();
+    };
+    let name = match name::canonical(local) {
+        Ok(n) => n,
+        Err(e) => return format!("(bad name: {e})"),
+    };
+    let (addr, server) = match resolve_domain(domain).await {
+        Ok(v) => v,
+        Err(e) => return format!("(unreachable: {e})"),
+    };
+    let mut client = match Client::connect(addr, server.as_bytes()).await {
+        Ok(c) => c,
+        Err(e) => return format!("(unreachable: {e})"),
+    };
+    let body = match client
+        .post("/name/resolve", name::Resolve { name }.encode())
+        .await
+    {
+        Ok((200, body)) => body,
+        Ok((code, body)) => return format!("(exchange said {code}: {})", said(&body)),
+        Err(e) => return format!("(unreachable: {e})"),
+    };
+    match name::Resolved::decode(&body) {
+        Ok(r) if !r.found => "✗ no longer registered".into(),
+        Ok(r) if &r.account != me => format!("✗ resolves to {} — NOT this identity", r.account),
+        Ok(r) if r.stale => "✓ STALE (lease lapsed, may be reclaimed)".into(),
+        Ok(_) => "✓".into(),
+        Err(e) => format!("(bad reply: {e})"),
+    }
+}
+
 async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), String> {
     match cmd {
         ResolveCmd::Publish {
@@ -1211,7 +1640,7 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
         }
         ResolveCmd::Get { key } => {
             let target = match key {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -1257,7 +1686,7 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
                 return Err("a YubiKey cannot be a transport identity".into());
             }
             let signer = load_software_identity(cli, cfg)?;
-            let to = parse_key(successor)?;
+            let to = resolve_target(cli, cfg, successor).await?;
             let (addr, server) = endpoint(cli, cfg).await?;
             let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
             let req = ResolveSuccessor {
@@ -1320,7 +1749,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             // Reading is open, but connecting as ourselves is what lets the
             // exchange disclose our own withheld record.
             let target = match key {
-                Some(k) => parse_key(k)?,
+                Some(k) => resolve_target(cli, cfg, k).await?,
                 None => own_identity(cli, cfg)?,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
@@ -1389,8 +1818,8 @@ fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
 /// The layers a caller can speak through, most specific first. Resolution is
 /// shared with the other clients in `sqex_discovery::target`, because three
 /// copies of it is what produced two bugs in a day.
-fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
-    [
+fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
+    let mut layers = vec![
         sqex_discovery::Layer {
             server: cli.server.clone(),
             host: cli.server_host.clone(),
@@ -1415,13 +1844,37 @@ fn layers(cli: &Cli, cfg: &Config) -> [sqex_discovery::Layer; 3] {
             },
             _ => sqex_discovery::Layer::default(),
         },
-    ]
+    ];
+    // Lowest priority: the active identity's primary handle domain (SIP-38), so
+    // a claimed name *is* the default exchange and no `server =` pointer is
+    // needed. Reading the sidecar is a cleartext file read — no passphrase.
+    if let Ok(id) = identity_path(cli, cfg)
+        && let Some(domain) = handles::primary_domain(&id)
+    {
+        layers.push(sqex_discovery::Layer {
+            server: Some(domain),
+            ..Default::default()
+        });
+    }
+    layers
 }
 
 /// Resolve the server address and pinned key without connecting.
 async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), String> {
+    let (addr, key, _domain) = resolve_endpoint(cli, cfg).await?;
+    Ok((addr, key))
+}
+
+/// Like [`endpoint`], but also returns the domain when the exchange was reached
+/// by SIP-33 discovery (`None` for a literal host+key). The domain is what a
+/// SIP-38 handle needs — the caller can record `name@domain` only when it is
+/// known.
+async fn resolve_endpoint(
+    cli: &Cli,
+    cfg: &Config,
+) -> Result<(SocketAddr, PubKey, Option<String>), String> {
     match sqex_discovery::target::resolve(&layers(cli, cfg)).map_err(|e| e.to_string())? {
-        sqex_discovery::Target::Direct { address, key } => Ok((resolve(&address)?, key)),
+        sqex_discovery::Target::Direct { address, key } => Ok((resolve(&address)?, key, None)),
         sqex_discovery::Target::Discover(domain) => {
             let found = sqex_discovery::discover(&domain)
                 .await
@@ -1433,7 +1886,7 @@ async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), Strin
                     found.key
                 );
             }
-            Ok((resolve(&found.address)?, found.key))
+            Ok((resolve(&found.address)?, found.key, Some(domain)))
         }
     }
 }
@@ -1444,32 +1897,16 @@ async fn endpoint(cli: &Cli, cfg: &Config) -> Result<(SocketAddr, PubKey), Strin
 /// is not one either: this used to parse straight to a `SocketAddr`, which
 /// accepts only an IP, so `sqex --server ex.example.com` failed with a message
 /// about the address being bad when it was perfectly good.
+/// Turn a `host:port` into something dialable. One copy of this lives in
+/// `sqex-discovery`, which owns addresses and the default port.
 fn resolve(address: &str) -> Result<SocketAddr, String> {
-    if let Ok(socket) = address.parse::<SocketAddr>() {
-        return Ok(socket);
-    }
-    let with_port = if address.starts_with('[') || !has_port(address) {
-        format!("{address}:{}", sqex_discovery::DEFAULT_PORT)
-    } else {
-        address.to_string()
-    };
-    std::net::ToSocketAddrs::to_socket_addrs(&with_port)
-        .map_err(|e| format!("cannot resolve {address:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{address:?} resolved to no addresses"))
-}
-
-/// Whether a trailing `:port` is present, leaving IPv6 literals alone.
-fn has_port(address: &str) -> bool {
-    !address.starts_with('[')
-        && address
-            .rsplit_once(':')
-            .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
+    sqex_discovery::resolve_addr(address)
 }
 
 async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
     match cmd {
         AdminCmd::Whitelist { action } => whitelist(cli, cfg, action).await,
+        AdminCmd::Peer { action } => peer(cli, cfg, action).await,
         AdminCmd::Audit { count } => {
             let v = submit(cli, cfg, vec![Op::AuditTail(*count).to_operation()]).await?;
             print_audit(&result(&v, 0));
@@ -1480,7 +1917,56 @@ async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
             println!("{}", result(&v, 0));
             Ok(())
         }
+        AdminCmd::Name { cmd } => admin_name(cli, cfg, cmd).await,
     }
+}
+
+async fn admin_name(cli: &Cli, cfg: &Config, cmd: &AdminNameCmd) -> Result<(), String> {
+    let op = match cmd {
+        AdminNameCmd::Assign { name, account } => {
+            // Canonicalise before signing, so the summary the operator sees and
+            // signs is the name that will be stored.
+            let name = name::canonical(name).map_err(|e| e.to_string())?;
+            Op::NameAssign {
+                name,
+                account: parse_key(account)?,
+            }
+        }
+        AdminNameCmd::Release { name } => {
+            Op::NameRelease(name::canonical(name).map_err(|e| e.to_string())?)
+        }
+        AdminNameCmd::List => Op::NameList,
+    };
+    let v = submit(cli, cfg, vec![op.to_operation()]).await?;
+    match cmd {
+        AdminNameCmd::List => {
+            let r = result(&v, 0);
+            let names = r["names"].as_array().cloned().unwrap_or_default();
+            if names.is_empty() {
+                println!("no names bound");
+            }
+            for n in names {
+                let expires = n["expires_at"].as_u64().unwrap_or(0);
+                println!(
+                    "{}\t{}\t{}{}",
+                    n["name"].as_str().unwrap_or("?"),
+                    n["account"].as_str().unwrap_or("?"),
+                    if n["admin_set"].as_bool().unwrap_or(false) {
+                        "assigned"
+                    } else {
+                        "claimed"
+                    },
+                    if expires == 0 {
+                        String::new()
+                    } else {
+                        format!(" (expires_at {expires})")
+                    },
+                );
+            }
+        }
+        _ => println!("ok: {}", v["results"]),
+    }
+    Ok(())
 }
 
 async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
@@ -1563,6 +2049,65 @@ async fn whitelist(cli: &Cli, cfg: &Config, action: &WhitelistCmd) -> Result<(),
         _ => println!("ok: {}", v["results"]),
     }
     Ok(())
+}
+
+async fn peer(cli: &Cli, cfg: &Config, action: &PeerCmd) -> Result<(), String> {
+    let ops: Vec<Operation> = match action {
+        PeerCmd::List => vec![Op::PeerList.to_operation()],
+        PeerCmd::Add { keys, label } => keyed_ops(keys, |key| Op::PeerAdd {
+            key,
+            label: label.clone(),
+        })?,
+        PeerCmd::Remove { keys } => keyed_ops(keys, Op::PeerRemove)?,
+    };
+    let v = submit(cli, cfg, ops).await?;
+    match action {
+        PeerCmd::List => print_peers(&result(&v, 0)),
+        _ => println!("ok: {}", v["results"]),
+    }
+    Ok(())
+}
+
+fn print_peers(v: &serde_json::Value) {
+    let peers = v["peers"].as_array().cloned().unwrap_or_default();
+    if peers.is_empty() {
+        // Said rather than shown as an empty list: an exchange with no peers
+        // refuses every cross-exchange call, and that is worth stating.
+        println!("no relay peers — this exchange federates with nobody");
+        return;
+    }
+    println!("{} relay peer(s):", peers.len());
+    for p in &peers {
+        let key = p["key"].as_str().unwrap_or("?");
+        let label = p["label"].as_str().unwrap_or("");
+        println!("  {key}  {}", provenance(p["added_by"].as_str(), label));
+    }
+}
+
+/// How a peer came to be on the list, as one readable clause.
+///
+/// A seeded entry has no admin and carries "seed" as its label, so the obvious
+/// rendering said the same word twice — `seed  (added by seed)`. The two are
+/// different facts and deserve different sentences: nobody signed for a seeded
+/// peer, and saying so is the point. It also happens to be the operationally
+/// interesting half — a seeded peer is not in the state file yet, so a restart
+/// re-seeds it from config.
+fn provenance(added_by: Option<&str>, label: &str) -> String {
+    match added_by {
+        Some(admin) if label.is_empty() => format!("(added by {admin})"),
+        Some(admin) => format!("({label}, added by {admin})"),
+        None => "(seeded from config, not signed for)".to_string(),
+    }
+}
+
+/// Build one op per key, for the batches that are just a list of keys.
+fn keyed_ops(keys: &[String], make: impl Fn(PubKey) -> Op) -> Result<Vec<Operation>, String> {
+    if keys.is_empty() {
+        return Err("give at least one key".into());
+    }
+    keys.iter()
+        .map(|k| Ok(make(parse_key(k)?).to_operation()))
+        .collect()
 }
 
 fn add_ops(keys: &[String], label: &Option<String>) -> Result<Vec<Operation>, String> {
@@ -1723,4 +2268,31 @@ fn parse_key(s: &str) -> Result<PubKey, String> {
 /// An environment variable's value, or None if unset or empty.
 fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+// `name@domain` classification lives in `sqex_proto::name::classify`, shared by
+// the CLI, chat, and voice clients; its tests are there.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first run of `admin peer list` against a real exchange printed
+    /// `seed  (added by seed)` — the label and the fallback saying the same
+    /// word. A seeded peer and an administered one are different facts.
+    #[test]
+    fn a_seeded_peer_reads_differently_from_an_administered_one() {
+        assert_eq!(
+            provenance(None, "seed"),
+            "(seeded from config, not signed for)",
+            "a seeded peer must not claim an administrator added it"
+        );
+        assert_eq!(
+            provenance(Some("HR2vxdPD"), "indra.org"),
+            "(indra.org, added by HR2vxdPD)"
+        );
+        // An administrator who gave no label still gets named, without a
+        // stray comma where the label would have been.
+        assert_eq!(provenance(Some("HR2vxdPD"), ""), "(added by HR2vxdPD)");
+    }
 }

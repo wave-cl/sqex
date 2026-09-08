@@ -298,6 +298,19 @@ impl Trouble {
     }
 }
 
+/// An answer with more than one item in it: who is here, who has read, who is
+/// blocked.
+///
+/// Held as its own rows rather than one joined string. Joining is what put a
+/// list on the status line in the first place, and a reader who cannot see the
+/// separators cannot see where one entry ends and the next begins.
+pub struct Listing {
+    /// What was asked, so a reader arriving at a screen of keys knows which
+    /// question they are looking at the answer to.
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
 /// One row of a directory search.
 pub struct Found {
     pub channel: [u8; 32],
@@ -361,6 +374,28 @@ pub struct App {
     pub has_avatar: bool,
     /// The command list is on screen, over the transcript.
     pub helping: bool,
+    /// An answer too long for the status line, on screen over the transcript.
+    ///
+    /// `/who` in a channel of twenty-two put twenty-two names and their keys
+    /// into a one-row status area, which drew the first line's worth and
+    /// dropped the rest without a word. A list is not a sentence and does not
+    /// belong on a line: it goes here, where it wraps, scrolls, and says how
+    /// much is below — the same treatment the command list already gets.
+    pub listing: Option<Listing>,
+    /// How far down the command list **or a listing** the reader has scrolled,
+    /// in lines.
+    ///
+    /// One field for both because they are one view: only ever one of them is
+    /// on screen, both are opened by a command and closed by `Esc`, and a
+    /// second scroll position would only be a second thing to reset. Like
+    /// [`scroll`](Self::scroll), this is a wish that the renderer clamps and
+    /// hands back, so a held key cannot wind it up for ever against a short
+    /// list.
+    ///
+    /// The list outgrew a screen — and until it scrolled, it simply clipped:
+    /// adding one command silently pushed the last one off the bottom, where
+    /// nothing said it had gone.
+    pub help_scroll: usize,
     /// What a search turned up, and what was searched for. A view over the
     /// transcript, like the directory and the command list.
     pub hits: Vec<Hit>,
@@ -452,6 +487,24 @@ pub struct App {
 pub const REACTIONS: &[&str] = &["👍", "🎉", "🧡", "😂", "🤔", "👀"];
 
 impl App {
+    /// Whether a scrolling view is over the transcript.
+    ///
+    /// The command list and a listing are the same kind of thing to everything
+    /// that has to know: both are modal, both scroll on the same field, both
+    /// close on `Esc`, and while either is up the transcript underneath must
+    /// not act on the keys that move it.
+    pub fn overlay(&self) -> bool {
+        self.helping || self.listing.is_some()
+    }
+
+    /// Put a scrolling view away, whichever one is up, and open the next at the
+    /// top rather than wherever the last was left.
+    pub fn close_overlay(&mut self) {
+        self.helping = false;
+        self.listing = None;
+        self.help_scroll = 0;
+    }
+
     pub fn selected_row(&self) -> Option<&Row> {
         self.rows.iter().find(|r| Some(r.channel) == self.selected)
     }
@@ -676,6 +729,10 @@ impl Drawn {
 }
 
 pub fn draw(f: &mut Frame, app: &App) -> Drawn {
+    // Asked for before the layout, because the status area's height depends on
+    // what is in it. A fixed single row is what silently ate every answer
+    // longer than the terminal is wide.
+    let status_h = status_rows(app, f.area().width as usize);
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -684,7 +741,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Drawn {
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(status_h),
         ])
         .split(f.area());
 
@@ -1321,8 +1378,10 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
     // The views that are not the conversation have nothing to hover: no rows
     // of theirs belong to a message.
     if app.helping {
-        help(f, area);
-        return Drawn::default();
+        return help(f, area, app.help_scroll);
+    }
+    if let Some(l) = &app.listing {
+        return listing(f, area, l, app.help_scroll);
     }
     if app.searching {
         results(f, app, area);
@@ -1688,6 +1747,19 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "calls",
+        &[
+            (
+                "/call  /answer",
+                "ring everyone here; take it — sqex-voice joins the audio",
+            ),
+            (
+                "/decline  /busy  /hangup",
+                "refuse it, or end it — each one is recorded",
+            ),
+        ],
+    ),
+    (
         "finding things",
         &[("/search <text>", "find it in this conversation")],
     ),
@@ -1721,7 +1793,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
 /// forty of these. It was the only list there was, and at eighty columns the
 /// end of it was simply cut off — so the commands that fell off were
 /// undiscoverable and nothing said so.
-fn help(f: &mut Frame, area: Rect) {
+fn help(f: &mut Frame, area: Rect, scroll: usize) -> Drawn {
     let dim = Style::default().fg(palette::MUTED);
     let key = Style::default().fg(palette::ATTENTION);
     let head = Style::default().fg(palette::ACCENT);
@@ -1789,8 +1861,97 @@ fn help(f: &mut Frame, area: Rect) {
         }
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled("  Esc to go back", dim)));
-    f.render_widget(Paragraph::new(lines), area);
+    scrolled(f, area, lines, scroll)
+}
+
+/// Draw `lines` into `area` as a scrolling modal view, with a footer saying how
+/// to move and how much is below.
+///
+/// Shared by the command list and by a listing, because the thing that made the
+/// command list wrong was not what was in it: a fixed pane that clips in
+/// silence deforms whatever is written into it. One of these, used by both, is
+/// what stops the next long answer being clipped again.
+fn scrolled(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>, scroll: usize) -> Drawn {
+    let dim = Style::default().fg(palette::MUTED);
+    // The footer sits outside the scrolled body, or the one line telling
+    // somebody how to scroll would be the first thing to scroll away.
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let (body, foot) = (split[0], split[1]);
+
+    let room = body.height as usize;
+    let total = lines.len();
+    // What the reader asked for, against what there is. Clamped here and handed
+    // back, the way the transcript's own scroll is.
+    let furthest = total.saturating_sub(room);
+    let at = scroll.min(furthest);
+    f.render_widget(Paragraph::new(lines).scroll((at as u16, 0)), body);
+
+    // Say that there is more, and how to reach it. A list that clipped in
+    // silence is what this replaced — so the line that says so must not clip
+    // either, and it did: at eighty columns the transcript pane is fifty wide,
+    // and "more below" fell off the end of its own warning.
+    //
+    // Ordered by what a reader loses most by not seeing, and a group is shown
+    // whole or not at all — the same rule the key hints follow. How much is
+    // below is the fact; how to leave is next; which keys scroll is the part
+    // that can go, since ↑↓ is the first thing anybody tries.
+    let mut groups: Vec<String> = Vec::new();
+    match furthest.saturating_sub(at) {
+        _ if furthest == 0 => {}
+        0 => {}
+        more => groups.push(format!("{more} more below")),
+    }
+    groups.push("Esc to go back".to_string());
+    if furthest > 0 {
+        groups.push("↑↓ ^U ^D to scroll".to_string());
+    }
+    let mut hint = String::new();
+    for g in &groups {
+        let sep = if hint.is_empty() { "  " } else { "    " };
+        if hint.chars().count() + sep.len() + g.chars().count() > foot.width as usize {
+            break;
+        }
+        hint += sep;
+        hint += g;
+    }
+    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, dim))), foot);
+
+    Drawn {
+        pane: area,
+        rows: Vec::new(),
+        scroll: at,
+        total,
+        room,
+    }
+}
+
+/// A multi-item answer, one item to a row.
+///
+/// Each entry is wrapped here rather than by `Paragraph`, so that an entry too
+/// wide for the pane — a name and a whole 44-character key, which is exactly
+/// what `/who` produces — continues on the next row instead of being cut. The
+/// continuation is indented, so a reader can still see where one entry ends.
+fn listing(f: &mut Frame, area: Rect, l: &Listing, scroll: usize) -> Drawn {
+    let dim = Style::default().fg(palette::MUTED);
+    let head = Style::default().fg(palette::ACCENT);
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = vec![
+        Line::from(Span::styled(l.title.clone(), head)),
+        Line::from(""),
+    ];
+    for entry in &l.lines {
+        for (n, row) in wrap_to(entry, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let indent = if n == 0 { "  " } else { "    " };
+            lines.push(Line::from(Span::styled(format!("{indent}{row}"), dim)));
+        }
+    }
+    scrolled(f, area, lines, scroll)
 }
 
 /// The directory, numbered so `/join <n>` can act on it.
@@ -1901,13 +2062,53 @@ fn keys_line(width: usize, scrollable: bool) -> String {
     out
 }
 
+/// The most rows the status area may take before it starts cutting.
+///
+/// It has to have a limit — the transcript is the point of the screen and a
+/// long refusal should not swallow it — but the limit is four rather than the
+/// one it was, because one row could not hold a sentence. At eighty columns
+/// four rows is around three hundred characters, which is every answer this
+/// client gives that is not a list; lists go to [`Listing`] instead.
+const STATUS_MAX: usize = 4;
+
+/// How many rows the status area needs at this width, up to [`STATUS_MAX`].
+///
+/// Measured with the same wrapper that draws it, so what is allocated and what
+/// is rendered agree. They did not before: the area was one row and the text
+/// was handed to a `Paragraph` that does not wrap, so everything past the first
+/// row's worth was dropped without a mark. The note telling somebody how to
+/// join a call they had just placed ended, on screen, mid-clause.
+fn status_rows(app: &App, width: usize) -> u16 {
+    let (text, _) = status_text(app, width);
+    wrap_to(&text, width).len().clamp(1, STATUS_MAX) as u16
+}
+
 fn status(f: &mut Frame, app: &App, area: Rect) {
+    let width = area.width as usize;
+    let (text, style) = status_text(app, width);
+    let mut rows = wrap_to(&text, width);
+    // Still too long for the space it is allowed. Cut, but say so: an ellipsis
+    // is the difference between an answer the reader knows is incomplete and
+    // one they believe they have read.
+    if rows.len() > STATUS_MAX {
+        rows.truncate(STATUS_MAX);
+        if let Some(last) = rows.last_mut() {
+            while UnicodeWidthStr::width(last.as_str()) + 1 > width && !last.is_empty() {
+                last.pop();
+            }
+            last.push('…');
+        }
+    }
+    f.render_widget(Paragraph::new(rows.join("\n")).style(style), area);
+}
+
+fn status_text(app: &App, width: usize) -> (String, Style) {
     // Anything the client has to say outranks every hint, including the
     // mode's own. `c` in pick mode copies a key and the answer — whether it
     // reached a clipboard at all — arrives this way; behind the hints it was
     // invisible, so a copy that silently failed looked exactly like one that
     // worked, and the difference is only discovered at the paste.
-    let (text, style) = if !app.trouble.is_quiet() {
+    if !app.trouble.is_quiet() {
         (
             format!(" {}", app.trouble.line()),
             Style::default().fg(palette::ATTENTION),
@@ -1947,11 +2148,10 @@ fn status(f: &mut Frame, app: &App, area: Rect) {
         )
     } else {
         (
-            keys_line(area.width as usize, app.scrollable),
+            keys_line(width, app.scrollable),
             Style::default().fg(palette::MUTED),
         )
-    };
-    f.render_widget(Paragraph::new(text).style(style), area);
+    }
 }
 
 /// Wall-clock time of day, UTC, from a Unix timestamp.
@@ -4327,7 +4527,10 @@ mod tests {
     fn help_lists_the_commands_and_the_keys() {
         let mut app = sample();
         app.helping = true;
-        let out = render(&app, 110, 40);
+        // Tall enough for the whole list: this asserts what the help *says*,
+        // not what one screenful of it shows. Whether it fits is the scrolling
+        // test's business, below.
+        let out = render(&app, 110, 80);
         // A sample from each section, and the keys that are not commands at
         // all — which were the least discoverable thing in the client.
         for want in [
@@ -4340,6 +4543,143 @@ mod tests {
         assert!(
             !out.contains("are you there?"),
             "the transcript showed through"
+        );
+    }
+
+    /// The list outgrew a screen, and until it scrolled it simply clipped:
+    /// adding a command pushed the last one off the bottom with nothing saying
+    /// so. Now the bottom is reachable, and the footer says it is there.
+    /// The status area was one row and did not wrap, so every answer longer
+    /// than the terminal is wide lost its tail without a mark. This is the
+    /// note a caller gets, which ended on screen at "on the call in the".
+    #[test]
+    fn a_long_answer_is_not_cut_off_by_the_status_line() {
+        let mut app = sample();
+        app.trouble.message = Some(
+            "calling — every device here is ringing. This client carries no audio; the \
+             join command is on the call in the transcript"
+                .into(),
+        );
+        let out = render(&app, 80, 24);
+        assert!(
+            out.contains("on the call in the transcript"),
+            "the end of the answer was cut off:\n{out}"
+        );
+    }
+
+    /// And when even four rows will not hold it, the cut is visible rather
+    /// than silent.
+    #[test]
+    fn an_answer_too_long_for_the_status_area_says_it_was_cut() {
+        let mut app = sample();
+        app.trouble.message = Some("word ".repeat(200));
+        let out = render(&app, 80, 24);
+        assert!(out.contains('…'), "a cut answer must say so:\n{out}");
+    }
+
+    /// `/who` in a channel of twenty-two: every entry has to be reachable, and
+    /// the view has to say when some are not on screen yet.
+    #[test]
+    fn a_listing_shows_every_entry_and_says_what_is_below() {
+        let mut app = sample();
+        let lines: Vec<String> = (0..22).map(|n| format!("member{n:02}")).collect();
+        app.listing = Some(Listing {
+            title: "who is here — 22".into(),
+            lines,
+        });
+
+        let top = render(&app, 80, 16);
+        assert!(top.contains("who is here — 22"), "{top}");
+        assert!(top.contains("member00"), "{top}");
+        assert!(
+            top.contains("more below"),
+            "a clipped listing must say there is more:\n{top}"
+        );
+        assert!(
+            !top.contains("member21"),
+            "the last entry should be past the fold at this height:\n{top}"
+        );
+
+        app.help_scroll = usize::MAX;
+        let end = render(&app, 80, 16);
+        assert!(
+            end.contains("member21"),
+            "scrolling must reach the last entry:\n{end}"
+        );
+        assert!(
+            !end.contains("more below"),
+            "nothing is below the end:\n{end}"
+        );
+    }
+
+    /// A name and a whole 44-character key is wider than a narrow pane. It
+    /// wraps; it does not lose its tail. Reading a key off the screen is the
+    /// entire reason `/who` prints the whole thing.
+    #[test]
+    fn a_listing_entry_wider_than_the_pane_wraps_whole() {
+        let mut app = sample();
+        let key = "13Ku4n95k8Tu8cpTu5F7apfjQGdLjMCmNAUFaskArxQk";
+        app.listing = Some(Listing {
+            title: "who is here — 1".into(),
+            lines: vec![format!("Eve Hartley {key}")],
+        });
+        // 70 columns: a 30-column sidebar leaves the pane 40 wide, and the
+        // entry is 56 characters.
+        let out = render(&app, 70, 16);
+        assert!(out.contains("Eve Hartley"), "{out}");
+        // Everything the frame puts between the fragments is removed — the
+        // row padding, the line breaks and the sidebar's own border — so what
+        // is left is the characters of the answer. None of them may be gone.
+        let flat: String = out
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect();
+        assert!(
+            flat.contains(key),
+            "the key must survive wrapping whole:\n{out}"
+        );
+    }
+
+    #[test]
+    fn one_view_at_a_time_and_esc_puts_it_away() {
+        let mut app = sample();
+        app.helping = true;
+        app.help_scroll = 7;
+        assert!(app.overlay());
+        app.close_overlay();
+        assert!(!app.overlay());
+        assert_eq!(app.help_scroll, 0, "the next view opens at the top");
+    }
+
+    #[test]
+    fn help_scrolls_to_what_does_not_fit() {
+        let mut app = sample();
+        app.helping = true;
+
+        // Short enough that the end of the list is past the fold.
+        let top = render(&app, 110, 24);
+        assert!(top.contains("keys"), "the head should be visible:\n{top}");
+        assert!(
+            top.contains("more below"),
+            "a clipped list must say there is more:\n{top}"
+        );
+        let tail = "/whoami";
+        assert!(
+            !top.contains(tail),
+            "{tail} should be past the fold at this height:\n{top}"
+        );
+
+        // Asking for more than there is lands at the bottom, and the bottom is
+        // where the last of the list is.
+        app.help_scroll = usize::MAX;
+        let end = render(&app, 110, 24);
+        assert!(
+            end.contains(tail),
+            "scrolling to the end should reach {tail}:\n{end}"
+        );
+        assert!(
+            !end.contains("more below"),
+            "nothing is below the end:\n{end}"
         );
     }
 
