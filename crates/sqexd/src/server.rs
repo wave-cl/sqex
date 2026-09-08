@@ -1801,10 +1801,12 @@ async fn route(
             (None, _) => no_identity("reading a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
-                match server
-                    .channels
-                    .info(&me, &device.unwrap_or(me), &req.channel)
-                {
+                match server.channels.info(
+                    &me,
+                    &device.unwrap_or(me),
+                    &req.channel,
+                    server.welcome.as_ref(),
+                ) {
                     Ok(info) => (200, "application/octet-stream", info.encode()),
                     Err(e) => refused(e),
                 }

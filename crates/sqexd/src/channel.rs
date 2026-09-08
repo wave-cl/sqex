@@ -1878,11 +1878,18 @@ impl Channels {
     /// An admin need not be a member of a public channel, where the role is
     /// durable — and one deciding whether to close a room should be able to see
     /// who is in it first.
+    /// What a member may know about a channel.
+    ///
+    /// `welcome` is the configured welcome channel, if there is one. Passed in
+    /// rather than held here for the same reason `share_a_channel` takes its
+    /// exclusion: which channel is the front room is the server's
+    /// configuration, not a property of the store.
     pub fn info(
         &self,
         caller: &PubKey,
         device: &PubKey,
         channel: &[u8; 32],
+        welcome: Option<&[u8; 32]>,
     ) -> Result<ChannelInfo, ChannelError> {
         let db = self.db.lock().unwrap();
         let (visibility, epoch, retention, _) = channel_row(&db, channel)?;
@@ -1907,14 +1914,41 @@ impl Channels {
             .map_err(storage("read high water"))?
             .unwrap_or(0) as u64;
 
-        let mut stmt = db
-            .prepare(
-                "SELECT account, role, joined FROM member
-                 WHERE channel = ?1 AND present = 1 ORDER BY account ASC",
-            )
-            .map_err(storage("prepare members"))?;
+        // **In the welcome channel, the roster is who has taken part.**
+        //
+        // Everywhere else membership is a deliberate act — `join` on a public
+        // channel, an admin's invitation on a private one — so the roster is a
+        // list of people who chose to be listed. The welcome channel is the one
+        // exception: the exchange seats every account that connects, without
+        // asking and with nobody to sign for it, so its roster was the list of
+        // every account this exchange has ever seen. `/channel/info` on it was
+        // the only primitive here that handed over the whole user set in one
+        // request.
+        //
+        // So somebody who merely arrived is not listed; somebody who has
+        // spoken, or who holds the admin role, is. That keeps the answer
+        // truthful about what it reports — the count matches the list, and both
+        // describe the room rather than the exchange — and it costs a lurker
+        // their visibility in one channel, which is the trade being made.
+        //
+        // The same reasoning already excludes this channel from
+        // `share_a_channel`: "everybody is in it, so counting it would leave a
+        // withheld profile withheld from nobody". A channel that does not count
+        // towards knowing somebody should not be the thing that says who
+        // everybody is.
+        let participants = welcome == Some(channel);
+        let sql = if participants {
+            "SELECT account, role, joined FROM member
+             WHERE channel = ?1 AND present = 1 AND (posted = 1 OR role = 1 OR account = ?2)
+             ORDER BY account ASC"
+        } else {
+            "SELECT account, role, joined FROM member
+             WHERE channel = ?1 AND present = 1 AND (?2 IS NOT NULL OR ?2 IS NULL)
+             ORDER BY account ASC"
+        };
+        let mut stmt = db.prepare(sql).map_err(storage("prepare members"))?;
         let members = stmt
-            .query_map(params![&channel[..]], |r| {
+            .query_map(params![&channel[..], caller.as_bytes()], |r| {
                 Ok(Member {
                     account: PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
                     role: Role::from_u8(r.get::<_, i64>(1)? as u8).unwrap_or(Role::Member),

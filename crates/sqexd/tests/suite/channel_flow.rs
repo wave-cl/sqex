@@ -26,6 +26,56 @@ use crate::common::{Signer, instance_for};
 use sqex_proto::entry_sig::GENESIS;
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    server_named(dir, "", None).await
+}
+
+/// A server with a welcome channel, whose first admin is `founder`.
+async fn server_welcoming(
+    dir: &Path,
+    name: &str,
+    founder: &PubKey,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    server_named(dir, name, Some(founder)).await
+}
+
+async fn server_named(
+    dir: &Path,
+    welcome: &str,
+    founder: Option<&PubKey>,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    let admins = founder
+        .map(|f| format!("{:?}", f.to_string()))
+        .unwrap_or_default();
+    let key_path = dir.join("host_key");
+    if !key_path.exists() {
+        let (server_sk, _) = squic::generate_keypair();
+        std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    }
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{admins}]\n\
+         welcome_channel = {welcome:?}\n",
+        key_path.to_string_lossy(),
+        dir.join("sqex.state").to_string_lossy(),
+    );
+    let config_path = dir.join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let bound = sqexd::bind(config, Some(config_path), signing_key)
+        .await
+        .unwrap();
+    let addr = bound.local_addr;
+    let server_pub = bound.public_key.to_bytes();
+    let handle = tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+    (addr, server_pub, handle)
+}
+
+#[allow(dead_code)]
+async fn server_in_unused(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     if !key_path.exists() {
         let (server_sk, _) = squic::generate_keypair();
@@ -1258,4 +1308,121 @@ async fn retention_outside_the_permitted_range_is_refused_by_retain_too() {
 
     let info = ChannelInfo::decode(&info(&mut a.client, channel).await.1).unwrap();
     assert_eq!(info.retention_secs, 3600, "a refused change took effect");
+}
+
+/// **The welcome channel's roster is who has taken part, not who has arrived.**
+///
+/// The exchange seats every account that connects into its front room, without
+/// asking and with nobody to sign for it. That made `/channel/info` on it the
+/// one primitive here that handed over the exchange's whole user set in a
+/// single request, to anybody who could connect — which is anybody.
+///
+/// Somebody who merely arrived is not listed. Somebody who has spoken is, and
+/// so is an admin, who moderates the room and needs to see it.
+#[tokio::test]
+async fn the_welcome_channel_lists_who_has_taken_part_not_who_has_arrived() {
+    let dir = tempfile::tempdir().unwrap();
+    let founder_seed = [80u8; 32];
+    let founder = PubKey::new(
+        SigningKey::from_bytes(&founder_seed)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let (addr, pubkey, _h) = server_welcoming(dir.path(), "lobby", &founder).await;
+
+    // Connecting is all it takes to be seated. Each makes one request so the
+    // welcome actually runs for them.
+    let mut host = as_identity(addr, pubkey, founder_seed).await;
+    let mut talker = as_identity(addr, pubkey, [81u8; 32]).await;
+    let mut lurker = as_identity(addr, pubkey, [82u8; 32]).await;
+    for p in [&mut host, &mut talker, &mut lurker] {
+        let _ = p
+            .client
+            .post(
+                "/channel/mine",
+                List {
+                    offset: 0,
+                    query: String::new(),
+                }
+                .encode(),
+            )
+            .await;
+    }
+
+    let (_, body) = host
+        .client
+        .post(
+            "/channel/list",
+            List {
+                offset: 0,
+                query: "lobby".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    let lobby = Listing::decode(&body)
+        .unwrap()
+        .channels
+        .first()
+        .expect("the lobby should be in the directory")
+        .channel;
+
+    // One of them speaks.
+    assert_eq!(post(&mut talker, lobby, b"hello everybody").await.0, 200);
+
+    let (code, body) = lurker
+        .client
+        .post(
+            "/channel/info",
+            ByChannel { channel: lobby }.encode(TYPE_INFO),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let info = ChannelInfo::decode(&body).unwrap();
+    let listed: Vec<PubKey> = info.members.iter().map(|m| m.account).collect();
+
+    assert!(
+        listed.contains(&talker.signer.account),
+        "somebody who spoke is in the room"
+    );
+    assert!(
+        listed.contains(&founder),
+        "and so is the admin, who moderates it"
+    );
+    assert!(
+        listed.contains(&lurker.signer.account),
+        "a caller always sees themselves, or the room looks like one they are not in"
+    );
+
+    // The point: a further account that only ever connected is not disclosed.
+    // Before this, `/channel/info` here enumerated the exchange.
+    let mut quiet = as_identity(addr, pubkey, [83u8; 32]).await;
+    let _ = quiet
+        .client
+        .post(
+            "/channel/mine",
+            List {
+                offset: 0,
+                query: String::new(),
+            }
+            .encode(),
+        )
+        .await;
+
+    let (_, body) = lurker
+        .client
+        .post(
+            "/channel/info",
+            ByChannel { channel: lobby }.encode(TYPE_INFO),
+        )
+        .await
+        .unwrap();
+    let after = ChannelInfo::decode(&body).unwrap();
+    let listed: Vec<PubKey> = after.members.iter().map(|m| m.account).collect();
+    assert!(
+        !listed.contains(&quiet.signer.account),
+        "an account that only arrived must not be disclosed by the front room"
+    );
 }

@@ -916,7 +916,7 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         "the message did not survive the copy"
     );
     let seen = whole
-        .info(&bob, &bob, &channel)
+        .info(&bob, &bob, &channel, None)
         .expect("the joiner was not derived as a member");
     assert_eq!(seen.members.len(), 2);
     assert!(
