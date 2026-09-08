@@ -2080,13 +2080,23 @@ fn print_peers(v: &serde_json::Value) {
     for p in &peers {
         let key = p["key"].as_str().unwrap_or("?");
         let label = p["label"].as_str().unwrap_or("");
-        let by = p["added_by"].as_str().unwrap_or("seed");
-        let label = if label.is_empty() {
-            String::new()
-        } else {
-            format!("  {label}")
-        };
-        println!("  {key}{label}  (added by {by})");
+        println!("  {key}  {}", provenance(p["added_by"].as_str(), label));
+    }
+}
+
+/// How a peer came to be on the list, as one readable clause.
+///
+/// A seeded entry has no admin and carries "seed" as its label, so the obvious
+/// rendering said the same word twice — `seed  (added by seed)`. The two are
+/// different facts and deserve different sentences: nobody signed for a seeded
+/// peer, and saying so is the point. It also happens to be the operationally
+/// interesting half — a seeded peer is not in the state file yet, so a restart
+/// re-seeds it from config.
+fn provenance(added_by: Option<&str>, label: &str) -> String {
+    match added_by {
+        Some(admin) if label.is_empty() => format!("(added by {admin})"),
+        Some(admin) => format!("({label}, added by {admin})"),
+        None => "(seeded from config, not signed for)".to_string(),
     }
 }
 
@@ -2262,3 +2272,27 @@ fn env_nonempty(key: &str) -> Option<String> {
 
 // `name@domain` classification lives in `sqex_proto::name::classify`, shared by
 // the CLI, chat, and voice clients; its tests are there.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first run of `admin peer list` against a real exchange printed
+    /// `seed  (added by seed)` — the label and the fallback saying the same
+    /// word. A seeded peer and an administered one are different facts.
+    #[test]
+    fn a_seeded_peer_reads_differently_from_an_administered_one() {
+        assert_eq!(
+            provenance(None, "seed"),
+            "(seeded from config, not signed for)",
+            "a seeded peer must not claim an administrator added it"
+        );
+        assert_eq!(
+            provenance(Some("HR2vxdPD"), "indra.org"),
+            "(indra.org, added by HR2vxdPD)"
+        );
+        // An administrator who gave no label still gets named, without a
+        // stray comma where the label would have been.
+        assert_eq!(provenance(Some("HR2vxdPD"), ""), "(added by HR2vxdPD)");
+    }
+}
