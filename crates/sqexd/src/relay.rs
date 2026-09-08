@@ -144,7 +144,6 @@ struct RelayInner {
     /// What a domain resolved to, for as long as its link lives. Dropped with
     /// the link, so it cannot go stale on its own.
     domains: HashMap<String, PubKey>,
-    next_seq: u64,
 }
 
 /// SIP-39 relay state: the peer allowlist, the bridge ceiling, and the live
@@ -182,9 +181,27 @@ impl Relay {
         self.inner.lock().unwrap().bridges.len()
     }
 
+    /// A fresh local id for a bridged session.
+    ///
+    /// Random rather than sequential. The authorization check in
+    /// [`close_bridge`] is what makes an id unusable by a stranger, and this is
+    /// the second layer: a counter from 1 meant every live bridge on the
+    /// exchange could be named by guessing a small number, so one missing check
+    /// exposed all of them at once rather than one of them.
     fn next_session(inner: &mut RelayInner) -> u64 {
-        inner.next_seq += 1;
-        BRIDGE_BIT | inner.next_seq
+        loop {
+            let n = rand::RngCore::next_u64(&mut rand::rng()) & !BRIDGE_BIT;
+            // Never 0: a zero session id means "not established yet" on a
+            // `BridgeRec`, and minting one would make an unestablished bridge
+            // indistinguishable from an established one.
+            if n == 0 {
+                continue;
+            }
+            let id = BRIDGE_BIT | n;
+            if !inner.by_session.contains_key(&id) {
+                return id;
+            }
+        }
     }
 }
 
@@ -483,7 +500,7 @@ pub fn decline(server: &Server, device: PubKey, bridge: relay::Bridge, reason: u
 
 /// Tear down a bridged session and tell the peer. Returns false if the id is
 /// not a bridge, so the caller can fall through to the local close path.
-pub fn close_bridge(server: &Server, session_id: u64) -> bool {
+pub fn close_bridge(server: &Server, me: PubKey, session_id: u64) -> bool {
     if session_id & BRIDGE_BIT == 0 {
         return false;
     }
@@ -491,6 +508,25 @@ pub fn close_bridge(server: &Server, session_id: u64) -> bool {
     let Some(bridge) = inner.by_session.get(&session_id).copied() else {
         return true;
     };
+    // **Only a party to the bridge may end it.** This check was missing, and
+    // its absence was worse than it looks: session ids were a counter, so any
+    // identity that could reach the exchange could walk small values and drop
+    // every cross-exchange call on it — and the far side was told
+    // `REASON_ENDED`, which reads as the other party hanging up rather than as
+    // an attack. `decline` and `maybe_divert` in this file both had the check;
+    // this one did not.
+    //
+    // `local` is the party on this side: the caller's device on A's exchange,
+    // the answering device on B's. Device rather than account, matching
+    // `maybe_divert` — the device that took the call is the one on it.
+    let mine = inner.bridges.get(&bridge).is_some_and(|r| r.local == me);
+    if !mine {
+        // Claimed, not refused. Every answer for a bridge id is the same
+        // answer — closed, already gone, and somebody else's — so that
+        // `/session/close` cannot be used to probe which calls are in flight,
+        // the property SIP-39 already requires of `decline`.
+        return true;
+    }
     let peer = inner.bridges.get(&bridge).map(|r| r.peer);
     if let Some(peer) = peer {
         send_control(

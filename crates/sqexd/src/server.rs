@@ -2399,7 +2399,7 @@ async fn route(
             (Some(me), Ok(r)) => {
                 // SIP-39: a bridged session id tears down across the link;
                 // anything else is an ordinary local close.
-                let closed = crate::relay::close_bridge(server, r.session_id)
+                let closed = crate::relay::close_bridge(server, me, r.session_id)
                     || server.sessions.close(&me, r.session_id);
                 (200, "application/octet-stream", vec![u8::from(closed)])
             }

@@ -337,6 +337,129 @@ async fn a_call_to_an_unfederated_domain_is_refused() {
 
 /// Bringing up the two federated exchanges, with Alice on X and Bob on Y, for
 /// the refusal tests below.
+/// **A stranger may not hang up somebody else's call.**
+///
+/// `close_bridge` took a session id and no caller, so any identity that could
+/// reach the exchange could end any bridged call on it — and session ids were a
+/// counter from 1, so all of them could be named by guessing small numbers. The
+/// far side was told `REASON_ENDED`, which reads as the other party hanging up
+/// rather than as an attack.
+#[tokio::test]
+async fn only_a_party_to_a_bridge_may_close_it() {
+    let dir_x = tempfile::tempdir().unwrap();
+    let dir_y = tempfile::tempdir().unwrap();
+    let (xk, x_pub) = identity(190);
+    let (yk, y_pub) = identity(191);
+    let (x_key, y_key) = (SigningKey::from_bytes(&xk), SigningKey::from_bytes(&yk));
+
+    let (y_addr, y_server_pub, y_h) = relay_server(dir_y.path(), &y_key, &[x_pub], &[]).await;
+    let (x_addr, x_server_pub, x_h) =
+        relay_server(dir_x.path(), &x_key, &[y_pub], &[("y.test", y_pub, y_addr)]).await;
+
+    let (a_seed, a_id) = identity(192);
+    let (b_seed, b_id) = identity(193);
+    let (e_seed, _e_id) = identity(194);
+    let (a_eph, a_eph_pub) = ephemeral();
+    let (b_eph, b_eph_pub) = ephemeral();
+
+    let mut alice = Client::connect_as(x_addr, &x_server_pub, &a_seed)
+        .await
+        .unwrap();
+    let mut bob = Client::connect_as(y_addr, &y_server_pub, &b_seed)
+        .await
+        .unwrap();
+    let _bob_events = subscribe(&bob).await;
+
+    // Establish a real bridged call.
+    let target = format!("{b_id}@y.test");
+    assert_eq!(
+        call(&mut alice, &target, a_eph_pub).await.state,
+        CallState::Ringing
+    );
+    let b_ack = open(&mut bob, a_id, b_eph_pub).await;
+    let mut a_ack = call(&mut alice, &target, a_eph_pub).await;
+    for _ in 0..50 {
+        if a_ack.state == CallState::Established {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        a_ack = call(&mut alice, &target, a_eph_pub).await;
+    }
+    assert_eq!(a_ack.state, CallState::Established, "the call connects");
+
+    // Eve — a third identity on Alice's own exchange, party to nothing.
+    let mut eve = Client::connect_as(x_addr, &x_server_pub, &e_seed)
+        .await
+        .unwrap();
+    let (code, body) = eve
+        .post(
+            "/session/close",
+            sqex_proto::session::BySession::close(a_ack.session_id).encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "the route answers rather than erroring");
+    // Uniform: Eve cannot tell a bridge she was not party to from one that was
+    // never there, so /session/close is not a probe for calls in flight.
+    assert_eq!(
+        body,
+        vec![1u8],
+        "every answer for a bridge id is the same answer"
+    );
+
+    // The call is still up: a datagram still crosses both exchanges.
+    let a_sess = Session::derive(&a_seed, &a_eph, &b_id, &a_ack.peer_ephemeral).unwrap();
+    let b_sess = Session::derive(&b_seed, &b_eph, &a_id, &b_ack.peer_ephemeral).unwrap();
+    let audio = b"still talking";
+    let ct = a_sess.seal_datagram(0, audio).unwrap();
+    alice
+        .send_datagram(
+            DatagramFrame {
+                session_id: a_ack.session_id,
+                seq: 0,
+                ciphertext: ct,
+            }
+            .encode(),
+        )
+        .unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), bob.read_datagram())
+        .await
+        .expect("Eve must not have torn the bridge down")
+        .unwrap();
+    let frame = DatagramFrame::decode(&got).unwrap();
+    assert_eq!(b_sess.open(frame.seq, &frame.ciphertext).unwrap(), audio);
+
+    // And Alice, who *is* a party, can still end her own call.
+    let (code, _) = alice
+        .post(
+            "/session/close",
+            sqex_proto::session::BySession::close(a_ack.session_id).encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let ct = a_sess.seal_datagram(1, b"after the hangup").unwrap();
+    alice
+        .send_datagram(
+            DatagramFrame {
+                session_id: a_ack.session_id,
+                seq: 1,
+                ciphertext: ct,
+            }
+            .encode(),
+        )
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), bob.read_datagram())
+            .await
+            .is_err(),
+        "once the party closes it, the bridge really is gone"
+    );
+
+    x_h.abort();
+    y_h.abort();
+}
+
 struct Pair {
     alice: Client,
     bob: Client,
