@@ -491,8 +491,23 @@ impl Chat {
         seed: [u8; 32],
         device: PubKey,
         exchange: PubKey,
-        store: Store,
+        mut store: Store,
     ) -> Chat {
+        // The store is told which exchange it is for here, and only here.
+        // Every row about a channel is scoped by it, because a channel
+        // identifier is not unique across exchanges: a direct message's is
+        // derived from its two accounts, so one conversation has identical
+        // channel bytes everywhere it exists.
+        //
+        // A failure is not fatal and must not be: the scope only fails if the
+        // store cannot be written to at all, and a client that refused to
+        // start over it would be one nobody could use to find out why. It is
+        // reported by the first operation that needs it.
+        // Ignored deliberately, and not fatal: this fails only if the store
+        // cannot be written to at all, and a client that refused to start over
+        // it would be one nobody could use to find out why. The first
+        // operation that needs a scope reports it, in words.
+        let _ = store.scope_to(&exchange);
         let me = store.account().ok().flatten().unwrap_or(device);
         Chat {
             client,

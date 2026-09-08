@@ -57,18 +57,26 @@ CREATE TABLE IF NOT EXISTS contact (
 -- The keys, sealed. Nothing else in this file needs protecting; these are the
 -- conversation.
 CREATE TABLE IF NOT EXISTS channel_key (
+    exchange BLOB   NOT NULL,
     channel BLOB    NOT NULL,
     epoch   INTEGER NOT NULL,
     sealed  BLOB    NOT NULL,
-    PRIMARY KEY (channel, epoch)
+    PRIMARY KEY (exchange, channel, epoch)
 );
 -- SIP-23's pool, made durable. `spent` is as load-bearing as the secret: a
 -- restart that forgot it would forgive a replay this client had already caught.
+-- One pool per exchange. SIP-23's whole value is that a prekey is served
+-- once and destroyed on use; publishing one pool to two exchanges has each of
+-- them serving "the same" one-time key to a different sender, and the
+-- recipient's duplicate check -- SIP-23's own defence -- then fires on a
+-- condition that has become normal.
 CREATE TABLE IF NOT EXISTS prekey (
-    id     INTEGER PRIMARY KEY,
+    exchange BLOB NOT NULL,
+    id     INTEGER NOT NULL,
     kind   INTEGER NOT NULL,
     sealed BLOB,
-    spent  INTEGER NOT NULL DEFAULT 0
+    spent  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (exchange, id)
 );
 -- The conversation itself, decrypted once and kept.
 --
@@ -77,13 +85,14 @@ CREATE TABLE IF NOT EXISTS prekey (
 -- keep is one it can never read again — the entry stays on the exchange and
 -- stays shut. Sealed at rest like the keys, because this is the plaintext.
 CREATE TABLE IF NOT EXISTS message (
+    exchange BLOB   NOT NULL,
     channel BLOB    NOT NULL,
     seq     INTEGER NOT NULL,
     account BLOB    NOT NULL,
     posted  INTEGER NOT NULL,
     kind    INTEGER NOT NULL,
     sealed  BLOB,
-    PRIMARY KEY (channel, seq)
+    PRIMARY KEY (exchange, channel, seq)
 );
 -- Note for whoever adds a column here next: this store is on people's
 -- machines, so `CREATE TABLE IF NOT EXISTS` is no longer enough. It creates
@@ -98,26 +107,31 @@ CREATE TABLE IF NOT EXISTS message (
 -- channel with no name. `label` is the name from that sealed metadata, or a
 -- peer's name for a direct message.
 CREATE TABLE IF NOT EXISTS channel_meta (
-    channel BLOB PRIMARY KEY,
+    exchange BLOB NOT NULL,
+    channel BLOB NOT NULL,
     kind    INTEGER NOT NULL DEFAULT 0,   -- 0 direct message, 1 group
     label   TEXT    NOT NULL DEFAULT '',
-    admins  BLOB    NOT NULL DEFAULT x''  -- concatenated 32-byte accounts
+    admins  BLOB    NOT NULL DEFAULT x'', -- concatenated 32-byte accounts
+    PRIMARY KEY (exchange, channel)
 );
 -- SIP-17's replay set. Not secret — it is a list of counters the exchange
 -- already published in entry headers — so it is stored in the clear.
 CREATE TABLE IF NOT EXISTS seen (
+    exchange BLOB   NOT NULL,
     channel BLOB    NOT NULL,
     device  BLOB    NOT NULL,
     epoch   INTEGER NOT NULL,
     msg_seq INTEGER NOT NULL,
-    PRIMARY KEY (channel, device, epoch, msg_seq)
+    PRIMARY KEY (exchange, channel, device, epoch, msg_seq)
 );
 -- How far we have read, and how far we have counted.
 CREATE TABLE IF NOT EXISTS cursor (
-    channel  BLOB PRIMARY KEY,
+    exchange BLOB NOT NULL,
+    channel  BLOB NOT NULL,
     since    INTEGER NOT NULL DEFAULT 0,
     msg_seq  INTEGER NOT NULL DEFAULT 0,
-    epoch    INTEGER NOT NULL DEFAULT 0
+    epoch    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (exchange, channel)
 );
 -- SIP-31 chain state: where this device stands in each channel.
 --
@@ -127,9 +141,11 @@ CREATE TABLE IF NOT EXISTS cursor (
 -- a fork that reads as its own misconduct. We resume from the greater of this
 -- and what we are told.
 CREATE TABLE IF NOT EXISTS chain (
-    channel   BLOB PRIMARY KEY,
+    exchange  BLOB NOT NULL,
+    channel   BLOB NOT NULL,
     chain_seq INTEGER NOT NULL,
-    head      BLOB    NOT NULL
+    head      BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel)
 );
 -- SIP-32: which incarnation of a channel our state belongs to.
 --
@@ -140,14 +156,16 @@ CREATE TABLE IF NOT EXISTS chain (
 -- something has been fetched. The incarnation says so outright, and says it
 -- before the first thing we sign.
 CREATE TABLE IF NOT EXISTS incarnation (
-    channel  BLOB PRIMARY KEY,
+    exchange BLOB NOT NULL,
+    channel  BLOB NOT NULL,
     instance BLOB NOT NULL,
     -- Set when the incarnation changed under us and we cleared this channel,
     -- and cleared when a poll has reported it. Durable, because a client that
     -- reset and then stopped should still say so when it comes back: the reset
     -- is the whole reason the conversation above the divider is not the one
     -- below it.
-    announce INTEGER NOT NULL DEFAULT 0
+    announce INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (exchange, channel)
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -163,10 +181,12 @@ CREATE TABLE IF NOT EXISTS meta (
 -- its subject, so it is not a secret, and the rows that are secret are sealed
 -- for a reason this one does not share.
 CREATE TABLE IF NOT EXISTS profile (
-    account BLOB PRIMARY KEY,
+    exchange BLOB NOT NULL,
+    account BLOB NOT NULL,
     name    TEXT    NOT NULL DEFAULT '',
     title   TEXT    NOT NULL DEFAULT '',
-    fetched INTEGER NOT NULL DEFAULT 0
+    fetched INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (exchange, account)
 );
 -- SIP-38 handles, cached. The exchange's reverse-lookup of an account's names;
 -- `name` is the bare local part (the domain is the connected exchange's, added
@@ -174,15 +194,241 @@ CREATE TABLE IF NOT EXISTS profile (
 -- account key is the identity, and a handle is the exchange's word, leased and
 -- reclaimable. Empty = asked and told nothing, like `profile`.
 CREATE TABLE IF NOT EXISTS handle (
-    account BLOB PRIMARY KEY,
+    exchange BLOB NOT NULL,
+    account BLOB NOT NULL,
     name    TEXT    NOT NULL DEFAULT '',
-    fetched INTEGER NOT NULL DEFAULT 0
+    fetched INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (exchange, account)
 );
 "#;
 
 pub struct Store {
     db: Connection,
     cipher: ChaCha20Poly1305,
+    /// Every scoped row this store reads and writes belongs to this.
+    ///
+    /// `None` until [`Store::scope_to`] is called.
+    ///
+    /// A channel identifier is **not** unique across exchanges: a direct
+    /// message's is derived from its two accounts, so one conversation has
+    /// identical channel bytes everywhere it exists. Without this column, two
+    /// exchanges' rows for one conversation would share a primary key — which
+    /// is not a merge but a collision, and under SIP-17 a reused counter costs
+    /// the confidentiality of two messages.
+    exchange: Option<PubKey>,
+}
+
+/// Grow an older store to carry an exchange on every row that needs one.
+///
+/// # Why this is a rebuild and not an `ALTER`
+///
+/// The column has to be part of the **primary key**, and SQLite cannot alter
+/// one. So each table is recreated, copied into, and renamed over — all five
+/// inside a single transaction, so the migration either lands whole or not at
+/// all. There is no half-migrated state to recover from, which matters more
+/// here than anywhere else in this codebase: an epoch key arrives sealed
+/// against a one-time prekey, opening it spends the prekey, and the row in
+/// this file is the only copy that will ever exist.
+///
+/// # Why existing rows are not attributed
+///
+/// **This store never recorded which exchange a row came from.** It records
+/// the account and nothing else, so the migration cannot know, and guessing
+/// would be the one mistake that cannot be undone: a channel key filed under
+/// the wrong exchange is a conversation that will not open again.
+///
+/// So nothing is guessed. Rows are marked [`Store::UNCLAIMED`] and stay that
+/// way until an exchange claims them — see [`claim`].
+fn migrate(db: &Connection) -> Result<()> {
+    let already: bool = db
+        .prepare("SELECT 1 FROM pragma_table_info('channel_key') WHERE name = 'exchange'")
+        .and_then(|mut s| s.exists([]))
+        .map_err(storage("inspect the store's shape"))?;
+    // A store that has no `channel_key` table at all is a new one, and the
+    // schema will create it in the right shape a moment from now.
+    let fresh: bool = !db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='channel_key'")
+        .and_then(|mut s| s.exists([]))
+        .map_err(storage("inspect the store's shape"))?;
+    if already || fresh {
+        return Ok(());
+    }
+
+    let zero = &Store::UNCLAIMED[..];
+    db.execute_batch("BEGIN IMMEDIATE")
+        .map_err(storage("begin the migration"))?;
+    let outcome = rebuild(db, zero);
+    match outcome {
+        Ok(()) => db
+            .execute_batch("COMMIT")
+            .map_err(storage("commit the migration")),
+        Err(e) => {
+            // Rolled back explicitly rather than left to a dropped connection:
+            // a half-applied schema is the one state this file must never be
+            // found in.
+            let _ = db.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn rebuild(db: &Connection, zero: &[u8]) -> Result<()> {
+    let steps: &[(&str, &str, &str)] = &[
+        (
+            "channel_key",
+            "CREATE TABLE channel_key_new (
+                exchange BLOB   NOT NULL, channel BLOB NOT NULL, epoch INTEGER NOT NULL,
+                sealed BLOB NOT NULL, PRIMARY KEY (exchange, channel, epoch))",
+            "INSERT INTO channel_key_new SELECT ?1, channel, epoch, sealed FROM channel_key",
+        ),
+        (
+            "message",
+            "CREATE TABLE message_new (
+                exchange BLOB NOT NULL, channel BLOB NOT NULL, seq INTEGER NOT NULL,
+                account BLOB NOT NULL, posted INTEGER NOT NULL, kind INTEGER NOT NULL,
+                sealed BLOB, PRIMARY KEY (exchange, channel, seq))",
+            "INSERT INTO message_new
+                 SELECT ?1, channel, seq, account, posted, kind, sealed FROM message",
+        ),
+        (
+            "cursor",
+            "CREATE TABLE cursor_new (
+                exchange BLOB NOT NULL, channel BLOB NOT NULL,
+                since INTEGER NOT NULL DEFAULT 0, msg_seq INTEGER NOT NULL DEFAULT 0,
+                epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (exchange, channel))",
+            "INSERT INTO cursor_new SELECT ?1, channel, since, msg_seq, epoch FROM cursor",
+        ),
+        (
+            "chain",
+            "CREATE TABLE chain_new (
+                exchange BLOB NOT NULL, channel BLOB NOT NULL, chain_seq INTEGER NOT NULL,
+                head BLOB NOT NULL, PRIMARY KEY (exchange, channel))",
+            "INSERT INTO chain_new SELECT ?1, channel, chain_seq, head FROM chain",
+        ),
+        (
+            "incarnation",
+            "CREATE TABLE incarnation_new (
+                exchange BLOB NOT NULL, channel BLOB NOT NULL, instance BLOB NOT NULL,
+                announce INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (exchange, channel))",
+            "INSERT INTO incarnation_new SELECT ?1, channel, instance, announce FROM incarnation",
+        ),
+        (
+            "seen",
+            "CREATE TABLE seen_new (
+                exchange BLOB NOT NULL, channel BLOB NOT NULL, device BLOB NOT NULL,
+                epoch INTEGER NOT NULL, msg_seq INTEGER NOT NULL,
+                PRIMARY KEY (exchange, channel, device, epoch, msg_seq))",
+            "INSERT INTO seen_new SELECT ?1, channel, device, epoch, msg_seq FROM seen",
+        ),
+        (
+            "channel_meta",
+            "CREATE TABLE channel_meta_new (
+                exchange BLOB NOT NULL, channel BLOB NOT NULL,
+                kind INTEGER NOT NULL DEFAULT 0, label TEXT NOT NULL DEFAULT '',
+                admins BLOB NOT NULL DEFAULT x'', PRIMARY KEY (exchange, channel))",
+            "INSERT INTO channel_meta_new
+                 SELECT ?1, channel, kind, label, admins FROM channel_meta",
+        ),
+        (
+            "prekey",
+            "CREATE TABLE prekey_new (
+                exchange BLOB NOT NULL, id INTEGER NOT NULL, kind INTEGER NOT NULL,
+                sealed BLOB, spent INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (exchange, id))",
+            "INSERT INTO prekey_new SELECT ?1, id, kind, sealed, spent FROM prekey",
+        ),
+        (
+            "profile",
+            "CREATE TABLE profile_new (
+                exchange BLOB NOT NULL, account BLOB NOT NULL,
+                name TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',
+                fetched INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (exchange, account))",
+            "INSERT INTO profile_new SELECT ?1, account, name, title, fetched FROM profile",
+        ),
+        (
+            "handle",
+            "CREATE TABLE handle_new (
+                exchange BLOB NOT NULL, account BLOB NOT NULL,
+                name TEXT NOT NULL DEFAULT '', fetched INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (exchange, account))",
+            "INSERT INTO handle_new SELECT ?1, account, name, fetched FROM handle",
+        ),
+    ];
+    for (name, create, copy) in steps {
+        db.execute_batch(create)
+            .map_err(storage("create the migrated table"))?;
+        db.execute(copy, params![zero])
+            .map_err(storage("copy rows into the migrated table"))?;
+        db.execute_batch(&format!(
+            "DROP TABLE {name}; ALTER TABLE {name}_new RENAME TO {name};"
+        ))
+        .map_err(storage("swap in the migrated table"))?;
+    }
+    Ok(())
+}
+
+/// Attribute rows that predate this column to the exchange in front of us.
+///
+/// The **first** exchange this store is opened against after the migration
+/// takes the unattributed rows, and that is recorded so no later one can take
+/// them again. It is the only answer available: nothing in the file says where
+/// they came from, and today no client can have put rows from two exchanges in
+/// one store, so they are all from whichever one it was.
+///
+/// The case this gets wrong is somebody whose first connection after upgrading
+/// is to a *different* exchange than the history came from. That is why the
+/// claim is written down rather than assumed: it is a fact about the store
+/// that somebody can be shown and can act on, instead of a silent relabelling.
+fn claim(db: &Connection, exchange: &PubKey) -> Result<()> {
+    let recorded: Option<Vec<u8>> = db
+        .query_row("SELECT value FROM meta WHERE key = 'exchange'", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(storage("read the store's exchange"))?;
+    if recorded.is_some() {
+        return Ok(());
+    }
+    let zero = &Store::UNCLAIMED[..];
+    let mine = &exchange.as_bytes()[..];
+    db.execute_batch("BEGIN IMMEDIATE")
+        .map_err(storage("begin the claim"))?;
+    let outcome = (|| -> Result<()> {
+        for table in [
+            "channel_key",
+            "message",
+            "cursor",
+            "chain",
+            "incarnation",
+            "seen",
+            "channel_meta",
+            "prekey",
+            "profile",
+            "handle",
+        ] {
+            db.execute(
+                &format!("UPDATE {table} SET exchange = ?1 WHERE exchange = ?2"),
+                params![mine, zero],
+            )
+            .map_err(storage("claim rows for this exchange"))?;
+        }
+        db.execute(
+            "INSERT INTO meta (key, value) VALUES ('exchange', ?1)
+             ON CONFLICT (key) DO NOTHING",
+            params![mine],
+        )
+        .map_err(storage("record the store's exchange"))?;
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => db
+            .execute_batch("COMMIT")
+            .map_err(storage("commit the claim")),
+        Err(e) => {
+            let _ = db.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -283,6 +529,13 @@ impl Store {
     ///
     /// `None` gives an in-memory database, which is what the tests use and what
     /// a caller wanting a deliberately amnesiac client would ask for.
+    /// The exchange a row belonged to before this store knew about exchanges.
+    ///
+    /// **This store never recorded which exchange its rows came from**, so a
+    /// migration cannot know. Rows carry this until an exchange claims them —
+    /// see [`Store::open`].
+    const UNCLAIMED: [u8; 32] = [0u8; 32];
+
     pub fn open(seed: &[u8; 32], path: Option<&std::path::Path>) -> Result<Store> {
         let db = match path {
             Some(p) => Connection::open(p).map_err(storage("open store"))?,
@@ -302,6 +555,11 @@ impl Store {
             .map_err(storage("set journal_mode"))?;
         db.pragma_update(None, "synchronous", "FULL")
             .map_err(storage("set synchronous"))?;
+        // Order matters: an older store has to grow the column before the
+        // schema is applied, because `CREATE TABLE IF NOT EXISTS` will not
+        // alter a table that already exists — it silently does nothing, which
+        // is how a schema change reaches a user's machine and is ignored.
+        migrate(&db)?;
         db.execute_batch(SCHEMA).map_err(storage("create schema"))?;
 
         let mut h = Sha512::new();
@@ -311,7 +569,47 @@ impl Store {
         let cipher = ChaCha20Poly1305::new_from_slice(&okm[0..32])
             .map_err(|e| StoreError::Sealed(format!("derive store key: {e}")))?;
 
-        Ok(Store { db, cipher })
+        Ok(Store {
+            db,
+            cipher,
+            exchange: None,
+        })
+    }
+
+    /// Say which exchange this store is for, and claim what predates the
+    /// column. Called once, by [`crate::client::Chat::new`].
+    ///
+    /// Scoping is separate from opening because the two happen at different
+    /// moments: the contact list is read before anything connects — that is
+    /// what lets `add` work while the exchange is down — and the exchange is
+    /// not known until it does. Making it an argument to `open` would have
+    /// forced a placeholder into that path, and a placeholder that looks like
+    /// a real exchange is exactly how rows end up filed under one.
+    pub fn scope_to(&mut self, exchange: &PubKey) -> Result<()> {
+        claim(&self.db, exchange)?;
+        self.exchange = Some(*exchange);
+        Ok(())
+    }
+
+    /// Which exchange this store is reading and writing for, if it has been
+    /// told.
+    pub fn exchange(&self) -> Option<PubKey> {
+        self.exchange
+    }
+
+    /// The exchange, as a query parameter. Every scoped row goes through this.
+    ///
+    /// **Refuses rather than defaulting.** A store that has not been told
+    /// which exchange it is for cannot answer a question about a channel, and
+    /// a zero standing in for "not told" would be a value rows get filed
+    /// under — indistinguishable, later, from a real one.
+    fn scope(&self) -> Result<Vec<u8>> {
+        match &self.exchange {
+            Some(e) => Ok(e.as_bytes().to_vec()),
+            None => Err(StoreError::Storage(
+                "this store has not been told which exchange it is for".into(),
+            )),
+        }
     }
 
     /// Seal bytes with a fresh random nonce, which travels in front of them.
@@ -401,9 +699,10 @@ impl Store {
         let sealed = self.seal(key.as_bytes())?;
         self.db
             .execute(
-                "INSERT INTO channel_key (channel, epoch, sealed) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (channel, epoch) DO NOTHING",
-                params![&channel[..], epoch as i64, sealed],
+                "INSERT INTO channel_key (channel, epoch, sealed, exchange)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel, epoch) DO NOTHING",
+                params![&channel[..], epoch as i64, sealed, self.scope()?],
             )
             .map_err(storage("store channel key"))?;
         Ok(())
@@ -413,8 +712,9 @@ impl Store {
         let sealed: Option<Vec<u8>> = self
             .db
             .query_row(
-                "SELECT sealed FROM channel_key WHERE channel = ?1 AND epoch = ?2",
-                params![&channel[..], epoch as i64],
+                "SELECT sealed FROM channel_key
+                 WHERE channel = ?1 AND epoch = ?2 AND exchange = ?3",
+                params![&channel[..], epoch as i64, self.scope()?],
                 |r| r.get(0),
             )
             .optional()
@@ -430,8 +730,8 @@ impl Store {
         let e: Option<i64> = self
             .db
             .query_row(
-                "SELECT MAX(epoch) FROM channel_key WHERE channel = ?1",
-                params![&channel[..]],
+                "SELECT MAX(epoch) FROM channel_key WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
                 |r| r.get(0),
             )
             .optional()
@@ -446,10 +746,10 @@ impl Store {
     pub fn pool(&self, seed: &[u8; 32]) -> Result<Pool> {
         let mut stmt = self
             .db
-            .prepare("SELECT id, kind, sealed, spent FROM prekey")
+            .prepare("SELECT id, kind, sealed, spent FROM prekey WHERE exchange = ?1")
             .map_err(storage("prepare prekeys"))?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(params![self.scope()?], |r| {
                 Ok((
                     r.get::<_, i64>(0)? as u32,
                     r.get::<_, i64>(1)? as u8,
@@ -506,6 +806,8 @@ impl Store {
     /// and those are two different requirements that this satisfies at once.
     pub fn save_pool(&mut self, pool: &Pool) -> Result<()> {
         let state = pool.save();
+        // Taken before the transaction borrows `self.db` mutably.
+        let scope = self.scope()?;
         let tx = self.db.transaction().map_err(storage("begin save pool"))?;
         for (id, secret) in &state.one_time {
             let sealed = {
@@ -522,9 +824,10 @@ impl Store {
                 out
             };
             tx.execute(
-                "INSERT INTO prekey (id, kind, sealed, spent) VALUES (?1, ?2, ?3, 0)
-                 ON CONFLICT (id) DO UPDATE SET sealed = ?3, spent = 0",
-                params![*id as i64, KIND_ONE_TIME as i64, sealed],
+                "INSERT INTO prekey (id, kind, sealed, spent, exchange)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT (exchange, id) DO UPDATE SET sealed = ?3, spent = 0",
+                params![*id as i64, KIND_ONE_TIME as i64, sealed, &scope],
             )
             .map_err(storage("store one-time prekey"))?;
         }
@@ -543,17 +846,19 @@ impl Store {
                 out
             };
             tx.execute(
-                "INSERT INTO prekey (id, kind, sealed, spent) VALUES (?1, ?2, ?3, 0)
-                 ON CONFLICT (id) DO UPDATE SET sealed = ?3, spent = 0",
-                params![*id as i64, KIND_FALLBACK as i64, sealed],
+                "INSERT INTO prekey (id, kind, sealed, spent, exchange)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT (exchange, id) DO UPDATE SET sealed = ?3, spent = 0",
+                params![*id as i64, KIND_FALLBACK as i64, sealed, &scope],
             )
             .map_err(storage("store fallback"))?;
         }
         for id in &state.spent {
             tx.execute(
-                "INSERT INTO prekey (id, kind, sealed, spent) VALUES (?1, ?2, NULL, 1)
-                 ON CONFLICT (id) DO UPDATE SET sealed = NULL, spent = 1",
-                params![*id as i64, KIND_ONE_TIME as i64],
+                "INSERT INTO prekey (id, kind, sealed, spent, exchange)
+                 VALUES (?1, ?2, NULL, 1, ?3)
+                 ON CONFLICT (exchange, id) DO UPDATE SET sealed = NULL, spent = 1",
+                params![*id as i64, KIND_ONE_TIME as i64, &scope],
             )
             .map_err(storage("record spent prekey"))?;
         }
@@ -571,10 +876,13 @@ impl Store {
     pub fn replay_for(&self, channel: &[u8; 32]) -> Result<Replay> {
         let mut stmt = self
             .db
-            .prepare("SELECT device, epoch, msg_seq FROM seen WHERE channel = ?1")
+            .prepare(
+                "SELECT device, epoch, msg_seq FROM seen
+                 WHERE channel = ?1 AND exchange = ?2",
+            )
             .map_err(storage("prepare seen"))?;
         let rows = stmt
-            .query_map(params![&channel[..]], |r| {
+            .query_map(params![&channel[..], self.scope()?], |r| {
                 Ok((
                     PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
                     r.get::<_, i64>(1)? as u32,
@@ -599,13 +907,14 @@ impl Store {
     ) -> Result<()> {
         self.db
             .execute(
-                "INSERT OR IGNORE INTO seen (channel, device, epoch, msg_seq)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO seen (channel, device, epoch, msg_seq, exchange)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     &channel[..],
                     device.as_bytes(),
                     epoch as i64,
-                    msg_seq as i64
+                    msg_seq as i64,
+                    self.scope()?
                 ],
             )
             .map_err(storage("record seen"))?;
@@ -627,9 +936,9 @@ impl Store {
         };
         self.db
             .execute(
-                "INSERT INTO message (channel, seq, account, posted, kind, sealed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT (channel, seq)
+                "INSERT INTO message (channel, seq, account, posted, kind, sealed, exchange)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (exchange, channel, seq)
                  DO UPDATE SET sealed = COALESCE(message.sealed, excluded.sealed)",
                 params![
                     &channel[..],
@@ -637,7 +946,8 @@ impl Store {
                     account.as_bytes(),
                     posted as i64,
                     kind as i64,
-                    sealed
+                    sealed,
+                    self.scope()?
                 ],
             )
             .map_err(storage("store message"))?;
@@ -659,8 +969,9 @@ impl Store {
         let empty = self.seal_bytes(&[])?;
         self.db
             .execute(
-                "UPDATE message SET sealed = ?3 WHERE channel = ?1 AND seq = ?2",
-                params![&channel[..], seq as i64, empty],
+                "UPDATE message SET sealed = ?3
+                 WHERE channel = ?1 AND seq = ?2 AND exchange = ?4",
+                params![&channel[..], seq as i64, empty, self.scope()?],
             )
             .map_err(storage("redact message"))?;
         Ok(())
@@ -682,8 +993,9 @@ impl Store {
         let n: i64 = self
             .db
             .query_row(
-                "SELECT COUNT(*) FROM message WHERE channel = ?1 AND kind = ?2",
-                params![&channel[..], KIND_MEMBER],
+                "SELECT COUNT(*) FROM message
+                 WHERE channel = ?1 AND kind = ?2 AND exchange = ?3",
+                params![&channel[..], KIND_MEMBER, self.scope()?],
                 |r| r.get(0),
             )
             .map_err(storage("count held"))?;
@@ -705,12 +1017,12 @@ impl Store {
             .db
             .prepare(
                 "SELECT seq FROM message
-                 WHERE channel = ?1 AND kind = ?2 AND sealed IS NULL
+                 WHERE channel = ?1 AND kind = ?2 AND sealed IS NULL AND exchange = ?3
                  ORDER BY seq ASC",
             )
             .map_err(storage("prepare unopened"))?;
         let rows = stmt
-            .query_map(params![&channel[..], KIND_MEMBER], |r| {
+            .query_map(params![&channel[..], KIND_MEMBER, self.scope()?], |r| {
                 r.get::<_, i64>(0).map(|n| n as u64)
             })
             .map_err(storage("query unopened"))?;
@@ -731,11 +1043,11 @@ impl Store {
             .db
             .prepare(
                 "SELECT seq, account, posted, kind, sealed FROM message
-                 WHERE channel = ?1 ORDER BY seq ASC",
+                 WHERE channel = ?1 AND exchange = ?2 ORDER BY seq ASC",
             )
             .map_err(storage("prepare messages"))?;
         let rows = stmt
-            .query_map(params![&channel[..]], |r| {
+            .query_map(params![&channel[..], self.scope()?], |r| {
                 Ok((
                     r.get::<_, i64>(0)? as u64,
                     PubKey::new(r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32])),
@@ -767,10 +1079,11 @@ impl Store {
     pub fn put_profile(&self, account: &PubKey, name: &str, title: &str, now: u64) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO profile (account, name, title, fetched)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (account) DO UPDATE SET name = ?2, title = ?3, fetched = ?4",
-                params![account.as_bytes(), name, title, now as i64],
+                "INSERT INTO profile (account, name, title, fetched, exchange)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, account)
+                 DO UPDATE SET name = ?2, title = ?3, fetched = ?4",
+                params![account.as_bytes(), name, title, now as i64, self.scope()?],
             )
             .map_err(storage("store profile"))?;
         Ok(())
@@ -780,8 +1093,9 @@ impl Store {
     pub fn profile(&self, account: &PubKey) -> Result<Option<(String, String, u64)>> {
         self.db
             .query_row(
-                "SELECT name, title, fetched FROM profile WHERE account = ?1",
-                params![account.as_bytes()],
+                "SELECT name, title, fetched FROM profile
+                 WHERE account = ?1 AND exchange = ?2",
+                params![account.as_bytes(), self.scope()?],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -802,10 +1116,10 @@ impl Store {
     pub fn put_handle(&self, account: &PubKey, name: &str, now: u64) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO handle (account, name, fetched)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (account) DO UPDATE SET name = ?2, fetched = ?3",
-                params![account.as_bytes(), name, now as i64],
+                "INSERT INTO handle (account, name, fetched, exchange)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, account) DO UPDATE SET name = ?2, fetched = ?3",
+                params![account.as_bytes(), name, now as i64, self.scope()?],
             )
             .map_err(storage("store handle"))?;
         Ok(())
@@ -815,8 +1129,8 @@ impl Store {
     pub fn handle(&self, account: &PubKey) -> Result<Option<(String, u64)>> {
         self.db
             .query_row(
-                "SELECT name, fetched FROM handle WHERE account = ?1",
-                params![account.as_bytes()],
+                "SELECT name, fetched FROM handle WHERE account = ?1 AND exchange = ?2",
+                params![account.as_bytes(), self.scope()?],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
             )
             .optional()
@@ -868,10 +1182,11 @@ impl Store {
         }
         self.db
             .execute(
-                "INSERT INTO channel_meta (channel, kind, label, admins)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (channel) DO UPDATE SET kind = ?2, label = ?3, admins = ?4",
-                params![&channel[..], i64::from(group), label, flat],
+                "INSERT INTO channel_meta (channel, kind, label, admins, exchange)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, channel)
+                 DO UPDATE SET kind = ?2, label = ?3, admins = ?4",
+                params![&channel[..], i64::from(group), label, flat, self.scope()?],
             )
             .map_err(storage("store channel"))?;
         Ok(())
@@ -884,9 +1199,9 @@ impl Store {
     pub fn set_label(&self, channel: &[u8; 32], label: &str) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO channel_meta (channel, label) VALUES (?1, ?2)
-                 ON CONFLICT (channel) DO UPDATE SET label = ?2",
-                params![&channel[..], label],
+                "INSERT INTO channel_meta (channel, label, exchange) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (exchange, channel) DO UPDATE SET label = ?2",
+                params![&channel[..], label, self.scope()?],
             )
             .map_err(storage("set label"))?;
         Ok(())
@@ -898,11 +1213,12 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT channel, kind, label, admins FROM channel_meta ORDER BY label, channel",
+                "SELECT channel, kind, label, admins FROM channel_meta
+                 WHERE exchange = ?1 ORDER BY label, channel",
             )
             .map_err(storage("prepare channels"))?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(params![self.scope()?], |r| {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
                     r.get::<_, i64>(1)? != 0,
@@ -947,8 +1263,8 @@ impl Store {
         let row: Option<Vec<u8>> = self
             .db
             .query_row(
-                "SELECT instance FROM incarnation WHERE channel = ?1",
-                params![&channel[..]],
+                "SELECT instance FROM incarnation WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
                 |r| r.get(0),
             )
             .optional()
@@ -964,9 +1280,15 @@ impl Store {
     ) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO incarnation (channel, instance, announce) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (channel) DO UPDATE SET instance = ?2, announce = ?3",
-                params![&channel[..], &instance[..], i64::from(announce)],
+                "INSERT INTO incarnation (channel, instance, announce, exchange)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel) DO UPDATE SET instance = ?2, announce = ?3",
+                params![
+                    &channel[..],
+                    &instance[..],
+                    i64::from(announce),
+                    self.scope()?
+                ],
             )
             .map_err(storage("set incarnation"))?;
         Ok(())
@@ -978,8 +1300,8 @@ impl Store {
         let pending: Option<i64> = self
             .db
             .query_row(
-                "SELECT announce FROM incarnation WHERE channel = ?1",
-                params![&channel[..]],
+                "SELECT announce FROM incarnation WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
                 |r| r.get(0),
             )
             .optional()
@@ -987,8 +1309,9 @@ impl Store {
         if pending == Some(1) {
             self.db
                 .execute(
-                    "UPDATE incarnation SET announce = 0 WHERE channel = ?1",
-                    params![&channel[..]],
+                    "UPDATE incarnation SET announce = 0
+                     WHERE channel = ?1 AND exchange = ?2",
+                    params![&channel[..], self.scope()?],
                 )
                 .map_err(storage("clear announcement"))?;
             return Ok(true);
@@ -998,18 +1321,18 @@ impl Store {
 
     pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
         for sql in [
-            "DELETE FROM message WHERE channel = ?1",
-            "DELETE FROM seen WHERE channel = ?1",
-            "DELETE FROM channel_key WHERE channel = ?1",
-            "DELETE FROM cursor WHERE channel = ?1",
+            "DELETE FROM message WHERE channel = ?1 AND exchange = ?2",
+            "DELETE FROM seen WHERE channel = ?1 AND exchange = ?2",
+            "DELETE FROM channel_key WHERE channel = ?1 AND exchange = ?2",
+            "DELETE FROM cursor WHERE channel = ?1 AND exchange = ?2",
             // SIP-31 chain state, for the same reason as the rest: a recreated
             // channel is a different channel, and a position carried into it
             // is one the exchange has no record of — every signature after it
             // refused as a broken chain, for good.
-            "DELETE FROM chain WHERE channel = ?1",
+            "DELETE FROM chain WHERE channel = ?1 AND exchange = ?2",
         ] {
             self.db
-                .execute(sql, params![&channel[..]])
+                .execute(sql, params![&channel[..], self.scope()?])
                 .map_err(storage("reset sequence space"))?;
         }
         Ok(())
@@ -1018,8 +1341,8 @@ impl Store {
     pub fn forget_channel(&self, channel: &[u8; 32]) -> Result<()> {
         self.db
             .execute(
-                "DELETE FROM channel_meta WHERE channel = ?1",
-                params![&channel[..]],
+                "DELETE FROM channel_meta WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
             )
             .map_err(storage("forget channel"))?;
         Ok(())
@@ -1031,8 +1354,9 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT since, msg_seq, epoch FROM cursor WHERE channel = ?1",
-                params![&channel[..]],
+                "SELECT since, msg_seq, epoch FROM cursor
+                 WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)? as u64,
@@ -1053,8 +1377,8 @@ impl Store {
     pub fn rewind(&self, channel: &[u8; 32]) -> Result<()> {
         self.db
             .execute(
-                "UPDATE cursor SET since = 0 WHERE channel = ?1",
-                params![&channel[..]],
+                "UPDATE cursor SET since = 0 WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
             )
             .map_err(storage("rewind"))?;
         Ok(())
@@ -1063,9 +1387,9 @@ impl Store {
     pub fn set_since(&self, channel: &[u8; 32], since: u64) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO cursor (channel, since) VALUES (?1, ?2)
-                 ON CONFLICT (channel) DO UPDATE SET since = MAX(since, ?2)",
-                params![&channel[..], since as i64],
+                "INSERT INTO cursor (channel, since, exchange) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (exchange, channel) DO UPDATE SET since = MAX(since, ?2)",
+                params![&channel[..], since as i64, self.scope()?],
             )
             .map_err(storage("set since"))?;
         Ok(())
@@ -1077,8 +1401,8 @@ impl Store {
         let row: Option<(i64, Vec<u8>)> = self
             .db
             .query_row(
-                "SELECT chain_seq, head FROM chain WHERE channel = ?1",
-                params![&channel[..]],
+                "SELECT chain_seq, head FROM chain WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -1098,11 +1422,12 @@ impl Store {
     pub fn set_chain(&self, channel: &[u8; 32], chain_seq: u64, head: &[u8; 32]) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO chain (channel, chain_seq, head) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (channel) DO UPDATE SET
+                "INSERT INTO chain (channel, chain_seq, head, exchange)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel) DO UPDATE SET
                      chain_seq = MAX(chain_seq, ?2),
                      head      = CASE WHEN ?2 >= chain_seq THEN ?3 ELSE head END",
-                params![&channel[..], chain_seq as i64, &head[..]],
+                params![&channel[..], chain_seq as i64, &head[..], self.scope()?],
             )
             .map_err(storage("set chain"))?;
         Ok(())
@@ -1116,11 +1441,12 @@ impl Store {
     pub fn set_msg_seq(&self, channel: &[u8; 32], epoch: u32, msg_seq: u64) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO cursor (channel, epoch, msg_seq) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (channel) DO UPDATE SET
+                "INSERT INTO cursor (channel, epoch, msg_seq, exchange)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel) DO UPDATE SET
                      msg_seq = CASE WHEN ?2 > epoch THEN ?3 ELSE MAX(msg_seq, ?3) END,
                      epoch   = MAX(epoch, ?2)",
-                params![&channel[..], epoch as i64, msg_seq as i64],
+                params![&channel[..], epoch as i64, msg_seq as i64, self.scope()?],
             )
             .map_err(storage("set msg_seq"))?;
         Ok(())
@@ -1233,9 +1559,24 @@ mod tests {
         PubKey::new([b; 32])
     }
 
+    /// The exchange these tests are against.
+    ///
+    /// Any one will do for most of them — what matters is that there *is* one,
+    /// because an unscoped store refuses every question about a channel.
+    fn an_exchange() -> PubKey {
+        PubKey::new([9; 32])
+    }
+
+    /// A store already told which exchange it is for. What a client has.
+    fn scoped(seed: &[u8; 32], path: Option<&std::path::Path>) -> Store {
+        let mut s = Store::open(seed, path).unwrap();
+        s.scope_to(&an_exchange()).unwrap();
+        s
+    }
+
     #[test]
     fn a_channel_key_round_trips() {
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         let k = ChannelKey::generate();
         s.put_key(&[7; 32], 3, &k).unwrap();
         assert_eq!(s.key(&[7; 32], 3).unwrap().unwrap(), k);
@@ -1251,10 +1592,10 @@ mod tests {
         let path = dir.path().join("chat.db");
         let k = ChannelKey::generate();
         {
-            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            let s = scoped(&seed(1), Some(&path));
             s.put_key(&[7; 32], 1, &k).unwrap();
         }
-        let theirs = Store::open(&seed(2), Some(&path)).unwrap();
+        let theirs = scoped(&seed(2), Some(&path));
         assert!(matches!(
             theirs.key(&[7; 32], 1),
             Err(StoreError::Sealed(_))
@@ -1268,7 +1609,7 @@ mod tests {
         // a count that only saw opened messages would report zero exactly
         // when the warning is needed, and the conversation would go back to
         // rendering as empty.
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         assert_eq!(s.held(&[7; 32]).unwrap(), 0, "a channel with nothing in it");
 
         s.put_message(
@@ -1329,7 +1670,7 @@ mod tests {
         // opened, an empty body means redacted. `redact_message` writes the
         // empty one on purpose so the two survive a restart apart, and a
         // report that confused them would call deleted messages lost history.
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         assert!(s.unopened(&[7; 32]).unwrap().is_empty(), "nothing held");
 
         let put = |seq: u64, kind: u8, plain: Option<&[u8]>| {
@@ -1380,7 +1721,7 @@ mod tests {
         let path = dir.path().join("chat.db");
         let k = ChannelKey::new([0xab; 32]);
         {
-            let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+            let mut s = scoped(&seed(1), Some(&path));
             s.put_key(&[7; 32], 1, &k).unwrap();
             let mut pool = Pool::new(&seed(1));
             pool.mint_one_time(4);
@@ -1411,7 +1752,7 @@ mod tests {
         let spent;
         let kept;
         {
-            let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+            let mut s = scoped(&seed(1), Some(&path));
             let mut pool = s.pool(&seed(1)).unwrap();
             let published = pool.mint_one_time(4);
             spent = published[0].id;
@@ -1419,7 +1760,7 @@ mod tests {
             pool.take(spent).unwrap();
             s.save_pool(&pool).unwrap();
         }
-        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let s = scoped(&seed(1), Some(&path));
         let mut pool = s.pool(&seed(1)).unwrap();
         assert!(pool.take(spent).is_err(), "a restart forgave a replay");
         assert!(pool.take(kept).is_ok(), "a restart lost a live secret");
@@ -1431,13 +1772,13 @@ mod tests {
         let path = dir.path().join("chat.db");
         let first: Vec<u32>;
         {
-            let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+            let mut s = scoped(&seed(1), Some(&path));
             let mut pool = s.pool(&seed(1)).unwrap();
             first = pool.mint_one_time(4).iter().map(|p| p.id).collect();
             pool.take(first[0]).unwrap();
             s.save_pool(&pool).unwrap();
         }
-        let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+        let mut s = scoped(&seed(1), Some(&path));
         let mut pool = s.pool(&seed(1)).unwrap();
         let next: Vec<u32> = pool.mint_one_time(4).iter().map(|p| p.id).collect();
         // Including past the spent one: its row is kept precisely so the
@@ -1455,11 +1796,11 @@ mod tests {
         let path = dir.path().join("chat.db");
         let device = key(9);
         {
-            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            let s = scoped(&seed(1), Some(&path));
             s.record_seen(&[7; 32], &device, 1, 0).unwrap();
             s.record_seen(&[7; 32], &device, 1, 1).unwrap();
         }
-        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let s = scoped(&seed(1), Some(&path));
         let mut replay = s.replay_for(&[7; 32]).unwrap();
         assert!(!replay.accept(&device, 1, 0), "a restart forgot an entry");
         assert!(!replay.accept(&device, 1, 1));
@@ -1471,7 +1812,7 @@ mod tests {
 
     #[test]
     fn the_counter_never_walks_backwards() {
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         s.set_msg_seq(&[7; 32], 1, 5).unwrap();
         s.set_msg_seq(&[7; 32], 1, 3).unwrap();
         assert_eq!(s.cursor(&[7; 32]).unwrap().1, 5, "a stale reply lowered it");
@@ -1484,7 +1825,7 @@ mod tests {
 
     #[test]
     fn contacts_round_trip() {
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         s.add_contact(&key(2), "bob", 100).unwrap();
         s.add_contact(&key(3), "carol", 101).unwrap();
         s.add_contact(&key(2), "bob on the boat", 102).unwrap();
@@ -1502,7 +1843,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chat.db");
         {
-            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            let s = scoped(&seed(1), Some(&path));
             s.put_message(
                 &[7; 32],
                 Kept {
@@ -1538,7 +1879,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let s = scoped(&seed(1), Some(&path));
         let got = s.messages(&[7; 32]).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].0, 3);
@@ -1552,7 +1893,7 @@ mod tests {
 
     #[test]
     fn a_message_is_not_stored_twice() {
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         s.put_message(
             &[7; 32],
             Kept {
@@ -1588,7 +1929,7 @@ mod tests {
         let path = dir.path().join("chat.db");
         let secret = b"meet me at the usual place";
         {
-            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            let s = scoped(&seed(1), Some(&path));
             s.put_message(
                 &[7; 32],
                 Kept {
@@ -1618,13 +1959,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first: Vec<u32>;
         {
-            let mut s = Store::open(&seed(1), Some(&dir.path().join("chat.db"))).unwrap();
+            let mut s = scoped(&seed(1), Some(&dir.path().join("chat.db")));
             let mut pool = s.pool(&seed(1)).unwrap();
             first = pool.mint_one_time(64).iter().map(|p| p.id).collect();
             s.save_pool(&pool).unwrap();
         }
         // The store is gone; the identity is not.
-        let mut fresh = Store::open(&seed(1), Some(&dir.path().join("new.db"))).unwrap();
+        let mut fresh = scoped(&seed(1), Some(&dir.path().join("new.db")));
         let mut pool = fresh.pool(&seed(1)).unwrap();
         let next: Vec<u32> = pool.mint_one_time(4).iter().map(|p| p.id).collect();
         // The clock floor gets a lost store out of the range it has already
@@ -1644,12 +1985,12 @@ mod tests {
         let path = dir.path().join("chat.db");
         let first: Vec<u32>;
         {
-            let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+            let mut s = scoped(&seed(1), Some(&path));
             let mut pool = s.pool(&seed(1)).unwrap();
             first = pool.mint_one_time(4).iter().map(|p| p.id).collect();
             s.save_pool(&pool).unwrap();
         }
-        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let s = scoped(&seed(1), Some(&path));
         let mut pool = s.pool(&seed(1)).unwrap();
         let next = pool.mint_one_time(1)[0].id;
         assert_eq!(next, first[3] + 1, "a reopen jumped its counter");
@@ -1663,13 +2004,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chat.db");
         {
-            let s = Store::open(&seed(1), Some(&path)).unwrap();
+            let s = scoped(&seed(1), Some(&path));
             s.put_channel(&[7; 32], true, "the group", &[key(1), key(2)])
                 .unwrap();
             s.put_channel(&[8; 32], false, "bob", &[key(1), key(3)])
                 .unwrap();
         }
-        let s = Store::open(&seed(1), Some(&path)).unwrap();
+        let s = scoped(&seed(1), Some(&path));
         let got = s.channels().unwrap();
         assert_eq!(got.len(), 2);
         let group = got.iter().find(|c| c.0 == [7; 32]).unwrap();
@@ -1682,7 +2023,7 @@ mod tests {
     fn a_label_and_a_membership_are_set_independently() {
         // They arrive from different places: the name from a sealed entry only
         // members can read, the admins from the exchange.
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         s.put_channel(&[7; 32], true, "", &[key(1)]).unwrap();
         s.set_label(&[7; 32], "renamed").unwrap();
         let got = s.channels().unwrap();
@@ -1692,9 +2033,283 @@ mod tests {
 
     #[test]
     fn forgetting_a_channel_removes_it() {
-        let s = Store::open(&seed(1), None).unwrap();
+        let s = scoped(&seed(1), None);
         s.put_channel(&[7; 32], true, "gone", &[]).unwrap();
         s.forget_channel(&[7; 32]).unwrap();
         assert!(s.channels().unwrap().is_empty());
+    }
+}
+
+/// The migration, and the claim that follows it.
+///
+/// These run against a **copy** of a store built in the old shape, never
+/// against a real one. Losing this file loses the conversations in it for
+/// everybody in them, so the migration is the one piece of this codebase where
+/// "it worked when I tried it" is not a standard worth meeting.
+#[cfg(test)]
+mod migration {
+    use super::*;
+
+    /// The schema as it stood before rows carried an exchange.
+    ///
+    /// Kept verbatim rather than generated, because a migration test that
+    /// builds its "old" database with the *new* code is testing nothing: it
+    /// would pass whatever the migration did, including nothing at all.
+    const OLD: &str = r#"
+CREATE TABLE contact (account BLOB PRIMARY KEY, label TEXT NOT NULL, added INTEGER NOT NULL);
+CREATE TABLE channel_key (channel BLOB NOT NULL, epoch INTEGER NOT NULL, sealed BLOB NOT NULL,
+    PRIMARY KEY (channel, epoch));
+CREATE TABLE prekey (id INTEGER PRIMARY KEY, kind INTEGER NOT NULL, sealed BLOB,
+    spent INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE message (channel BLOB NOT NULL, seq INTEGER NOT NULL, account BLOB NOT NULL,
+    posted INTEGER NOT NULL, kind INTEGER NOT NULL, sealed BLOB, PRIMARY KEY (channel, seq));
+CREATE TABLE channel_meta (channel BLOB PRIMARY KEY, kind INTEGER NOT NULL DEFAULT 0,
+    label TEXT NOT NULL DEFAULT '', admins BLOB NOT NULL DEFAULT x'');
+CREATE TABLE seen (channel BLOB NOT NULL, device BLOB NOT NULL, epoch INTEGER NOT NULL,
+    msg_seq INTEGER NOT NULL, PRIMARY KEY (channel, device, epoch, msg_seq));
+CREATE TABLE cursor (channel BLOB PRIMARY KEY, since INTEGER NOT NULL DEFAULT 0,
+    msg_seq INTEGER NOT NULL DEFAULT 0, epoch INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE chain (channel BLOB PRIMARY KEY, chain_seq INTEGER NOT NULL, head BLOB NOT NULL);
+CREATE TABLE incarnation (channel BLOB PRIMARY KEY, instance BLOB NOT NULL,
+    announce INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+CREATE TABLE profile (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '', fetched INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+    fetched INTEGER NOT NULL DEFAULT 0);
+"#;
+
+    fn seed(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    /// A store in the old shape, with something in every table that matters.
+    fn an_old_store(path: &std::path::Path) {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch(OLD).unwrap();
+        db.execute(
+            "INSERT INTO channel_key (channel, epoch, sealed) VALUES (?1, 3, ?2)",
+            params![&[7u8; 32][..], &b"a sealed key"[..]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message (channel, seq, account, posted, kind, sealed)
+             VALUES (?1, 1, ?2, 100, 1, ?3)",
+            params![&[7u8; 32][..], &[2u8; 32][..], &b"a sealed body"[..]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO seen (channel, device, epoch, msg_seq) VALUES (?1, ?2, 3, 9)",
+            params![&[7u8; 32][..], &[2u8; 32][..]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO cursor (channel, since, msg_seq, epoch) VALUES (?1, 5, 9, 3)",
+            params![&[7u8; 32][..]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO chain (channel, chain_seq, head) VALUES (?1, 4, ?2)",
+            params![&[7u8; 32][..], &[8u8; 32][..]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO channel_meta (channel, kind, label, admins)
+             VALUES (?1, 1, 'the old room', x'')",
+            params![&[7u8; 32][..]],
+        )
+        .unwrap();
+    }
+
+    fn count(db: &Connection, table: &str) -> i64 {
+        db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn an_old_store_keeps_every_row_and_gains_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        an_old_store(&path);
+
+        // Before: no exchange anywhere. This is the negative control for the
+        // test itself — if the fixture were already in the new shape, the
+        // migration would be a no-op and everything below would pass without
+        // testing it.
+        {
+            let db = Connection::open(&path).unwrap();
+            let has: bool = db
+                .prepare("SELECT 1 FROM pragma_table_info('channel_key') WHERE name = 'exchange'")
+                .unwrap()
+                .exists([])
+                .unwrap();
+            assert!(!has, "the fixture must start in the old shape");
+        }
+
+        let mut store = Store::open(&seed(1), Some(&path)).unwrap();
+        store.scope_to(&PubKey::new([9; 32])).unwrap();
+
+        let db = Connection::open(&path).unwrap();
+        for table in [
+            "channel_key",
+            "message",
+            "seen",
+            "cursor",
+            "chain",
+            "channel_meta",
+        ] {
+            assert_eq!(count(&db, table), 1, "{table} lost its row");
+            let has: bool = db
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'exchange'"
+                ))
+                .unwrap()
+                .exists([])
+                .unwrap();
+            assert!(has, "{table} did not gain the column");
+        }
+    }
+
+    #[test]
+    fn the_first_exchange_claims_what_predates_the_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        an_old_store(&path);
+
+        let mine = PubKey::new([9; 32]);
+        let mut store = Store::open(&seed(1), Some(&path)).unwrap();
+        store.scope_to(&mine).unwrap();
+
+        // Rows that were there before are now this exchange's, and readable.
+        assert_eq!(store.highest_epoch(&[7; 32]).unwrap(), 3);
+        assert_eq!(store.cursor(&[7; 32]).unwrap(), (5, 9, 3));
+        // `chain` reports the *next* position to sign at, so a stored 4 reads
+        // back as 5. Asserting the stored number would have been asserting the
+        // fixture rather than the migration.
+        assert_eq!(store.chain(&[7; 32]).unwrap().0, 5);
+
+        let db = Connection::open(&path).unwrap();
+        let unclaimed: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM channel_key WHERE exchange = ?1",
+                params![&Store::UNCLAIMED[..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unclaimed, 0, "nothing may be left unattributed");
+    }
+
+    #[test]
+    fn a_second_exchange_does_not_take_the_first_ones_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        an_old_store(&path);
+
+        let first = PubKey::new([9; 32]);
+        let second = PubKey::new([10; 32]);
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&first).unwrap();
+        drop(a);
+
+        // The claim is recorded, so opening against another exchange finds
+        // nothing to take -- and sees none of the first one's rows.
+        let mut b = Store::open(&seed(1), Some(&path)).unwrap();
+        b.scope_to(&second).unwrap();
+        assert_eq!(
+            b.highest_epoch(&[7; 32]).unwrap(),
+            0,
+            "the second exchange must not inherit the first one's keys"
+        );
+        assert_eq!(b.cursor(&[7; 32]).unwrap(), (0, 0, 0));
+
+        // And the first still has them.
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&first).unwrap();
+        assert_eq!(a.highest_epoch(&[7; 32]).unwrap(), 3);
+    }
+
+    /// The whole reason the column exists.
+    ///
+    /// A direct message's channel identifier is derived from its two accounts,
+    /// so one conversation has **identical channel bytes on every exchange**.
+    /// Two exchanges' rows for it must not collide.
+    #[test]
+    fn two_exchanges_keep_separate_rows_for_one_channel_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+
+        let one = ChannelKey::generate();
+        let two = ChannelKey::generate();
+        assert_ne!(one, two);
+
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&PubKey::new([9; 32])).unwrap();
+        a.put_key(&[7; 32], 1, &one).unwrap();
+
+        let mut b = Store::open(&seed(1), Some(&path)).unwrap();
+        b.scope_to(&PubKey::new([10; 32])).unwrap();
+        b.put_key(&[7; 32], 1, &two).unwrap();
+
+        // Without the column these are one row, and the second `put_key` is a
+        // no-op: `ON CONFLICT DO NOTHING`. One of the two conversations would
+        // then be sealed under a key this client does not hold, and opening an
+        // epoch key spends the prekey it came in on -- so it would not be
+        // recoverable by asking again.
+        assert_eq!(a.key(&[7; 32], 1).unwrap().unwrap(), one);
+        assert_eq!(b.key(&[7; 32], 1).unwrap().unwrap(), two);
+    }
+
+    /// SIP-17's replay set is per exchange too.
+    ///
+    /// Shared, a counter used at one exchange marks the identical coordinates
+    /// at another as already seen — and a genuine message is **silently
+    /// dropped as a replay**. This table was not in the original list of what
+    /// needed the column; it was found by reading each one.
+    #[test]
+    fn the_replay_set_does_not_reject_another_exchanges_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let device = PubKey::new([2; 32]);
+
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&PubKey::new([9; 32])).unwrap();
+        a.record_seen(&[7; 32], &device, 1, 5).unwrap();
+        // `accept` returns false for a counter already used, which is the
+        // rejection this table exists to make.
+        assert!(
+            !a.replay_for(&[7; 32]).unwrap().accept(&device, 1, 5),
+            "the exchange that saw it rejects it as a replay"
+        );
+
+        let mut b = Store::open(&seed(1), Some(&path)).unwrap();
+        b.scope_to(&PubKey::new([10; 32])).unwrap();
+        assert!(
+            b.replay_for(&[7; 32]).unwrap().accept(&device, 1, 5),
+            "another exchange's counter is not this one's replay, and a message \
+             at the same coordinates there must not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_store_refuses_rather_than_guessing() {
+        // Reading the contact list needs no exchange, which is what lets the
+        // CLI's `add` work before anything connects.
+        let store = Store::open(&seed(1), None).unwrap();
+        assert!(store.contacts().is_ok());
+        // Anything about a channel does, and says so rather than answering
+        // from rows nobody claimed.
+        assert!(store.highest_epoch(&[7; 32]).is_err());
+    }
+
+    #[test]
+    fn migrating_twice_is_not_a_second_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        an_old_store(&path);
+        for _ in 0..3 {
+            let mut s = Store::open(&seed(1), Some(&path)).unwrap();
+            s.scope_to(&PubKey::new([9; 32])).unwrap();
+            assert_eq!(s.highest_epoch(&[7; 32]).unwrap(), 3);
+        }
     }
 }
