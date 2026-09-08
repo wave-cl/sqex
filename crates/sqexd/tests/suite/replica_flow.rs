@@ -902,11 +902,20 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         "the creator must be derived as the first admin"
     );
 
-    // A stranger is refused by the derived roster, exactly as at the origin.
+    // A stranger is refused by the derived roster — and told the channel is
+    // not here at all.
+    //
+    // `NoSuchChannel` rather than `NotAMember`, and the difference is the
+    // replica's own honesty: a pulled channel row is written
+    // `Visibility::Private` unconditionally, because the signed `created`
+    // system entry carries no visibility and a replica cannot know. Not
+    // knowing, it conceals; saying "this exists and you are not in it" would
+    // assert something it cannot check. An origin still answers `NotAMember`
+    // for a channel it knows to be public.
     let (_, stranger) = identity(143);
     assert!(matches!(
         whole.fetch(&stranger, &stranger, &channel, 0, false),
-        Err(ChannelError::NotAMember)
+        Err(ChannelError::NoSuchChannel)
     ));
 
     // And the other side of the rule: a replica that began after the

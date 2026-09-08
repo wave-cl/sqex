@@ -15,6 +15,14 @@
 //! The list is not verified — it cannot be, across crates — so it is a claim,
 //! not a proof. What is verified is that a claim exists for every route and
 //! that no claim outlives its route.
+//!
+//! Each route carries a second claim: **who may reach it**. An audit of all
+//! eighty found a route that ended anybody's call, a route whose comment
+//! asserted a membership check the code did not make, and a blob path that
+//! widened its own audience — each one a route somebody served without writing
+//! down who it was for. An audit finds those once. This makes the next one fail
+//! the build, and pins the handful of facts about the surface that would
+//! otherwise have to be rediscovered by reading eighty handlers.
 
 /// What reaches a route. The payload is where to look, so a failure here points
 /// at something rather than only asserting.
@@ -45,124 +53,289 @@ enum By {
 
 use By::*;
 
+/// **Who may reach a route**, as a claim this file makes about each one.
+///
+/// The same device as [`By`], pointed at a different question. `By` asks
+/// whether anything calls a route; this asks who is allowed to. Neither is
+/// verified — a test cannot read an authorization out of a handler — so both
+/// are claims. What is verified is that a claim exists for every route and that
+/// no claim outlives its route, which is what makes adding a route without
+/// deciding who may reach it fail here rather than in production.
+///
+/// It exists because an audit of all eighty found a route that ended anybody's
+/// call, a route whose comment claimed a membership check the code did not
+/// make, and a blob path that widened its own audience. Each was a route
+/// somebody wrote without writing down who it was for. A one-time audit finds
+/// those once; this makes the next one fail the build.
+#[derive(Debug, PartialEq, Eq)]
+enum Who {
+    /// Anyone who can reach the exchange, identified or not.
+    Anyone,
+    /// Any advertised identity, with no further test. The caller is named but
+    /// nothing about them is required.
+    Identity,
+    /// The connection's own account or device, and no other. The request names
+    /// no subject, or names one that must equal the caller.
+    SelfOnly,
+    /// A present member of the named channel (`role_of`).
+    Member,
+    /// An admin of the named channel (`is_admin`), or the owner of the thing.
+    ChannelAdmin,
+    /// The exchange's administrator, proved by signature rather than by
+    /// connection. **Not** a channel admin: SIP-24 and SIP-38 both warn that
+    /// conflating them would let anybody who made a chat room grant transport
+    /// access or hand out names.
+    ExchangeAdmin,
+    /// A SIP-35 replication peer on the operator's list, *and* a per-channel
+    /// authorisation signed into the log by a channel admin.
+    ReplicationPeer,
+    /// A party to the named session or bridge.
+    SessionParty,
+    /// The managed whitelist (SIP-8). Exactly one route uses it, which is worth
+    /// knowing: enabling the whitelist does not restrict the chat surface.
+    Whitelisted,
+    /// Holding a secret is the whole authorization. SIP-13 rooms: the exchange
+    /// is never given the room secret and cannot check membership, so anyone
+    /// with the handle is a member. Deliberate, and the only entry here that
+    /// is not a check the exchange performs.
+    Capability,
+}
+
+use Who::*;
+
 /// The dispatch table, mirrored. Order is `server.rs`'s own.
-const ROUTES: &[(&str, &str, By)] = &[
-    ("GET", "/health", Probe),
-    ("GET", "/status", Cli("sqex status")),
-    ("GET", "/admin/challenge", Sqnr("challenge/response auth")),
-    ("POST", "/admin/command", Sqnr("signed transactions")),
-    ("POST", "/beacon/beat", Cli("sqex beacon")),
-    ("POST", "/beacon/read", Cli("sqex beacon read")),
+const ROUTES: &[(&str, &str, By, Who)] = &[
+    ("GET", "/health", Probe, Anyone),
+    ("GET", "/status", Cli("sqex status"), Anyone),
+    (
+        "GET",
+        "/admin/challenge",
+        Sqnr("challenge/response auth"),
+        Anyone,
+    ),
+    (
+        "POST",
+        "/admin/command",
+        Sqnr("signed transactions"),
+        ExchangeAdmin,
+    ),
+    ("POST", "/beacon/beat", Cli("sqex beacon"), Identity),
+    ("POST", "/beacon/read", Cli("sqex beacon read"), Anyone),
     // SIP-25 rendezvous. Coordination only: nothing punches yet, and the
     // command says so rather than implying a connection was made.
-    ("POST", "/rendezvous/introduce", Cli("sqex meet")),
+    ("POST", "/rendezvous/introduce", Cli("sqex meet"), Identity),
     // SIP-27 attestation.
     (
         "POST",
         "/attest/lodge",
         Cli("sqex attest say, sqex attest withdraw"),
+        Anyone,
     ),
-    ("POST", "/attest/read", Cli("sqex attest read")),
+    ("POST", "/attest/read", Cli("sqex attest read"), Anyone),
     // SIP-28 resolution.
-    ("POST", "/resolve/publish", Cli("sqex resolve publish")),
-    ("POST", "/resolve/get", Cli("sqex resolve get")),
-    ("POST", "/resolve/successor", Cli("sqex resolve moved")),
-    ("POST", "/admission/request", Chat("sqex-chat admit")),
-    ("POST", "/profile/put", Chat("/profile")),
-    ("POST", "/profile/get", Chat("Chat::refresh_profiles")),
-    ("POST", "/block/set", Chat("/block, /unblock")),
-    ("POST", "/block/list", Chat("/blocked")),
-    ("POST", "/device/register", Chat("Chat::register_self")),
-    ("POST", "/device/revoke", Chat("Chat::revoke_device")),
-    ("POST", "/device/list", Chat("Chat::my_devices")),
+    (
+        "POST",
+        "/resolve/publish",
+        Cli("sqex resolve publish"),
+        SelfOnly,
+    ),
+    ("POST", "/resolve/get", Cli("sqex resolve get"), Identity),
+    (
+        "POST",
+        "/resolve/successor",
+        Cli("sqex resolve moved"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/admission/request",
+        Chat("sqex-chat admit"),
+        Identity,
+    ),
+    ("POST", "/profile/put", Chat("/profile"), SelfOnly),
+    (
+        "POST",
+        "/profile/get",
+        Chat("Chat::refresh_profiles"),
+        Identity,
+    ),
+    ("POST", "/block/set", Chat("/block, /unblock"), SelfOnly),
+    ("POST", "/block/list", Chat("/blocked"), SelfOnly),
+    (
+        "POST",
+        "/device/register",
+        Chat("Chat::register_self"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/device/revoke",
+        Chat("Chat::revoke_device"),
+        SelfOnly,
+    ),
+    ("POST", "/device/list", Chat("Chat::my_devices"), Anyone),
     // SIP-38 names.
-    ("POST", "/name/claim", Cli("sqex name claim")),
-    ("POST", "/name/release", Cli("sqex name release")),
-    ("POST", "/name/resolve", Cli("sqex name resolve")),
-    ("POST", "/name/reverse", Cli("sqex name reverse")),
-    ("POST", "/blob/limits", Chat("Chat::send_file")),
-    ("POST", "/blob/begin", Chat("Chat::send_file")),
-    ("POST", "/blob/put", Chat("Chat::send_file")),
-    ("POST", "/blob/commit", Chat("Chat::send_file")),
-    ("POST", "/blob/abort", Chat("Chat::send_file, on failure")),
-    ("POST", "/blob/head", Chat("Chat::fetch_file")),
-    ("POST", "/blob/get", Chat("Chat::fetch_file")),
-    ("POST", "/blob/attach", Chat("/forward")),
+    ("POST", "/name/claim", Cli("sqex name claim"), SelfOnly),
+    ("POST", "/name/release", Cli("sqex name release"), SelfOnly),
+    ("POST", "/name/resolve", Cli("sqex name resolve"), Anyone),
+    ("POST", "/name/reverse", Cli("sqex name reverse"), Anyone),
+    ("POST", "/blob/limits", Chat("Chat::send_file"), Anyone),
+    ("POST", "/blob/begin", Chat("Chat::send_file"), Member),
+    ("POST", "/blob/put", Chat("Chat::send_file"), SelfOnly),
+    ("POST", "/blob/commit", Chat("Chat::send_file"), SelfOnly),
+    (
+        "POST",
+        "/blob/abort",
+        Chat("Chat::send_file, on failure"),
+        SelfOnly,
+    ),
+    ("POST", "/blob/head", Chat("Chat::fetch_file"), Member),
+    ("POST", "/blob/get", Chat("Chat::fetch_file"), Member),
+    ("POST", "/blob/attach", Chat("/forward"), Member),
     (
         "POST",
         "/blob/detach",
         Chat("Chat::redact, via Chat::detach"),
+        ChannelAdmin,
     ),
-    ("POST", "/prekey/publish", Chat("Chat::top_up_prekeys")),
-    ("POST", "/prekey/take", Chat("Chat::ensure_epoch")),
-    ("POST", "/prekey/count", Chat("Chat::top_up_prekeys")),
+    (
+        "POST",
+        "/prekey/publish",
+        Chat("Chat::top_up_prekeys"),
+        SelfOnly,
+    ),
+    ("POST", "/prekey/take", Chat("Chat::ensure_epoch"), Identity),
+    (
+        "POST",
+        "/prekey/count",
+        Chat("Chat::top_up_prekeys"),
+        SelfOnly,
+    ),
     (
         "POST",
         "/prekey/clear",
         Chat("Chat::top_up_prekeys, after a lost store"),
+        SelfOnly,
     ),
-    ("POST", "/channel/create", Chat("/new, /public, open_dm")),
-    ("POST", "/channel/join", Chat("/join")),
-    ("POST", "/channel/leave", Chat("/leave")),
-    ("POST", "/channel/post", Chat("Chat::send_body")),
-    ("POST", "/channel/info", Chat("Chat::info")),
-    ("POST", "/channel/retain", Chat("/retain")),
+    (
+        "POST",
+        "/channel/create",
+        Chat("/new, /public, open_dm"),
+        Identity,
+    ),
+    ("POST", "/channel/join", Chat("/join"), Identity),
+    ("POST", "/channel/leave", Chat("/leave"), Member),
+    ("POST", "/channel/post", Chat("Chat::send_body"), Member),
+    ("POST", "/channel/info", Chat("Chat::info"), Member),
+    ("POST", "/channel/retain", Chat("/retain"), ChannelAdmin),
     // `/name` and `/topic` on a public channel: the sealed entry members fold
     // goes to `/channel/post`, and this is the directory copy strangers search.
-    ("POST", "/channel/directory", Chat("/name")),
-    ("POST", "/channel/close", Chat("/close yes")),
-    ("POST", "/channel/mine", Chat("Chat::mine")),
-    ("POST", "/channel/list", Chat("/find")),
-    ("POST", "/channel/invite", Chat("/invite")),
-    ("POST", "/channel/remove", Chat("/kick")),
+    ("POST", "/channel/directory", Chat("/name"), ChannelAdmin),
+    ("POST", "/channel/close", Chat("/close yes"), ChannelAdmin),
+    ("POST", "/channel/mine", Chat("Chat::mine"), SelfOnly),
+    ("POST", "/channel/list", Chat("/find"), Anyone),
+    ("POST", "/channel/invite", Chat("/invite"), ChannelAdmin),
+    ("POST", "/channel/remove", Chat("/kick"), ChannelAdmin),
     // SIP-35. The peering routes are called by another exchange rather than by
     // a person, which is what `Peer` says: the caller is `sqexd::replica`,
     // driven from `replicate` entries in the config.
-    ("POST", "/channel/replicate", Chat("/replicate")),
-    ("POST", "/channel/unreplicate", Chat("/unreplicate")),
-    ("POST", "/peer/hello", Peer("replica::pull_once")),
-    ("POST", "/peer/pull", Peer("replica::pull_once")),
-    ("POST", "/peer/envelopes", Peer("replica::pull_envelopes")),
-    ("POST", "/peer/blobs", Peer("replica::pull_blobs")),
-    ("POST", "/peer/records", Peer("replica::pull_profiles")),
+    (
+        "POST",
+        "/channel/replicate",
+        Chat("/replicate"),
+        ChannelAdmin,
+    ),
+    (
+        "POST",
+        "/channel/unreplicate",
+        Chat("/unreplicate"),
+        ChannelAdmin,
+    ),
+    (
+        "POST",
+        "/peer/hello",
+        Peer("replica::pull_once"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/pull",
+        Peer("replica::pull_once"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/envelopes",
+        Peer("replica::pull_envelopes"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/blobs",
+        Peer("replica::pull_blobs"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/records",
+        Peer("replica::pull_profiles"),
+        ReplicationPeer,
+    ),
     // Reached when a fetch is refused with `equivocated`: the client asks for
     // the evidence rather than reporting a bare refusal.
     (
         "POST",
         "/channel/equivocation",
         Chat("Chat::poll, on an equivocated refusal"),
+        Member,
     ),
-    ("POST", "/channel/key/put", Chat("Chat::ensure_epoch")),
-    ("POST", "/channel/key/get", Chat("Chat::collect_keys")),
-    ("POST", "/channel/key/missing", Chat("Chat::stranded")),
-    ("POST", "/channel/cursor", Chat("Chat::mark_read")),
-    ("POST", "/channel/cursors", Chat("/read")),
-    ("POST", "/channel/redact", Chat("/redact")),
-    ("POST", "/channel/signal", Chat("Chat::typing")),
-    ("POST", "/channel/fetch", Chat("Chat::poll")),
+    (
+        "POST",
+        "/channel/key/put",
+        Chat("Chat::ensure_epoch"),
+        Member,
+    ),
+    (
+        "POST",
+        "/channel/key/get",
+        Chat("Chat::collect_keys"),
+        Member,
+    ),
+    (
+        "POST",
+        "/channel/key/missing",
+        Chat("Chat::stranded"),
+        Member,
+    ),
+    ("POST", "/channel/cursor", Chat("Chat::mark_read"), Member),
+    ("POST", "/channel/cursors", Chat("/read"), Member),
+    ("POST", "/channel/redact", Chat("/redact"), ChannelAdmin),
+    ("POST", "/channel/signal", Chat("Chat::typing"), Member),
+    ("POST", "/channel/fetch", Chat("Chat::poll"), Member),
     // Not in the dispatch match: an event stream has no body to return, so
     // it is answered in `handle_stream` before `route` is reached. `served()`
     // scans for that shape too, or this route would be invisible here — which
     // is the exact failure this file exists to prevent.
-    ("POST", "/events", Chat("Chat::subscribe")),
-    ("POST", "/room/join", Voice("sqex-voice rooms")),
-    ("POST", "/room/leave", Voice("sqex-voice rooms")),
-    ("POST", "/mailbox/send", Cli("sqex mail send")),
-    ("POST", "/mailbox/list", Cli("sqex mail list")),
-    ("POST", "/mailbox/fetch", Cli("sqex mail fetch")),
-    ("POST", "/mailbox/delete", Cli("sqex mail delete")),
-    ("POST", "/mailbox/status", Cli("sqex mail status")),
-    ("POST", "/session/open", Cli("sqex session")),
-    ("POST", "/session/send", Cli("sqex session")),
-    ("POST", "/session/recv", Cli("sqex session")),
-    ("POST", "/session/close", Cli("sqex session")),
-    ("POST", "/session/call", Voice("sqex-voice call")),
+    ("POST", "/events", Chat("Chat::subscribe"), SelfOnly),
+    ("POST", "/room/join", Voice("sqex-voice rooms"), Capability),
+    ("POST", "/room/leave", Voice("sqex-voice rooms"), Capability),
+    ("POST", "/mailbox/send", Cli("sqex mail send"), Identity),
+    ("POST", "/mailbox/list", Cli("sqex mail list"), SelfOnly),
+    ("POST", "/mailbox/fetch", Cli("sqex mail fetch"), SelfOnly),
+    ("POST", "/mailbox/delete", Cli("sqex mail delete"), SelfOnly),
+    ("POST", "/mailbox/status", Cli("sqex mail status"), SelfOnly),
+    ("POST", "/session/open", Cli("sqex session"), Identity),
+    ("POST", "/session/send", Cli("sqex session"), SessionParty),
+    ("POST", "/session/recv", Cli("sqex session"), SessionParty),
+    ("POST", "/session/close", Cli("sqex session"), SessionParty),
+    ("POST", "/session/call", Voice("sqex-voice call"), Identity),
     (
         "POST",
         "/session/decline",
         Voice("sqex-voice answer --decline"),
+        SessionParty,
     ),
-    ("GET", "/exchange/ping", Probe),
+    ("GET", "/exchange/ping", Probe, Whitelisted),
 ];
 
 /// Pull the dispatch arms out of `server.rs`.
@@ -239,7 +412,7 @@ fn every_route_names_something_that_reaches_it() {
     let mut served = served();
     let mut listed: Vec<(String, String)> = ROUTES
         .iter()
-        .map(|(m, p, _)| (m.to_string(), p.to_string()))
+        .map(|(m, p, _, _)| (m.to_string(), p.to_string()))
         .collect();
     served.sort();
     listed.sort();
@@ -267,8 +440,8 @@ fn every_route_names_something_that_reaches_it() {
 fn the_unreachable_routes_are_the_ones_we_know_about() {
     let open: Vec<&str> = ROUTES
         .iter()
-        .filter(|(_, _, by)| matches!(by, Unreachable(_)))
-        .map(|(_, p, _)| *p)
+        .filter(|(_, _, by, _)| matches!(by, Unreachable(_)))
+        .map(|(_, p, _, _)| *p)
         .collect();
 
     // Empty, and the assertion below is what keeps it that way: a route added
@@ -283,4 +456,86 @@ fn the_unreachable_routes_are_the_ones_we_know_about() {
          up, mark it here and remove it from `expected`; if a new one appeared, \
          it needs a client."
     );
+}
+
+/// The invariants worth pinning about who may reach what.
+///
+/// Not "every route has a `Who`" — the type guarantees that. These are the
+/// facts about the shape of the surface that would be surprising to lose, and
+/// each one is a sentence somebody would otherwise have to rediscover by
+/// reading eighty handlers.
+#[test]
+fn the_authorization_surface_holds_its_shape() {
+    let who = |path: &str| {
+        &ROUTES
+            .iter()
+            .find(|(_, p, _, _)| *p == path)
+            .unwrap_or_else(|| panic!("{path} is not in the table"))
+            .3
+    };
+
+    // Replication is peer-gated on every one of its routes, with no exception
+    // for the handshake: SIP-35 requires an origin to answer every peering
+    // route identically to a caller not on its list.
+    for (_, path, _, w) in ROUTES.iter().filter(|(_, p, _, _)| p.starts_with("/peer/")) {
+        assert_eq!(w, &ReplicationPeer, "{path} must be peer-gated");
+    }
+
+    // The directory is the only channel route open to anybody, and it can be
+    // because its SQL is hard-filtered to public channels. Every other
+    // `/channel/` route names an id, and an id is not an authorization.
+    for (_, path, _, w) in ROUTES
+        .iter()
+        .filter(|(_, p, _, _)| p.starts_with("/channel/"))
+    {
+        if *path == "/channel/list" {
+            assert_eq!(w, &Anyone, "the directory is public by construction");
+        } else {
+            assert_ne!(w, &Anyone, "{path} names a channel id and must not be open");
+        }
+    }
+
+    // Exactly one route is gated by the managed whitelist, and an operator who
+    // runs `sqex admin whitelist enable` believing it restricts the chat
+    // surface is mistaken. If that ever stops being true, this fails and
+    // somebody gets to say so out loud.
+    let whitelisted: Vec<&str> = ROUTES
+        .iter()
+        .filter(|(_, _, _, w)| *w == Whitelisted)
+        .map(|(_, p, _, _)| *p)
+        .collect();
+    assert_eq!(
+        whitelisted,
+        vec!["/exchange/ping"],
+        "the whitelist gates one route; enabling it does not restrict the exchange"
+    );
+
+    // Holding a secret is the whole authorization in exactly one place. SIP-13
+    // is explicit that the exchange is never given a room secret and so cannot
+    // check membership; anywhere else, that would be a gap rather than a design.
+    let capability: Vec<&str> = ROUTES
+        .iter()
+        .filter(|(_, _, _, w)| *w == Capability)
+        .map(|(_, p, _, _)| *p)
+        .collect();
+    assert_eq!(capability, vec!["/room/join", "/room/leave"]);
+
+    // The two admin kinds are not the same kind, and SIP-24 and SIP-38 both
+    // warn what conflating them would cost: anybody who made a chat room could
+    // grant transport access, or hand out names in the domain.
+    assert_eq!(who("/admin/command"), &ExchangeAdmin);
+    assert_eq!(who("/channel/invite"), &ChannelAdmin);
+
+    // Reads of a channel take membership, including the key routes — closing
+    // the existence oracle on `fetch` and leaving `/channel/key/get` open would
+    // not have closed it.
+    for path in [
+        "/channel/fetch",
+        "/channel/info",
+        "/channel/key/get",
+        "/channel/cursors",
+        "/channel/equivocation",
+    ] {
+        assert_eq!(who(path), &Member, "{path} is a read of a channel");
+    }
 }

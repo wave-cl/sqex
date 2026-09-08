@@ -81,6 +81,8 @@ pub enum ChannelError {
     WrongEpoch,
     /// Key distribution against a public channel, which seals nothing.
     NotPrivate,
+    /// SIP-18: this attachment would widen the blob's audience to everyone.
+    WouldPublish,
     /// Adding or removing a member of a direct message, whose membership can
     /// only ever be the two identities it is named after.
     DirectMessage,
@@ -153,6 +155,7 @@ impl ChannelError {
             ChannelError::TooManyChannels => "too_many_channels",
             ChannelError::WrongEpoch => "wrong_epoch",
             ChannelError::NotPrivate => "not_private",
+            ChannelError::WouldPublish => "would_publish",
             ChannelError::DirectMessage => "direct_message",
             ChannelError::NoPrekey => "no_prekey",
             ChannelError::NoSuchUpload => "no_such_upload",
@@ -191,6 +194,7 @@ impl ChannelError {
             ChannelError::TooManyChannels => Code::TooManyChannels,
             ChannelError::WrongEpoch => Code::WrongEpoch,
             ChannelError::NotPrivate => Code::NotPrivate,
+            ChannelError::WouldPublish => Code::WouldPublish,
             ChannelError::DirectMessage => Code::DirectMessage,
             ChannelError::NoPrekey => Code::NoPrekey,
             ChannelError::NoSuchUpload => Code::NoSuchUpload,
@@ -242,6 +246,7 @@ impl ChannelError {
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
             | ChannelError::NotPrivate
+            | ChannelError::WouldPublish
             | ChannelError::DirectMessage
             | ChannelError::NoPrekey
             | ChannelError::BadChunk
@@ -1211,7 +1216,10 @@ impl Channels {
         Channels::read_only(&tx, channel)?;
         let visibility = visibility_of(&tx, channel)?;
         if visibility != Visibility::Public {
-            return Err(ChannelError::NotPublic);
+            // A private channel is not merely un-joinable, it is unmentionable:
+            // answering `not_public` here would reopen, on this route, exactly the
+            // existence oracle the read paths close.
+            return Err(Self::unreadable(&tx, channel));
         }
         let (members, _) = counts(&tx, channel)?;
         let already = role_of(&tx, channel, caller).is_some();
@@ -1269,7 +1277,7 @@ impl Channels {
         Channels::read_only(&tx, channel)?;
         let visibility = visibility_of(&tx, channel)?;
         let Some(role) = role_of(&tx, channel, caller) else {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&tx, channel));
         };
 
         let (members, admins) = counts(&tx, channel)?;
@@ -1347,7 +1355,7 @@ impl Channels {
             Channels::read_only(&tx, &req.channel)?;
             let (visibility, epoch, retention, next) = channel_row(&tx, &req.channel)?;
             if role_of(&tx, &req.channel, account).is_none() {
-                return Err(ChannelError::NotAMember);
+                return Err(Self::unreadable(&tx, &req.channel));
             }
             // Epoch 0 means unsealed. That is every entry in a public channel
             // and no member entry in a private one, which is why a private
@@ -1496,7 +1504,7 @@ impl Channels {
         Channels::not_equivocated(&db, channel)?;
         Channels::derivable(&db, channel)?;
         if role_of(&db, channel, caller).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&db, channel));
         }
         // Before anything is read, so a caller asking an exchange that cannot
         // answer in the shape it asked for is refused rather than served
@@ -1885,7 +1893,7 @@ impl Channels {
         // summary wearing this exchange's name.
         Channels::derivable(&db, channel)?;
         if role_of(&db, channel, caller).is_none() && !is_admin(&db, channel, caller) {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&db, channel));
         }
         let (first, last) = window(&db, channel);
 
@@ -1980,7 +1988,10 @@ impl Channels {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin set_directory"))?;
         if visibility_of(&tx, &req.channel)? != Visibility::Public {
-            return Err(ChannelError::NotPublic);
+            // A private channel is not merely un-joinable, it is unmentionable:
+            // answering `not_public` here would reopen, on this route, exactly the
+            // existence oracle the read paths close.
+            return Err(Self::unreadable(&tx, &req.channel));
         }
         if !is_admin(&tx, &req.channel, caller) {
             return Err(ChannelError::NotAnAdmin);
@@ -2754,6 +2765,16 @@ impl Channels {
     /// and a reply that varied would make them an existence oracle for private
     /// channels — SIP-24's rule for its admission endpoint and SIP-4's for a
     /// withheld beacon, applied here for the same reason.
+    /// Whether `account` is a present member of `channel`.
+    ///
+    /// The public face of `role_of`, for the one caller outside this module
+    /// that needs it: a SIP-35 peer acting for an account may pull the channels
+    /// that account can already read.
+    pub fn is_member(&self, channel: &[u8; 32], account: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        role_of(&db, channel, account).is_some()
+    }
+
     pub fn replicates_to(&self, channel: &[u8; 32], peer: &PubKey) -> bool {
         let db = self.db.lock().unwrap();
         db.query_row(
@@ -2927,6 +2948,24 @@ impl Channels {
 
     /// The SIP-34 proof this replica holds for a channel, if it has caught the
     /// origin saying two things about one position.
+    /// The equivocation proof for a channel, to a member of it.
+    ///
+    /// Membership is the gate the route's own comment always described. The
+    /// artifact discloses no content — receipts, entry hashes and timestamps —
+    /// but it does disclose that this exchange holds the channel at all, and a
+    /// direct message's identifier is computable by anyone holding two public
+    /// keys. Serving it to a stranger made this the one channel route that
+    /// answered that question.
+    pub fn equivocation_seen(&self, who: &PubKey, channel: &[u8; 32]) -> Option<Vec<u8>> {
+        {
+            let db = self.db.lock().unwrap();
+            if role_of(&db, channel, who).is_none() && !is_admin(&db, channel, who) {
+                return None;
+            }
+        }
+        self.equivocation_for(channel)
+    }
+
     pub fn equivocation_for(&self, channel: &[u8; 32]) -> Option<Vec<u8>> {
         let db = self.db.lock().unwrap();
         db.query_row(
@@ -3156,7 +3195,7 @@ impl Channels {
             return Err(ChannelError::NotPrivate);
         }
         if role_of(&tx, &req.channel, caller).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&tx, &req.channel));
         }
         if req.epoch != epoch && req.epoch != epoch + 1 {
             return Err(ChannelError::WrongEpoch);
@@ -3324,7 +3363,7 @@ impl Channels {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
         if role_of(&db, channel, account).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&db, channel));
         }
         let mut stmt = db
             .prepare(
@@ -3388,7 +3427,7 @@ impl Channels {
         let (_, epoch, _, _) = channel_row(&db, channel)?;
         let admin = is_admin(&db, channel, caller);
         if !admin && role_of(&db, channel, caller).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&db, channel));
         }
         let mut stmt = db
             .prepare(
@@ -3623,7 +3662,7 @@ impl Channels {
         let tx = db.transaction().map_err(storage("begin upload"))?;
         visibility_of(&tx, &req.channel)?;
         if role_of(&tx, &req.channel, uploader).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&tx, &req.channel));
         }
         expire_uploads(&tx, now)?;
 
@@ -3776,12 +3815,72 @@ impl Channels {
             .map_err(storage("query fetch check"))?
             .filter_map(|c| c.ok())
             .collect();
+        // A public attachment grants access to everyone — but **only if the
+        // blob is not also attached to a private channel**. Without that
+        // qualifier a member of a private channel could attach its file to any
+        // public one and make the bytes world-fetchable for good, with no way
+        // back: `detach` answers to the uploader or an admin *of the channel
+        // holding the attachment*, so the person who uploaded it has no
+        // standing in the public channel they were forwarded into.
+        //
+        // `attach_blob` refuses to create that state now, so this pass is the
+        // second line: it holds even for an attachment made before the rule,
+        // and it errs towards the private channel's audience, which is the
+        // safe direction.
+        let mut member = false;
+        let mut public = false;
+        let mut private = false;
         for c in channels {
-            if visibility_of(db, &c) == Ok(Visibility::Public) || role_of(db, &c, who).is_some() {
-                return Ok(true);
+            match visibility_of(db, &c) {
+                Ok(Visibility::Public) => public = true,
+                Ok(Visibility::Private) => private = true,
+                // A channel that has gone: it grants nothing either way.
+                Err(_) => {}
+            }
+            if role_of(db, &c, who).is_some() {
+                member = true;
             }
         }
-        Ok(false)
+        Ok(member || (public && !private))
+    }
+
+    /// How a channel refuses somebody who is not in it.
+    ///
+    /// **A private channel refuses exactly as a channel that is not here.** A
+    /// direct message's identifier is `SHA256` over its two account keys and
+    /// nothing else, so anybody holding two public keys can compute it; while
+    /// "no such channel" and "not a member" were distinguishable answers, one
+    /// request per pair turned that into a queryable question — *do these two
+    /// people have a conversation on this exchange?* Content was never at risk;
+    /// the social graph was, and SIP-16's own security section admitted the
+    /// probe rather than closing it.
+    ///
+    /// A public channel keeps the explicit refusal. Its existence, name and
+    /// topic are in the directory to anybody who asks, so there is nothing left
+    /// to conceal and a clear answer is worth more than a uniform one.
+    ///
+    /// Applied at **every** route that refuses a non-member, not only at
+    /// `fetch`: an oracle closed on one route and left open on another is not
+    /// closed, and `/channel/key/get` would have answered the same question.
+    fn unreadable(db: &Connection, channel: &[u8; 32]) -> ChannelError {
+        match visibility_of(db, channel) {
+            Ok(Visibility::Public) => ChannelError::NotAMember,
+            _ => ChannelError::NoSuchChannel,
+        }
+    }
+
+    /// Whether any channel this blob is attached to is private.
+    fn attached_privately(db: &Connection, blob: &[u8; 32]) -> Result<bool, ChannelError> {
+        let mut stmt = db
+            .prepare(
+                "SELECT 1 FROM attachment a JOIN channel c ON c.id = a.channel \
+                 WHERE a.blob = ?1 AND c.visibility = 0 LIMIT 1",
+            )
+            .map_err(storage("prepare private attachment check"))?;
+        let found = stmt
+            .exists(params![&blob[..]])
+            .map_err(storage("query private attachment check"))?;
+        Ok(found)
     }
 
     pub fn head_blob(&self, who: &PubKey, blob: &[u8; 32]) -> Result<Headed, ChannelError> {
@@ -3857,6 +3956,17 @@ impl Channels {
         }
         if !Self::may_fetch(&tx, who, &req.blob)? {
             return Err(ChannelError::NoSuchBlob);
+        }
+        // **Attaching does not widen an audience.** Into a public channel, a
+        // blob that any private channel holds is refused: the attachment would
+        // publish its bytes to every identity on the exchange, permanently, and
+        // the uploader would have no standing to take it back. Sharing it
+        // publicly means uploading it again — a distinct blob, with its own
+        // key, leaving the private channel's copy alone.
+        if visibility_of(&tx, &req.channel)? == Visibility::Public
+            && Self::attached_privately(&tx, &req.blob)?
+        {
+            return Err(ChannelError::WouldPublish);
         }
         attach(&tx, &req.channel, &req.blob, who, req.expires_after, now)?;
         tx.commit().map_err(storage("commit attach"))?;
@@ -4355,7 +4465,7 @@ impl Channels {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
         if role_of(&db, channel, caller).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&db, channel));
         }
         // The same rule on the way in. A row that does not exist yet belongs to
         // an account that has never fetched, so nothing has been delivered to
@@ -4393,7 +4503,7 @@ impl Channels {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
         if role_of(&db, channel, caller).is_none() {
-            return Err(ChannelError::NotAMember);
+            return Err(Self::unreadable(&db, channel));
         }
         let mine: bool = db
             .query_row(
@@ -4511,7 +4621,7 @@ impl Channels {
             let db = self.db.lock().unwrap();
             visibility_of(&db, channel)?;
             if role_of(&db, channel, caller).is_none() {
-                return Err(ChannelError::NotAMember);
+                return Err(Self::unreadable(&db, channel));
             }
             let mut stmt = db
                 .prepare("SELECT account FROM member WHERE channel = ?1 AND present = 1")

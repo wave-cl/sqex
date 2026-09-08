@@ -304,7 +304,9 @@ async fn a_blocked_invitation_is_dropped_and_answered_as_though_it_landed() {
         .post("/channel/info", ByChannel { channel }.encode(TYPE_INFO))
         .await
         .unwrap();
-    assert_eq!(code, 403);
+    // The blocked invitee is not a member, so the private channel answers as
+    // absent — one step further from telling them an invitation was dropped.
+    assert_eq!(code, 404);
 }
 
 #[tokio::test]
