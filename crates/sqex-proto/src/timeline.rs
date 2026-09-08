@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use sqnr_core::PubKey;
 
 use crate::blob::Attachment;
-use crate::channel::KIND_SYSTEM;
+use crate::channel::{KIND_SYSTEM, System};
 use crate::message::{Body, EDIT_WINDOW, Post};
 
 /// What SIP-31 verification concluded about an entry.
@@ -161,6 +161,15 @@ pub struct Received {
     /// What SIP-34 verification concluded, which is a different question — see
     /// [`Standing`].
     pub standing: Standing,
+    /// SIP-16's own record, for an entry the exchange wrote itself.
+    ///
+    /// Separate from `body`, which is a SIP-19 message body: a system entry
+    /// has none and never will. Decoded by whoever held the bytes, because
+    /// this type is what is handed to the fold and the fold is given no bytes.
+    ///
+    /// `None` on a member entry, and on a system entry whose event this
+    /// version does not know — SIP-16 says an unknown event is ignored.
+    pub system: Option<System>,
 }
 
 /// A message as it should be shown.
@@ -193,10 +202,35 @@ impl Message {
     }
 }
 
+/// Something that happened to the channel rather than in it.
+///
+/// # Why these are kept
+///
+/// The exchange writes a signed entry for every membership and metadata
+/// change — twelve of them, from a channel being created to a member being
+/// removed — and the fold used to drop all twelve on the floor with a comment
+/// saying they were "rendered from SIP-16's own `System` layout", by nobody.
+/// So a group could gain and lose people and the conversation showed no trace
+/// of it, which is exactly the record the exchange goes to the trouble of
+/// signing.
+///
+/// They are held in the same sequence space as the messages, because that is
+/// the order everybody sees them in and a reader needs to know whether
+/// somebody was in the room when a thing was said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Happening {
+    pub seq: u64,
+    pub posted: u64,
+    /// The exchange's record, signed by the actor's device.
+    pub what: System,
+}
+
 /// The conversation, folded.
 #[derive(Debug, Clone, Default)]
 pub struct Timeline {
     messages: BTreeMap<u64, Message>,
+    /// Membership and metadata events, in the exchange's order.
+    events: BTreeMap<u64, Happening>,
     /// Bodies we could not read at all, by sequence number.
     unreadable: Vec<u64>,
     forged: Vec<u64>,
@@ -282,6 +316,12 @@ impl Timeline {
         self.messages.get(&seq)
     }
 
+    /// Membership and metadata events, in the order the exchange assigned —
+    /// the same sequence space as [`Timeline::messages`], so the two interleave.
+    pub fn events(&self) -> impl Iterator<Item = &Happening> {
+        self.events.values()
+    }
+
     /// Sequence numbers whose body we could not read — a later version of the
     /// format, or a key we do not hold. A client should say something was
     /// there rather than showing a gap it cannot explain.
@@ -329,6 +369,18 @@ impl Timeline {
         // SIP-16's own `System` layout, and counting it as something we failed
         // to read would tell a client a gap exists where none does.
         if e.kind == KIND_SYSTEM {
+            // Kept, not dropped. An unknown event decodes to `None` and is
+            // ignored, which is SIP-16's own rule for one.
+            if let Some(what) = e.system {
+                self.events.insert(
+                    e.seq,
+                    Happening {
+                        seq: e.seq,
+                        posted: e.posted,
+                        what,
+                    },
+                );
+            }
             return;
         }
         let Some(body) = &e.body else {
@@ -505,6 +557,7 @@ mod call_tests {
             tombstone: false,
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 
@@ -614,10 +667,79 @@ mod call_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::{EVENT_ADDED, EVENT_CREATED, EVENT_REMOVED, System};
     use crate::message::Post;
 
     fn key(b: u8) -> PubKey {
         PubKey::new([b; 32])
+    }
+
+    /// An entry the exchange wrote, encoded and decoded the way one actually
+    /// arrives -- through `System::decode`, so an event this version does not
+    /// know is `None` here exactly as it would be on the wire.
+    fn system_entry(seq: u64, event: u8, subject: u8, actor: u8, posted: u64) -> Received {
+        let what = System {
+            event,
+            subject: key(subject),
+            actor: key(actor),
+            actor_device: key(actor),
+            chain_seq: 0,
+            prev: [0; 32],
+            sig: [0; 64],
+        };
+        Received {
+            seq,
+            account: key(actor),
+            posted,
+            kind: KIND_SYSTEM,
+            body: None,
+            system: System::decode(&what.encode()).unwrap(),
+            tombstone: false,
+            verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
+        }
+    }
+
+    /// A group gaining and losing people leaves a record, and it is in the
+    /// same order as what was said.
+    ///
+    /// The exchange signs one of these for every membership and metadata
+    /// change and the fold used to discard all of them, so a channel could be
+    /// created, invite four people, remove one and promote another, and a
+    /// reader would see nothing but the messages.
+    #[test]
+    fn what_happened_to_the_channel_is_kept_beside_what_was_said() {
+        let t = Timeline::fold(
+            &[
+                system_entry(1, EVENT_CREATED, 1, 1, 100),
+                system_entry(2, EVENT_ADDED, 2, 1, 101),
+                post(3, 2, 102, "hello"),
+                system_entry(4, EVENT_REMOVED, 2, 1, 103),
+            ],
+            &[key(1)],
+        );
+        let events: Vec<(u64, u8)> = t.events().map(|h| (h.seq, h.what.event)).collect();
+        assert_eq!(
+            events,
+            vec![(1, EVENT_CREATED), (2, EVENT_ADDED), (4, EVENT_REMOVED)],
+            "the exchange's own record is dropped"
+        );
+        // And they are not messages: a membership event has no body and must
+        // not be shown as somebody having said something.
+        assert_eq!(t.messages().count(), 1);
+        assert!(t.unreadable().is_empty(), "a system entry is not a gap");
+        // Who and by whom, which is the whole of what these are for.
+        let removed = t.events().find(|h| h.what.event == EVENT_REMOVED).unwrap();
+        assert_eq!(removed.what.subject, key(2));
+        assert_eq!(removed.what.actor, key(1));
+    }
+
+    /// SIP-16's rule for an event this version does not know: ignore it.
+    #[test]
+    fn an_event_nobody_here_understands_is_ignored_rather_than_shown() {
+        let t = Timeline::fold(&[system_entry(1, 0x7f, 2, 1, 100)], &[key(1)]);
+        assert_eq!(t.events().count(), 0);
+        assert_eq!(t.messages().count(), 0);
     }
 
     fn tombstone(seq: u64, who: u8, posted: u64) -> Received {
@@ -630,6 +752,7 @@ mod tests {
             body: None,
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 
@@ -643,6 +766,7 @@ mod tests {
             body: Some(Body::Post(Post::text(text))),
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 
@@ -656,6 +780,7 @@ mod tests {
             body: Some(b),
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 
@@ -926,6 +1051,7 @@ mod tests {
                     body: None,
                     verdict: Verdict::Valid,
                     standing: Standing::Unclaimed,
+                    system: None,
                 },
             ],
             &[],
@@ -951,6 +1077,7 @@ mod tests {
                     body: None,
                     verdict: Verdict::Valid,
                     standing: Standing::Unclaimed,
+                    system: None,
                 },
             ],
             &[],
@@ -1019,6 +1146,7 @@ mod deletion_tests {
             tombstone: false,
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 
@@ -1032,6 +1160,7 @@ mod deletion_tests {
             tombstone: true,
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 
@@ -1045,6 +1174,7 @@ mod deletion_tests {
             tombstone: false,
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         }
     }
 

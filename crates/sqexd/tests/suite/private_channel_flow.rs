@@ -1078,6 +1078,7 @@ fn timeline_of(
                 .and_then(|plain| Body::decode(&plain).ok().flatten()),
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
+            system: None,
         })
         .collect();
     Timeline::fold(&received, admins)

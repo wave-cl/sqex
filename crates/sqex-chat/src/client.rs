@@ -13,7 +13,7 @@ use sqex_proto::channel::{
     EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
     EVENT_UNREPLICATE, Entries, Entry, Fetch, Invite, Invitee, KIND_MEMBER, KIND_SYSTEM, List,
     Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark, Marks, Membership,
-    Mine, Mines, Post, Posted, Retain, Role, TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION,
+    Mine, Mines, Post, Posted, Retain, Role, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION,
     TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_UNREPLICATE,
     Visibility, constitution, direct_message_id,
 };
@@ -1712,7 +1712,20 @@ impl Chat {
                     // of it, and *unclaimed* is exactly what that is.
                     tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
                     standing: Standing::Unclaimed,
-                    body: plain.and_then(|p| Body::decode(&p).ok().flatten()),
+                    // Two decoders, chosen by kind and never both: a system
+                    // entry carries SIP-16's own layout and a member entry a
+                    // SIP-19 body, and neither decoder would make sense of the
+                    // other's bytes.
+                    system: (kind == KIND_SYSTEM)
+                        .then(|| {
+                            plain
+                                .as_deref()
+                                .and_then(|p| System::decode(p).ok().flatten())
+                        })
+                        .flatten(),
+                    body: (kind == KIND_MEMBER)
+                        .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
+                        .flatten(),
                 },
                 admins,
             );
@@ -3395,6 +3408,9 @@ impl Chat {
                         kind: e.kind,
                         tombstone,
                         body: None,
+                        // Nobody vouched for it, so nothing is decoded from
+                        // it either.
+                        system: None,
                         verdict,
                         standing,
                     },
@@ -3424,6 +3440,17 @@ impl Chat {
             if tombstone {
                 self.store.redact_message(channel, e.seq)?;
             }
+            // An entry the exchange wrote itself carries SIP-16's `System`
+            // layout, not a SIP-19 body. Decoded here rather than dropped:
+            // membership and metadata changes are the exchange's own signed
+            // record and a reader should see them in the conversation.
+            let system = (e.kind == KIND_SYSTEM)
+                .then(|| {
+                    plain
+                        .as_deref()
+                        .and_then(|p| System::decode(p).ok().flatten())
+                })
+                .flatten();
             let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
             let redacts = match &body {
                 Some(Body::Redact { target }) => Some(*target),
@@ -3437,6 +3464,7 @@ impl Chat {
                     kind: e.kind,
                     tombstone,
                     body,
+                    system,
                     verdict,
                     standing,
                 },
