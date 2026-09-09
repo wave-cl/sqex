@@ -355,6 +355,25 @@ fn rebuild(db: &Connection, zero: &[u8]) -> Result<()> {
         ),
     ];
     for (name, create, copy) in steps {
+        // **A table this store never had.** The guard above asks one table —
+        // `channel_key` — whether the store predates the exchange column, and
+        // then this rebuilt all nine as though a store were a single version.
+        // It is not: `handle` arrived with SIP-38 and `profile` before it, so
+        // a store older than either has `channel_key` and no `handle`, and the
+        // copy failed with `no such table: handle`. Twelve of the fourteen
+        // stores on the machine this was found on were in exactly that shape,
+        // and none of them would open.
+        //
+        // Skipped rather than rebuilt: `SCHEMA` runs straight after this and
+        // creates a missing table in the shape the migration would have
+        // produced, and there is nothing to copy into it either way.
+        let present: bool = db
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1")
+            .and_then(|mut s| s.exists(params![name]))
+            .map_err(storage("inspect the store's shape"))?;
+        if !present {
+            continue;
+        }
         db.execute_batch(create)
             .map_err(storage("create the migrated table"))?;
         db.execute(copy, params![zero])
@@ -2313,6 +2332,87 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
         assert!(store.highest_epoch(&[7; 32]).is_err());
     }
 
+    /// A store older than some of the tables the migration rebuilds.
+    ///
+    /// # Why this is not the same fixture with a row removed
+    ///
+    /// `OLD` is the schema as it stood at **one** moment. A store on somebody's
+    /// disk is the schema as it stood at whatever moment they last opened it,
+    /// and `handle` arrived with SIP-38 while `profile` arrived before that —
+    /// so a real store can have `channel_key` and neither of those. The
+    /// migration decided "this store predates the exchange column" by asking
+    /// `channel_key` alone and then rebuilt all nine tables as though a store
+    /// were a single version, and failed with `no such table: handle`.
+    ///
+    /// Twelve of the fourteen stores on the machine where this was found were
+    /// in exactly that shape, and none of them would open.
+    #[test]
+    fn a_store_older_than_the_tables_it_lacks_still_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("older.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            // Everything `OLD` has except the two tables that came later.
+            let older: String = OLD
+                .lines()
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace(
+                    "CREATE TABLE profile (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',\n    title TEXT NOT NULL DEFAULT '', fetched INTEGER NOT NULL DEFAULT 0);",
+                    "",
+                )
+                .replace(
+                    "CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',\n    fetched INTEGER NOT NULL DEFAULT 0);",
+                    "",
+                );
+            assert!(
+                !older.contains("CREATE TABLE handle") && !older.contains("CREATE TABLE profile"),
+                "the fixture still has the tables this is about"
+            );
+            db.execute_batch(&older).unwrap();
+            db.execute(
+                "INSERT INTO channel_key (channel, epoch, sealed) VALUES (?1, 3, ?2)",
+                params![&[7u8; 32][..], &b"a sealed key"[..]],
+            )
+            .unwrap();
+        }
+
+        // Opening it at all is the thing: this failed with
+        // `no such table: handle` and the store could not be used.
+        let _store = Store::open(&seed(1), Some(&path)).expect("an older store still opens");
+
+        // Read back through SQL rather than the store's accessors: the
+        // fixture's `sealed` bytes are a placeholder and not real ciphertext,
+        // so decrypting one would fail for a reason that has nothing to do
+        // with the migration.
+        let db = Connection::open(&path).unwrap();
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM channel_key", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the row did not survive the rebuild");
+        let has_exchange: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('channel_key') WHERE name = 'exchange'")
+            .and_then(|mut s| s.exists([]))
+            .unwrap();
+        assert!(has_exchange, "the table it did have was not migrated");
+        // And the tables it never had are there now, in the new shape — the
+        // schema creates them, which is why the migration can skip them.
+        for missing in ["handle", "profile"] {
+            let made: bool = db
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1")
+                .and_then(|mut s| s.exists(params![missing]))
+                .unwrap();
+            assert!(made, "{missing} was skipped and never created");
+            let scoped: bool = db
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{missing}') WHERE name = 'exchange'"
+                ))
+                .and_then(|mut s| s.exists([]))
+                .unwrap();
+            assert!(scoped, "{missing} was created in the old shape");
+        }
+    }
+
     #[test]
     fn migrating_twice_is_not_a_second_migration() {
         let dir = tempfile::tempdir().unwrap();
@@ -2363,5 +2463,43 @@ mod locking {
             lock(&path, &an_exchange(10)).is_ok(),
             "a second exchange shares no counter with the first"
         );
+    }
+}
+
+#[cfg(test)]
+mod against_real_stores {
+    use super::*;
+
+    /// Every store this machine actually holds, opened from a **copy**.
+    ///
+    /// Ignored by default: it reads whatever is in `~/.sqex/chat`, which is
+    /// nothing on a build machine and somebody's whole conversation history on
+    /// a real one. Run it deliberately, and never against the originals — the
+    /// copy is the point.
+    ///
+    /// This is the check the fixture could not be: `OLD` is the schema at one
+    /// moment and these files are the schema at fourteen different ones.
+    #[test]
+    #[ignore = "reads ~/.sqex/chat; run deliberately with --ignored"]
+    fn every_store_on_this_machine_opens() {
+        let from = match std::env::var("SQEX_STORE_COPIES") {
+            Ok(d) => std::path::PathBuf::from(d),
+            Err(_) => return,
+        };
+        let mut looked = 0;
+        for entry in std::fs::read_dir(&from).expect("the copies") {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "db") {
+                continue;
+            }
+            looked += 1;
+            Store::open(&[1u8; 32], Some(&path))
+                .unwrap_or_else(|e| panic!("{} would not open: {e}", path.display()));
+        }
+        assert!(
+            looked > 0,
+            "no stores were looked at, so nothing was tested"
+        );
+        eprintln!("opened {looked} stores");
     }
 }
