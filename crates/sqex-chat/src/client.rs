@@ -75,6 +75,20 @@ const PROFILE_TTL: u64 = 60 * 60;
 /// name and anybody seeing it.
 const PROFILE_MISS_TTL: u64 = 3 * 60;
 
+/// How long a poll will believe what it was last told about a channel.
+///
+/// **A poll that fetched nothing has nothing to attribute.** `poll` asked the
+/// exchange who is in the channel, and then asked it once per member which
+/// devices they hold, on *every* poll — so a client watching a quiet
+/// conversation at 700ms was making four requests a tick to learn that nothing
+/// had happened, three of them about a membership that had not moved.
+///
+/// Anything that *does* move the membership or the epoch arrives as an entry,
+/// and an entry refreshes both at once, so this only bounds how stale the
+/// answer can be when nothing at all is arriving. Fifteen seconds of that is a
+/// question worth not asking a thousand times.
+const POLL_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// How long the credential in an admission request stays valid.
 ///
 /// Long enough for somebody to read the request and act on it, short enough
@@ -462,6 +476,11 @@ pub struct Chat {
     /// receipts mid-connection, and retrying every call would turn a settled
     /// answer into a request per fetch.
     receipts: AtomicBool,
+    /// What the exchange last said about a channel, and when, for polling
+    /// only. See [`Chat::poll`]'s use of it and `POLL_TTL`.
+    told_about: HashMap<[u8; 32], (ChannelInfo, std::time::Instant)>,
+    /// Which device belongs to which account, per channel, for the same.
+    bound_in: HashMap<[u8; 32], (HashMap<PubKey, Option<PubKey>>, std::time::Instant)>,
     /// The domain this exchange was discovered under (SIP-33), for rendering a
     /// SIP-38 handle as `name@domain`. `None` when reached by a literal
     /// host+key, where there is no domain to show.
@@ -517,6 +536,8 @@ impl Chat {
             seed,
             exchange,
             receipts: AtomicBool::new(true),
+            told_about: HashMap::new(),
+            bound_in: HashMap::new(),
             domain: None,
             endpoint: None,
             link: Link::Up,
@@ -3363,7 +3384,21 @@ impl Chat {
 
         // Who may redact and whose metadata counts — Timeline needs this, and
         // it is only in the member list.
-        let mut info = self.info(channel).await?;
+        //
+        // **Asked again only when something arrived**, or when what we were
+        // told has gone stale: see `POLL_TTL`. A poll that fetched no entries
+        // has nothing to attribute and nothing to fold, and the membership it
+        // would be asking about cannot have moved without an entry saying so.
+        let arrived = !entries.entries.is_empty();
+        let mut info = match self.told_about.get(channel) {
+            Some((info, at)) if !arrived && at.elapsed() < POLL_TTL => info.clone(),
+            _ => {
+                let fresh = self.info(channel).await?;
+                self.told_about
+                    .insert(*channel, (fresh.clone(), std::time::Instant::now()));
+                fresh
+            }
+        };
 
         // Somebody may have rotated while this client was running — after a
         // removal, or after revoking a device. Collect once when we hold no key
@@ -3372,6 +3407,8 @@ impl Chat {
         if info.epoch > 0 && self.store.key(channel, info.epoch)?.is_none() {
             self.collect_keys(channel).await?;
             info = self.info(channel).await?;
+            self.told_about
+                .insert(*channel, (info.clone(), std::time::Instant::now()));
         }
         let admins: Vec<PubKey> = info
             .members
@@ -3393,7 +3430,17 @@ impl Chat {
         // Fetched once for the batch rather than per entry: SIP-31's second
         // step needs a credential for every device that signed one, and the
         // members are who could have.
-        let bound = self.bindings(&members_of(&info)).await.unwrap_or_default();
+        // The same question, and the same answer: one `/device/list` per member
+        // per poll, to bind signatures on entries that did not arrive.
+        let bound = match self.bound_in.get(channel) {
+            Some((bound, at)) if !arrived && at.elapsed() < POLL_TTL => bound.clone(),
+            _ => {
+                let fresh = self.bindings(&members_of(&info)).await.unwrap_or_default();
+                self.bound_in
+                    .insert(*channel, (fresh.clone(), std::time::Instant::now()));
+                fresh
+            }
+        };
         let mut last = since;
         for e in &entries.entries {
             last = last.max(e.seq);
