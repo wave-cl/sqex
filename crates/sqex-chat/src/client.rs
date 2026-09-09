@@ -437,6 +437,9 @@ pub struct Chat {
     /// pushing, and the caller is on its own cadence until it resubscribes —
     /// which is exactly the state a fresh connection starts in.
     events: Option<crate::events::Stream>,
+    /// Somewhere to be told a frame arrived, so a caller need not ask on a
+    /// timer. See [`crate::events::Wake`] and `Chat::wake_on_events`.
+    wake_events: Option<crate::events::Wake>,
     /// The account we act for. Membership, roles, direct-message identifiers
     /// and display are all per account.
     pub me: PubKey,
@@ -521,6 +524,7 @@ impl Chat {
             next_dial: Instant::now(),
             dialing: None,
             events: None,
+            wake_events: None,
             me,
             device,
             store,
@@ -1178,6 +1182,19 @@ impl Chat {
         self.events.is_some()
     }
 
+    /// Be told when the event stream has something, rather than asking.
+    ///
+    /// Draining never waits, which is what keeps it out of the keyboard's way,
+    /// and it leaves a client that drains on a timer learning about a message
+    /// when its timer comes round rather than when the message arrives. Set
+    /// this and the stream's reader will notify it as each batch is queued.
+    ///
+    /// Set it **before** subscribing: the stream open at the time is the one
+    /// that was told where to knock.
+    pub fn wake_on_events(&mut self, wake: crate::events::Wake) {
+        self.wake_events = Some(wake);
+    }
+
     /// Open an event stream, if there is not one already.
     ///
     /// **A caller must reconcile after this returns, not before.** The exchange
@@ -1195,7 +1212,7 @@ impl Chat {
         if self.offline() {
             return Err(ChatError::Transport("the exchange is unreachable".into()));
         }
-        match crate::events::Stream::open(&self.client).await {
+        match crate::events::Stream::open(&self.client, self.wake_events.clone()).await {
             Ok(stream) => {
                 self.events = Some(stream);
                 self.up();

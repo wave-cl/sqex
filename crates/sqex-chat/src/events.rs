@@ -82,6 +82,21 @@ pub struct Stream {
     heard: Instant,
 }
 
+/// Somewhere to be told that a frame has arrived.
+///
+/// # Why a caller wants this
+///
+/// Draining never waits, which is what keeps it out of the keyboard's way --
+/// and it means a client that only drains on a timer learns about a message
+/// when its timer comes round rather than when the message arrives. sigil's
+/// was 700ms, so an event that had crossed the world in 90ms then sat in a
+/// queue for up to seven times that.
+///
+/// A `Notify` rather than the receiver itself, because the receiver lives
+/// inside the `Chat` that the caller is also using to fetch: waiting on it
+/// would borrow the whole client for as long as nothing was happening.
+pub type Wake = std::sync::Arc<tokio::sync::Notify>;
+
 impl Stream {
     /// Subscribe, and start reading.
     ///
@@ -91,7 +106,7 @@ impl Stream {
     /// know that anything changing during the reconcile is queued rather than
     /// missed. Reconciling first and subscribing after would lose exactly the
     /// window in between, silently.
-    pub async fn open(client: &sqnr::Client) -> Result<Stream, Refusal> {
+    pub async fn open(client: &sqnr::Client, wake: Option<Wake>) -> Result<Stream, Refusal> {
         let body = Subscribe { version: VERSION }.encode();
         let mut stream = client
             .stream("POST", "/events", body)
@@ -108,7 +123,7 @@ impl Stream {
             return Err(Refusal::Status(status, said));
         }
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(pump(stream, tx));
+        let task = tokio::spawn(pump(stream, tx, wake));
         Ok(Stream {
             rx,
             task,
@@ -158,7 +173,7 @@ impl Drop for Stream {
 }
 
 /// Read frames until the stream breaks, posting each decoded event.
-async fn pump(mut stream: sqnr::Stream, tx: mpsc::UnboundedSender<Event>) {
+async fn pump(mut stream: sqnr::Stream, tx: mpsc::UnboundedSender<Event>, wake: Option<Wake>) {
     let mut framer = Framer::new();
     loop {
         let chunk = match stream.next().await {
@@ -173,10 +188,18 @@ async fn pump(mut stream: sqnr::Stream, tx: mpsc::UnboundedSender<Event>) {
         let Ok(events) = framer.feed(&chunk) else {
             return;
         };
+        let mut arrived = false;
         for e in events {
             if tx.send(e).is_err() {
                 return; // nobody is listening any more
             }
+            arrived = true;
+        }
+        // **After they are queued, not before.** A caller woken first would
+        // drain an empty queue and go back to sleep, and the events it was
+        // woken for would wait for whatever it was waiting for.
+        if arrived && let Some(wake) = &wake {
+            wake.notify_one();
         }
     }
 }
