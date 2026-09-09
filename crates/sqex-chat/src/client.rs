@@ -1034,6 +1034,26 @@ impl Chat {
             .outcome)
     }
 
+    /// Give up a SIP-38 name this account holds (`POST /name/release`).
+    ///
+    /// **A no-op unless this account holds it**, and an acknowledgement either
+    /// way — the exchange's `resolve` already discloses who holds a name, so
+    /// there is nothing an error here would protect and something it would
+    /// leak: whether the caller was the holder.
+    ///
+    /// Nothing is destroyed. A name is a lease at one exchange, and letting go
+    /// of one leaves every conversation, key and counter exactly where it was;
+    /// what stops is `name@domain` resolving to this account. Somebody else may
+    /// take it afterwards, which is the part worth saying out loud before
+    /// anybody presses it.
+    pub async fn release_name(&mut self, name: &str) -> Result<()> {
+        let name =
+            sqex_proto::name::canonical(name).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.post("/name/release", sqex_proto::name::Release { name }.encode())
+            .await?;
+        Ok(())
+    }
+
     /// The SIP-38 handles the exchange reports for an account
     /// (`POST /name/reverse`), oldest first. The exchange's word — a hint for
     /// display, never an authority.

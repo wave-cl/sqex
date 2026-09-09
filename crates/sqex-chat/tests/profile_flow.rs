@@ -559,3 +559,62 @@ async fn a_claimed_name_becomes_a_handle() {
     alice.set_domain(None);
     assert_eq!(alice.handle(&alice_key), None);
 }
+
+/// A name can be given up, and somebody else may then have it.
+///
+/// A name is a lease at one exchange. Letting go of one leaves every
+/// conversation, key and counter where it was — what stops is `name@domain`
+/// resolving to this account, and the name going back into the namespace is
+/// the part worth saying before anybody presses it.
+#[tokio::test]
+async fn a_name_is_released_and_becomes_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, bob_key) = identity(2);
+
+    assert_eq!(
+        alice.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    assert_eq!(
+        bob.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_TAKEN
+    );
+
+    alice.release_name("ada").await.unwrap();
+    assert!(
+        alice.resolve_name("ada").await.is_err(),
+        "the name still resolves to somebody"
+    );
+    // And it is genuinely back in the namespace.
+    assert_eq!(
+        bob.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    assert_eq!(alice.resolve_name("ada").await.unwrap(), bob_key);
+}
+
+/// Releasing a name this account does not hold changes nothing and says so
+/// the same way.
+///
+/// An error here would protect nothing — `resolve` already discloses the
+/// holder — and would leak the one thing it does not: whether the caller was
+/// the holder.
+#[tokio::test]
+async fn releasing_somebody_elses_name_is_a_no_op_and_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+
+    alice.claim_name("ada").await.unwrap();
+    bob.release_name("ada").await.expect("an acknowledgement");
+    assert_eq!(
+        bob.resolve_name("ada").await.unwrap(),
+        alice_key,
+        "somebody else's name was given away"
+    );
+}
