@@ -359,11 +359,122 @@ impl Chat {
     }
 }
 
+/// Which device each account signs from, as far as the exchange will say.
+///
+/// `None` for an account with no linked device: SIP-22 makes such an account
+/// its own device, so there is nothing to bind and nothing missing.
+type Bindings = HashMap<PubKey, Option<PubKey>>;
+
 /// Whether an account may mint an epoch here.
 fn is_admin(info: &ChannelInfo, who: &PubKey) -> bool {
     info.members
         .iter()
         .any(|m| m.account == *who && m.role == Role::Admin)
+}
+
+/// What a fetch brought back, before anything has been made of it.
+///
+/// Opaque on purpose: it is a body off the wire plus the two things needed to
+/// read it — the cursor it was asked from, and whether receipts were asked for.
+/// Nothing can be learned from one without [`Chat::absorb`], which holds the
+/// keys.
+pub struct Fetched {
+    channel: [u8; 32],
+    since: u64,
+    receipts: bool,
+    body: Vec<u8>,
+}
+
+impl Fetched {
+    /// Which conversation this is an answer about.
+    pub fn channel(&self) -> [u8; 32] {
+        self.channel
+    }
+}
+
+/// A fetch that has not been sent yet, and need not be sent from here.
+///
+/// # Why this exists
+///
+/// `/channel/fetch` takes a `wait_secs`: the exchange holds the request open
+/// and answers the moment an entry or a signal arrives (SIP-16). One request
+/// then delivers a message in a single trip and costs nothing while nothing is
+/// happening — which is what a chat client wants and what every caller here
+/// declined, passing `wait_secs = 0` and asking again on a timer, because
+/// `Chat` is one borrow and a request parked in it for twenty-five seconds is
+/// twenty-five seconds in which nothing else can be sent.
+///
+/// So the parked half is taken out. A `Watch` owns a [`sqnr::Requests`] — a
+/// handle on the same connection, its own HTTP/3 stream, no second handshake
+/// and no second socket — and knows nothing else. It cannot touch the store,
+/// cannot spend a counter and cannot decide the link is down; it fetches bytes
+/// and hands them back for [`Chat::absorb`] to make sense of.
+///
+/// **It does not follow a reconnection.** The handle belongs to the connection
+/// it was taken from, so a `Watch` outstanding when the client redials is
+/// answering about a connection that is gone. A caller that redials should drop
+/// it and take another; what comes back from the old one is stale, not wrong,
+/// but there is no reason to wait for it.
+pub struct Watch {
+    requests: sqnr::Requests,
+    channel: [u8; 32],
+    since: u64,
+    receipts: bool,
+    wait: u16,
+}
+
+impl Watch {
+    /// Which conversation this is parked on.
+    pub fn channel(&self) -> [u8; 32] {
+        self.channel
+    }
+
+    /// How long the exchange may hold it open with nothing to say.
+    pub fn waits(&self) -> u16 {
+        self.wait
+    }
+
+    /// Park it, and hand back what arrives.
+    ///
+    /// Returns when the exchange has something -- an entry or a signal -- or
+    /// when `wait` expires with nothing, which is an ordinary empty answer and
+    /// not an error. Consumes itself: a fetch is asked from a cursor, and one
+    /// answered is one whose cursor has moved.
+    ///
+    /// Refusals are returned rather than acted on: this has no client to lower
+    /// a link on or to renegotiate receipts with. A caller that gets an error
+    /// here should fall back to [`Chat::poll`], which does both.
+    pub async fn arrived(self) -> Result<Fetched> {
+        let req = Fetch {
+            channel: self.channel,
+            since: self.since,
+            wait_secs: self.wait,
+            receipts: self.receipts,
+        };
+        // The exchange's own wait, plus what an ordinary request is allowed.
+        // Judging a long poll by the ordinary deadline would call a working one
+        // a dead connection.
+        let patience = PATIENCE + Duration::from_secs(u64::from(self.wait));
+        let sent =
+            tokio::time::timeout(patience, self.requests.post("/channel/fetch", req.encode()))
+                .await
+                .map_err(|_| {
+                    ChatError::Transport(format!(
+                        "the exchange stopped answering ({}s)",
+                        patience.as_secs()
+                    ))
+                })?;
+        let (code, body) = sent.map_err(ChatError::Transport)?;
+        if code != 200 {
+            return Err(classify("/channel/fetch", code, &body));
+        }
+        Ok(Fetched {
+            channel: self.channel,
+            since: self.since,
+            receipts: self.receipts,
+            body,
+        })
+    }
 }
 
 /// What a fetch turned up, and everything the reader must be told about it.
@@ -480,7 +591,7 @@ pub struct Chat {
     /// only. See [`Chat::poll`]'s use of it and `POLL_TTL`.
     told_about: HashMap<[u8; 32], (ChannelInfo, std::time::Instant)>,
     /// Which device belongs to which account, per channel, for the same.
-    bound_in: HashMap<[u8; 32], (HashMap<PubKey, Option<PubKey>>, std::time::Instant)>,
+    bound_in: HashMap<[u8; 32], (Bindings, std::time::Instant)>,
     /// The domain this exchange was discovered under (SIP-33), for rendering a
     /// SIP-38 handle as `name@domain`. `None` when reached by a literal
     /// host+key, where there is no domain to show.
@@ -754,7 +865,7 @@ impl Chat {
     /// cannot produce a credential for — a registration made before SIP-32, or
     /// an exchange withholding one — and it is carried rather than dropped so a
     /// reader is told the difference between evidence and an assertion.
-    async fn bindings(&mut self, accounts: &[PubKey]) -> Result<HashMap<PubKey, Option<PubKey>>> {
+    async fn bindings(&mut self, accounts: &[PubKey]) -> Result<Bindings> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -3288,13 +3399,47 @@ impl Chat {
     ///
     /// `timeline` carries what we already had, so this is incremental: the
     /// exchange is asked only for entries past our cursor.
+    ///
+    /// Two halves, and they are separable on purpose — see [`Chat::watch`] and
+    /// [`Chat::absorb`]. The asking is transport and can be parked anywhere;
+    /// the making sense of the answer needs the store, the keys and the
+    /// counters, and belongs to whoever holds this.
     pub async fn poll(
         &mut self,
         channel: &[u8; 32],
         timeline: &mut Timeline,
         wait_secs: u16,
     ) -> Result<Conversation> {
-        let (mut since, _, _) = self.store.cursor(channel)?;
+        let got = self.ask(channel, wait_secs).await?;
+        self.absorb(timeline, got).await
+    }
+
+    /// A fetch for `channel` that can be parked off this client.
+    ///
+    /// See [`Watch`] for why. The cursor is read now, so a watch taken and then
+    /// left for a minute asks from where the conversation was when it was
+    /// taken -- which is right: anything that arrives in between is what it is
+    /// waiting for.
+    ///
+    /// `None` when there is no connection to park on. `wait` is clamped by the
+    /// exchange to `sqex_proto::channel::MAX_WAIT`.
+    pub fn watch(&self, channel: &[u8; 32], wait: u16) -> Option<Watch> {
+        if self.offline() {
+            return None;
+        }
+        let (since, _, _) = self.store.cursor(channel).ok()?;
+        Some(Watch {
+            requests: self.client.requests(),
+            channel: *channel,
+            since,
+            receipts: self.receipts.load(Ordering::Relaxed),
+            wait,
+        })
+    }
+
+    /// The asking half of [`poll`](Self::poll), on this client's own borrow.
+    async fn ask(&mut self, channel: &[u8; 32], wait_secs: u16) -> Result<Fetched> {
+        let (since, _, _) = self.store.cursor(channel)?;
         // A long poll is *meant* to sit there: `wait_secs` is how long the
         // exchange may hold the request open with nothing to say. Judging it
         // by the ordinary deadline would call a working long poll a dead
@@ -3329,8 +3474,31 @@ impl Chat {
             }
             Err(e) => return Err(e),
         };
+        Ok(Fetched {
+            channel: *channel,
+            since,
+            receipts: req.receipts,
+            body,
+        })
+    }
+
+    /// Make a conversation out of what a fetch brought back.
+    ///
+    /// The other half of [`poll`](Self::poll), and the only half that needs
+    /// this client: it opens entries with the epoch keys, spends SIP-17
+    /// counters, writes the store and folds `timeline`. A caller that parked
+    /// the fetch elsewhere — see [`Chat::watch`] — hands the [`Fetched`] here
+    /// and gets exactly what `poll` would have returned.
+    pub async fn absorb(&mut self, timeline: &mut Timeline, got: Fetched) -> Result<Conversation> {
+        let Fetched {
+            channel,
+            mut since,
+            receipts,
+            body,
+        } = got;
+        let channel = &channel;
         let mut entries =
-            Entries::decode(&body, req.receipts).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            Entries::decode(&body, receipts).map_err(|e| ChatError::Protocol(e.to_string()))?;
 
         // Being *above* the newest retained entry is not being ahead of the
         // conversation: it is holding the cursor of a channel that no longer
@@ -3370,7 +3538,7 @@ impl Chat {
                 channel: *channel,
                 since: 0,
                 wait_secs: 0,
-                receipts: req.receipts,
+                receipts,
             };
             let body = self.post("/channel/fetch", again.encode()).await?;
             entries = Entries::decode(&body, again.receipts)
