@@ -27,21 +27,45 @@ use sqnr_core::PubKey;
 use crate::common;
 use crate::common::{Chain, Signer, instance_for};
 
-/// A server whose peering whitelist holds `peers`.
+/// A server whose peering whitelist holds `peers` as full replicas.
 async fn server_in(
     dir: &Path,
     peers: &[PubKey],
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    let list = peers
+        .iter()
+        .map(|p| format!("{:?}", p.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    server_peering(dir, &list).await
+}
+
+/// A server whose one peer acts for `accounts` rather than being a full
+/// replica: it may pull what those accounts may read, with no per-channel
+/// authorisation.
+async fn server_acting_for(
+    dir: &Path,
+    peer: PubKey,
+    accounts: &[PubKey],
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    let acts = accounts
+        .iter()
+        .map(|a| format!("{:?}", a.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let list = format!("{{ key = {:?}, for = [{acts}] }}", peer.to_string());
+    server_peering(dir, &list).await
+}
+
+async fn server_peering(
+    dir: &Path,
+    list: &str,
 ) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     if !key_path.exists() {
         let (server_sk, _) = squic::generate_keypair();
         std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
     }
-    let list = peers
-        .iter()
-        .map(|p| format!("{:?}", p.to_string()))
-        .collect::<Vec<_>>()
-        .join(", ");
     let config_toml = format!(
         "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
          welcome_channel = \"\"\nreplication_peers = [{list}]\n",
@@ -892,7 +916,7 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         "the message did not survive the copy"
     );
     let seen = whole
-        .info(&bob, &bob, &channel)
+        .info(&bob, &bob, &channel, None)
         .expect("the joiner was not derived as a member");
     assert_eq!(seen.members.len(), 2);
     assert!(
@@ -1226,5 +1250,117 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
         blob_id(&[lying.sealed]),
         id,
         "bytes that hash to the same name would make the check meaningless"
+    );
+}
+
+/// **A peer acting for an account pulls that account's channels, and no
+/// others.**
+///
+/// The other half of SIP-35's gate, and the one with no per-channel signature:
+/// a read replica, or somebody's own exchange syncing conversations they are
+/// already in. It needs no `0x0b` because those accounts can already fetch
+/// every one of those entries as clients — the entries arriving on their own
+/// box is the same disclosure in a different place.
+///
+/// The scope is the whole point, so this drives both halves against a real
+/// second exchange: a channel Alice is in, and one she is not.
+#[tokio::test]
+async fn a_peer_acting_for_an_account_pulls_only_that_accounts_channels() {
+    use sqex_proto::h3::H3Client;
+    use sqexd::replica::{Origin, pull_once};
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+
+    let replica_key_path = replica_dir.path().join("host_key");
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(&replica_key_path, hex::encode(replica_sk.to_bytes())).unwrap();
+    let replica_key = PubKey::new(replica_pub);
+
+    let (alice_seed, alice) = identity(151);
+    let (bob_seed, bob) = identity(152);
+
+    // The peer acts for Alice, and for nobody else.
+    let (origin_addr, origin_pub, _oh) =
+        server_acting_for(origin_dir.path(), replica_key, &[alice]).await;
+    let origin = PubKey::new(origin_pub);
+
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
+    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed)
+        .await
+        .unwrap();
+
+    // Alice's channel.
+    let hers = [151u8; 32];
+    let s_a = Signer::new(alice_seed, alice, origin_pub);
+    let mut a_chain = Chain::default();
+    a_room(&mut a, &s_a, &mut a_chain, hers).await;
+    say(
+        &mut a,
+        &s_a,
+        &mut a_chain,
+        hers,
+        b"alice's own conversation",
+    )
+    .await;
+
+    // Bob's channel, which Alice is not in.
+    let his = [152u8; 32];
+    let s_b = Signer::new(bob_seed, bob, origin_pub);
+    let mut b_chain = Chain::default();
+    a_room(&mut b, &s_b, &mut b_chain, his).await;
+    say(&mut b, &s_b, &mut b_chain, his, b"none of her business").await;
+
+    // No `/channel/replicate` anywhere in this test. That is the difference
+    // being exercised: a full replica would need one per channel.
+    let replica = bind_replica(replica_dir.path()).await;
+    let store = replica.channels();
+    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+        .await
+        .expect("the replica could not reach the origin");
+
+    let took = pull_once(
+        &mut client,
+        &replica,
+        &Origin {
+            key: origin,
+            addr: origin_addr,
+            channels: vec![hers],
+            interval: std::time::Duration::from_secs(1),
+        },
+    )
+    .await
+    .unwrap();
+    let t = took
+        .get(&hers)
+        .expect("a peer acting for Alice must get Alice's channel with no 0x0b");
+    assert!(t.stored >= 2, "create and message: {t:?}");
+    assert_eq!(store.origin_of(&hers), Some(origin));
+
+    // And Bob's is refused, because Alice is not in it. Being named for one
+    // account is not being named for the exchange.
+    let took = pull_once(
+        &mut client,
+        &replica,
+        &Origin {
+            key: origin,
+            addr: origin_addr,
+            channels: vec![his],
+            interval: std::time::Duration::from_secs(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        took.get(&his).is_none_or(|t| t.stored == 0),
+        "a peer acting for Alice must not receive Bob's channel: {:?}",
+        took.get(&his)
+    );
+    assert_eq!(
+        store.origin_of(&his),
+        None,
+        "and must not end up holding it"
     );
 }
