@@ -343,13 +343,36 @@ pub async fn connect(
     signer: &sqnr_core::SoftwareSigner,
     report: &mut dyn Report,
 ) -> Result<Client, String> {
-    let me = PubKey::new(signer.public());
     let client =
         Client::connect_as(endpoint.address, endpoint.server.as_bytes(), &signer.seed()).await?;
+    adopt(client, signer, report)
+}
+
+/// The same, on a connection somebody else already holds.
+///
+/// A program that is already talking to this exchange as this identity — a
+/// chat client, in practice — can hand its connection here rather than have a
+/// second one dialled. That saves the handshake at the moment somebody presses
+/// call, and saves more than that afterwards: an exchange fans a relayed
+/// datagram out to *every* connection an identity holds, so a second one means
+/// every audio frame is also written to a connection where nothing reads it.
+///
+/// The datagram check is the same, and is not a formality on a borrowed
+/// connection: whether this path carries datagrams is a property of the
+/// connection, so one dialled for something else has to be asked as well.
+///
+/// **Datagrams have a single reader.** Handing a connection here hands over the
+/// reading of them; the lender must not read them too, or the two will take one
+/// each.
+pub fn adopt(
+    client: Client,
+    signer: &sqnr_core::SoftwareSigner,
+    report: &mut dyn Report,
+) -> Result<Client, String> {
     if client.max_datagram_size().is_none() {
         return Err("this path does not carry datagrams, so it cannot carry a call".into());
     }
-    report.event(Event::Identity(me));
+    report.event(Event::Identity(PubKey::new(signer.public())));
     Ok(client)
 }
 
