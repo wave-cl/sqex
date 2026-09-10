@@ -31,4 +31,4 @@ pub mod store;
 
 pub use attach::{Prepared, describe, file_name, kind_of};
 pub use client::{Chat, ChatError, Conversation, Fetched, Link, Watch};
-pub use store::{Contact, Store, StoreError};
+pub use store::{Channel, Contact, Store, StoreError};

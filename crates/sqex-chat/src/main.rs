@@ -547,7 +547,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             .iter()
             .find(|c| chat.dm_with(&c.account) == m.channel)
             .map(|c| (c.account, c.label.clone()));
-        let remembered = known.iter().find(|k| k.0 == m.channel);
+        let remembered = known.iter().find(|k| k.channel == m.channel);
 
         // The exchange is authoritative about who administers a channel; the
         // store is what makes that survive being offline.
@@ -563,7 +563,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
                 info.members.len(),
             ),
             Err(_) => (
-                remembered.map(|k| k.3.clone()).unwrap_or_default(),
+                remembered.map(|k| k.admins.clone()).unwrap_or_default(),
                 String::new(),
                 0,
             ),
@@ -577,13 +577,22 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             // until the log is read it goes by its identifier.
             None if public && !given_name.is_empty() => given_name,
             None => remembered
-                .map(|k| k.2.clone())
+                .map(|k| k.label.clone())
                 .filter(|l| !l.is_empty())
                 .unwrap_or_else(|| format!("group {}", hex8(&m.channel))),
         };
 
         chat.store()
-            .put_channel(&m.channel, peer.is_none(), &label, &admins)
+            // The exchange has just said which it is, so it is recorded:
+            // the next start knows without asking. A direct message answers
+            // `Some(false)` from `peer.is_some()` alone.
+            .put_channel(
+                &m.channel,
+                peer.is_none(),
+                peer.is_some().then_some(false).or(Some(public)),
+                &label,
+                &admins,
+            )
             .map_err(ChatError::Store)?;
 
         let timeline = chat.history(&m.channel, &admins).unwrap_or_default();
@@ -1199,6 +1208,7 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
                 let _ = chat.store().put_channel(
                     &conv.channel,
                     conv.peer.is_none(),
+                    Some(conv.public),
                     &conv.label,
                     &conv.admins,
                 );

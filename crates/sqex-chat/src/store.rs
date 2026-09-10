@@ -109,7 +109,9 @@ CREATE TABLE IF NOT EXISTS message (
 CREATE TABLE IF NOT EXISTS channel_meta (
     exchange BLOB NOT NULL,
     channel BLOB NOT NULL,
-    kind    INTEGER NOT NULL DEFAULT 0,   -- 0 direct message, 1 group
+    -- 0 direct message, 1 group of unrecorded kind, 2 private group,
+    -- 3 public channel. See `Kind` for why 1 still exists and must.
+    kind    INTEGER NOT NULL DEFAULT 0,
     label   TEXT    NOT NULL DEFAULT '',
     admins  BLOB    NOT NULL DEFAULT x'', -- concatenated 32-byte accounts
     PRIMARY KEY (exchange, channel)
@@ -201,6 +203,105 @@ CREATE TABLE IF NOT EXISTS handle (
     PRIMARY KEY (exchange, account)
 );
 "#;
+
+/// What the store knows about one channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Channel {
+    pub channel: [u8; 32],
+    /// More than two people.
+    pub group: bool,
+    /// Whether anybody may join it, and so whether anything in it is
+    /// encrypted.
+    ///
+    /// **`None` means this store does not know**, and is not the same as
+    /// `Some(false)`. A row written before the distinction was recorded says
+    /// only "a group", and a client that read that as private would be telling
+    /// somebody their words are sealed when they may be in the clear. So the
+    /// answer is withheld until the exchange gives one.
+    pub public: Option<bool>,
+    pub label: String,
+    pub admins: Vec<PubKey>,
+}
+
+/// The `kind` column, which is an integer and now carries two facts.
+///
+/// # Why a fourth value rather than a fifth column
+///
+/// The column recorded group-or-not. Nothing recorded whether a group was
+/// public, so a client restoring its own list from disk could not tell a
+/// private group from a public channel, and had to draw neither until the
+/// exchange answered -- a visible wait on every start, for a fact that never
+/// changes.
+///
+/// A new column would need a migration, and `channel_meta`'s migration is a
+/// whole-table rebuild inside a transaction. This needs none: the column is
+/// already an `INTEGER`, and every client that has ever read it reads
+/// **`kind != 0`** to mean "a group". So 2 and 3 arrive at an old client as
+/// groups, which is exactly what they are, and it keeps working.
+///
+/// The other direction is why [`Kind::Group`] must stay. A row already on disk
+/// says 1, and 1 is *ambiguous* -- it was written when nobody was recording
+/// the difference. It must not be read as "private": that is the claim that
+/// would be a lie. It stays unknown until the exchange says, and the next
+/// write records the answer, so a store heals itself one sweep after upgrading
+/// and never guesses in the meantime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A direct message. Two people, and never public.
+    Direct,
+    /// A group, written before anybody recorded whether it was public.
+    Group,
+    /// A group that is not public.
+    Private,
+    /// A channel anybody may join, whose contents are in the clear.
+    Public,
+}
+
+impl Kind {
+    fn of(group: bool, public: Option<bool>) -> Self {
+        match (group, public) {
+            (false, _) => Kind::Direct,
+            (true, None) => Kind::Group,
+            (true, Some(false)) => Kind::Private,
+            (true, Some(true)) => Kind::Public,
+        }
+    }
+
+    /// Anything unrecognised is a group of unknown kind, which is the answer
+    /// that claims least: a value from a newer client than this one is
+    /// certainly not a direct message, and might be either sort of group.
+    fn from_i64(n: i64) -> Self {
+        match n {
+            0 => Kind::Direct,
+            2 => Kind::Private,
+            3 => Kind::Public,
+            _ => Kind::Group,
+        }
+    }
+
+    fn as_i64(self) -> i64 {
+        match self {
+            Kind::Direct => 0,
+            Kind::Group => 1,
+            Kind::Private => 2,
+            Kind::Public => 3,
+        }
+    }
+
+    fn group(self) -> bool {
+        self != Kind::Direct
+    }
+
+    fn public(self) -> Option<bool> {
+        match self {
+            // A direct message has two members and cannot be joined, so this
+            // one is known rather than assumed.
+            Kind::Direct | Kind::Private => Some(false),
+            Kind::Public => Some(true),
+            Kind::Group => None,
+        }
+    }
+}
 
 pub struct Store {
     db: Connection,
@@ -1192,6 +1293,7 @@ impl Store {
         &self,
         channel: &[u8; 32],
         group: bool,
+        public: Option<bool>,
         label: &str,
         admins: &[PubKey],
     ) -> Result<()> {
@@ -1205,7 +1307,13 @@ impl Store {
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (exchange, channel)
                  DO UPDATE SET kind = ?2, label = ?3, admins = ?4",
-                params![&channel[..], i64::from(group), label, flat, self.scope()?],
+                params![
+                    &channel[..],
+                    Kind::of(group, public).as_i64(),
+                    label,
+                    flat,
+                    self.scope()?
+                ],
             )
             .map_err(storage("store channel"))?;
         Ok(())
@@ -1226,9 +1334,8 @@ impl Store {
         Ok(())
     }
 
-    /// Every channel this client knows about: id, group, label, admins.
-    #[allow(clippy::type_complexity)]
-    pub fn channels(&self) -> Result<Vec<([u8; 32], bool, String, Vec<PubKey>)>> {
+    /// Every channel this client knows about.
+    pub fn channels(&self) -> Result<Vec<Channel>> {
         let mut stmt = self
             .db
             .prepare(
@@ -1240,7 +1347,7 @@ impl Store {
             .query_map(params![self.scope()?], |r| {
                 Ok((
                     r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
-                    r.get::<_, i64>(1)? != 0,
+                    Kind::from_i64(r.get::<_, i64>(1)?),
                     r.get::<_, String>(2)?,
                     r.get::<_, Vec<u8>>(3)?,
                 ))
@@ -1248,14 +1355,20 @@ impl Store {
             .map_err(storage("query channels"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (channel, group, label, flat) = row.map_err(storage("read channel"))?;
+            let (channel, kind, label, flat) = row.map_err(storage("read channel"))?;
             let admins = flat
                 .as_chunks::<32>()
                 .0
                 .iter()
                 .map(|c| PubKey::new(*c))
                 .collect();
-            out.push((channel, group, label, admins));
+            out.push(Channel {
+                channel,
+                group: kind.group(),
+                public: kind.public(),
+                label,
+                admins,
+            });
         }
         Ok(out)
     }
@@ -2036,18 +2149,18 @@ mod tests {
         let path = dir.path().join("chat.db");
         {
             let s = scoped(&seed(1), Some(&path));
-            s.put_channel(&[7; 32], true, "the group", &[key(1), key(2)])
+            s.put_channel(&[7; 32], true, Some(false), "the group", &[key(1), key(2)])
                 .unwrap();
-            s.put_channel(&[8; 32], false, "bob", &[key(1), key(3)])
+            s.put_channel(&[8; 32], false, Some(false), "bob", &[key(1), key(3)])
                 .unwrap();
         }
         let s = scoped(&seed(1), Some(&path));
         let got = s.channels().unwrap();
         assert_eq!(got.len(), 2);
-        let group = got.iter().find(|c| c.0 == [7; 32]).unwrap();
-        assert!(group.1, "the group lost its kind");
-        assert_eq!(group.2, "the group");
-        assert_eq!(group.3, vec![key(1), key(2)]);
+        let group = got.iter().find(|c| c.channel == [7; 32]).unwrap();
+        assert!(group.group, "the group lost its kind");
+        assert_eq!(group.label, "the group");
+        assert_eq!(group.admins, vec![key(1), key(2)]);
     }
 
     #[test]
@@ -2055,17 +2168,125 @@ mod tests {
         // They arrive from different places: the name from a sealed entry only
         // members can read, the admins from the exchange.
         let s = scoped(&seed(1), None);
-        s.put_channel(&[7; 32], true, "", &[key(1)]).unwrap();
+        s.put_channel(&[7; 32], true, Some(false), "", &[key(1)])
+            .unwrap();
         s.set_label(&[7; 32], "renamed").unwrap();
         let got = s.channels().unwrap();
-        assert_eq!(got[0].2, "renamed");
-        assert_eq!(got[0].3, vec![key(1)], "setting a label dropped the admins");
+        assert_eq!(got[0].label, "renamed");
+        assert_eq!(
+            got[0].admins,
+            vec![key(1)],
+            "setting a label dropped the admins"
+        );
+    }
+
+    /// What a channel is survives being written down.
+    ///
+    /// The point of the whole thing: a client restoring its list from disk
+    /// used to know only "group or not", so it could not tell a private group
+    /// from a public channel and drew neither mark until the exchange
+    /// answered.
+    #[test]
+    fn a_public_channel_and_a_private_group_are_told_apart_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        {
+            let s = scoped(&seed(1), Some(&path));
+            s.put_channel(&[1; 32], true, Some(true), "public", &[])
+                .unwrap();
+            s.put_channel(&[2; 32], true, Some(false), "private", &[])
+                .unwrap();
+            s.put_channel(&[3; 32], false, Some(false), "bob", &[])
+                .unwrap();
+            // A group whose kind nobody has said yet.
+            s.put_channel(&[4; 32], true, None, "unanswered", &[])
+                .unwrap();
+        }
+        let s = scoped(&seed(1), Some(&path));
+        let got = s.channels().unwrap();
+        let of = |id: [u8; 32]| got.iter().find(|c| c.channel == id).unwrap().clone();
+
+        assert_eq!(of([1; 32]).public, Some(true), "a public channel");
+        assert_eq!(of([2; 32]).public, Some(false), "a private group");
+        assert_eq!(of([3; 32]).public, Some(false), "a direct message");
+        assert_eq!(
+            of([4; 32]).public,
+            None,
+            "a group nobody has answered for must stay unanswered, not become \
+             private -- that claim is the one that would be a lie"
+        );
+        // And all four still know whether they are a group.
+        assert!(of([1; 32]).group);
+        assert!(of([2; 32]).group);
+        assert!(!of([3; 32]).group, "a direct message is not a group");
+        assert!(of([4; 32]).group);
+    }
+
+    /// A row written by a client that had never heard of this reads as a group
+    /// of unknown kind -- never as a private one.
+    ///
+    /// Written as raw SQL, because the point is a row this code did **not**
+    /// write. Building the "old" row with the new encoding would test the new
+    /// encoding against itself.
+    #[test]
+    fn a_row_from_before_this_is_a_group_of_unknown_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        {
+            let s = scoped(&seed(1), Some(&path));
+            // Exactly what every client up to v0.46 wrote for a group.
+            s.db.execute(
+                "INSERT INTO channel_meta (channel, kind, label, admins, exchange)
+                 VALUES (?1, 1, 'old', x'', ?2)",
+                params![&[9u8; 32][..], s.scope().unwrap()],
+            )
+            .unwrap();
+        }
+        let s = scoped(&seed(1), Some(&path));
+        let got = s.channels().unwrap();
+        let old = got.iter().find(|c| c.channel == [9; 32]).unwrap();
+        assert!(old.group, "it is still a group");
+        assert_eq!(
+            old.public, None,
+            "a row that never recorded the answer must not be read as having \
+             given one"
+        );
+    }
+
+    /// And a value from a **newer** client than this one claims nothing it
+    /// cannot support.
+    #[test]
+    fn a_kind_from_the_future_is_a_group_of_unknown_kind() {
+        assert_eq!(Kind::from_i64(4).public(), None);
+        assert!(Kind::from_i64(4).group());
+        assert_eq!(Kind::from_i64(-1).public(), None);
+    }
+
+    /// Every kind survives the trip through the column, which is what lets an
+    /// old client keep reading a store a new one has written: it asks
+    /// `kind != 0`, and 2 and 3 answer "a group", which they are.
+    #[test]
+    fn the_column_round_trips_and_stays_readable_to_an_old_client() {
+        for (group, public) in [
+            (false, Some(false)),
+            (true, None),
+            (true, Some(false)),
+            (true, Some(true)),
+        ] {
+            let kind = Kind::of(group, public);
+            assert_eq!(Kind::from_i64(kind.as_i64()), kind, "{group} {public:?}");
+            assert_eq!(kind.group(), group);
+            assert_eq!(kind.public(), public);
+            // The old reader, written out rather than described.
+            assert_eq!(kind.as_i64() != 0, group, "an old client would disagree");
+        }
     }
 
     #[test]
     fn forgetting_a_channel_removes_it() {
         let s = scoped(&seed(1), None);
-        s.put_channel(&[7; 32], true, "gone", &[]).unwrap();
+        s.put_channel(&[7; 32], true, Some(false), "gone", &[])
+            .unwrap();
         s.forget_channel(&[7; 32]).unwrap();
         assert!(s.channels().unwrap().is_empty());
     }

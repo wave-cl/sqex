@@ -149,7 +149,7 @@ async fn closing_a_channel_ends_it_for_everyone() {
             .channels()
             .unwrap()
             .iter()
-            .any(|(c, ..)| *c == channel),
+            .any(|k| k.channel == channel),
         "the closing client kept the channel it destroyed"
     );
 }
