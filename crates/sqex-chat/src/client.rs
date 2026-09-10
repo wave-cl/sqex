@@ -1215,6 +1215,28 @@ impl Chat {
         (!name.is_empty()).then(|| format!("{name}@{domain}"))
     }
 
+    /// A handle on the connection this client holds.
+    ///
+    /// For another part of the same program to reach the same exchange as the
+    /// same identity without dialling again — a call, in practice. It is the
+    /// same connection: one handshake, one socket, one keep-alive timer, and
+    /// each request its own stream over the one path.
+    ///
+    /// **Worth more than the handshake it saves.** An exchange fans a relayed
+    /// datagram out to every connection an identity holds, so a client holding
+    /// a chat connection beside a call connection has every audio frame written
+    /// to the one where nothing reads it.
+    ///
+    /// `None` when there is nothing live to hand out. The handle does not
+    /// follow a reconnection either: it belongs to the connection it was taken
+    /// from, and a caller that wants the new one asks again.
+    ///
+    /// Datagrams have a single reader — see `sqnr::Client` — so whoever takes
+    /// this is the one that may read them. Nothing here ever does.
+    pub fn connection(&self) -> Option<sqnr::Client> {
+        (!self.offline()).then(|| self.client.clone())
+    }
+
     /// Whether the exchange is reachable, as far as anything has been able to
     /// tell.
     pub fn link(&self) -> Link {

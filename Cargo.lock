@@ -2759,6 +2759,7 @@ dependencies = [
  "ratatui",
  "rpassword",
  "rusqlite",
+ "serde_json",
  "sha2",
  "sqex-discovery",
  "sqex-proto",
@@ -2889,8 +2890,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr"
-version = "0.10.8"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.8#9f76ee95198b44e2ae635166614dc4c3f5ef6622"
+version = "0.10.9"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.9#516e8651ad89accf11ac77a0647e20d64cccb25a"
 dependencies = [
  "argon2",
  "bs58",
@@ -2921,8 +2922,8 @@ dependencies = [
 
 [[package]]
 name = "sqnr-core"
-version = "0.10.8"
-source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.8#9f76ee95198b44e2ae635166614dc4c3f5ef6622"
+version = "0.10.9"
+source = "git+https://github.com/wave-cl/sqnr?tag=v0.10.9#516e8651ad89accf11ac77a0647e20d64cccb25a"
 dependencies = [
  "bs58",
  "ed25519-dalek",

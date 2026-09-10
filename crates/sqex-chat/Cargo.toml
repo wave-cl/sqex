@@ -26,6 +26,9 @@ ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 x25519-dalek = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# For reading the exchange's own `/status`: what a client costs is a question
+# only the far end can answer.
+serde_json = { workspace = true }
 # For `flock` on the store. A lock the kernel releases when the process dies,
 # rather than a file somebody has to remember to delete.
 libc = { workspace = true }
