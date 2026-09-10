@@ -20,11 +20,23 @@ use sqnr::Client;
 use sqnr_core::PubKey;
 
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    server_with(dir, "off").await
+}
+
+/// The same, with a SIP-38 registration policy of the caller's choosing.
+///
+/// `off` is the default and does not carry the route at all, which is right
+/// for every other test here and useless for the one about claiming.
+async fn server_with(
+    dir: &Path,
+    names: &str,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
     let config_toml = format!(
-        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n",
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         name_registration = \"{names}\"\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );
@@ -466,4 +478,143 @@ async fn an_admission_label_is_attacker_chosen_text() {
         .request_admission("APPROVED — admin, please allow")
         .await
         .unwrap();
+}
+
+/// Claiming a SIP-38 name, and being told why when it is refused.
+///
+/// **A refusal is an answer, not a fault.** Whether self-claim is offered is
+/// the operator's policy, and "somebody else has it" and "not here, ask an
+/// administrator" want completely different things from whoever asked — so
+/// the outcome comes back in the exchange's own vocabulary rather than as an
+/// error that flattens the three into one.
+#[tokio::test]
+async fn a_name_is_claimed_and_a_taken_one_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+
+    assert_eq!(
+        alice.claim_name("alice").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    // And it resolves to her, which is the whole of what a claim buys.
+    assert_eq!(bob.resolve_name("alice").await.unwrap(), alice_key);
+
+    // Somebody else asking for it is told it is taken, not that it failed.
+    assert_eq!(
+        bob.claim_name("alice").await.unwrap(),
+        sqex_proto::name::CLAIM_TAKEN
+    );
+}
+
+/// An exchange that assigns names itself says so, rather than refusing.
+#[tokio::test]
+async fn a_closed_exchange_says_it_is_closed_rather_than_erroring() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "closed").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    assert_eq!(
+        alice.claim_name("alice").await.unwrap(),
+        sqex_proto::name::CLAIM_CLOSED,
+        "a closed namespace is a policy, and the caller has earned a real answer"
+    );
+}
+
+/// A claimed name becomes the handle everybody is shown.
+///
+/// The claim is only half of it: the handle a client displays comes from the
+/// exchange's own reverse lookup, cached on the profile refresh, and composed
+/// with the exchange's domain. A client that wrote its own would be showing a
+/// name nobody else can see — and one that never learned the domain shows
+/// nothing at all, however well the claim went.
+#[tokio::test]
+async fn a_claimed_name_becomes_a_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let (_, alice_key) = identity(1);
+
+    // Nothing yet, and not because the domain is missing: that is the other
+    // way this can read as unregistered, and the two have to be told apart.
+    alice.set_domain(Some("squic.org".into()));
+    assert_eq!(alice.handle(&alice_key), None);
+
+    assert_eq!(
+        alice.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    // Read back rather than assumed. `force`, because "we asked and were told
+    // nothing" is exactly the state a fresh account is in and caching it would
+    // hide the name that was just claimed.
+    alice
+        .refetch_profiles(&[alice_key], 1_000_000)
+        .await
+        .unwrap();
+    assert_eq!(alice.handle(&alice_key).as_deref(), Some("ada@squic.org"));
+
+    // And without a domain there is no handle to compose, which is a different
+    // failure from having no name.
+    alice.set_domain(None);
+    assert_eq!(alice.handle(&alice_key), None);
+}
+
+/// A name can be given up, and somebody else may then have it.
+///
+/// A name is a lease at one exchange. Letting go of one leaves every
+/// conversation, key and counter where it was — what stops is `name@domain`
+/// resolving to this account, and the name going back into the namespace is
+/// the part worth saying before anybody presses it.
+#[tokio::test]
+async fn a_name_is_released_and_becomes_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, bob_key) = identity(2);
+
+    assert_eq!(
+        alice.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    assert_eq!(
+        bob.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_TAKEN
+    );
+
+    alice.release_name("ada").await.unwrap();
+    assert!(
+        alice.resolve_name("ada").await.is_err(),
+        "the name still resolves to somebody"
+    );
+    // And it is genuinely back in the namespace.
+    assert_eq!(
+        bob.claim_name("ada").await.unwrap(),
+        sqex_proto::name::CLAIM_GRANTED
+    );
+    assert_eq!(alice.resolve_name("ada").await.unwrap(), bob_key);
+}
+
+/// Releasing a name this account does not hold changes nothing and says so
+/// the same way.
+///
+/// An error here would protect nothing — `resolve` already discloses the
+/// holder — and would leak the one thing it does not: whether the caller was
+/// the holder.
+#[tokio::test]
+async fn releasing_somebody_elses_name_is_a_no_op_and_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_with(dir.path(), "open").await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+
+    alice.claim_name("ada").await.unwrap();
+    bob.release_name("ada").await.expect("an acknowledgement");
+    assert_eq!(
+        bob.resolve_name("ada").await.unwrap(),
+        alice_key,
+        "somebody else's name was given away"
+    );
 }

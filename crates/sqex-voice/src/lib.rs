@@ -19,4 +19,5 @@ pub mod engine;
 pub mod jitter;
 pub mod media;
 pub mod mix;
+pub mod ring;
 pub mod room;

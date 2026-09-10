@@ -1741,7 +1741,12 @@ async fn redacting_takes_the_words_off_both_disks() {
 
     // Empty and not absent: "deleted" and "held but could not be opened" are
     // different things and have to survive a restart as different things.
-    let reopened = Store::open(&identity(2).0, Some(&dir.path().join("bob.db"))).unwrap();
+    // Opened directly to look inside, so it has to be told which exchange it
+    // is for -- `Chat::new` is what normally does that, and an unscoped store
+    // refuses every question about a channel rather than answering from rows
+    // nobody claimed.
+    let mut reopened = Store::open(&identity(2).0, Some(&dir.path().join("bob.db"))).unwrap();
+    reopened.scope_to(&PubKey::new(server_pub)).unwrap();
     let row = reopened
         .messages(&channel)
         .unwrap()
@@ -1833,7 +1838,8 @@ async fn words_deleted_before_we_learned_to_forget_them_are_cleared_on_reload() 
     // What an older client's store looked like: the message with its words
     // still in it, and the notice that deleted it sitting right after.
     {
-        let store = Store::open(&seed, Some(&path)).unwrap();
+        let mut store = Store::open(&seed, Some(&path)).unwrap();
+        store.scope_to(&PubKey::new(server_pub)).unwrap();
         let post = Body::Post(SipPost::text("the incriminating words")).encode();
         store
             .put_message(

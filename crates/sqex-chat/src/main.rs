@@ -271,7 +271,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     //
     // Held for the length of the session: dropping the guard, or the process
     // ending however it ends, hands it on.
-    let _lock = store::lock(&path).map_err(|e| e.to_string())?;
+    let _lock = store::lock(&path, &server).map_err(|e| e.to_string())?;
     interface(chat, pinned_notice).await
 }
 
@@ -3858,6 +3858,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 standing: Standing::Unclaimed,
+                system: None,
                 body: Some(Body::Post(SipPost::text(text))),
                 verdict: Verdict::Valid,
             },
@@ -3875,6 +3876,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 standing: Standing::Unclaimed,
+                system: None,
                 body: Some(Body::Call {
                     media: MEDIA_AUDIO,
                     ring_secs: RING_SECS,
@@ -4032,6 +4034,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 standing: Standing::Unclaimed,
+                system: None,
                 body: Some(Body::Post(SipPost::text("hello"))),
                 verdict: Verdict::Valid,
             }],
@@ -4254,6 +4257,7 @@ mod tests {
                 kind: sqex_proto::channel::KIND_MEMBER,
                 tombstone: false,
                 standing: Standing::Unclaimed,
+                system: None,
                 body: Some(Body::Post(SipPost::text("did you see this?"))),
                 verdict: Verdict::Valid,
             }],
@@ -4341,6 +4345,7 @@ mod tests {
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
                     standing: Standing::Unclaimed,
+                    system: None,
                     body: Some(Body::Post(SipPost::text("theirs"))),
                     verdict: Verdict::Valid,
                 },
@@ -4351,6 +4356,7 @@ mod tests {
                     kind: sqex_proto::channel::KIND_MEMBER,
                     tombstone: false,
                     standing: Standing::Unclaimed,
+                    system: None,
                     body: Some(Body::Post(SipPost::text("mine"))),
                     verdict: Verdict::Valid,
                 },
@@ -4385,6 +4391,7 @@ mod tests {
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
             standing: Standing::Unclaimed,
+            system: None,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };
@@ -4429,6 +4436,7 @@ mod tests {
             kind: sqex_proto::channel::KIND_MEMBER,
             tombstone: false,
             standing: Standing::Unclaimed,
+            system: None,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };

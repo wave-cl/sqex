@@ -154,6 +154,53 @@ async fn a_message_arrives_as_an_event_with_nothing_polling() {
     );
 }
 
+/// A client can be told a frame arrived, instead of asking on a timer.
+///
+/// Draining never waits, which is what keeps it out of the keyboard's way --
+/// and it leaves a client that drains on a timer learning about a message when
+/// its timer comes round rather than when the message arrives. sigil's timer
+/// was 700ms, so an event that had crossed the world in ninety milliseconds
+/// then sat in a queue for up to seven times that.
+///
+/// **Waited on, not slept through.** The test parks on the notifier with a
+/// deadline: if nothing ever knocks it fails by timing out rather than by
+/// passing because a sleep was long enough.
+#[tokio::test]
+async fn an_arriving_event_knocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _srv, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+
+    // Before subscribing: the stream open at the time is the one that was told
+    // where to knock.
+    let knock: sqex_chat::events::Wake = std::sync::Arc::new(tokio::sync::Notify::new());
+    bob.wake_on_events(knock.clone());
+    assert!(bob.subscribe().await.unwrap(), "bob did not subscribe");
+
+    alice.send(&channel, "and nobody had to ask").await.unwrap();
+
+    let knocked = tokio::time::timeout(SOON, knock.notified()).await;
+    assert!(
+        knocked.is_ok(),
+        "a message arrived and nothing told the client: it would have waited \
+         for its own timer"
+    );
+    // And what it was woken for is there to be taken.
+    let events = bob.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Channel { .. })),
+        "woken, and then handed nothing: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_rename_reaches_everybody_who_shares_a_channel() {
     let dir = tempfile::tempdir().unwrap();
@@ -402,13 +449,13 @@ async fn one_connection_carries_several_streams_and_then_refuses() {
     let mut held = Vec::new();
     for i in 0..sqexd::events::MAX_PER_IDENTITY {
         held.push(
-            sqex_chat::events::Stream::open(&client)
+            sqex_chat::events::Stream::open(&client, None)
                 .await
                 .unwrap_or_else(|e| panic!("stream {i} on one connection: {e}")),
         );
     }
 
-    match sqex_chat::events::Stream::open(&client).await {
+    match sqex_chat::events::Stream::open(&client, None).await {
         Err(sqex_chat::events::Refusal::Status(429, said)) => {
             // The reason survives the layer, which is the point of carrying the
             // body: a bare 429 does not tell the operator how many streams they
@@ -453,7 +500,7 @@ async fn one_connection_carries_several_streams_and_then_refuses() {
         }
     }
     assert!(freed, "a dropped stream never gave its slot back");
-    assert!(sqex_chat::events::Stream::open(&client).await.is_ok());
+    assert!(sqex_chat::events::Stream::open(&client, None).await.is_ok());
 }
 
 /// The claim the whole change is for, measured rather than asserted.
@@ -644,7 +691,7 @@ async fn a_stream_being_read_can_be_dropped() {
     drop(raw);
 
     // Still usable afterwards, which is what a reconnect needs.
-    let again = sqex_chat::events::Stream::open(&client).await;
+    let again = sqex_chat::events::Stream::open(&client, None).await;
     assert!(
         again.is_ok(),
         "could not resubscribe after dropping a stream"
