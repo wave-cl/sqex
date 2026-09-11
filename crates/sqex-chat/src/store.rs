@@ -1531,6 +1531,26 @@ impl Store {
         Ok(Some(chunks))
     }
 
+    /// Whether one is here, without reading it.
+    ///
+    /// For deciding whether to *ask* for a blob: a client that fetches
+    /// pictures unasked only up to a size still wants a bigger one it has
+    /// already got -- its own upload, or one it fetched last time. Reading the
+    /// whole thing to find out would cost what the question is trying to
+    /// avoid, and would mark it used. Says nothing about whether it still
+    /// hashes to its name; [`Store::blob`] checks that on the read.
+    pub fn has_blob(&self, blob: &[u8; 32]) -> Result<bool> {
+        self.db
+            .query_row(
+                "SELECT 1 FROM blob WHERE exchange = ?1 AND blob = ?2",
+                params![self.scope()?, &blob[..]],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(storage("look for blob"))
+    }
+
     /// Put one down.
     pub fn forget_blob(&self, blob: &[u8; 32]) -> Result<()> {
         self.db
@@ -2511,6 +2531,10 @@ mod tests {
         assert_eq!(s.blob(&id).unwrap().as_deref(), Some(chunks.as_slice()));
         assert_eq!(s.blob_bytes().unwrap(), 157);
         assert!(s.blob(&[0u8; 32]).unwrap().is_none(), "one never kept");
+        assert!(s.has_blob(&id).unwrap());
+        assert!(!s.has_blob(&[0u8; 32]).unwrap(), "one never kept");
+        s.forget_blob(&id).unwrap();
+        assert!(!s.has_blob(&id).unwrap(), "put down");
     }
 
     /// A row the disc has damaged is caught on the way out, and put down.
