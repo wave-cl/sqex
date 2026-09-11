@@ -293,3 +293,62 @@ async fn join_public(chat: &mut Chat, channel: [u8; 32]) -> Result<(), sqex_chat
         .unwrap_or([0u8; 32]);
     chat.join(&channel, instance).await
 }
+
+/// A picture sent into a public channel can be fetched back out of it.
+///
+/// Reported from the desktop client: an image sent to a public channel never
+/// displayed. The client's send and fetch paths do not branch on the kind of
+/// channel, so whatever is different is below them -- and this is the whole
+/// of that path with nothing else in the way.
+#[tokio::test]
+async fn a_picture_sent_to_a_public_channel_can_be_fetched_back() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut founder = chat_at(addr, server_pub, 50, &dir.path().join("a.db")).await;
+    let channel = founder.create_public("pictures", "").await.unwrap();
+
+    let path = dir.path().join("picture.bin");
+    let secret: Vec<u8> = (0..(CHUNK + 99)).map(|i| (i % 241) as u8).collect();
+    std::fs::write(&path, &secret).unwrap();
+    let prepared = founder.prepare_file(&path, CHUNK).unwrap();
+    let attachment = match founder.upload(&channel, &prepared).await {
+        Ok(a) => a,
+        Err(e) => panic!("the upload into a public channel was refused: {e}"),
+    };
+    let mut post = SipPost::text("look");
+    post.parts.push(Part::Attachment(attachment));
+    founder.send_post(&channel, post).await.unwrap();
+
+    // The sender reads their own channel back.
+    let mut mine = Timeline::new();
+    let got = founder.poll(&channel, &mut mine, 0).await.unwrap();
+    let a = got
+        .timeline
+        .messages()
+        .find_map(|m| m.post.attachments().next().cloned())
+        .expect("the attachment is not on the message that carried it");
+    assert_eq!(
+        founder.download(&a).await.unwrap(),
+        secret,
+        "the sender cannot fetch their own picture back"
+    );
+
+    // And somebody who joined afterwards.
+    let mut joiner = chat_at(addr, server_pub, 51, &dir.path().join("b.db")).await;
+    join_public(&mut joiner, channel).await.unwrap();
+    let mut theirs = Timeline::new();
+    let got = joiner.poll(&channel, &mut theirs, 0).await.unwrap();
+    let a = got
+        .timeline
+        .messages()
+        .find_map(|m| m.post.attachments().next().cloned())
+        .expect("the joiner does not see the attachment on the message");
+    assert_eq!(
+        joiner.download(&a).await.unwrap(),
+        secret,
+        "a member of a public channel cannot fetch a picture posted in it"
+    );
+}
