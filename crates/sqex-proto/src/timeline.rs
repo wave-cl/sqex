@@ -233,6 +233,9 @@ pub struct Timeline {
     events: BTreeMap<u64, Happening>,
     /// Bodies we could not read at all, by sequence number.
     unreadable: Vec<u64>,
+    /// Who wrote each of those, and when: what a redaction of one needs, since
+    /// nothing else about the entry survived.
+    unreadable_by: BTreeMap<u64, (PubKey, u64)>,
     forged: Vec<u64>,
     broken: Vec<(u64, Verdict)>,
     pub name: String,
@@ -410,6 +413,7 @@ impl Timeline {
             // Well formed and not understood, or sealed under a key we lack.
             // Either way it happened, and the reader is told.
             self.unreadable.push(e.seq);
+            self.unreadable_by.insert(e.seq, (e.account, e.posted));
             return;
         };
         match body {
@@ -451,6 +455,35 @@ impl Timeline {
             }
             Body::Redact { target } => {
                 let Some(m) = self.messages.get_mut(target) else {
+                    // **An entry this reader never understood can still be
+                    // deleted**, and the deletion has to land. It did not: a
+                    // redaction of a message that was not in `messages` did
+                    // nothing, so a message that would never open -- one with
+                    // a preview over the cap, say -- stayed counted as
+                    // unreadable for every reader for ever, *after* its
+                    // author took it down. The same authority rule, against
+                    // the author remembered when it was found unreadable; it
+                    // becomes the tombstone it would have been had it opened.
+                    if let Some(&(author, posted)) = self.unreadable_by.get(target)
+                        && (author == e.account || admins.contains(&e.account))
+                    {
+                        self.unreadable.retain(|s| s != target);
+                        self.unreadable_by.remove(target);
+                        self.messages.insert(
+                            *target,
+                            Message {
+                                seq: *target,
+                                account: author,
+                                posted,
+                                post: Post::default(),
+                                edited: None,
+                                edit_seq: None,
+                                redacted: true,
+                                deletion: Deletion::Asked,
+                                reactions: BTreeMap::new(),
+                            },
+                        );
+                    }
                     return;
                 };
                 if m.account != e.account && !admins.contains(&e.account) {
@@ -1084,6 +1117,58 @@ mod tests {
         );
         assert_eq!(t.messages().count(), 1);
         assert_eq!(t.unreadable(), &[2]);
+    }
+
+    /// A body we could not read can still be deleted, and the deletion lands.
+    ///
+    /// It did not: a `Redact` of a target not in `messages` did nothing, so an
+    /// entry that would never open stayed counted as unreadable for every
+    /// reader for ever, after its author had taken it down. Now it becomes the
+    /// tombstone it would have been had it opened -- and only for the author
+    /// or an admin, the same rule as for one that did.
+    #[test]
+    fn an_unreadable_body_can_be_redacted_by_its_author() {
+        let shut = |seq: u64, who: u8| Received {
+            seq,
+            account: key(who),
+            posted: 100 + seq,
+            kind: 0x01,
+            tombstone: false,
+            body: None,
+            verdict: Verdict::Valid,
+            standing: Standing::Unclaimed,
+            system: None,
+        };
+        // Written by 1; somebody else asks first, then the author does.
+        let t = Timeline::fold(
+            &[shut(2, 1), body(3, 2, 103, Body::Redact { target: 2 })],
+            &[],
+        );
+        assert_eq!(t.unreadable(), &[2], "a stranger's redaction must not land");
+        assert_eq!(t.messages().count(), 0);
+
+        let t = Timeline::fold(
+            &[shut(2, 1), body(3, 1, 103, Body::Redact { target: 2 })],
+            &[],
+        );
+        assert!(
+            t.unreadable().is_empty(),
+            "the author's redaction did not land"
+        );
+        let m = t.get(2).expect("the tombstone");
+        assert!(m.redacted);
+        assert_eq!(m.deletion, Deletion::Asked);
+        assert_eq!(m.account, key(1));
+
+        // And an admin may, for anybody.
+        let t = Timeline::fold(
+            &[shut(2, 1), body(3, 9, 103, Body::Redact { target: 2 })],
+            &[key(9)],
+        );
+        assert!(
+            t.unreadable().is_empty(),
+            "an admin's redaction did not land"
+        );
     }
 
     /// A reader arriving after a redaction never held the words and never
