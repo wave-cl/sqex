@@ -1639,12 +1639,31 @@ async fn redacting_takes_the_file_with_it() {
         outcome.left_behind
     );
 
-    // The reference Bob still holds no longer resolves.
-    let after = bob.download(&held).await;
+    // **The exchange's half**: the reference Bob still holds no longer
+    // resolves there. Asked with `head`, which goes to the exchange and
+    // nowhere else -- `download` now asks the store first, and Bob kept the
+    // file when he fetched it, so a `download` here would be answered off
+    // Bob's own disc and say nothing about the exchange.
+    let headed = bob.head(&held.blob).await.unwrap();
     assert!(
-        after.is_err(),
-        "the exchange still served the file of a deleted message to a reader \
+        !headed.found,
+        "the exchange still holds the file of a deleted message for a reader \
          holding its id"
+    );
+
+    // **The client's half**: once Bob hears of the redaction, what he kept
+    // goes too. He cannot forget what he has not been told -- a client that
+    // never polls again is in the same position as one that saved the file
+    // -- so the poll is what carries the redaction to him.
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    assert!(
+        got.timeline.get(regret).is_some_and(|m| m.redacted),
+        "bob's poll did not carry the redaction"
+    );
+    assert!(
+        bob.download(&held).await.is_err(),
+        "the file of a deleted message is still on the reader's disc after the \
+         reader heard of the deletion"
     );
 }
 
@@ -1920,4 +1939,85 @@ async fn join_public(chat: &mut Chat, channel: [u8; 32]) -> Result<(), sqex_chat
         Err(_) => [0u8; 32],
     };
     chat.join(&channel, instance).await
+}
+
+/// A picture fetched once is there after the exchange has let go of it.
+///
+/// # What this is for
+///
+/// A fetched attachment was held in memory and nowhere else, so every launch
+/// fetched every picture again as somebody scrolled to it -- and a picture
+/// whose retention window had closed at the exchange in the meantime was
+/// gone, though this machine had held every byte of it once. The store keeps
+/// what is fetched, as served, and `download` asks the store first.
+///
+/// # Why the blob is detached rather than the exchange killed
+///
+/// Aborting the exchange's task stops it accepting connections and **does not
+/// stop the ones it already has** -- each is a task of its own -- so a client
+/// that fetched once went on being served after the "kill", and the first
+/// version of this test passed with the store never read at all. Detaching
+/// the blob makes the exchange collect it, which is precisely what a closed
+/// retention window does, and `head` asks the exchange directly to prove it.
+#[tokio::test]
+async fn a_downloaded_attachment_is_kept_and_read_back_after_the_exchange_lets_go() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    let path = dir.path().join("picture.bin");
+    let secret: Vec<u8> = (0..(CHUNK * 2 + 77)).map(|i| (i % 253) as u8).collect();
+    std::fs::write(&path, &secret).unwrap();
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    let attachment = alice.upload(&channel, &prepared).await.unwrap();
+    let mut post = SipPost::text("a picture");
+    post.parts.push(Part::Attachment(attachment));
+    alice.send_post(&channel, post).await.unwrap();
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let a = got
+        .timeline
+        .messages()
+        .next()
+        .unwrap()
+        .post
+        .attachments()
+        .next()
+        .expect("no attachment arrived")
+        .clone();
+    assert_eq!(bob.download(&a).await.unwrap(), secret, "the first fetch");
+
+    // The exchange lets go of it, as it does when a retention window closes.
+    alice.detach(&channel, &a.blob).await.unwrap();
+    let headed = bob.head(&a.blob).await.unwrap();
+    assert!(
+        !headed.found,
+        "the exchange still holds the blob, so this would test nothing"
+    );
+
+    // Whatever comes back now came off the disc.
+    let again = bob.download(&a).await;
+    assert_eq!(
+        again.ok().as_deref(),
+        Some(secret.as_slice()),
+        "the attachment was fetched once and is not here now the exchange has \
+         let go of it"
+    );
+
+    // And the sender never needed to fetch it at all: what was sent was kept.
+    let alices = alice.download(&a).await;
+    assert_eq!(
+        alices.ok().as_deref(),
+        Some(secret.as_slice()),
+        "the sender's own attachment was not kept when it was sent"
+    );
 }

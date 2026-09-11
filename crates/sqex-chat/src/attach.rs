@@ -211,6 +211,13 @@ impl Chat {
                 "the exchange refused the upload: what arrived did not hash to its name".into(),
             ));
         }
+        // Kept, so the sender's own pictures are never fetched back from the
+        // exchange. The sealed chunks are in hand; not keeping them would be
+        // throwing away what a fetch exists to get. A failure to keep is not
+        // a failure to send, and is not reported as one.
+        let _ = self
+            .store()
+            .keep_blob(&prepared.attachment.blob, &prepared.sealed);
         Ok(prepared.attachment.clone())
     }
 
@@ -298,33 +305,53 @@ impl Chat {
     /// the id is the hash of the ciphertext, so a client can tell it got the
     /// bytes it asked for without trusting the exchange to have served them
     /// honestly.
+    ///
+    /// # Kept on the disc
+    ///
+    /// The store is asked before the exchange is. A blob fetched once is kept
+    /// as served, so scrolling back to a picture after a restart costs no
+    /// round trips -- and a picture whose retention window has since closed
+    /// at the exchange is **still here**, which a fetch could never give
+    /// back. The store checks the hash on the way out, so a kept blob is held
+    /// to the same standard as a served one.
     pub async fn download(&mut self, a: &Attachment) -> Result<Vec<u8>> {
-        let mut sealed = Vec::with_capacity(a.chunks as usize);
-        for index in 0..a.chunks {
-            let body = self
-                .post_raw(
-                    "/blob/get",
-                    GetChunk {
-                        blob: a.blob,
-                        index,
+        let sealed = match self.store().blob(&a.blob) {
+            Ok(Some(kept)) => kept,
+            _ => {
+                let mut sealed = Vec::with_capacity(a.chunks as usize);
+                for index in 0..a.chunks {
+                    let body = self
+                        .post_raw(
+                            "/blob/get",
+                            GetChunk {
+                                blob: a.blob,
+                                index,
+                            }
+                            .encode(),
+                        )
+                        .await?;
+                    let chunk =
+                        Chunk::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                    if !chunk.found {
+                        return Err(ChatError::Protocol(format!(
+                            "the exchange no longer holds chunk {index} — the attachment has \
+                             passed its retention window"
+                        )));
                     }
-                    .encode(),
-                )
-                .await?;
-            let chunk = Chunk::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
-            if !chunk.found {
-                return Err(ChatError::Protocol(format!(
-                    "the exchange no longer holds chunk {index} — the attachment has \
-                     passed its retention window"
-                )));
+                    sealed.push(chunk.sealed);
+                }
+                sealed
             }
-            sealed.push(chunk.sealed);
-        }
+        };
         if blob_id(&sealed) != a.blob {
             return Err(ChatError::Protocol(
                 "what the exchange served does not hash to the name the message gave".into(),
             ));
         }
+        // Verified, so kept. After the hash check and not before: what goes
+        // on the disc is only ever something that has passed it. Idempotent
+        // on a hit -- keeping again only marks it used.
+        let _ = self.store().keep_blob(&a.blob, &sealed);
 
         let cipher = ChaCha20Poly1305::new_from_slice(&a.key)
             .map_err(|e| ChatError::Protocol(format!("blob key: {e}")))?;

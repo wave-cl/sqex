@@ -202,7 +202,36 @@ CREATE TABLE IF NOT EXISTS handle (
     fetched INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (exchange, account)
 );
+-- Attachments fetched once and kept, **as the exchange served them**: the
+-- sealed chunks, framed, under the attachment's own key, which lives in the
+-- sealed message that named it. Not re-encrypted here -- there is nothing in
+-- the clear to protect, and the id is the hash of exactly these bytes, so a
+-- row that has rotted is caught on the way out rather than decrypted into
+-- rubbish. See `Store::blob`.
+--
+-- `used` is when it was last read, and is what eviction goes by: a picture
+-- somebody keeps coming back to stays, whatever its age.
+CREATE TABLE IF NOT EXISTS blob (
+    exchange BLOB NOT NULL,
+    blob    BLOB    NOT NULL,
+    sealed  BLOB    NOT NULL,
+    bytes   INTEGER NOT NULL,
+    used    INTEGER NOT NULL,
+    PRIMARY KEY (exchange, blob)
+);
 "#;
+
+/// How much of the disc fetched attachments may hold, per store.
+///
+/// A store is one account, so this is what one account's pictures cost the
+/// machine. A quarter of a gigabyte is a few hundred photographs at the size
+/// a client fetches unasked, which is far more than anybody is scrolling
+/// through and far less than a disc will notice.
+pub const BLOB_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The largest attachment kept. Anything bigger was a download somebody asked
+/// for -- a file to save -- and would evict everything else to stay.
+pub const BLOB_KEEP_MAX: u64 = 16 * 1024 * 1024;
 
 /// What the store knows about one channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +630,34 @@ fn now_secs() -> u32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(1)
+}
+
+/// Chunks as one column: a four-byte length before each.
+///
+/// The boundaries matter -- the id hashes the chunks as a list, and each one
+/// opens under its own nonce -- so they are written down rather than
+/// recovered by guessing at the chunk size.
+fn frame(chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunks.iter().map(|c| c.len() + 4).sum());
+    for c in chunks {
+        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        out.extend_from_slice(c);
+    }
+    out
+}
+
+/// The inverse of [`frame`]. `None` for anything that does not parse to the
+/// end, which a damaged row would not.
+fn unframe(framed: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut chunks = Vec::new();
+    let mut at = 0;
+    while at < framed.len() {
+        let len = u32::from_le_bytes(framed.get(at..at + 4)?.try_into().ok()?) as usize;
+        at += 4;
+        chunks.push(framed.get(at..at + len)?.to_vec());
+        at += len;
+    }
+    Some(chunks)
 }
 
 /// One message, as it goes into the store.
@@ -1086,6 +1143,39 @@ impl Store {
     /// could not be opened" and the two must stay distinguishable across a
     /// restart.
     pub fn redact_message(&self, channel: &[u8; 32], seq: u64) -> Result<()> {
+        // **What it carried goes with it.** SIP-18: deleting a message must
+        // delete what it carried, and the exchange can only do its half --
+        // the reference is inside a sealed body it cannot read. A client that
+        // kept the file is the other half. Read out of the body *before* it
+        // is blanked, because afterwards nothing names the files. Every path
+        // a redaction reaches the store by comes through here -- the
+        // redactor's own, the poll that hears of one, the fold at startup --
+        // so this is the one place the rule lives.
+        let sealed: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT sealed FROM message
+                 WHERE channel = ?1 AND seq = ?2 AND exchange = ?3",
+                params![&channel[..], seq as i64, self.scope()?],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read redacted"))?
+            .flatten();
+        if let Some(sealed) = sealed
+            && let Ok(plain) = self.unseal_bytes(&sealed)
+            && let Ok(Some(body)) = sqex_proto::message::Body::decode(&plain)
+        {
+            let post = match body {
+                sqex_proto::message::Body::Post(p)
+                | sqex_proto::message::Body::Edit { post: p, .. } => Some(p),
+                _ => None,
+            };
+            for a in post.iter().flat_map(|p| p.attachments()) {
+                self.forget_blob(&a.blob)?;
+            }
+        }
+
         let empty = self.seal_bytes(&[])?;
         self.db
             .execute(
@@ -1371,6 +1461,135 @@ impl Store {
             });
         }
         Ok(out)
+    }
+
+    // ---- attachments, kept ----------------------------------------------
+
+    /// Keep a fetched attachment, as served.
+    ///
+    /// `chunks` are the sealed chunks exactly as the exchange handed them
+    /// over, in order; their hash is the blob's id, and [`Store::blob`] checks
+    /// that on the way back out. Nothing bigger than [`BLOB_KEEP_MAX`] is
+    /// kept, and keeping this one may put down the least recently read
+    /// others to stay inside [`BLOB_BUDGET`].
+    pub fn keep_blob(&self, blob: &[u8; 32], chunks: &[Vec<u8>]) -> Result<()> {
+        self.keep_blob_within(blob, chunks, BLOB_BUDGET)
+    }
+
+    /// [`Store::keep_blob`] with the budget as an argument, so eviction can be
+    /// tested with a budget a test can fill.
+    fn keep_blob_within(&self, blob: &[u8; 32], chunks: &[Vec<u8>], budget: u64) -> Result<()> {
+        let bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+        if bytes > BLOB_KEEP_MAX || bytes > budget {
+            return Ok(());
+        }
+        let framed = frame(chunks);
+        self.db
+            .execute(
+                "INSERT INTO blob (exchange, blob, sealed, bytes, used)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, blob) DO UPDATE SET used = ?5",
+                params![self.scope()?, &blob[..], framed, bytes as i64, now_secs()],
+            )
+            .map_err(storage("keep blob"))?;
+        self.put_down_blobs(budget)
+    }
+
+    /// A kept attachment's sealed chunks, if it is here and still hashes to
+    /// its name.
+    ///
+    /// **Checked, not trusted.** The id is the hash of the chunks, so a row
+    /// the disc has damaged fails the same check a dishonest exchange would,
+    /// and is put down so the next read fetches instead of finding it again.
+    /// Reading marks it used.
+    pub fn blob(&self, blob: &[u8; 32]) -> Result<Option<Vec<Vec<u8>>>> {
+        let framed: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT sealed FROM blob WHERE exchange = ?1 AND blob = ?2",
+                params![self.scope()?, &blob[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read blob"))?;
+        let Some(framed) = framed else {
+            return Ok(None);
+        };
+        let chunks = match unframe(&framed) {
+            Some(chunks) if sqex_proto::blob_store::blob_id(&chunks) == *blob => chunks,
+            _ => {
+                self.forget_blob(blob)?;
+                return Ok(None);
+            }
+        };
+        self.db
+            .execute(
+                "UPDATE blob SET used = ?3 WHERE exchange = ?1 AND blob = ?2",
+                params![self.scope()?, &blob[..], now_secs()],
+            )
+            .map_err(storage("touch blob"))?;
+        Ok(Some(chunks))
+    }
+
+    /// Put one down.
+    pub fn forget_blob(&self, blob: &[u8; 32]) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM blob WHERE exchange = ?1 AND blob = ?2",
+                params![self.scope()?, &blob[..]],
+            )
+            .map_err(storage("forget blob"))?;
+        Ok(())
+    }
+
+    /// What the kept attachments come to, across every exchange in this
+    /// store: the file is the unit the disc counts.
+    pub fn blob_bytes(&self) -> Result<u64> {
+        self.db
+            .query_row("SELECT COALESCE(SUM(bytes), 0) FROM blob", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n as u64)
+            .map_err(storage("sum blobs"))
+    }
+
+    /// Put down the least recently read until the rest fit the budget.
+    ///
+    /// Across every exchange, because the budget is about the file. Whole
+    /// rows, oldest `used` first, stopping as soon as what is left fits.
+    fn put_down_blobs(&self, budget: u64) -> Result<()> {
+        let mut held = self.blob_bytes()?;
+        if held <= budget {
+            return Ok(());
+        }
+        let mut stmt = self
+            .db
+            .prepare("SELECT exchange, blob, bytes FROM blob ORDER BY used ASC, rowid ASC")
+            .map_err(storage("prepare eviction"))?;
+        let rows: Vec<(Vec<u8>, Vec<u8>, u64)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(storage("list blobs"))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(storage("read blobs"))?;
+        for (exchange, blob, bytes) in rows {
+            if held <= budget {
+                break;
+            }
+            self.db
+                .execute(
+                    "DELETE FROM blob WHERE exchange = ?1 AND blob = ?2",
+                    params![exchange, blob],
+                )
+                .map_err(storage("put down blob"))?;
+            held = held.saturating_sub(bytes);
+        }
+        Ok(())
     }
 
     /// Forget everything numbered in this channel's sequence space.
@@ -2280,6 +2499,120 @@ mod tests {
             // The old reader, written out rather than described.
             assert_eq!(kind.as_i64() != 0, group, "an old client would disagree");
         }
+    }
+
+    /// A kept blob comes back as it went in, chunk boundaries and all.
+    #[test]
+    fn a_kept_blob_round_trips_with_its_chunks_intact() {
+        let s = scoped(&seed(1), None);
+        let chunks = vec![vec![1u8; 100], vec![2u8; 50], vec![3u8; 7]];
+        let id = sqex_proto::blob_store::blob_id(&chunks);
+        s.keep_blob(&id, &chunks).unwrap();
+        assert_eq!(s.blob(&id).unwrap().as_deref(), Some(chunks.as_slice()));
+        assert_eq!(s.blob_bytes().unwrap(), 157);
+        assert!(s.blob(&[0u8; 32]).unwrap().is_none(), "one never kept");
+    }
+
+    /// A row the disc has damaged is caught on the way out, and put down.
+    ///
+    /// The id is the hash of the chunks, so this is the same check a served
+    /// blob gets -- a kept one is held to no lower a standard than the
+    /// exchange is. Written with raw SQL, because the point is bytes this
+    /// code did not write.
+    #[test]
+    fn a_rotted_blob_is_refused_and_put_down() {
+        let s = scoped(&seed(1), None);
+        let chunks = vec![vec![9u8; 64]];
+        let id = sqex_proto::blob_store::blob_id(&chunks);
+        s.keep_blob(&id, &chunks).unwrap();
+        // One byte turned, in the middle of the chunk.
+        s.db.execute(
+            "UPDATE blob SET sealed = ?1 WHERE blob = ?2",
+            params![
+                {
+                    let mut f = super::frame(&chunks);
+                    f[20] ^= 0x40;
+                    f
+                },
+                &id[..]
+            ],
+        )
+        .unwrap();
+        assert!(
+            s.blob(&id).unwrap().is_none(),
+            "a damaged row was handed back"
+        );
+        assert_eq!(s.blob_bytes().unwrap(), 0, "and it was not put down");
+    }
+
+    /// Past the budget, the least recently *read* goes, and only enough of
+    /// them. Not the oldest kept: a picture somebody keeps coming back to
+    /// stays, whatever its age.
+    #[test]
+    fn the_least_recently_read_blobs_are_put_down_to_fit_the_budget() {
+        let s = scoped(&seed(1), None);
+        let one = vec![vec![1u8; 100]];
+        let two = vec![vec![2u8; 100]];
+        let three = vec![vec![3u8; 100]];
+        let (a, b, c) = (
+            sqex_proto::blob_store::blob_id(&one),
+            sqex_proto::blob_store::blob_id(&two),
+            sqex_proto::blob_store::blob_id(&three),
+        );
+        // `used` is in whole seconds, so the order is forced by hand rather
+        // than by sleeping through it.
+        s.keep_blob_within(&a, &one, 1000).unwrap();
+        s.db.execute("UPDATE blob SET used = 10 WHERE blob = ?1", params![&a[..]])
+            .unwrap();
+        s.keep_blob_within(&b, &two, 1000).unwrap();
+        s.db.execute("UPDATE blob SET used = 20 WHERE blob = ?1", params![&b[..]])
+            .unwrap();
+        // Read `a` again: it is the oldest kept and the most recently used.
+        assert!(s.blob(&a).unwrap().is_some());
+        s.db.execute("UPDATE blob SET used = 30 WHERE blob = ?1", params![&a[..]])
+            .unwrap();
+
+        // Room for two; the third pushes one out, and it is `b`.
+        s.keep_blob_within(&c, &three, 250).unwrap();
+        assert!(s.blob(&a).unwrap().is_some(), "the most recently read went");
+        assert!(
+            s.blob(&b).unwrap().is_none(),
+            "the least recently read stayed"
+        );
+        assert!(s.blob(&c).unwrap().is_some(), "the one just kept went");
+        assert_eq!(s.blob_bytes().unwrap(), 200);
+    }
+
+    /// Nothing bigger than the cap is kept. Anything that size was a file
+    /// somebody asked to save, and would put down everything else to stay.
+    #[test]
+    fn an_oversized_blob_is_not_kept() {
+        let s = scoped(&seed(1), None);
+        let big = vec![vec![0u8; (BLOB_KEEP_MAX + 1) as usize]];
+        let id = sqex_proto::blob_store::blob_id(&big);
+        s.keep_blob(&id, &big).unwrap();
+        assert!(s.blob(&id).unwrap().is_none());
+        assert_eq!(s.blob_bytes().unwrap(), 0);
+    }
+
+    /// Framing survives an empty chunk and a run of them.
+    #[test]
+    fn framing_round_trips_edge_cases() {
+        for chunks in [
+            vec![],
+            vec![vec![]],
+            vec![vec![], vec![1u8]],
+            vec![vec![7u8; 3]; 4],
+        ] {
+            assert_eq!(
+                super::unframe(&super::frame(&chunks)).as_ref(),
+                Some(&chunks)
+            );
+        }
+        assert!(
+            super::unframe(&[1, 0, 0, 0]).is_none(),
+            "a length with no bytes after it"
+        );
     }
 
     #[test]
