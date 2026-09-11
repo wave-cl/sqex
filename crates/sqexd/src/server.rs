@@ -517,6 +517,9 @@ pub async fn bind_with(
     if let Some(n) = config.max_connections {
         squic_config.max_connections = Some(n);
     }
+    if let Some(c) = config.congestion {
+        squic_config.congestion_controller = c;
+    }
 
     let accepted_envelope_versions = squic_config.accepted_envelope_versions.clone();
     let listener = Arc::new(
@@ -730,8 +733,29 @@ pub async fn serve(bound: Bound) -> Result<()> {
                         if crate::relay::alpn_of(&conn).as_deref() == Some(sqex_proto::relay::ALPN)
                         {
                             crate::relay::serve_relay(&server, conn, peer.identity).await;
-                        } else if let Err(e) = serve_h3(server, conn, peer).await {
-                            tracing::debug!("connection ended: {e}");
+                        } else {
+                            let ended = serve_h3(server, conn.clone(), peer).await;
+                            // **The transport, in numbers, once per
+                            // connection.** A slow download looked identical
+                            // from outside whether the path was lossy, the
+                            // window never grew, or the client was slow to
+                            // read, and this is the only place the server's
+                            // own window and loss count are visible.
+                            let s = conn.stats();
+                            tracing::info!(
+                                rtt_ms = s.path.rtt.as_millis() as u64,
+                                cwnd = s.path.cwnd,
+                                mtu = s.path.current_mtu,
+                                sent = s.path.sent_packets,
+                                lost = s.path.lost_packets,
+                                congestion_events = s.path.congestion_events,
+                                tx_bytes = s.udp_tx.bytes,
+                                rx_bytes = s.udp_rx.bytes,
+                                "connection ended"
+                            );
+                            if let Err(e) = ended {
+                                tracing::debug!("connection ended: {e}");
+                            }
                         }
                     }
                     Err(e) => tracing::debug!("handshake failed: {e}"),

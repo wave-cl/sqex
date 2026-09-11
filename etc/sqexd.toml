@@ -31,6 +31,16 @@ seed_whitelist = [
 # How long an issued challenge nonce stays valid, in seconds.
 challenge_ttl_secs = 30
 
+# Congestion controller for every connection: "cubic" (squic's default) or
+# "bbr". Omit to keep the default.
+#
+# Measured from a client sixty milliseconds away, Cubic sent one connection
+# at under a megabyte a second while the same path carried five over TCP, and
+# a four-megabyte picture took seven seconds to arrive. Every connection's
+# window, loss and round trip are logged at `info` when it ends
+# ("connection ended"), which is where to look before changing this.
+# congestion = "bbr"
+
 # ---------------------------------------------------------------------------
 # SIP-35: replication.
 # ---------------------------------------------------------------------------

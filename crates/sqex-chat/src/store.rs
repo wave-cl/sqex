@@ -204,17 +204,21 @@ CREATE TABLE IF NOT EXISTS handle (
 );
 -- Attachments fetched once and kept, **as the exchange served them**: the
 -- sealed chunks, framed, under the attachment's own key, which lives in the
--- sealed message that named it. Not re-encrypted here -- there is nothing in
--- the clear to protect, and the id is the hash of exactly these bytes, so a
--- row that has rotted is caught on the way out rather than decrypted into
+-- sealed message that named it. Not re-encrypted -- there is nothing in the
+-- clear to protect, and the id is the hash of exactly these bytes, so a file
+-- that has rotted is caught on the way out rather than decrypted into
 -- rubbish. See `Store::blob`.
+--
+-- This is the index; the bytes are one file per blob beside the store, in
+-- `assets/<account>/<blob>`, named by the id. A multi-megabyte row was never
+-- what a database is for, and a file named by its content is what a cache
+-- of content is.
 --
 -- `used` is when it was last read, and is what eviction goes by: a picture
 -- somebody keeps coming back to stays, whatever its age.
-CREATE TABLE IF NOT EXISTS blob (
+CREATE TABLE IF NOT EXISTS asset (
     exchange BLOB NOT NULL,
     blob    BLOB    NOT NULL,
-    sealed  BLOB    NOT NULL,
     bytes   INTEGER NOT NULL,
     used    INTEGER NOT NULL,
     PRIMARY KEY (exchange, blob)
@@ -340,6 +344,9 @@ impl Kind {
 pub struct Store {
     db: Connection,
     cipher: ChaCha20Poly1305,
+    /// Where kept attachments live, one file per blob. `None` for a store
+    /// with no path, which keeps none: memory-only means memory-only.
+    assets: Option<std::path::PathBuf>,
     /// Every scoped row this store reads and writes belongs to this.
     ///
     /// `None` until [`Store::scope_to`] is called.
@@ -375,6 +382,12 @@ pub struct Store {
 /// So nothing is guessed. Rows are marked [`Store::UNCLAIMED`] and stay that
 /// way until an exchange claims them — see [`claim`].
 fn migrate(db: &Connection) -> Result<()> {
+    // The cache of attachments used to be rows carrying the bytes. It is a
+    // cache, so an older store's is simply dropped: what it held is fetched
+    // again into files, and nothing that cannot be fetched again was ever in
+    // it.
+    db.execute_batch("DROP TABLE IF EXISTS blob")
+        .map_err(storage("drop the old attachment cache"))?;
     let already: bool = db
         .prepare("SELECT 1 FROM pragma_table_info('channel_key') WHERE name = 'exchange'")
         .and_then(|mut s| s.exists([]))
@@ -642,6 +655,34 @@ fn now_secs() -> u32 {
 /// The boundaries matter -- the id hashes the chunks as a list, and each one
 /// opens under its own nonce -- so they are written down rather than
 /// recovered by guessing at the chunk size.
+/// `assets/<account>/` beside the store, made if need be, readable by its
+/// owner only. The account is the store's file stem, so
+/// `~/.sqex/chat/<account>.db` keeps its files at
+/// `~/.sqex/chat/assets/<account>/`.
+fn assets_dir(store: &std::path::Path) -> Result<std::path::PathBuf> {
+    let parent = store.parent().unwrap_or(std::path::Path::new("."));
+    let stem = store
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "store".into());
+    let dir = parent.join("assets").join(stem);
+    std::fs::create_dir_all(&dir).map_err(storage("create assets directory"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        if let Some(assets) = dir.parent() {
+            let _ = std::fs::set_permissions(assets, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(dir)
+}
+
+/// One blob's file: named by its id, which is the hash of what is in it.
+fn asset_path(dir: &std::path::Path, blob: &[u8; 32]) -> std::path::PathBuf {
+    dir.join(bs58::encode(blob).into_string())
+}
+
 fn frame(chunks: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(chunks.iter().map(|c| c.len() + 4).sum());
     for c in chunks {
@@ -743,6 +784,10 @@ impl Store {
         // is how a schema change reaches a user's machine and is ignored.
         migrate(&db)?;
         db.execute_batch(SCHEMA).map_err(storage("create schema"))?;
+        let assets = match path {
+            Some(p) => Some(assets_dir(p)?),
+            None => None,
+        };
 
         let mut h = Sha512::new();
         h.update(STORE_CONTEXT);
@@ -751,11 +796,14 @@ impl Store {
         let cipher = ChaCha20Poly1305::new_from_slice(&okm[0..32])
             .map_err(|e| StoreError::Sealed(format!("derive store key: {e}")))?;
 
-        Ok(Store {
+        let store = Store {
             db,
             cipher,
+            assets,
             exchange: None,
-        })
+        };
+        store.sweep_assets()?;
+        Ok(store)
     }
 
     /// Say which exchange this store is for, and claim what predates the
@@ -1488,13 +1536,29 @@ impl Store {
         if bytes > BLOB_KEEP_MAX || bytes > budget {
             return Ok(());
         }
-        let framed = frame(chunks);
+        let Some(dir) = &self.assets else {
+            return Ok(());
+        };
+        // The file first, whole, and only then the row: a row without a file
+        // is a miss on the next read, and a file without a row is swept at
+        // the next open. Written beside its name and renamed into place, so
+        // a crash mid-write leaves a `.part` and never a short file under a
+        // name that promises a hash.
+        let path = asset_path(dir, blob);
+        let part = path.with_extension("part");
+        std::fs::write(&part, frame(chunks)).map_err(storage("write asset"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&part, &path).map_err(storage("place asset"))?;
         self.db
             .execute(
-                "INSERT INTO blob (exchange, blob, sealed, bytes, used)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (exchange, blob) DO UPDATE SET used = ?5",
-                params![self.scope()?, &blob[..], framed, bytes as i64, now_secs()],
+                "INSERT INTO asset (exchange, blob, bytes, used)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, blob) DO UPDATE SET used = ?4",
+                params![self.scope()?, &blob[..], bytes as i64, now_secs()],
             )
             .map_err(storage("keep blob"))?;
         self.put_down_blobs(budget)
@@ -1508,17 +1572,20 @@ impl Store {
     /// and is put down so the next read fetches instead of finding it again.
     /// Reading marks it used.
     pub fn blob(&self, blob: &[u8; 32]) -> Result<Option<Vec<Vec<u8>>>> {
-        let framed: Option<Vec<u8>> = self
-            .db
-            .query_row(
-                "SELECT sealed FROM blob WHERE exchange = ?1 AND blob = ?2",
-                params![self.scope()?, &blob[..]],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(storage("read blob"))?;
-        let Some(framed) = framed else {
+        if !self.has_blob(blob)? {
             return Ok(None);
+        }
+        let Some(dir) = &self.assets else {
+            return Ok(None);
+        };
+        // A row whose file has gone -- deleted by hand, or a crash between
+        // the two -- is a miss, and the row goes with it.
+        let framed = match std::fs::read(asset_path(dir, blob)) {
+            Ok(framed) => framed,
+            Err(_) => {
+                self.forget_blob(blob)?;
+                return Ok(None);
+            }
         };
         let chunks = match unframe(&framed) {
             Some(chunks) if sqex_proto::blob_store::blob_id(&chunks) == *blob => chunks,
@@ -1529,7 +1596,7 @@ impl Store {
         };
         self.db
             .execute(
-                "UPDATE blob SET used = ?3 WHERE exchange = ?1 AND blob = ?2",
+                "UPDATE asset SET used = ?3 WHERE exchange = ?1 AND blob = ?2",
                 params![self.scope()?, &blob[..], now_secs()],
             )
             .map_err(storage("touch blob"))?;
@@ -1547,7 +1614,7 @@ impl Store {
     pub fn has_blob(&self, blob: &[u8; 32]) -> Result<bool> {
         self.db
             .query_row(
-                "SELECT 1 FROM blob WHERE exchange = ?1 AND blob = ?2",
+                "SELECT 1 FROM asset WHERE exchange = ?1 AND blob = ?2",
                 params![self.scope()?, &blob[..]],
                 |_| Ok(()),
             )
@@ -1560,10 +1627,56 @@ impl Store {
     pub fn forget_blob(&self, blob: &[u8; 32]) -> Result<()> {
         self.db
             .execute(
-                "DELETE FROM blob WHERE exchange = ?1 AND blob = ?2",
+                "DELETE FROM asset WHERE exchange = ?1 AND blob = ?2",
                 params![self.scope()?, &blob[..]],
             )
             .map_err(storage("forget blob"))?;
+        self.unlink_if_unreferenced(blob)
+    }
+
+    /// Remove a blob's file once no exchange's row names it. The file is
+    /// content-addressed, so the same attachment fetched at two exchanges is
+    /// one file with two rows, and it goes when the last row does.
+    fn unlink_if_unreferenced(&self, blob: &[u8; 32]) -> Result<()> {
+        let referenced: bool = self
+            .db
+            .prepare("SELECT 1 FROM asset WHERE blob = ?1")
+            .and_then(|mut s| s.exists(params![&blob[..]]))
+            .map_err(storage("look for blob"))?;
+        if !referenced && let Some(dir) = &self.assets {
+            let _ = std::fs::remove_file(asset_path(dir, blob));
+        }
+        Ok(())
+    }
+
+    /// Remove any file in the assets directory no row names, and any
+    /// `.part` a crash left behind. Run at open, so the directory never
+    /// holds more than the index says it does.
+    fn sweep_assets(&self) -> Result<()> {
+        let Some(dir) = &self.assets else {
+            return Ok(());
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let keep = bs58::decode(name.as_ref())
+                .into_vec()
+                .ok()
+                .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                .map(|blob| {
+                    self.db
+                        .prepare("SELECT 1 FROM asset WHERE blob = ?1")
+                        .and_then(|mut s| s.exists(params![&blob[..]]))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if !keep {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
         Ok(())
     }
 
@@ -1571,7 +1684,7 @@ impl Store {
     /// store: the file is the unit the disc counts.
     pub fn blob_bytes(&self) -> Result<u64> {
         self.db
-            .query_row("SELECT COALESCE(SUM(bytes), 0) FROM blob", [], |r| {
+            .query_row("SELECT COALESCE(SUM(bytes), 0) FROM asset", [], |r| {
                 r.get::<_, i64>(0)
             })
             .map(|n| n as u64)
@@ -1589,7 +1702,7 @@ impl Store {
         }
         let mut stmt = self
             .db
-            .prepare("SELECT exchange, blob, bytes FROM blob ORDER BY used ASC, rowid ASC")
+            .prepare("SELECT exchange, blob, bytes FROM asset ORDER BY used ASC, rowid ASC")
             .map_err(storage("prepare eviction"))?;
         let rows: Vec<(Vec<u8>, Vec<u8>, u64)> = stmt
             .query_map([], |r| {
@@ -1608,10 +1721,13 @@ impl Store {
             }
             self.db
                 .execute(
-                    "DELETE FROM blob WHERE exchange = ?1 AND blob = ?2",
-                    params![exchange, blob],
+                    "DELETE FROM asset WHERE exchange = ?1 AND blob = ?2",
+                    params![exchange, &blob],
                 )
                 .map_err(storage("put down blob"))?;
+            if let Ok(id) = <[u8; 32]>::try_from(blob.as_slice()) {
+                self.unlink_if_unreferenced(&id)?;
+            }
             held = held.saturating_sub(bytes);
         }
         Ok(())
@@ -1960,6 +2076,14 @@ mod tests {
         let mut s = Store::open(seed, path).unwrap();
         s.scope_to(&an_exchange()).unwrap();
         s
+    }
+
+    /// A store on the disc, because kept attachments are files beside it
+    /// and a memory-only store keeps none.
+    fn on_disc() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = scoped(&seed(1), Some(&dir.path().join("acct.db")));
+        (dir, s)
     }
 
     #[test]
@@ -2529,7 +2653,7 @@ mod tests {
     /// A kept blob comes back as it went in, chunk boundaries and all.
     #[test]
     fn a_kept_blob_round_trips_with_its_chunks_intact() {
-        let s = scoped(&seed(1), None);
+        let (dir, s) = on_disc();
         let chunks = vec![vec![1u8; 100], vec![2u8; 50], vec![3u8; 7]];
         let id = sqex_proto::blob_store::blob_id(&chunks);
         s.keep_blob(&id, &chunks).unwrap();
@@ -2538,8 +2662,86 @@ mod tests {
         assert!(s.blob(&[0u8; 32]).unwrap().is_none(), "one never kept");
         assert!(s.has_blob(&id).unwrap());
         assert!(!s.has_blob(&[0u8; 32]).unwrap(), "one never kept");
+        // One file per blob, named by its id, beside the store under the
+        // account's name, and nothing else in there.
+        let file = dir
+            .path()
+            .join("assets")
+            .join("acct")
+            .join(bs58::encode(id).into_string());
+        assert!(file.is_file(), "no file at {}", file.display());
+        assert_eq!(std::fs::read(&file).unwrap(), super::frame(&chunks));
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
         s.forget_blob(&id).unwrap();
         assert!(!s.has_blob(&id).unwrap(), "put down");
+        assert!(!file.exists(), "put down, and the file stayed");
+    }
+
+    /// A memory-only store keeps no attachments: there is nowhere to put
+    /// them that would outlive it.
+    #[test]
+    fn a_memory_only_store_keeps_nothing() {
+        let s = scoped(&seed(1), None);
+        let chunks = vec![vec![1u8; 100]];
+        let id = sqex_proto::blob_store::blob_id(&chunks);
+        s.keep_blob(&id, &chunks).unwrap();
+        assert!(!s.has_blob(&id).unwrap());
+        assert!(s.blob(&id).unwrap().is_none());
+    }
+
+    /// A file no row names, or a `.part` a crash left, is swept at open; a
+    /// file a row names is not.
+    #[test]
+    fn files_the_index_does_not_name_are_swept_at_open() {
+        let (dir, s) = on_disc();
+        let chunks = vec![vec![5u8; 10]];
+        let id = sqex_proto::blob_store::blob_id(&chunks);
+        s.keep_blob(&id, &chunks).unwrap();
+        let assets = dir.path().join("assets").join("acct");
+        std::fs::write(
+            assets.join(bs58::encode([7u8; 32]).into_string()),
+            b"orphan",
+        )
+        .unwrap();
+        std::fs::write(assets.join("something.part"), b"half").unwrap();
+        drop(s);
+        let s = scoped(&seed(1), Some(&dir.path().join("acct.db")));
+        let left: Vec<String> = std::fs::read_dir(&assets)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec![bs58::encode(id).into_string()]);
+        assert!(
+            s.blob(&id).unwrap().is_some(),
+            "the named one was swept too"
+        );
+    }
+
+    /// The same attachment fetched at two exchanges is one file with two
+    /// rows, and the file goes only when the last row does.
+    #[test]
+    fn a_file_shared_by_two_exchanges_outlives_the_first_to_forget_it() {
+        let (dir, mut s) = on_disc();
+        let chunks = vec![vec![6u8; 10]];
+        let id = sqex_proto::blob_store::blob_id(&chunks);
+        s.keep_blob(&id, &chunks).unwrap();
+        let other = PubKey::new([0xEE; 32]);
+        s.scope_to(&other).unwrap();
+        s.keep_blob(&id, &chunks).unwrap();
+        let file = dir
+            .path()
+            .join("assets")
+            .join("acct")
+            .join(bs58::encode(id).into_string());
+        s.forget_blob(&id).unwrap();
+        assert!(file.exists(), "the other exchange's row still names it");
+        s.scope_to(&an_exchange()).unwrap();
+        assert!(s.blob(&id).unwrap().is_some());
+        s.forget_blob(&id).unwrap();
+        assert!(!file.exists(), "nobody names it now");
     }
 
     /// A row the disc has damaged is caught on the way out, and put down.
@@ -2550,28 +2752,25 @@ mod tests {
     /// code did not write.
     #[test]
     fn a_rotted_blob_is_refused_and_put_down() {
-        let s = scoped(&seed(1), None);
+        let (dir, s) = on_disc();
         let chunks = vec![vec![9u8; 64]];
         let id = sqex_proto::blob_store::blob_id(&chunks);
         s.keep_blob(&id, &chunks).unwrap();
         // One byte turned, in the middle of the chunk.
-        s.db.execute(
-            "UPDATE blob SET sealed = ?1 WHERE blob = ?2",
-            params![
-                {
-                    let mut f = super::frame(&chunks);
-                    f[20] ^= 0x40;
-                    f
-                },
-                &id[..]
-            ],
-        )
-        .unwrap();
+        let file = dir
+            .path()
+            .join("assets")
+            .join("acct")
+            .join(bs58::encode(id).into_string());
+        let mut f = std::fs::read(&file).unwrap();
+        f[20] ^= 0x40;
+        std::fs::write(&file, f).unwrap();
         assert!(
             s.blob(&id).unwrap().is_none(),
-            "a damaged row was handed back"
+            "a damaged file was handed back"
         );
         assert_eq!(s.blob_bytes().unwrap(), 0, "and it was not put down");
+        assert!(!file.exists(), "and the file stayed");
     }
 
     /// Past the budget, the least recently *read* goes, and only enough of
@@ -2579,7 +2778,7 @@ mod tests {
     /// stays, whatever its age.
     #[test]
     fn the_least_recently_read_blobs_are_put_down_to_fit_the_budget() {
-        let s = scoped(&seed(1), None);
+        let (_dir, s) = on_disc();
         let one = vec![vec![1u8; 100]];
         let two = vec![vec![2u8; 100]];
         let three = vec![vec![3u8; 100]];
@@ -2591,15 +2790,24 @@ mod tests {
         // `used` is in whole seconds, so the order is forced by hand rather
         // than by sleeping through it.
         s.keep_blob_within(&a, &one, 1000).unwrap();
-        s.db.execute("UPDATE blob SET used = 10 WHERE blob = ?1", params![&a[..]])
-            .unwrap();
+        s.db.execute(
+            "UPDATE asset SET used = 10 WHERE blob = ?1",
+            params![&a[..]],
+        )
+        .unwrap();
         s.keep_blob_within(&b, &two, 1000).unwrap();
-        s.db.execute("UPDATE blob SET used = 20 WHERE blob = ?1", params![&b[..]])
-            .unwrap();
+        s.db.execute(
+            "UPDATE asset SET used = 20 WHERE blob = ?1",
+            params![&b[..]],
+        )
+        .unwrap();
         // Read `a` again: it is the oldest kept and the most recently used.
         assert!(s.blob(&a).unwrap().is_some());
-        s.db.execute("UPDATE blob SET used = 30 WHERE blob = ?1", params![&a[..]])
-            .unwrap();
+        s.db.execute(
+            "UPDATE asset SET used = 30 WHERE blob = ?1",
+            params![&a[..]],
+        )
+        .unwrap();
 
         // Room for two; the third pushes one out, and it is `b`.
         s.keep_blob_within(&c, &three, 250).unwrap();
@@ -2616,7 +2824,7 @@ mod tests {
     /// somebody asked to save, and would put down everything else to stay.
     #[test]
     fn an_oversized_blob_is_not_kept() {
-        let s = scoped(&seed(1), None);
+        let (_dir, s) = on_disc();
         let big = vec![vec![0u8; (BLOB_KEEP_MAX + 1) as usize]];
         let id = sqex_proto::blob_store::blob_id(&big);
         s.keep_blob(&id, &big).unwrap();

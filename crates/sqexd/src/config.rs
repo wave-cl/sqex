@@ -101,6 +101,14 @@ pub struct FileConfig {
     #[serde(default)]
     pub max_connections: Option<u64>,
 
+    /// Congestion controller for every connection: `"cubic"` (squic's
+    /// default) or `"bbr"`. Measured against a client sixty milliseconds
+    /// away, Cubic here sent one connection at under a megabyte a second
+    /// while the same path carried five over TCP; see `etc/sqexd.toml`.
+    /// Unset keeps squic's default.
+    #[serde(default)]
+    pub congestion: Option<String>,
+
     /// SIP-38 name registration mode: `"off"` (default, route disabled),
     /// `"open"` (anyone may claim a free or lapsed name), or `"closed"` (only an
     /// administrator's assignment binds one). Off by default, like every other
@@ -271,6 +279,7 @@ pub struct Config {
     pub welcome_channel: String,
     pub accepted_envelope_versions: Option<Vec<u8>>,
     pub max_connections: Option<u64>,
+    pub congestion: Option<squic::CongestionController>,
     pub name_registration: NameMode,
     pub max_names_per_account: usize,
     pub name_lease_secs: u64,
@@ -402,6 +411,16 @@ impl FileConfig {
                 "max_connections must be omitted (unlimited) or a positive value".into(),
             ));
         }
+        let congestion = match self.congestion.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some("cubic") => Some(squic::CongestionController::Cubic),
+            Some("bbr") => Some(squic::CongestionController::Bbr),
+            Some(other) => {
+                return Err(Error::Malformed(format!(
+                    "congestion must be \"cubic\" or \"bbr\", not {other:?}"
+                )));
+            }
+        };
 
         // SIP-38. An unknown mode is a configuration mistake worth naming at
         // load, not a silent fallback to off.
@@ -446,6 +465,7 @@ impl FileConfig {
             welcome_channel: self.welcome_channel.trim().to_string(),
             accepted_envelope_versions: self.accepted_envelope_versions,
             max_connections: self.max_connections,
+            congestion,
             name_registration,
             max_names: self.max_names,
             max_names_per_account: self.max_names_per_account as usize,
@@ -625,6 +645,31 @@ mod tests {
         assert_eq!(cfg.seed_whitelist, vec![PubKey::new([2u8; 32])]);
         assert_eq!(cfg.challenge_ttl.as_secs(), 15);
         assert_eq!(cfg.listen.port(), 5400);
+    }
+
+    #[test]
+    fn congestion_names_a_controller_or_is_refused() {
+        let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
+        assert_eq!(
+            cfg.resolve().unwrap().congestion,
+            None,
+            "unset keeps squic's default"
+        );
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\ncongestion = \"bbr\"\n").unwrap();
+        assert_eq!(
+            cfg.resolve().unwrap().congestion,
+            Some(squic::CongestionController::Bbr)
+        );
+        let cfg: FileConfig =
+            toml::from_str("key_file = \"/x\"\ncongestion = \"cubic\"\n").unwrap();
+        assert_eq!(
+            cfg.resolve().unwrap().congestion,
+            Some(squic::CongestionController::Cubic)
+        );
+        // A misspelling is refused at load, not quietly left at the default.
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\ncongestion = \"reno\"\n").unwrap();
+        let err = cfg.resolve().unwrap_err();
+        assert!(err.to_string().contains("reno"), "{err}");
     }
 
     #[test]
