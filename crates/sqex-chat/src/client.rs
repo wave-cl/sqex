@@ -131,6 +131,9 @@ const PATIENCE: Duration = Duration::from_secs(8);
 /// was working perfectly.
 const BLOB_PATIENCE: Duration = Duration::from_secs(300);
 
+/// How many chunks of one file are asked for at once. See [`Chat::post_many`].
+const IN_FLIGHT: usize = 8;
+
 /// How much of each tick may be spent advancing a dial in progress.
 ///
 /// The interface has a keyboard to serve. `connect_as` allows five seconds for
@@ -1421,6 +1424,77 @@ impl Chat {
 
     async fn post(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
         self.post_within(path, body, PATIENCE).await
+    }
+
+    /// Several requests to one route, in flight together, answered in order.
+    ///
+    /// **A file is fetched a chunk at a time, and each chunk was a round
+    /// trip.** Forty chunks against an exchange sixty milliseconds away is
+    /// two and a half seconds of waiting before bandwidth counts for
+    /// anything. Each request is its own HTTP/3 stream on the one connection
+    /// already -- `sqnr::Requests` is a handle on it that needs no borrow of
+    /// `Chat` -- so there was never a reason for the second to wait on the
+    /// first except that this code did.
+    ///
+    /// Bounded at [`IN_FLIGHT`], because a hundred-megabyte file is four
+    /// hundred chunks and the exchange has other callers. Refused whole on the
+    /// first failure, the way one request is, and the link is marked the same
+    /// way: any answer proves it, silence or a transport error counts against
+    /// it. Every body is a `Vec` because the caller has them all in hand
+    /// (chunks to put) or can name them all (chunks to get).
+    pub(crate) async fn post_many(
+        &mut self,
+        path: &str,
+        bodies: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>> {
+        use futures::stream::{StreamExt, TryStreamExt};
+        if self.offline() {
+            return Err(ChatError::Transport(
+                "not connected to the exchange".to_string(),
+            ));
+        }
+        let requests = self.client.requests();
+        let path_owned = path.to_string();
+        let answers: std::result::Result<Vec<(u16, Vec<u8>)>, ChatError> =
+            futures::stream::iter(bodies)
+                .map(|body| {
+                    let requests = requests.clone();
+                    let path = path_owned.clone();
+                    async move {
+                        match tokio::time::timeout(BLOB_PATIENCE, requests.post(&path, body)).await
+                        {
+                            Ok(Ok(got)) => Ok(got),
+                            Ok(Err(e)) => Err(ChatError::Transport(e)),
+                            Err(_) => Err(ChatError::Transport(format!(
+                                "the exchange stopped answering ({}s)",
+                                BLOB_PATIENCE.as_secs()
+                            ))),
+                        }
+                    }
+                })
+                .buffered(IN_FLIGHT)
+                .try_collect()
+                .await;
+        let answers = match answers {
+            Ok(answers) => {
+                self.up();
+                answers
+            }
+            Err(e) => {
+                self.down();
+                return Err(e);
+            }
+        };
+        answers
+            .into_iter()
+            .map(|(code, body)| {
+                if code == 200 {
+                    Ok(body)
+                } else {
+                    Err(classify(path, code, &body))
+                }
+            })
+            .collect()
     }
 
     async fn post_within(

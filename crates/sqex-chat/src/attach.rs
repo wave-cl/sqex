@@ -221,19 +221,22 @@ impl Chat {
         Ok(prepared.attachment.clone())
     }
 
+    /// The exchange takes chunks in any order, so they go up together.
     async fn put_chunks(&mut self, upload: u64, prepared: &Prepared) -> Result<()> {
-        for (i, s) in prepared.sealed.iter().enumerate() {
-            self.post_raw(
-                "/blob/put",
+        let puts = prepared
+            .sealed
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
                 PutChunk {
                     upload,
                     index: i as u32,
                     sealed: s.clone(),
                 }
-                .encode(),
-            )
-            .await?;
-        }
+                .encode()
+            })
+            .collect();
+        self.post_many("/blob/put", puts).await?;
         Ok(())
     }
 
@@ -318,20 +321,21 @@ impl Chat {
         let sealed = match self.store().blob(&a.blob) {
             Ok(Some(kept)) => kept,
             _ => {
+                // All the chunks at once, not one after another: see
+                // `post_many` for what the difference costs.
+                let asks = (0..a.chunks)
+                    .map(|index| {
+                        GetChunk {
+                            blob: a.blob,
+                            index,
+                        }
+                        .encode()
+                    })
+                    .collect();
                 let mut sealed = Vec::with_capacity(a.chunks as usize);
-                for index in 0..a.chunks {
-                    let body = self
-                        .post_raw(
-                            "/blob/get",
-                            GetChunk {
-                                blob: a.blob,
-                                index,
-                            }
-                            .encode(),
-                        )
-                        .await?;
+                for (index, body) in self.post_many("/blob/get", asks).await?.iter().enumerate() {
                     let chunk =
-                        Chunk::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                        Chunk::decode(body).map_err(|e| ChatError::Protocol(e.to_string()))?;
                     if !chunk.found {
                         return Err(ChatError::Protocol(format!(
                             "the exchange no longer holds chunk {index} — the attachment has \

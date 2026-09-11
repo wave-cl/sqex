@@ -495,6 +495,59 @@ async fn a_file_travels_end_to_end_and_the_exchange_cannot_open_it() {
     );
 }
 
+/// A file of more chunks than go up or come down at once arrives whole and
+/// in order.
+///
+/// Chunks travel several at a time now, on their own streams of the one
+/// connection, and the bound on how many is smaller than this file: so the
+/// second wave of asks is issued while the first is being answered, and
+/// answers land in whatever order the exchange has them. The bytes differ
+/// chunk to chunk, so an answer put in the wrong place is a different file
+/// -- and the name is the hash of the sealed chunks, so it is refused as one.
+#[tokio::test]
+async fn a_file_of_many_chunks_goes_up_and_comes_down_in_order() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    // Twelve chunks, and the number in flight at once is eight. Each chunk
+    // starts with its own index so a transposition is a different file.
+    let path = dir.path().join("long.bin");
+    let secret: Vec<u8> = (0..(CHUNK * 12 - 5))
+        .map(|i| ((i / CHUNK) as u8).wrapping_add((i % 7) as u8))
+        .collect();
+    std::fs::write(&path, &secret).unwrap();
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let prepared = alice.prepare_file(&path, CHUNK).unwrap();
+    assert_eq!(prepared.chunks(), 12);
+    let attachment = alice.upload(&channel, &prepared).await.unwrap();
+    let mut post = SipPost::text("the long one");
+    post.parts.push(Part::Attachment(attachment));
+    alice.send_post(&channel, post).await.unwrap();
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let a = got
+        .timeline
+        .messages()
+        .next()
+        .unwrap()
+        .post
+        .attachments()
+        .next()
+        .expect("no attachment arrived")
+        .clone();
+    assert_eq!(bob.download(&a).await.unwrap(), secret);
+}
+
 #[tokio::test]
 async fn a_blob_served_wrong_is_refused_before_it_is_decrypted() {
     // The id is the hash of the ciphertext, which is what lets a client tell it

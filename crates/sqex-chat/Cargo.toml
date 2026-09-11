@@ -19,6 +19,7 @@ sqex-discovery = { workspace = true }
 sqnr = { workspace = true }
 sqnr-core = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 clap = { workspace = true }
 bs58 = { workspace = true }
 dirs = { workspace = true }
