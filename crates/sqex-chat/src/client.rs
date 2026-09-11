@@ -134,6 +134,10 @@ const BLOB_PATIENCE: Duration = Duration::from_secs(300);
 /// How many chunks of one file are asked for at once. See [`Chat::post_many`].
 const IN_FLIGHT: usize = 8;
 
+/// How many device lists are asked for at once. Small answers, so more of
+/// them: a channel of sixty members is four waves rather than eight.
+const LISTS_IN_FLIGHT: usize = 16;
+
 /// How much of each tick may be spent advancing a dial in progress.
 ///
 /// The interface has a keyboard to serve. `connect_as` allows five seconds for
@@ -868,16 +872,26 @@ impl Chat {
     /// cannot produce a credential for — a registration made before SIP-32, or
     /// an exchange withholding one — and it is carried rather than dropped so a
     /// reader is told the difference between evidence and an assertion.
+    ///
+    /// **One `/device/list` per member, all in flight together.** Asked one
+    /// after another, a channel of sixty members was sixty round trips --
+    /// four seconds against an exchange sixty milliseconds away -- on every
+    /// poll that brought an entry, before that entry could be shown. Nothing
+    /// about the answer for one account depends on another's.
     async fn bindings(&mut self, accounts: &[PubKey]) -> Result<Bindings> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let asks = accounts
+            .iter()
+            .map(|account| ListDevices { account: *account }.encode())
+            .collect();
+        let answers = self
+            .post_many_within("/device/list", asks, PATIENCE, LISTS_IN_FLIGHT)
+            .await?;
         let mut out = HashMap::new();
-        for account in accounts {
-            let body = self
-                .post("/device/list", ListDevices { account: *account }.encode())
-                .await?;
+        for (account, body) in accounts.iter().zip(answers) {
             let listed = Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
             for d in listed.devices {
                 let verified = d.credential.as_ref().is_some_and(|c| {
@@ -1447,52 +1461,83 @@ impl Chat {
         path: &str,
         bodies: Vec<Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>> {
-        use futures::stream::{StreamExt, TryStreamExt};
+        self.post_many_within(path, bodies, BLOB_PATIENCE, IN_FLIGHT)
+            .await
+    }
+
+    /// [`Chat::post_many`] with the deadline and the bound as arguments: a
+    /// chunk of a file and a device list are not held to the same clock, and
+    /// sixteen small answers in flight is not what eight large ones are.
+    async fn post_many_within(
+        &mut self,
+        path: &str,
+        bodies: Vec<Vec<u8>>,
+        patience: Duration,
+        in_flight: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.post_each(path, bodies, patience, in_flight)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// Several requests to one route, in flight together, **each with its
+    /// own answer**. For a caller that would have carried on past one
+    /// failure when it asked one at a time -- a profile that would not come
+    /// is a name not shown, not a conversation not shown.
+    ///
+    /// The link is marked from the batch as a whole: any answer at all proves
+    /// it, and it is lowered only when nothing answered and something failed
+    /// to.
+    async fn post_each(
+        &mut self,
+        path: &str,
+        bodies: Vec<Vec<u8>>,
+        patience: Duration,
+        in_flight: usize,
+    ) -> Vec<Result<Vec<u8>>> {
+        use futures::stream::StreamExt;
         if self.offline() {
-            return Err(ChatError::Transport(
-                "not connected to the exchange".to_string(),
-            ));
+            return bodies
+                .iter()
+                .map(|_| {
+                    Err(ChatError::Transport(
+                        "not connected to the exchange".to_string(),
+                    ))
+                })
+                .collect();
         }
         let requests = self.client.requests();
         let path_owned = path.to_string();
-        let answers: std::result::Result<Vec<(u16, Vec<u8>)>, ChatError> =
+        let answers: Vec<std::result::Result<(u16, Vec<u8>), ChatError>> =
             futures::stream::iter(bodies)
                 .map(|body| {
                     let requests = requests.clone();
                     let path = path_owned.clone();
                     async move {
-                        match tokio::time::timeout(BLOB_PATIENCE, requests.post(&path, body)).await
-                        {
+                        match tokio::time::timeout(patience, requests.post(&path, body)).await {
                             Ok(Ok(got)) => Ok(got),
                             Ok(Err(e)) => Err(ChatError::Transport(e)),
                             Err(_) => Err(ChatError::Transport(format!(
                                 "the exchange stopped answering ({}s)",
-                                BLOB_PATIENCE.as_secs()
+                                patience.as_secs()
                             ))),
                         }
                     }
                 })
-                .buffered(IN_FLIGHT)
-                .try_collect()
+                .buffered(in_flight)
+                .collect()
                 .await;
-        let answers = match answers {
-            Ok(answers) => {
-                self.up();
-                answers
-            }
-            Err(e) => {
-                self.down();
-                return Err(e);
-            }
-        };
+        if answers.iter().any(|a| a.is_ok()) {
+            self.up();
+        } else if answers.iter().any(|a| a.is_err()) {
+            self.down();
+        }
         answers
             .into_iter()
-            .map(|(code, body)| {
-                if code == 200 {
-                    Ok(body)
-                } else {
-                    Err(classify(path, code, &body))
-                }
+            .map(|a| match a? {
+                (200, body) => Ok(body),
+                (code, body) => Err(classify(path, code, &body)),
             })
             .collect()
     }
@@ -3112,32 +3157,54 @@ impl Chat {
         now: u64,
         force: bool,
     ) -> Result<usize> {
-        let mut asked = 0;
+        // Two ages, because the two facts are not equally strong. "They
+        // are called X" is worth keeping for an hour — SIP-21 caps updates
+        // at 32 an hour, so asking oftener could not learn much. "We asked
+        // and were told nothing" is barely a fact at all, and it is the
+        // state *everybody* starts in: caching it for an hour meant a
+        // freshly published name was invisible to everyone who had ever
+        // looked, which is exactly when somebody publishes one and wonders
+        // why nothing happened.
+        let age = |name: &str| {
+            if name.is_empty() {
+                PROFILE_MISS_TTL
+            } else {
+                PROFILE_TTL
+            }
+        };
+        // Who to ask about, decided first, so the asking can happen all at
+        // once. **Two round trips per member, one member at a time**, was
+        // how this ran: sixty-five members whose misses had aged out was
+        // eight seconds between a message arriving and being shown, every
+        // three minutes, on the busiest channel there is.
+        let mut stale = Vec::new();
         for account in accounts {
             // Our own included. It was skipped as a pointless round trip —
             // you know what you called yourself — but `/who` lists you among
             // the members, and naming everybody else while showing yourself as
             // a bare key is the one row a reader cannot account for.
             let held = self.store.profile(account)?;
-            // Two ages, because the two facts are not equally strong. "They
-            // are called X" is worth keeping for an hour — SIP-21 caps updates
-            // at 32 an hour, so asking oftener could not learn much. "We asked
-            // and were told nothing" is barely a fact at all, and it is the
-            // state *everybody* starts in: caching it for an hour meant a
-            // freshly published name was invisible to everyone who had ever
-            // looked, which is exactly when somebody publishes one and wonders
-            // why nothing happened.
-            let age = |name: &str| {
-                if name.is_empty() {
-                    PROFILE_MISS_TTL
-                } else {
-                    PROFILE_TTL
-                }
-            };
             if !force && held.is_some_and(|(name, _, at)| now.saturating_sub(at) < age(&name)) {
                 continue;
             }
-            let got = match self.profile_of(account).await {
+            stale.push(*account);
+        }
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let asks = stale
+            .iter()
+            .map(|account| ProfileByAccount { account: *account }.encode(profile::TYPE_GET))
+            .collect();
+        let answers = self
+            .post_each("/profile/get", asks, PATIENCE, LISTS_IN_FLIGHT)
+            .await;
+        let mut asked = 0;
+        let mut handles = Vec::new();
+        for (account, answer) in stale.iter().zip(answers) {
+            let got = match answer.and_then(|body| {
+                GotProfile::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+            }) {
                 Ok(got) => got,
                 Err(_) => continue,
             };
@@ -3162,15 +3229,24 @@ impl Chat {
                     None => true,
                 };
             if handle_stale {
-                let primary = self
-                    .reverse_names(account)
-                    .await
-                    .ok()
-                    .and_then(|mut v| (!v.is_empty()).then(|| v.remove(0)));
-                self.store
-                    .put_handle(account, primary.as_deref().unwrap_or(""), now)?;
+                handles.push(*account);
             }
             asked += 1;
+        }
+        let asks = handles
+            .iter()
+            .map(|account| sqex_proto::name::Reverse { account: *account }.encode())
+            .collect();
+        let answers = self
+            .post_each("/name/reverse", asks, PATIENCE, LISTS_IN_FLIGHT)
+            .await;
+        for (account, answer) in handles.iter().zip(answers) {
+            let primary = answer
+                .ok()
+                .and_then(|body| sqex_proto::name::Names::decode(&body).ok())
+                .and_then(|mut n| (!n.names.is_empty()).then(|| n.names.remove(0)));
+            self.store
+                .put_handle(account, primary.as_deref().unwrap_or(""), now)?;
         }
         Ok(asked)
     }
