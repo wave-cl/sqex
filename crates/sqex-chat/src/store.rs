@@ -227,20 +227,20 @@ CREATE TABLE IF NOT EXISTS asset (
 
 /// How much of the disc fetched attachments may hold, per store.
 ///
-/// A store is one account, so this is what one account's pictures cost the
-/// machine. Half a gigabyte is a few hundred photographs, or twenty of the
-/// largest picture a client fetches unasked, which is more than anybody is
-/// scrolling through and less than a disc will notice.
-pub const BLOB_BUDGET: u64 = 512 * 1024 * 1024;
+/// A store is one account, so this is what one account's files cost the
+/// machine. A gigabyte is a few hundred photographs and a couple of dozen
+/// videos, which is more than anybody is scrolling through and is a
+/// fraction of any disc a client runs on.
+pub const BLOB_BUDGET: u64 = 1024 * 1024 * 1024;
 
-/// The largest attachment kept. Anything bigger was a download somebody asked
-/// for -- a file to save -- and would evict everything else to stay.
+/// The largest attachment kept.
 ///
-/// Above what a client fetches unasked (sigil: 25 MiB), with room for the
-/// sealing, so that a picture it pulls on its own is a picture it keeps: one
-/// fetched every time the window opens is the cache failing at exactly the
-/// file it is slowest without.
-pub const BLOB_KEEP_MAX: u64 = 32 * 1024 * 1024;
+/// Sized for a video: a client plays one from the file, and a seven-minute
+/// 720p clip is fifty megabytes. One that has to be fetched again every
+/// time the window opens is the cache failing at exactly the file it is
+/// slowest without. Past this is a download somebody asked for -- a file to
+/// save -- and it would evict everything else to stay.
+pub const BLOB_KEEP_MAX: u64 = 256 * 1024 * 1024;
 
 /// What the store knows about one channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
