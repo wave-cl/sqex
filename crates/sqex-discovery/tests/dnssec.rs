@@ -131,3 +131,36 @@ async fn the_reference_exchange_is_discoverable() {
     assert_eq!(r.port, sqex_discovery::DEFAULT_PORT);
     assert_eq!(r.port, 443);
 }
+
+/// A system resolver that returns the answer without its proof is what an
+/// Ubuntu desktop's `systemd-resolved` stub does, and it refused squic.org
+/// -- a signed zone -- as "not signed". The lookup falls back to public
+/// resolvers as transport, and the proof is still checked here.
+#[tokio::test]
+#[ignore = "needs the real DNS"]
+async fn a_resolver_that_strips_the_proof_is_worked_around_by_the_public_ones() {
+    let stripping = dns::resolver_without_proofs().unwrap();
+    // On its own, the stripped answer is refused: that is the failure a
+    // desktop saw.
+    let alone = dns::lookup_txt_falling_back(
+        &stripping,
+        || async { Err(Error::Resolve("no fallback".into())) },
+        SIGNED_WITH_TXT,
+    )
+    .await;
+    assert!(
+        matches!(alone, Err(Error::Unsigned { .. }) | Err(Error::Resolve(_))),
+        "an answer without a proof must not satisfy discovery on its own: {alone:?}"
+    );
+    // With the fallback, the same lookup succeeds, validated.
+    let txts = dns::lookup_txt_falling_back(&stripping, dns::public_resolvers, SIGNED_WITH_TXT)
+        .await
+        .unwrap_or_else(|e| panic!("the fallback should have carried the proof: {e}"));
+    assert!(!txts.is_empty());
+    // And an unsigned zone is still refused through the fallback: the
+    // public resolvers change what is reachable, not what is believed.
+    let err = dns::lookup_txt_falling_back(&stripping, dns::public_resolvers, UNSIGNED)
+        .await
+        .expect_err("an unsigned zone must still be refused");
+    assert!(matches!(err, Error::Unsigned { .. }), "{err:?}");
+}

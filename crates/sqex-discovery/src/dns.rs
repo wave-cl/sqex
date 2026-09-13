@@ -7,6 +7,19 @@
 //! the resolver about work it says it did, and the path to the resolver is not
 //! protected; it is not consulted.
 //!
+//! # A resolver that strips the proof
+//!
+//! Some resolvers hand back the answer without the records that prove it:
+//! `systemd-resolved`'s stub at 127.0.0.53 with DNSSEC off, and the forwarder
+//! in most home routers, drop RRSIG and DS on the way through. To a validator
+//! that looks exactly like an unsigned zone, and on a Linux desktop it refused
+//! squic.org — a signed zone — with "the answer is not signed". So when the
+//! system resolvers cannot carry a proof, the same lookup is made through
+//! public resolvers that do (Cloudflare, Quad9, Google), **as transport only**:
+//! the chain is still checked here against the root anchor, and nothing they
+//! say is taken on trust, so this changes what is reachable and not what is
+//! believed.
+//!
 //! There is no feature flag turning this off. For `sqns://` addresses DNSSEC is
 //! defence in depth for a pointer and dropping it merely weakens them; here the
 //! record *is* the identity, so a build that could not validate would not be
@@ -29,6 +42,9 @@ use crate::record::{self, Parsed, Record};
 /// it is done once and shared.
 static RESOLVER: OnceCell<TokioResolver> = OnceCell::const_new();
 
+/// The public resolvers, built once, for when the system's strip the proof.
+static PUBLIC: OnceCell<TokioResolver> = OnceCell::const_new();
+
 async fn resolver() -> Result<&'static TokioResolver> {
     RESOLVER
         .get_or_try_init(|| async {
@@ -38,6 +54,29 @@ async fn resolver() -> Result<&'static TokioResolver> {
             // No trust anchor is set, so hickory's built-in root anchor is used:
             // the chain is checked here rather than taken on trust from whoever
             // answered.
+            builder.options_mut().validate = true;
+            builder
+                .build()
+                .map_err(|e| Error::Resolve(format!("cannot build a validating resolver: {e}")))
+        })
+        .await
+}
+
+/// Resolvers that carry DNSSEC records intact, as transport for a lookup the
+/// system's could not carry. Validating, like the other: what they answer is
+/// checked, not believed.
+async fn public_resolver() -> Result<&'static TokioResolver> {
+    use hickory_resolver::config::{CLOUDFLARE, GOOGLE, QUAD9, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    PUBLIC
+        .get_or_try_init(|| async {
+            let mut servers = Vec::new();
+            for group in [&CLOUDFLARE, &QUAD9, &GOOGLE] {
+                servers.extend(ResolverConfig::udp_and_tcp(group).into_parts().2);
+            }
+            let config = ResolverConfig::from_parts(None, Vec::new(), servers);
+            let mut builder =
+                Resolver::builder_with_config(config, TokioRuntimeProvider::default());
             builder.options_mut().validate = true;
             builder
                 .build()
@@ -101,8 +140,57 @@ pub async fn lookup(domain: &str) -> Result<Vec<Record>> {
 /// lookup ends at "not published" without the filter ever running, and the test
 /// passes whether the filter exists or not.
 pub async fn lookup_txt(name: &str) -> Result<Vec<String>> {
-    let resolver = resolver().await?;
+    lookup_txt_falling_back(resolver().await?, public_resolver, name).await
+}
 
+/// [`lookup_txt`] with the two resolvers as arguments: the system's, and a
+/// way to get the public ones only when they are needed. Public so a test
+/// can stand a resolver that carries no proof in for the system's.
+pub async fn lookup_txt_falling_back<F, Fut>(
+    system: &TokioResolver,
+    public: F,
+    name: &str,
+) -> Result<Vec<String>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<&'static TokioResolver>>,
+{
+    match lookup_txt_via(system, name).await {
+        // Only the outcomes a proof-stripping resolver produces: a signed
+        // zone that came back without its signatures, or a lookup the
+        // system resolver could not do at all. "Not published" is an answer
+        // and is kept; the public resolvers would say the same.
+        Err(Error::Unsigned { .. }) | Err(Error::Resolve(_)) => {
+            tracing::info!(
+                name,
+                "the system resolver returned no DNSSEC proof; asking public resolvers"
+            );
+            lookup_txt_via(public().await?, name).await
+        }
+        done => done,
+    }
+}
+
+/// The public resolvers, for a test of the fallback.
+pub async fn public_resolvers() -> Result<&'static TokioResolver> {
+    public_resolver().await
+}
+
+/// A resolver over the public servers that **does not validate**, so every
+/// answer comes back without a proof -- which is what a proof-stripping
+/// system resolver looks like from here. For tests.
+pub fn resolver_without_proofs() -> Result<TokioResolver> {
+    use hickory_resolver::config::{CLOUDFLARE, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    let config = ResolverConfig::udp_and_tcp(&CLOUDFLARE);
+    let mut builder = Resolver::builder_with_config(config, TokioRuntimeProvider::default());
+    builder.options_mut().validate = false;
+    builder
+        .build()
+        .map_err(|e| Error::Resolve(format!("cannot build a resolver: {e}")))
+}
+
+async fn lookup_txt_via(resolver: &TokioResolver, name: &str) -> Result<Vec<String>> {
     let answer = resolver.lookup(name, RecordType::TXT).await.map_err(|e| {
         if !e.is_no_records_found() {
             return Error::Resolve(format!(
