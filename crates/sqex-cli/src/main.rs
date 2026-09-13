@@ -2219,7 +2219,19 @@ fn print_audit(v: &serde_json::Value) {
 async fn connect(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey), String> {
     // Precedence for both address and key: CLI flag > env var > config file.
     let (socket, server) = endpoint(cli, cfg).await?;
-    let client = Client::connect(socket, server.as_bytes()).await?;
+    // **As the identity, when there is one.** The managed whitelist is on
+    // the transport: with it enabled the exchange keeps only the connections
+    // whose key it allows -- the list, the administrators, its peers -- and
+    // an anonymous connection is none of those, so an administrator signing
+    // over one would be answered once and then closed. A YubiKey cannot be
+    // a transport key and connects anonymously, which is the documented
+    // cost of the transport gate.
+    let client = match load_software_identity(cli, cfg) {
+        Ok(signer) if !cli.yubikey => {
+            Client::connect_as(socket, server.as_bytes(), &signer.seed()).await?
+        }
+        _ => Client::connect(socket, server.as_bytes()).await?,
+    };
     Ok((client, server))
 }
 

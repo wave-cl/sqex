@@ -146,9 +146,36 @@ pub struct Peer {
 #[derive(Default)]
 struct Connections {
     by_identity: Mutex<HashMap<PubKey, Vec<quinn::Connection>>>,
+    /// Every connection with a verified transport key, whether or not it
+    /// advertised an identity -- the whitelist is a set of transport keys,
+    /// and closing what it no longer allows has to find the anonymous ones
+    /// too.
+    by_key: Mutex<Vec<([u8; 32], quinn::Connection)>>,
 }
 
 impl Connections {
+    fn add_keyed(&self, key: [u8; 32], conn: quinn::Connection) {
+        self.by_key.lock().unwrap().push((key, conn));
+    }
+
+    fn remove_keyed(&self, conn: &quinn::Connection) {
+        self.by_key
+            .lock()
+            .unwrap()
+            .retain(|(_, c)| c.stable_id() != conn.stable_id());
+    }
+
+    /// Every live connection whose transport key `allowed` refuses.
+    fn not_allowed(&self, allowed: impl Fn(&[u8; 32]) -> bool) -> Vec<quinn::Connection> {
+        self.by_key
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, conn)| conn.close_reason().is_none() && !allowed(key))
+            .map(|(_, conn)| conn.clone())
+            .collect()
+    }
+
     fn add(&self, id: PubKey, conn: quinn::Connection) {
         self.by_identity
             .lock()
@@ -290,6 +317,75 @@ impl Server {
 
     fn is_admin(&self, key: &PubKey) -> bool {
         self.admins.read().unwrap().iter().any(|a| a == key)
+    }
+
+    /// **The managed whitelist, applied to the transport.** With the list
+    /// enabled, sQUIC drops a handshake from any key not on it before the
+    /// DH -- the silent server -- so a peer that is not listed never gets a
+    /// connection, let alone a refusal; and a peer already connected when
+    /// it is removed is closed here, since the transport only decides at the
+    /// door. Disabled, the transport accepts anyone holding the server key,
+    /// as before.
+    ///
+    /// Three sets are allowed through, not one: the list, the administrators
+    /// (or enabling the list would lock out the only keys that can disable
+    /// it), and the SIP-35 peering exchanges (which have an allowlist of
+    /// their own and do not belong on this one). All three are Ed25519 keys
+    /// forward-derived to the X25519 the transport verifies.
+    ///
+    /// What this costs, and is chosen: an administrator whose key lives on a
+    /// YubiKey has no X25519 to derive and cannot connect while the list is
+    /// on; and SIP-24's admission request, which exists so an unlisted
+    /// device can ask, cannot arrive from one -- the device's key has to be
+    /// added by an administrator who was told it some other way. The
+    /// per-request gate in `route` stays as well: it is what refuses a
+    /// connection that was admitted and then removed, in the moment before
+    /// this closes it.
+    /// Whether a connection with this transport key is admitted while the
+    /// list is on: the same set the transport was given -- the list, the
+    /// administrators, the peering exchanges -- read back from it, so the
+    /// route gate and the door cannot disagree. Everyone, when it is off.
+    fn admitted(&self, key: Option<[u8; 32]>) -> bool {
+        if !self.state.lock().unwrap().enabled() {
+            return true;
+        }
+        key.is_some_and(|k| self.transport.has_key(&k))
+    }
+
+    fn sync_transport(&self, state: &State) {
+        if !state.enabled() {
+            self.transport.disable_whitelist();
+            return;
+        }
+        let derive = |k: &PubKey| {
+            squic::crypto::ed25519_public_to_x25519(k.as_bytes())
+                .ok()
+                .map(|x| x.to_bytes())
+        };
+        let mut allowed: Vec<[u8; 32]> = state.transport_keys();
+        allowed.extend(self.admins.read().unwrap().iter().filter_map(derive));
+        allowed.extend(self.replication_peers.iter().filter_map(|p| derive(&p.key)));
+        self.transport.enable_whitelist(&allowed);
+        // Whoever is connected and no longer allowed goes -- a moment from
+        // now, not this instant: the op that enabled the list may have come
+        // over one of these connections (an administrator signing over an
+        // anonymous one), and its answer has not been written yet. The
+        // route gate refuses anything they ask in the meantime.
+        let allowed: std::collections::HashSet<[u8; 32]> = allowed.into_iter().collect();
+        let going = self.live_conns.not_allowed(|key| allowed.contains(key));
+        let gone = going.len();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            for conn in going {
+                conn.close(0u32.into(), b"not whitelisted");
+            }
+        });
+        tracing::info!(
+            listed = state.keys().len(),
+            allowed = allowed.len(),
+            closed = gone,
+            "transport whitelist enabled"
+        );
     }
 
     /// SIP-39: whether this exchange federates with `key`.
@@ -492,10 +588,11 @@ pub async fn bind_with(
         .as_ref()
         .map(|p| p.with_file_name("names.db"));
 
-    // The managed whitelist is enforced at the HTTP/3 layer, so sQUIC's own
-    // transport whitelist stays off: anyone holding the server key may connect,
-    // and the app decides per request. This keeps the signature-gated admin
-    // surface reachable no matter the whitelist state.
+    // The managed whitelist is applied to the transport as well as to the
+    // routes -- see `Server::sync_transport`. It is not set here because the
+    // set is the managed state's, read after the listener exists and kept in
+    // step with every change; `allowed_keys` at construction would be a
+    // second copy that stopped being true at the first admin op.
     let squic_config = SquicConfig {
         // `h3` for clients; `sqex-relay` (SIP-39) for a peering exchange's link,
         // which the accept loop tells apart by the negotiated ALPN.
@@ -627,6 +724,10 @@ pub async fn bind_with(
     // nothing can rename it or set its topic, because SIP-16 puts those behind
     // a role there would be nobody to hold. A room nobody administers beats no
     // room.
+    // The transport gate, from the state as loaded: an exchange restarted
+    // with the list enabled is closed from its first packet.
+    server.sync_transport(&server.state.lock().unwrap());
+
     let mut server = server;
     if !welcome_name.is_empty() {
         match server
@@ -830,6 +931,9 @@ async fn serve_h3(server: Arc<Server>, conn: quinn::Connection, peer: Peer) -> R
     // An identified connection can carry session datagrams, so register it and
     // pump them for as long as it lives. Anonymous connections cannot be a
     // party to a session, so they are never registered and never forwarded to.
+    if let Some(key) = peer.key {
+        server.live_conns.add_keyed(key, conn.clone());
+    }
     let registered = peer.identity.inspect(|id| {
         server.live_conns.add(*id, conn.clone());
         tokio::spawn(forward_datagrams(Arc::clone(&server), conn.clone(), *id));
@@ -856,6 +960,7 @@ async fn serve_h3(server: Arc<Server>, conn: quinn::Connection, peer: Peer) -> R
             }
         }
     }
+    server.live_conns.remove_keyed(&conn);
     if let Some(id) = registered {
         server.live_conns.remove(&id, &conn);
     }
@@ -1059,6 +1164,23 @@ async fn route(
         (Some(a), Some(d)) => Some((a, d)),
         _ => None,
     };
+
+    // **The managed whitelist, once enabled, closes every route a client
+    // uses.** SIP-2's closed set, matched against the MAC1-verified transport
+    // key, so a peer not on it is refused before anything below runs -- before
+    // the welcome, before any store is read. Four kinds of route stay open,
+    // each for a reason the design already gives: `/admin/*`, signature-gated
+    // and the only way to run the list itself (a YubiKey admin has no stable
+    // transport key to be on it with); `/admission/request`, SIP-24's one way
+    // in, which answers everyone identically so it is not an oracle;
+    // `/health` and `/status`, the exchange's own numbers and no one's
+    // content; and `/peer/*`, exchange to exchange, which has an allowlist of
+    // its own in `replication_peers`. Until now the list gated one route,
+    // `/exchange/ping`, put there to show the mechanism -- so enabling it
+    // changed nothing for anybody, which read as the list not working.
+    if !open_regardless(path) && !server.admitted(peer.key) {
+        return refuse(403, Code::NotWhitelisted, None);
+    }
 
     // The front door, held open once per account.
     //
@@ -2486,9 +2608,10 @@ async fn route(
             }
         },
 
-        // A protected exchange endpoint, to demonstrate whitelist enforcement.
+        // The route the whitelist gated before it gated everything: kept, and
+        // its own check with it, as the smallest thing a listed peer can ask.
         ("GET", "/exchange/ping") => {
-            if server.state.lock().unwrap().peer_allowed(peer.key) {
+            if server.admitted(peer.key) {
                 (
                     200,
                     "application/octet-stream",
@@ -2609,6 +2732,7 @@ impl Server {
         }
         if mutated {
             state.save()?;
+            self.sync_transport(&state);
         }
         Ok(json!({ "results": results }).to_string().into_bytes())
     }
@@ -2825,6 +2949,15 @@ impl Server {
 /// A refusal the bytes did not cause: the request was fine and the answer is
 /// no. Distinguishable from a malformed request, as SIP-16 requires, and never
 /// silent.
+/// The routes the managed whitelist never closes. See `route`.
+fn open_regardless(path: &str) -> bool {
+    path == "/health"
+        || path == "/status"
+        || path == "/admission/request"
+        || path.starts_with("/admin/")
+        || path.starts_with("/peer/")
+}
+
 fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
     refuse(e.status(), e.code(), None)
 }

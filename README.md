@@ -215,19 +215,27 @@ from the start.
 
 ## Whitelist enforcement
 
-The managed whitelist is sqex's own connection ACL, but it is enforced at the
-HTTP/3 layer using the transport's verified peer key (SIP-2 `peer_key`), **not**
-as sQUIC's transport whitelist. Gating the transport would drop the admin
-surface the moment the whitelist was enabled, since YubiKey admins have no
-stable transport key. So sQUIC accepts anyone holding the server key, and sqex
-answers `403` on protected endpoints for a peer whose key is not whitelisted.
-Admin commands are signature-gated and always reachable.
+The managed whitelist is applied **to the transport**: with it enabled, sQUIC
+drops the handshake of any key not allowed before the Diffie-Hellman -- the
+silent server -- so a peer that is not listed never gets a connection, let
+alone an answer. Three sets are allowed through: the list itself, the
+configured administrators (or enabling the list would lock out the only keys
+that can disable it), and the SIP-35 peering exchanges, which have an
+allowlist of their own. All are Ed25519 keys forward-derived to the X25519 the
+transport verifies (SIP-2), and the set is kept in step with every signed
+change, so `sqex admin whitelist add` takes effect at the door immediately and
+`remove` closes what it let in. The same set gates every client route as well
+(`403 not_whitelisted`), which is what refuses a connection in the moment
+between its removal and its close; `/health`, `/status`, `/admin/*`,
+`/admission/request` and `/peer/*` are open regardless.
 
-Which routes are protected is an operator's policy, and today only
-`/exchange/ping` is — it is there to demonstrate the mechanism. The chat routes
-are open to any advertised identity. SIP-24 covers the case where they should
-not be, and the queue and the admin ops for it are implemented; wiring
-enforcement onto a chosen set of routes is not.
+Two things this costs, chosen deliberately. An administrator whose key lives
+on a **YubiKey** has no X25519 to derive and connects anonymously, so it cannot
+reach the exchange while the list is on -- keep a software administrator for
+that. And SIP-24's admission request, which exists so an unlisted device can
+ask to be admitted, cannot arrive from one: with the transport gate a device's
+key is added by an administrator who was told it some other way. The queue and
+the ops for it remain.
 
 ## Storage
 

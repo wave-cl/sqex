@@ -207,6 +207,11 @@ impl State {
         self.enabled
     }
 
+    /// The listed keys as the transport sees them: X25519, forward-derived.
+    pub fn transport_keys(&self) -> Vec<[u8; 32]> {
+        self.x25519.iter().copied().collect()
+    }
+
     pub fn keys(&self) -> Vec<PubKey> {
         self.keys.keys().copied().collect()
     }

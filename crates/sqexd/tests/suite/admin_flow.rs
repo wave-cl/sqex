@@ -39,7 +39,20 @@ struct Client {
 
 impl Client {
     async fn connect(addr: SocketAddr, server_pub: &[u8; 32], client_seed: &[u8; 32]) -> Client {
-        let conn = squic::dial(
+        Client::try_connect(addr, server_pub, client_seed)
+            .await
+            .expect("the exchange answers this key")
+    }
+
+    /// A dial that may be dropped at the door: the silent server answers a
+    /// key it will not have with nothing, so this gives up after a while
+    /// rather than for ever.
+    async fn try_connect(
+        addr: SocketAddr,
+        server_pub: &[u8; 32],
+        client_seed: &[u8; 32],
+    ) -> Option<Client> {
+        let dial = squic::dial(
             addr,
             server_pub,
             SquicConfig {
@@ -47,19 +60,34 @@ impl Client {
                 client_key: Some(hex::encode(client_seed)),
                 ..Default::default()
             },
-        )
-        .await
-        .unwrap();
+        );
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(4), dial)
+            .await
+            .ok()?
+            .ok()?;
         let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn))
             .await
             .unwrap();
         let drive = tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });
-        Client {
+        Some(Client {
             send,
             _drive: drive,
-        }
+        })
+    }
+
+    /// A GET on a connection that may have been closed under it.
+    async fn try_get(&mut self, path: &str) -> Option<(u16, Vec<u8>)> {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("https://sqex{path}"))
+            .body(())
+            .unwrap();
+        let mut stream = self.send.send_request(req).await.ok()?;
+        stream.finish().await.ok()?;
+        let resp = stream.recv_response().await.ok()?;
+        Some((resp.status().as_u16(), Vec::new()))
     }
 
     async fn get(&mut self, path: &str) -> (u16, Vec<u8>) {
@@ -164,6 +192,10 @@ async fn full_admin_flow() {
     let (addr, server_pub_bytes, handle) = spawn_server(&config_toml, config_path.clone()).await;
     let server_pub = PubKey::new(server_pub_bytes);
     let mut client = Client::connect(addr, &server_pub_bytes, &client_seed).await;
+    // The administrator's own connection, as an administrator has: signing
+    // is by key, but with the list on the transport the *connection* has to
+    // be one the exchange will keep, and an admin's is.
+    let mut admin = Client::connect(addr, &server_pub_bytes, &[7u8; 32]).await;
 
     // Public endpoints.
     assert_eq!(client.get("/health").await.0, 200, "health is public");
@@ -174,7 +206,7 @@ async fn full_admin_flow() {
     );
 
     // A summary that does not match its payload is rejected (context binding).
-    let (s, _) = client
+    let (s, _) = admin
         .tx(
             vec![Operation {
                 summary: "Do something harmless".into(),
@@ -186,11 +218,11 @@ async fn full_admin_flow() {
         )
         .await;
     assert_eq!(s, 400, "summary/payload mismatch refused");
-    assert!(!client.whitelist_enabled().await, "and nothing was applied");
+    assert!(!admin.whitelist_enabled().await, "and nothing was applied");
 
     // A batch containing a bad op applies NONE of it (atomicity): enable first,
     // then an undecodable payload.
-    let (s, _) = client
+    let (s, _) = admin
         .tx(
             vec![
                 Op::WhitelistEnable.to_operation(),
@@ -206,25 +238,45 @@ async fn full_admin_flow() {
         .await;
     assert_eq!(s, 400, "batch with a bad op is refused");
     assert!(
-        !client.whitelist_enabled().await,
+        !admin.whitelist_enabled().await,
         "the good op in the bad batch was not applied"
     );
 
     // Enable the whitelist (admin, signed).
-    let (s, body) = client
+    let (s, body) = admin
         .admin(Op::WhitelistEnable, &server_pub, &admin_signer)
         .await;
     assert_eq!(s, 200, "admin enable: {}", String::from_utf8_lossy(&body));
 
-    // Non-whitelisted client now refused on the protected endpoint.
-    assert_eq!(
-        client.get("/exchange/ping").await.0,
-        403,
-        "ping refused: whitelist on, client not listed"
+    // **The list is on the transport.** The unlisted client's connection is
+    // closed under it, and a fresh dial with the same key is dropped at the
+    // door -- the silent server, nothing answers -- while the administrator,
+    // whose key is allowed through with the list, goes on being served.
+    // Refused at once by the route gate, or closed a moment later; either
+    // way, never served -- and after the moment, closed.
+    match client.try_get("/exchange/ping").await {
+        None => {}
+        Some((status, _)) => assert_eq!(status, 403, "served after the list went on"),
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        client.try_get("/health").await.is_none(),
+        "an unlisted peer's connection survived the list being enabled"
     );
-
+    assert!(
+        Client::try_connect(addr, &server_pub_bytes, &client_seed)
+            .await
+            .is_none(),
+        "an unlisted key was given a connection with the list on"
+    );
+    assert_eq!(
+        admin.get("/exchange/ping").await.0,
+        200,
+        "the administrator is allowed through with the list"
+    );
+    assert_eq!(admin.get("/health").await.0, 200);
     // A batch: add the client key AND read the list in one signed transaction.
-    let (s, body) = client
+    let (s, body) = admin
         .tx(
             vec![
                 Op::WhitelistAdd {
@@ -254,11 +306,52 @@ async fn full_admin_flow() {
         entry["added_by"].as_str(),
         Some(admin_pub.to_base58().as_str())
     );
+    // Listed, the client is let in again -- a new connection; the old one
+    // was closed -- and the routes answer it as a client.
+    let mut client = Client::try_connect(addr, &server_pub_bytes, &client_seed)
+        .await
+        .expect("a listed key is given a connection");
     assert_eq!(
         client.get("/exchange/ping").await.0,
         200,
         "ping allowed after the client's key is whitelisted"
     );
+    assert_ne!(
+        client.post("/channel/list", vec![]).await.0,
+        403,
+        "a listed peer is not refused as unlisted"
+    );
+
+    // **Removed while connected: gone.** The transport only decides at the
+    // door, so the exchange closes what it let in; a request racing the
+    // close is refused by the route gate instead. Either way, not served.
+    let (s, _) = admin
+        .admin(Op::WhitelistRemove(client_pub), &server_pub, &admin_signer)
+        .await;
+    assert_eq!(s, 200);
+    match client.try_get("/exchange/ping").await {
+        None => {}
+        Some((status, _)) => assert_eq!(status, 403, "served after removal"),
+    }
+    assert!(
+        Client::try_connect(addr, &server_pub_bytes, &client_seed)
+            .await
+            .is_none(),
+        "a removed key was given a connection"
+    );
+    // And back on, for the rest of the flow.
+    let (s, _) = admin
+        .admin(
+            Op::WhitelistAdd {
+                key: client_pub,
+                label: None,
+            },
+            &server_pub,
+            &admin_signer,
+        )
+        .await;
+    assert_eq!(s, 200);
+    let mut client = Client::connect(addr, &server_pub_bytes, &client_seed).await;
 
     // A non-admin signer is rejected.
     let (outsider_status, outsider_body) = client

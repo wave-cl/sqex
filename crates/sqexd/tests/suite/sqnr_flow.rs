@@ -55,7 +55,14 @@ async fn cli_flow_signs_a_batch() {
     let (addr, server_pub_bytes, handle) = spawn_server(&config_toml, config_path).await;
     let server = PubKey::new(server_pub_bytes);
 
-    let mut client = Client::connect(addr, &server_pub_bytes).await.unwrap();
+    // Connected **as the administrator**, not anonymously: the list goes on
+    // the transport the moment the first op below applies, and the only
+    // connections it keeps are those whose key it allows -- the listed, the
+    // administrators, the peers. An admin who signs over an anonymous
+    // connection is signing over one that closes under them.
+    let mut client = Client::connect_as(addr, &server_pub_bytes, &[7u8; 32])
+        .await
+        .unwrap();
     let admin = Backend::software(sqnr_core::SoftwareSigner::new(admin_sk));
     let no_review = |_: &Transaction| {};
     let no_touch = || {};
