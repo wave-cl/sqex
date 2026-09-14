@@ -1347,7 +1347,7 @@ async fn resolve_target(cli: &Cli, cfg: &Config, input: &str) -> Result<PubKey, 
                 Some(d) => format!("{name}@{d}"),
                 None => name.clone(),
             };
-            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let mut client = connect_preferring_identity(cli, cfg, addr, &server).await?;
             let (code, body) = client
                 .post(
                     "/name/resolve",
@@ -1468,7 +1468,7 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
                 Some(d) => resolve_domain(d).await?,
                 None => endpoint(cli, cfg).await?,
             };
-            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let mut client = connect_preferring_identity(cli, cfg, addr, &server).await?;
             let (code, body) = client
                 .post(
                     "/name/resolve",
@@ -1514,7 +1514,7 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
                 None => own_identity(cli, cfg)?,
             };
             let (addr, server) = endpoint(cli, cfg).await?;
-            let mut client = Client::connect(addr, server.as_bytes()).await?;
+            let mut client = connect_preferring_identity(cli, cfg, addr, &server).await?;
             let (code, body) = client
                 .post("/name/reverse", name::Reverse { account: target }.encode())
                 .await?;
@@ -1573,9 +1573,31 @@ async fn whoami(
         println!("  no handles recorded — claim one, or `sqex whoami --add name@domain`");
         return Ok(());
     }
+    // The checks connect as us when that costs no prompt — a plaintext
+    // identity — because a whitelisted exchange (SIP-8) drops an anonymous
+    // caller at the door, and this command promises not to ask for a
+    // passphrase. An encrypted identity is checked anonymously, and a
+    // whitelisted exchange then reads as unreachable; the line says so.
+    let signer = quiet_signer(cli, cfg);
     for (i, h) in hs.iter().enumerate() {
         let role = if i == 0 { "primary" } else { "alias  " };
-        println!("  {role}  {h}  {}", verify_handle(h, &me).await);
+        println!(
+            "  {role}  {h}  {}",
+            verify_handle(h, &me, signer.as_ref()).await
+        );
+    }
+    let encrypted = identity_path(cli, cfg)
+        .ok()
+        .filter(|p| p.exists())
+        .and_then(|p| identity::is_encrypted(&p).ok())
+        .unwrap_or(false);
+    if signer.is_none() && encrypted {
+        eprintln!(
+            "(checked anonymously: this identity is encrypted and whoami does not prompt. \
+             An exchange with its whitelist on refuses anonymous callers, so a handle there \
+             shows as unreachable even when it is yours — `sqex name resolve <handle>` asks \
+             as you.)"
+        );
     }
     Ok(())
 }
@@ -1583,7 +1605,11 @@ async fn whoami(
 /// Best-effort check that a `name@domain` handle still resolves to `me` on its
 /// domain's exchange. Returns a short status marker and never fails — a handle
 /// is a hint, and the exchange is the authority (SIP-38).
-async fn verify_handle(handle: &str, me: &PubKey) -> String {
+async fn verify_handle(
+    handle: &str,
+    me: &PubKey,
+    signer: Option<&sqnr_core::SoftwareSigner>,
+) -> String {
     let Some((local, domain)) = handle.split_once('@') else {
         return "(malformed handle)".into();
     };
@@ -1595,7 +1621,11 @@ async fn verify_handle(handle: &str, me: &PubKey) -> String {
         Ok(v) => v,
         Err(e) => return format!("(unreachable: {e})"),
     };
-    let mut client = match Client::connect(addr, server.as_bytes()).await {
+    let connected = match signer {
+        Some(s) => Client::connect_as(addr, server.as_bytes(), &s.seed()).await,
+        None => Client::connect(addr, server.as_bytes()).await,
+    };
+    let mut client = match connected {
         Ok(c) => c,
         Err(e) => return format!("(unreachable: {e})"),
     };
@@ -1832,6 +1862,41 @@ fn load_software_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::Software
 /// This caller's own Ed25519 identity, without needing to decrypt it.
 fn own_identity(cli: &Cli, cfg: &Config) -> Result<PubKey, String> {
     identity::read_public(&identity_path(cli, cfg)?)
+}
+
+/// Connect **as** our identity where we can, anonymously where we cannot.
+///
+/// The SIP-38 name routes are public — anyone authenticated may resolve — and
+/// used to be asked anonymously, which worked until an exchange turned its
+/// transport whitelist on (SIP-8): an anonymous key is not on any list, so
+/// the handshake is dropped in silence and `c@squic.org` reads as
+/// "unreachable" to the very identity that holds it. Asking as ourselves costs
+/// nothing when the identity is plaintext, and a passphrase when it is not —
+/// the same passphrase every signed command already asks for.
+async fn connect_preferring_identity(
+    cli: &Cli,
+    cfg: &Config,
+    addr: SocketAddr,
+    server: &PubKey,
+) -> Result<Client, String> {
+    match load_software_identity(cli, cfg) {
+        Ok(signer) => Client::connect_as(addr, server.as_bytes(), &signer.seed())
+            .await
+            .map_err(|e| e.to_string()),
+        Err(_) => Client::connect(addr, server.as_bytes())
+            .await
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Our identity if it can be used without asking anything: present and
+/// unencrypted. For the read-only paths that promise not to prompt.
+fn quiet_signer(cli: &Cli, cfg: &Config) -> Option<sqnr_core::SoftwareSigner> {
+    let path = identity_path(cli, cfg).ok()?;
+    if !path.exists() || identity::is_encrypted(&path).ok()? {
+        return None;
+    }
+    identity::load(&path, None).ok()
 }
 
 /// The layers a caller can speak through, most specific first. Resolution is
