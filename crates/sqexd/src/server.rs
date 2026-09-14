@@ -439,9 +439,11 @@ impl Server {
     /// if there is one, is replaced by one for `to`. A relay-peer key is a key
     /// held for a domain, found by discovering that domain, so when the pin
     /// follows a handover the entry SHOULD follow with it. Returns whether
-    /// anything changed; the caller logs it. Provenance records the domain
-    /// and the key it came from, and `added_by` is empty because no
-    /// administrator signed for this — the outgoing key did.
+    /// anything changed; the caller logs it. Provenance: `added_by` is the
+    /// outgoing key, because that is who authorised this — no administrator
+    /// signed a transaction, the retiring exchange signed a handover — and an
+    /// empty `added_by` would read as "seeded from config", which is a
+    /// different fact (a seed is re-applied on restart; this is persisted).
     pub(crate) fn follow_peer_handover(&self, domain: &str, from: &PubKey, to: PubKey) -> bool {
         let mut state = self.state.lock().unwrap();
         if !state.peers_with(from) {
@@ -451,8 +453,8 @@ impl Server {
         state.add_peer(
             to,
             crate::state::WhitelistEntry {
-                added_by: None,
-                label: Some(format!("{domain}, followed SIP-40 handover from {from}")),
+                added_by: Some(from.to_string()),
+                label: Some(format!("{domain}, SIP-40 handover")),
                 added_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())

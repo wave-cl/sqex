@@ -2318,6 +2318,14 @@ mod tests {
             provenance(Some("HR2vxdPD"), "indra.org"),
             "(indra.org, added by HR2vxdPD)"
         );
+        // A SIP-40 follow: the outgoing exchange key is who authorised it.
+        // Rendered as "added by" that key, not as a seed -- the first live
+        // rotation printed "seeded from config, not signed for" for an entry
+        // the retiring key had signed for and the state file held.
+        assert_eq!(
+            provenance(Some("7tbBEPxK"), "trunk.exchange, SIP-40 handover"),
+            "(trunk.exchange, SIP-40 handover, added by 7tbBEPxK)"
+        );
         // An administrator who gave no label still gets named, without a
         // stray comma where the label would have been.
         assert_eq!(provenance(Some("HR2vxdPD"), ""), "(added by HR2vxdPD)");
