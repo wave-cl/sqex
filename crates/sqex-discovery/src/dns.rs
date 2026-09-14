@@ -36,7 +36,7 @@ use hickory_resolver::{Resolver, TokioResolver};
 use tokio::sync::OnceCell;
 
 use crate::error::{Error, Result};
-use crate::record::{self, Parsed, Record};
+use crate::record::{self, Handover, Parsed, Record};
 
 /// Building a resolver reads the system configuration and sets up a cache, so
 /// it is done once and shared.
@@ -90,7 +90,25 @@ async fn public_resolver() -> Result<&'static TokioResolver> {
 /// Records that are not ours are skipped in silence. Records that are ours and
 /// malformed are an error: a domain that meant to publish one and got it wrong
 /// should hear about it rather than look like a domain that published nothing.
-pub async fn lookup(domain: &str) -> Result<Vec<Record>> {
+/// Everything a domain publishes at `_sqex`: its SIP-33 records and any SIP-40
+/// handovers that verified for this domain.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Published {
+    pub records: Vec<Record>,
+    /// Signature-checked against `domain`. A handover that did not verify is
+    /// not here, and was not reported: SIP-40 says a bad one is somebody
+    /// else's record.
+    pub handovers: Vec<Handover>,
+}
+
+impl Published {
+    /// The keys the domain currently publishes, in record order.
+    pub fn offered(&self) -> Vec<sqnr_core::PubKey> {
+        self.records.iter().map(|r| r.key).collect()
+    }
+}
+
+pub async fn lookup(domain: &str) -> Result<Published> {
     let name = record::query_name(domain);
     // `lookup_txt` reports against the name it queried, because a caller may
     // hand it any name. Here the user asked about a domain, so the domain is
@@ -109,9 +127,20 @@ pub async fn lookup(domain: &str) -> Result<Vec<Record>> {
     })?;
 
     let mut ours = Vec::new();
+    let mut handovers = Vec::new();
     for text in &texts {
         match record::parse(text) {
             Parsed::Ours(r) => ours.push(r),
+            Parsed::Handover(h) => {
+                // The one check the parser could not make. A failure is
+                // logged and dropped, never surfaced: the record is foreign
+                // by SIP-40's definition once its signature does not hold.
+                if h.verify(domain) {
+                    handovers.push(h);
+                } else {
+                    tracing::debug!(domain, from = %h.from, to = %h.to, "handover did not verify; ignored");
+                }
+            }
             Parsed::Foreign => {}
             Parsed::Broken(why) => {
                 return Err(Error::Malformed {
@@ -129,7 +158,10 @@ pub async fn lookup(domain: &str) -> Result<Vec<Record>> {
             negative_ttl: None,
         });
     }
-    Ok(ours)
+    Ok(Published {
+        records: ours,
+        handovers,
+    })
 }
 
 /// Every **Secure** `TXT` string published at `name`, one entry per record.

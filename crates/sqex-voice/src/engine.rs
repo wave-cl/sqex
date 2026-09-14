@@ -97,6 +97,14 @@ pub enum Event {
     Identity(PubKey),
     /// A domain was discovered over DNSSEC and pinned on first contact.
     Pinned { domain: String, key: PubKey },
+    /// The pinned key was withdrawn and had signed a handover; the pin
+    /// followed it (SIP-40). Said once, like `Pinned`, because the thing the
+    /// user trusted has changed hands.
+    Moved {
+        domain: String,
+        from: PubKey,
+        key: PubKey,
+    },
     /// Waiting for `peer` to name us in return. Consent is mutual, so nothing
     /// happens until they ask too.
     Waiting { peer: PubKey },
@@ -172,6 +180,12 @@ impl Event {
             Event::Pinned { domain, key } => format!(
                 "{domain}: discovered {key} over DNSSEC and pinned it. \
                  Forget it with `sqex discover --forget {domain}`."
+            ),
+            Event::Moved { domain, from, key } => format!(
+                "{domain}: its key changed hands. {from} was withdrawn and had signed a \
+                 handover to {key}, which the zone also publishes, so the pin followed it \
+                 (SIP-40). Forget it with `sqex discover --forget {domain}` if that is not \
+                 what you expected."
             ),
             Event::Waiting { peer } => {
                 format!("waiting for {peer} to open a session with you…")
@@ -307,11 +321,17 @@ pub async fn resolve(
             let found = sqex_discovery::discover(&domain)
                 .await
                 .map_err(|e| e.to_string())?;
-            if found.newly_pinned {
-                report.event(Event::Pinned {
+            match found.pin {
+                sqex_discovery::Pin::Held => {}
+                sqex_discovery::Pin::First => report.event(Event::Pinned {
                     domain,
                     key: found.key,
-                });
+                }),
+                sqex_discovery::Pin::Moved { from } => report.event(Event::Moved {
+                    domain,
+                    from,
+                    key: found.key,
+                }),
             }
             Ok(Endpoint {
                 address: resolve_addr(&found.address)?,

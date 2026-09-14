@@ -39,6 +39,28 @@ enum Command {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
+    /// Sign a SIP-40 handover from this exchange's key to its successor, and
+    /// print the TXT record to publish at `_sqex.<domain>` beside the
+    /// successor's own `k=` record.
+    ///
+    /// Nothing is changed by this command. The record is inert until it is
+    /// in the zone next to a `k=<to>` record; a client moves its pin only when
+    /// both agree. Once published it cannot be withdrawn, only outlived —
+    /// which is why the expiry is capped and why this prints exactly what it
+    /// signed before it signs.
+    Handover {
+        /// The successor's public key, base58 — `sqexd -k <new> --show-pubkey`.
+        #[arg(long)]
+        to: String,
+        /// The domain the record will be published under. Bound into the
+        /// signature, so a handover for one zone cannot be replayed under
+        /// another this key happens to serve.
+        #[arg(long)]
+        domain: String,
+        /// How long the handover stands, in days. At most 30 (SIP-40).
+        #[arg(long, default_value_t = 14)]
+        days: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -67,6 +89,24 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
 
     let config = build_config(&cli)?;
+
+    if let Some(Command::Handover { to, domain, days }) = &cli.command {
+        // Never `load_or_create`: a handover from a key that did not exist
+        // until this moment is a handover from nobody, and the created key
+        // would look like the exchange's identity to whoever read the file
+        // next.
+        if !config.key_file.exists() {
+            return Err(format!(
+                "key file {} does not exist; a handover is signed by the key being retired",
+                config.key_file.display()
+            )
+            .into());
+        }
+        let signing_key = load_or_create_key(&config.key_file, true)?;
+        handover(&signing_key, to, domain, *days)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let signing_key = load_or_create_key(&config.key_file, cli.key_file.is_some())?;
 
     if cli.show_pubkey {
@@ -163,6 +203,72 @@ fn load_or_create_key(
     keygen(path)?;
     let (sk, _pub) = squic::load_keypair(std::fs::read_to_string(path)?.trim())?;
     Ok(sk)
+}
+
+/// Sign a SIP-40 handover and print the record. See `Command::Handover`.
+fn handover(
+    signing_key: &SigningKey,
+    to: &str,
+    domain: &str,
+    days: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ed25519_dalek::Signer;
+    use sqex_discovery::{HANDOVER_MAX_SECS, Handover};
+    use sqnr_core::PubKey;
+
+    let from = PubKey::new(signing_key.verifying_key().to_bytes());
+    let to: PubKey = to
+        .parse()
+        .map_err(|_| format!("--to {to:?} is not a 32-byte base58 key"))?;
+    if to == from {
+        return Err("--to is this exchange's own key; a handover names a successor".into());
+    }
+    let domain = sqex_discovery::record::canonical_domain(domain);
+    if domain.is_empty() || domain.len() > 255 || domain.contains(char::is_whitespace) {
+        return Err(format!("--domain {domain:?} is not a domain").into());
+    }
+    let secs = days
+        .checked_mul(86_400)
+        .filter(|s| *s <= HANDOVER_MAX_SECS)
+        .ok_or_else(|| {
+            format!(
+                "--days {days} is beyond the SIP-40 cap of {} days",
+                HANDOVER_MAX_SECS / 86_400
+            )
+        })?;
+    if secs == 0 {
+        return Err("--days must be at least 1".into());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let until = now + secs;
+
+    let input = Handover::signing_input(&domain, &from, &to, until);
+    let sig = signing_key.sign(&input).to_bytes();
+    let h = Handover {
+        from,
+        to,
+        until,
+        sig,
+    };
+    debug_assert!(h.verify(&domain));
+
+    eprintln!("sqexd: signing a SIP-40 handover");
+    eprintln!("  domain: {domain}");
+    eprintln!("  from:   {from}  (this exchange's key)");
+    eprintln!("  to:     {to}");
+    eprintln!("  until:  {until}  ({days} days from now)");
+    eprintln!();
+    eprintln!("Publish this TXT record at _sqex.{domain}, beside a `v=sqex1; k={to}` record:");
+    eprintln!();
+    println!("{}", h.render());
+    eprintln!();
+    eprintln!(
+        "It grants nothing until `k={to}` is published too, and cannot be withdrawn once \
+         published — only outlived, at {until}."
+    );
+    Ok(())
 }
 
 /// Write a fresh hex Ed25519 seed to `path`, mode 0600.

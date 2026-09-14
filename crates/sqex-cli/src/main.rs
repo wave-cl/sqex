@@ -492,34 +492,57 @@ async fn discover(domain: Option<&str>, forget: Option<&str>) -> Result<(), Stri
         return Ok(());
     };
 
-    let records = sqex_discovery::dns::lookup(domain)
+    let published = sqex_discovery::dns::lookup(domain)
         .await
         .map_err(|e| e.to_string())?;
 
     println!(
         "{domain} publishes {} record(s) at _sqex.{domain}, DNSSEC-validated:",
-        records.len()
+        published.records.len()
     );
-    for r in &records {
+    for r in &published.records {
         let host = r.host.as_deref().unwrap_or(domain);
         println!("  {}  at {host}:{}", r.key, r.port);
     }
+    // Only the handovers that verified are here; a bad one was dropped in
+    // silence, as SIP-40 requires. Shown before the decision so a reader can
+    // see what the decision was made from.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for h in &published.handovers {
+        let state = if now < h.until {
+            format!("{}s left", h.until - now)
+        } else {
+            "expired".to_string()
+        };
+        println!("  handover (SIP-40): {} → {}  ({state})", h.from, h.to);
+    }
 
     // What would happen next, said plainly, without doing it.
-    let offered: Vec<_> = records.iter().map(|r| r.key).collect();
-    match sqex_discovery::known::decide(&offered, store.lookup(domain)) {
+    let offered = published.offered();
+    match sqex_discovery::known::decide(&offered, store.lookup(domain), &published.handovers, now) {
         Some(sqex_discovery::Decision::Pinned(k)) => {
             println!("\npinned already: {k}");
             if offered.len() > 1 {
                 println!(
                     "A rotation is in progress. The pin stays put until the key it names \n\
-                     stops being published — a key seen beside it earns nothing."
+                     stops being published — a key seen beside it earns nothing, and a \n\
+                     handover is acted on only once it has gone."
                 );
             }
         }
         Some(sqex_discovery::Decision::FirstContact(k)) => {
             println!("\nnothing pinned for {domain} yet.");
             println!("Connecting would pin {k} and refuse any later change.");
+        }
+        Some(sqex_discovery::Decision::Moved { from, to }) => {
+            println!("\npinned: {from}, which has been withdrawn and signed a handover to {to}.");
+            println!(
+                "Connecting would move the pin to {to} (SIP-40): the zone publishes it and \n\
+                 the pinned key vouched for it. Nothing has been changed by this command."
+            );
         }
         Some(sqex_discovery::Decision::Changed { pinned, offered }) => {
             println!();
@@ -1297,12 +1320,8 @@ async fn resolve_domain(domain: &str) -> Result<(SocketAddr, PubKey), String> {
     let found = sqex_discovery::discover(domain)
         .await
         .map_err(|e| e.to_string())?;
-    if found.newly_pinned {
-        eprintln!(
-            "{domain}: discovered {} over DNSSEC and pinned it. \
-             Forget it with `sqex discover --forget {domain}`.",
-            found.key
-        );
+    if let Some(notice) = found.notice(domain) {
+        eprintln!("{notice}");
     }
     Ok((resolve(&found.address)?, found.key))
 }
@@ -1879,12 +1898,8 @@ async fn resolve_endpoint(
             let found = sqex_discovery::discover(&domain)
                 .await
                 .map_err(|e| e.to_string())?;
-            if found.newly_pinned {
-                eprintln!(
-                    "{domain}: discovered {} over DNSSEC and pinned it. \
-                     Forget it with `sqex discover --forget {domain}`.",
-                    found.key
-                );
+            if let Some(notice) = found.notice(&domain) {
+                eprintln!("{notice}");
             }
             Ok((resolve(&found.address)?, found.key, Some(domain)))
         }

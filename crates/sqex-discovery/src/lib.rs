@@ -16,9 +16,13 @@ pub mod known;
 pub mod record;
 pub mod target;
 
+pub use dns::Published;
 pub use error::{Error, Result};
 pub use known::{Decision, Known};
-pub use record::{DEFAULT_PORT, Invalid, LABEL, Parsed, Record, VERSION};
+pub use record::{
+    DEFAULT_PORT, HANDOVER_MAX_SECS, HANDOVER_VERSION, Handover, Invalid, LABEL, Parsed, Record,
+    VERSION,
+};
 pub use target::{Layer, Target};
 
 /// Where one rung of the ladder came from, so a caller can say what it did and
@@ -46,6 +50,20 @@ pub struct Candidate {
     pub host: Option<String>,
 }
 
+/// What happened to the pin on this resolution. Two of the three are trust
+/// decisions made on the user's behalf, and a caller MUST say so for both:
+/// SIP-33 for a first contact, SIP-40 for a move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pin {
+    /// The pinned key is still the published one. Nothing to say.
+    Held,
+    /// A first contact: the key has just been pinned.
+    First,
+    /// The pinned key was withdrawn and signed a handover (SIP-40); the pin
+    /// now names its successor. `from` is the key it used to be.
+    Moved { from: sqnr_core::PubKey },
+}
+
 /// What a domain turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
@@ -53,9 +71,36 @@ pub struct Found {
     pub key: sqnr_core::PubKey,
     /// `host:port` to dial. The host is the record's `h`, or the domain itself.
     pub address: String,
-    /// True when this was a first contact and the key has just been pinned —
-    /// the caller should say so, because a trust decision was made for the user.
-    pub newly_pinned: bool,
+    /// What this resolution did to the pin store.
+    pub pin: Pin,
+}
+
+impl Found {
+    /// True when the store changed on this resolution — a first contact or a
+    /// move — and the caller should tell the user.
+    pub fn newly_pinned(&self) -> bool {
+        !matches!(self.pin, Pin::Held)
+    }
+
+    /// One line saying what happened to the pin, if anything did, in the
+    /// words every client uses. `None` when nothing did.
+    pub fn notice(&self, domain: &str) -> Option<String> {
+        match &self.pin {
+            Pin::Held => None,
+            Pin::First => Some(format!(
+                "{domain}: discovered {} over DNSSEC and pinned it. \
+                 Forget it with `sqex discover --forget {domain}`.",
+                self.key
+            )),
+            Pin::Moved { from } => Some(format!(
+                "{domain}: its key changed hands. The pinned key {from} was withdrawn \
+                 and had signed a handover to {}, which the zone also publishes, so \
+                 the pin has followed it (SIP-40). Forget it with \
+                 `sqex discover --forget {domain}` if that is not what you expected.",
+                self.key
+            )),
+        }
+    }
 }
 
 /// Find `domain`'s exchange, reconciling against the pin store.
@@ -64,18 +109,29 @@ pub struct Found {
 pub async fn discover(domain: &str) -> Result<Found> {
     let path = known::path();
     let mut store = Known::load(&path).map_err(Error::Store)?;
-    let records = dns::lookup(domain).await?;
+    let published = dns::lookup(domain).await?;
 
-    let offered: Vec<_> = records.iter().map(|r| r.key).collect();
-    let decision =
-        known::decide(&offered, store.lookup(domain)).expect("lookup returns no empty set");
+    let offered = published.offered();
+    let decision = known::decide(&offered, store.lookup(domain), &published.handovers, now())
+        .expect("lookup returns no empty set");
 
-    let (key, newly_pinned) = match decision {
-        Decision::Pinned(k) => (k, false),
+    let (key, pin) = match decision {
+        Decision::Pinned(k) => (k, Pin::Held),
         Decision::FirstContact(k) => {
             store.add(domain, k, &format!("discovered {}", today()));
             store.save(&path).map_err(Error::Store)?;
-            (k, true)
+            (k, Pin::First)
+        }
+        Decision::Moved { from, to } => {
+            // The old key goes into the comment: history a person can read,
+            // and nothing the store will ever authenticate against.
+            store.add(
+                domain,
+                to,
+                &format!("moved from {from} {} (SIP-40 handover)", today()),
+            );
+            store.save(&path).map_err(Error::Store)?;
+            (to, Pin::Moved { from })
         }
         Decision::Changed { pinned, offered } => {
             return Err(Error::Changed {
@@ -88,7 +144,8 @@ pub async fn discover(domain: &str) -> Result<Found> {
 
     // The record naming the key we settled on decides the address: with several
     // published, they may point at different hosts.
-    let chosen = records
+    let chosen = published
+        .records
         .iter()
         .find(|r| r.key == key)
         .expect("the key came from these records");
@@ -96,7 +153,7 @@ pub async fn discover(domain: &str) -> Result<Found> {
     Ok(Found {
         key,
         address: format!("{host}:{}", chosen.port),
-        newly_pinned,
+        pin,
     })
 }
 
@@ -120,7 +177,7 @@ pub async fn discover(domain: &str) -> Result<Found> {
 /// that cannot prove the pinned key — so the worst case is the delay, which is
 /// why a caller should give the early rungs a short deadline and not the full
 /// connect budget.
-pub async fn candidates(domain: &str) -> Result<(sqnr_core::PubKey, Vec<Candidate>, bool)> {
+pub async fn candidates(domain: &str) -> Result<(sqnr_core::PubKey, Vec<Candidate>, Pin)> {
     let path = known::path();
     let store = Known::load(&path).map_err(Error::Store)?;
     let held = store.get(domain).cloned();
@@ -176,7 +233,7 @@ pub async fn candidates(domain: &str) -> Result<(sqnr_core::PubKey, Vec<Candidat
             found.address
         )));
     }
-    Ok((found.key, out, found.newly_pinned))
+    Ok((found.key, out, found.pin))
 }
 
 /// Note where a domain actually answered, so the next start begins there.
@@ -231,11 +288,16 @@ async fn resolve_host(host: &str, port: u16) -> Vec<std::net::SocketAddr> {
 }
 
 /// `YYYY-MM-DD`, for the comment written beside a new pin.
-fn today() -> String {
-    let secs = std::time::SystemTime::now()
+/// Seconds since the epoch, for a handover's `until`.
+fn now() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn today() -> String {
+    let secs = now();
     let days = secs / 86_400;
     // Civil-from-days, Howard Hinnant's algorithm.
     let z = days as i64 + 719_468;

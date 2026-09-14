@@ -435,6 +435,39 @@ impl Server {
         self.state.lock().unwrap().peers_with(key)
     }
 
+    /// SIP-40 §Consumers other than pins: the relay-peer entry for `from`,
+    /// if there is one, is replaced by one for `to`. A relay-peer key is a key
+    /// held for a domain, found by discovering that domain, so when the pin
+    /// follows a handover the entry SHOULD follow with it. Returns whether
+    /// anything changed; the caller logs it. Provenance records the domain
+    /// and the key it came from, and `added_by` is empty because no
+    /// administrator signed for this — the outgoing key did.
+    pub(crate) fn follow_peer_handover(&self, domain: &str, from: &PubKey, to: PubKey) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.peers_with(from) {
+            return false;
+        }
+        state.remove_peer(from);
+        state.add_peer(
+            to,
+            crate::state::WhitelistEntry {
+                added_by: None,
+                label: Some(format!("{domain}, followed SIP-40 handover from {from}")),
+                added_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            },
+        );
+        if let Err(e) = state.save() {
+            tracing::warn!(
+                domain,
+                "peer list followed a handover but could not be saved: {e}"
+            );
+        }
+        true
+    }
+
     /// Whether this exchange federates with anybody at all.
     pub(crate) fn peering_enabled(&self) -> bool {
         self.state.lock().unwrap().peering_enabled()

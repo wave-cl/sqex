@@ -99,23 +99,50 @@ pub enum Find {
     Fixed(HashMap<String, (PubKey, SocketAddr)>),
 }
 
+/// What finding a domain turned up: the key, where it is, and — when SIP-40
+/// moved the pin on this lookup — the key it used to be, so the peer list can
+/// follow.
+struct Located {
+    key: PubKey,
+    addr: SocketAddr,
+    moved_from: Option<PubKey>,
+}
+
 impl Find {
-    async fn find(&self, domain: &str) -> Result<(PubKey, SocketAddr), String> {
+    async fn find(&self, domain: &str) -> Result<Located, String> {
         match self {
             Find::Fixed(map) => map
                 .get(domain)
                 .copied()
+                .map(|(key, addr)| Located {
+                    key,
+                    addr,
+                    moved_from: None,
+                })
                 .ok_or_else(|| format!("no peer for {domain}")),
             Find::Discover => {
                 let found = sqex_discovery::discover(domain)
                     .await
                     .map_err(|e| format!("discover {domain}: {e}"))?;
                 // Worth saying once: a first contact is when the key this
-                // exchange will hold a peer to gets fixed.
-                if found.newly_pinned {
-                    tracing::info!(domain, key = %found.key, "pinned a peer exchange");
-                }
-                Ok((found.key, sqex_discovery::resolve_addr(&found.address)?))
+                // exchange will hold a peer to gets fixed, and a move is when
+                // it changes hands.
+                let moved_from = match found.pin {
+                    sqex_discovery::Pin::Held => None,
+                    sqex_discovery::Pin::First => {
+                        tracing::info!(domain, key = %found.key, "pinned a peer exchange");
+                        None
+                    }
+                    sqex_discovery::Pin::Moved { from } => {
+                        tracing::info!(domain, from = %from, key = %found.key, "a peer exchange's key changed hands (SIP-40 handover); pin followed");
+                        Some(from)
+                    }
+                };
+                Ok(Located {
+                    key: found.key,
+                    addr: sqex_discovery::resolve_addr(&found.address)?,
+                    moved_from,
+                })
             }
         }
     }
@@ -743,7 +770,21 @@ async fn find_peer(server: &Arc<Server>, domain: &str) -> Result<(PubKey, Socket
             return Ok((*key, link.addr));
         }
     }
-    let (key, addr) = server.relay.find.find(domain).await?;
+    let Located {
+        key,
+        addr,
+        moved_from,
+    } = server.relay.find.find(domain).await?;
+    // SIP-40 §Consumers other than pins: a relay-peer entry is a key held for
+    // a domain, and SHOULD follow a handover the pin followed. The old key is
+    // replaced in place and the change is logged; an administrator who would
+    // rather not have followed it removes the new entry the same way they
+    // added the old one.
+    if let Some(from) = moved_from
+        && server.follow_peer_handover(domain, &from, key)
+    {
+        tracing::info!(domain, from = %from, to = %key, "relay peer entry followed the handover");
+    }
     server
         .relay
         .inner

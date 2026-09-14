@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 sqnr-core = { workspace = true }
 bs58 = { workspace = true }
+ed25519-dalek = { workspace = true }
 dirs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

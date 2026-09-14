@@ -15,6 +15,22 @@
 //! record that does begin `v=sqex1` and is then wrong is **broken**, and says
 //! so. Collapsing the two would mean a domain publishing anything else at that
 //! name produced errors instead of being ignored.
+//!
+//! # The handover, SIP-40
+//!
+//! A second record kind at the same name, `v=sqex1h`, is a statement signed by
+//! an exchange's outgoing key naming its successor. It is what lets a pinned
+//! client follow a rotation without the zone gaining any say over the pin: the
+//! pin moves only when the zone publishes the successor *and* the pinned key
+//! has signed for it. A SIP-33 parser that predates it sees a foreign version
+//! tag and skips it, which is what makes it additive.
+//!
+//! A handover that is structurally wrong — a key of the wrong length, a
+//! signature that does not verify — is **foreign**, not broken: the SIP says
+//! so, because the RRset is shared and a bad handover is not a fault in the
+//! client's own configuration. The signature needs the domain, which the
+//! parser does not have, so verification is [`Handover::verify`], run by the
+//! lookup that does.
 
 use sqnr_core::PubKey;
 
@@ -31,6 +47,85 @@ pub const VERSION: &str = "sqex1";
 
 /// The label a record is published beneath, per RFC 8552.
 pub const LABEL: &str = "_sqex";
+
+/// The version tag a SIP-40 handover opens with.
+pub const HANDOVER_VERSION: &str = "sqex1h";
+
+/// The furthest ahead a handover's `until` may lie. Thirty days: long enough
+/// for the slowest realistic client population, short enough that a
+/// pre-signed handover in a thief's pocket is worth little. A constant rather
+/// than a tag because a signer that could choose it would choose it.
+pub const HANDOVER_MAX_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// The domain-separation prefix of the handover signing input.
+const HANDOVER_PREFIX: &[u8; 16] = b"sqex-handover-v1";
+
+/// A SIP-40 handover: `from` says its successor is `to`, until `until`.
+///
+/// Structurally valid on construction — the right lengths, `from != to` — and
+/// **cryptographically valid only once [`verify`](Self::verify) has said so**
+/// for the domain it was published under. The two are separate because the
+/// parser does not know the domain, and a handover for one zone must not
+/// verify under another the same key happens to serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handover {
+    pub from: PubKey,
+    pub to: PubKey,
+    /// Seconds since the Unix epoch.
+    pub until: u64,
+    pub sig: [u8; 64],
+}
+
+impl Handover {
+    /// The bytes `from` signs: prefix, the lowercased domain with its length,
+    /// both keys, the expiry. Byte-exact per SIP-40 §The handover record.
+    pub fn signing_input(domain: &str, from: &PubKey, to: &PubKey, until: u64) -> Vec<u8> {
+        let domain = canonical_domain(domain);
+        let mut out = Vec::with_capacity(16 + 1 + domain.len() + 64 + 8);
+        out.extend_from_slice(HANDOVER_PREFIX);
+        out.push(domain.len() as u8);
+        out.extend_from_slice(domain.as_bytes());
+        out.extend_from_slice(from.as_bytes());
+        out.extend_from_slice(to.as_bytes());
+        out.extend_from_slice(&until.to_be_bytes());
+        out
+    }
+
+    /// Whether `from` really signed this, for `domain`.
+    pub fn verify(&self, domain: &str) -> bool {
+        let Ok(vk) = self.from.verifying_key() else {
+            return false;
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
+        let input = Self::signing_input(domain, &self.from, &self.to, self.until);
+        ed25519_dalek::Verifier::verify(&vk, &input, &sig).is_ok()
+    }
+
+    /// Whether this handover carries `pinned` to a key that `offered` also
+    /// publishes, and has not expired at `now`. The whole of SIP-40's rule
+    /// for one record; the caller decides what to do with several.
+    pub fn carries(&self, pinned: &PubKey, offered: &[PubKey], now: u64) -> bool {
+        &self.from == pinned && offered.contains(&self.to) && now < self.until
+    }
+
+    /// The record, as published.
+    pub fn render(&self) -> String {
+        format!(
+            "v={HANDOVER_VERSION}; from={}; to={}; until={}; sig={}",
+            self.from,
+            self.to,
+            self.until,
+            bs58::encode(self.sig).into_string()
+        )
+    }
+}
+
+/// The domain as it is signed: lowercased, no trailing dot. A record is looked
+/// up by whatever the user typed, and two spellings of one zone must produce
+/// one signing input.
+pub fn canonical_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
 
 /// A parsed discovery record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +169,9 @@ impl std::fmt::Display for Invalid {
 pub enum Parsed {
     /// Ours, and usable.
     Ours(Record),
+    /// A SIP-40 handover, structurally sound. Not yet verified: that needs the
+    /// domain, and is the lookup's job.
+    Handover(Handover),
     /// Not ours. Skipped without comment.
     Foreign,
     /// Ours, and broken.
@@ -106,6 +204,9 @@ pub fn parse(text: &str) -> Parsed {
     };
     match first.trim().split_once('=') {
         Some((n, v)) if n.trim() == "v" && v.trim() == VERSION => {}
+        Some((n, v)) if n.trim() == "v" && v.trim() == HANDOVER_VERSION => {
+            return parse_handover(text);
+        }
         _ => return Parsed::Foreign,
     }
 
@@ -174,6 +275,81 @@ pub fn parse(text: &str) -> Parsed {
             host,
             port: port.unwrap_or(DEFAULT_PORT),
         }),
+    }
+}
+
+/// Parse a `v=sqex1h` record's joined text.
+///
+/// Anything wrong is [`Parsed::Foreign`], never [`Parsed::Broken`]: SIP-40 says
+/// a bad handover MUST NOT be reported as an error, because the RRset is shared
+/// and a malformed record there is not a fault in the client's configuration.
+/// Duplicate tags are still fatal to the record, as in SIP-33.
+fn parse_handover(text: &str) -> Parsed {
+    let mut from: Option<PubKey> = None;
+    let mut to: Option<PubKey> = None;
+    let mut until: Option<u64> = None;
+    let mut sig: Option<[u8; 64]> = None;
+
+    for field in text.split(';').skip(1) {
+        let field = field.trim();
+        let Some((name, value)) = field.split_once('=') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        match name {
+            "from" => {
+                if from.is_some() {
+                    return Parsed::Foreign;
+                }
+                match value.parse::<PubKey>() {
+                    Ok(k) => from = Some(k),
+                    Err(_) => return Parsed::Foreign,
+                }
+            }
+            "to" => {
+                if to.is_some() {
+                    return Parsed::Foreign;
+                }
+                match value.parse::<PubKey>() {
+                    Ok(k) => to = Some(k),
+                    Err(_) => return Parsed::Foreign,
+                }
+            }
+            "until" => {
+                if until.is_some() {
+                    return Parsed::Foreign;
+                }
+                match value.parse::<u64>() {
+                    Ok(u) => until = Some(u),
+                    Err(_) => return Parsed::Foreign,
+                }
+            }
+            "sig" => {
+                if sig.is_some() {
+                    return Parsed::Foreign;
+                }
+                let Ok(bytes) = bs58::decode(value).into_vec() else {
+                    return Parsed::Foreign;
+                };
+                let Ok(arr) = <[u8; 64]>::try_from(bytes) else {
+                    return Parsed::Foreign;
+                };
+                sig = Some(arr);
+            }
+            _ => {}
+        }
+    }
+
+    match (from, to, until, sig) {
+        (Some(from), Some(to), Some(until), Some(sig)) if from != to => {
+            Parsed::Handover(Handover {
+                from,
+                to,
+                until,
+                sig,
+            })
+        }
+        _ => Parsed::Foreign,
     }
 }
 

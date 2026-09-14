@@ -3637,19 +3637,25 @@ async fn connect(
         ));
     }
 
-    let (server, candidates, newly_pinned) = sqex_discovery::candidates(domain)
+    let (server, candidates, pin) = sqex_discovery::candidates(domain)
         .await
         .map_err(|e| e.to_string())?;
     // Not printed here. This runs before the interface takes the terminal, so
     // an `eprintln!` lands underneath the status line ratatui is about to draw
     // over it — the first thing a new user sees, and it looks broken. It is
     // carried out and shown as a note once there is somewhere to put it.
-    let pinned_notice = newly_pinned.then(|| {
-        format!(
+    let pinned_notice = match pin {
+        sqex_discovery::Pin::Held => None,
+        sqex_discovery::Pin::First => Some(format!(
             "discovered {server} for {domain} over DNSSEC and pinned it — it will not \
              change without telling you. Forget it with `sqex discover --forget {domain}`."
-        )
-    });
+        )),
+        sqex_discovery::Pin::Moved { from } => Some(format!(
+            "{domain}'s key changed hands: {from} was withdrawn and had signed a handover \
+             to {server}, which the zone also publishes, so the pin followed it (SIP-40). \
+             Forget it with `sqex discover --forget {domain}` if that is not what you expected."
+        )),
+    };
 
     let mut last = String::new();
     for c in &candidates {

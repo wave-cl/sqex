@@ -2800,6 +2800,7 @@ version = "0.57.0"
 dependencies = [
  "bs58",
  "dirs",
+ "ed25519-dalek",
  "hickory-resolver",
  "sqnr-core",
  "tempfile",

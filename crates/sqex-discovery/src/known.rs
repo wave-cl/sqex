@@ -27,6 +27,16 @@
 //! no pin take the new one, so the population migrates as it turns over. When
 //! the old key is finally withdrawn, remaining pinned clients stop and a person
 //! decides. A key change is an event, and it is meant to feel like one.
+//!
+//! # Except when the pinned key itself says where to go (SIP-40)
+//!
+//! What a zone cannot forge is a signature by the pinned key. SIP-40 lets the
+//! outgoing key publish a handover naming its successor, and the pin follows
+//! **only** when the zone publishes that successor *and* the pinned key signed
+//! for it — two secrets, held by different parties, both required. A witnessed
+//! key still earns nothing; a signed-for one, also published, is the operator's
+//! deliberate act made checkable. The moved-from key is kept in the entry's
+//! comment as history, not as a pin: it authenticates nothing afterwards.
 
 use std::fs;
 use std::io::Write;
@@ -34,6 +44,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use sqnr_core::PubKey;
+
+use crate::record::Handover;
 
 /// What to do with a domain, given what DNS offered and what is pinned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +55,10 @@ pub enum Decision {
     FirstContact(PubKey),
     /// The pinned key is still published. Use it, and say nothing.
     Pinned(PubKey),
+    /// The pinned key was withdrawn and signed a handover to `to`, which the
+    /// zone also publishes. Move the pin, and say so — the user should know
+    /// the thing they trusted has changed hands, even legitimately.
+    Moved { from: PubKey, to: PubKey },
     /// The pinned key is not among those offered. Refuse.
     Changed {
         pinned: PubKey,
@@ -50,18 +66,44 @@ pub enum Decision {
     },
 }
 
-/// Decide, given the keys a domain published and the key pinned for it.
+/// Decide, given the keys a domain published, the key pinned for it, and any
+/// handovers that verified for the domain.
 ///
 /// `offered` is every key from every conforming record in the RRset. Order does
-/// not matter and duplicates are harmless.
-pub fn decide(offered: &[PubKey], pinned: Option<PubKey>) -> Option<Decision> {
+/// not matter and duplicates are harmless. `handovers` are already
+/// signature-checked ([`Handover::verify`]); this applies SIP-40's remaining
+/// rules — `from` is the pin, `to` is published, not expired at `now`, and
+/// exactly one successor — and a handover is consulted only once the pinned key
+/// is gone from `offered`. While it is still there, a handover changes nothing.
+pub fn decide(
+    offered: &[PubKey],
+    pinned: Option<PubKey>,
+    handovers: &[Handover],
+    now: u64,
+) -> Option<Decision> {
     if offered.is_empty() {
         return None;
     }
-    match pinned {
-        None => Some(Decision::FirstContact(offered[0])),
-        Some(p) if offered.contains(&p) => Some(Decision::Pinned(p)),
-        Some(p) => Some(Decision::Changed {
+    let Some(p) = pinned else {
+        return Some(Decision::FirstContact(offered[0]));
+    };
+    if offered.contains(&p) {
+        return Some(Decision::Pinned(p));
+    }
+    // Withdrawn. The one case a handover speaks to.
+    let mut successors: Vec<PubKey> = handovers
+        .iter()
+        .filter(|h| h.carries(&p, offered, now))
+        .map(|h| h.to)
+        .collect();
+    successors.dedup();
+    match successors.as_slice() {
+        [to] => Some(Decision::Moved { from: p, to: *to }),
+        // None, or several naming different keys. Two valid handovers from one
+        // key to different successors cannot both be the operator's intent,
+        // and "confused" and "one of these is a thief's" look the same from
+        // here. SIP-33's refusal, naming everything.
+        _ => Some(Decision::Changed {
             pinned: p,
             offered: offered.to_vec(),
         }),
@@ -304,7 +346,7 @@ mod tests {
     /// different key does not get followed.
     #[test]
     fn a_changed_key_is_refused_not_followed() {
-        let d = decide(&[key(2)], Some(key(1))).unwrap();
+        let d = decide(&[key(2)], Some(key(1)), &[], 0).unwrap();
         match d {
             Decision::Changed { pinned, offered } => {
                 assert_eq!(pinned, key(1));
@@ -317,7 +359,7 @@ mod tests {
     #[test]
     fn a_first_contact_takes_the_key() {
         assert_eq!(
-            decide(&[key(1)], None),
+            decide(&[key(1)], None, &[], 0),
             Some(Decision::FirstContact(key(1)))
         );
     }
@@ -325,7 +367,7 @@ mod tests {
     #[test]
     fn a_matching_pin_is_used() {
         assert_eq!(
-            decide(&[key(1)], Some(key(1))),
+            decide(&[key(1)], Some(key(1)), &[], 0),
             Some(Decision::Pinned(key(1)))
         );
     }
@@ -336,7 +378,7 @@ mod tests {
     #[test]
     fn an_overlap_keeps_the_pin_rather_than_following_the_new_key() {
         assert_eq!(
-            decide(&[key(2), key(1), key(3)], Some(key(1))),
+            decide(&[key(2), key(1), key(3)], Some(key(1)), &[], 0),
             Some(Decision::Pinned(key(1))),
             "the pin should win while it is still published"
         );
@@ -350,20 +392,204 @@ mod tests {
     fn having_been_seen_beside_the_new_key_does_not_earn_it_the_pin() {
         // Overlap: both published, pin holds.
         assert_eq!(
-            decide(&[key(1), key(2)], Some(key(1))),
+            decide(&[key(1), key(2)], Some(key(1)), &[], 0),
             Some(Decision::Pinned(key(1)))
         );
         // Old withdrawn: refused, despite key(2) having been published beside it.
         assert!(matches!(
-            decide(&[key(2)], Some(key(1))),
+            decide(&[key(2)], Some(key(1)), &[], 0),
             Some(Decision::Changed { .. })
         ));
     }
 
     #[test]
     fn nothing_offered_is_no_decision() {
-        assert_eq!(decide(&[], None), None);
-        assert_eq!(decide(&[], Some(key(1))), None);
+        assert_eq!(decide(&[], None, &[], 0), None);
+        assert_eq!(decide(&[], Some(key(1)), &[], 0), None);
+    }
+
+    // ---- SIP-40 handovers ---------------------------------------------------
+
+    /// A key whose secret is `[n; 32]`, so tests can sign as it.
+    fn signer(n: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[n; 32])
+    }
+    fn pk(sk: &ed25519_dalek::SigningKey) -> PubKey {
+        PubKey::new(sk.verifying_key().to_bytes())
+    }
+    fn signed(domain: &str, from: &ed25519_dalek::SigningKey, to: PubKey, until: u64) -> Handover {
+        use ed25519_dalek::Signer;
+        let f = pk(from);
+        let input = Handover::signing_input(domain, &f, &to, until);
+        Handover {
+            from: f,
+            to,
+            until,
+            sig: from.sign(&input).to_bytes(),
+        }
+    }
+    const NOW: u64 = 1_800_000_000;
+
+    /// The positive case: withdrawn, signed for, published, in date — moved.
+    #[test]
+    fn a_signed_handover_moves_a_withdrawn_pin() {
+        let (old, new) = (signer(1), signer(2));
+        let h = signed("example.com", &old, pk(&new), NOW + 100);
+        assert!(h.verify("example.com"));
+        assert_eq!(
+            decide(&[pk(&new)], Some(pk(&old)), &[h], NOW),
+            Some(Decision::Moved {
+                from: pk(&old),
+                to: pk(&new)
+            })
+        );
+    }
+
+    /// Negative control 1: the handover is from some other key. A pin only
+    /// follows its own key's word.
+    #[test]
+    fn a_handover_from_a_different_key_moves_nothing() {
+        let (old, new, other) = (signer(1), signer(2), signer(3));
+        let h = signed("example.com", &other, pk(&new), NOW + 100);
+        assert!(
+            h.verify("example.com"),
+            "the control must be a *valid* handover"
+        );
+        assert!(matches!(
+            decide(&[pk(&new)], Some(pk(&old)), &[h], NOW),
+            Some(Decision::Changed { .. })
+        ));
+    }
+
+    /// Negative control 2: signed for, but the zone does not publish the
+    /// successor. The signature proves intent; only the zone proves the key
+    /// is live, and both are required.
+    #[test]
+    fn a_successor_the_zone_does_not_publish_is_not_followed() {
+        let (old, new, zone) = (signer(1), signer(2), signer(3));
+        let h = signed("example.com", &old, pk(&new), NOW + 100);
+        assert!(matches!(
+            decide(&[pk(&zone)], Some(pk(&old)), &[h], NOW),
+            Some(Decision::Changed { .. })
+        ));
+    }
+
+    /// Negative control 3: expired.
+    #[test]
+    fn an_expired_handover_moves_nothing() {
+        let (old, new) = (signer(1), signer(2));
+        let h = signed("example.com", &old, pk(&new), NOW - 1);
+        assert!(matches!(
+            decide(&[pk(&new)], Some(pk(&old)), &[h], NOW),
+            Some(Decision::Changed { .. })
+        ));
+        // And the boundary: `until` itself is already expired (now < until).
+        let h = signed("example.com", &old, pk(&new), NOW);
+        assert!(matches!(
+            decide(&[pk(&new)], Some(pk(&old)), &[h], NOW),
+            Some(Decision::Changed { .. })
+        ));
+    }
+
+    /// Negative control 4: a signature over another domain's input. `verify`
+    /// is where this is caught, and the lookup drops it before `decide` ever
+    /// sees it — but the property belongs to the type, so it is asserted here.
+    #[test]
+    fn a_handover_signed_for_another_domain_does_not_verify() {
+        let (old, new) = (signer(1), signer(2));
+        let h = signed("example.com", &old, pk(&new), NOW + 100);
+        assert!(h.verify("example.com"));
+        assert!(
+            h.verify("EXAMPLE.COM."),
+            "case and the trailing dot are canonicalised"
+        );
+        assert!(!h.verify("example.org"));
+        // A flipped bit anywhere in the signature is a foreign record.
+        let mut bad = h.clone();
+        bad.sig[0] ^= 1;
+        assert!(!bad.verify("example.com"));
+    }
+
+    /// While the pinned key is still published, a handover is not acted on.
+    /// An operator who withdraws it before withdrawing the old key has changed
+    /// nothing for anyone.
+    #[test]
+    fn a_handover_is_not_acted_on_while_the_pin_is_still_published() {
+        let (old, new) = (signer(1), signer(2));
+        let h = signed("example.com", &old, pk(&new), NOW + 100);
+        assert_eq!(
+            decide(&[pk(&old), pk(&new)], Some(pk(&old)), &[h], NOW),
+            Some(Decision::Pinned(pk(&old)))
+        );
+    }
+
+    /// Two valid handovers naming different successors is a fault, not a
+    /// choice. Two naming the same one is one handover said twice.
+    #[test]
+    fn two_successors_is_a_refusal_and_a_duplicate_is_not() {
+        let (old, a, b) = (signer(1), signer(2), signer(3));
+        let ha = signed("example.com", &old, pk(&a), NOW + 100);
+        let hb = signed("example.com", &old, pk(&b), NOW + 100);
+        assert!(matches!(
+            decide(&[pk(&a), pk(&b)], Some(pk(&old)), &[ha.clone(), hb], NOW),
+            Some(Decision::Changed { .. })
+        ));
+        assert!(matches!(
+            decide(&[pk(&a)], Some(pk(&old)), &[ha.clone(), ha], NOW),
+            Some(Decision::Moved { .. })
+        ));
+    }
+
+    /// Chains are not walked: a client pinned to A with A→B and B→C published
+    /// moves to B, and only to B.
+    #[test]
+    fn a_chain_is_followed_one_link_at_a_time() {
+        let (a, b, c) = (signer(1), signer(2), signer(3));
+        let ab = signed("example.com", &a, pk(&b), NOW + 100);
+        let bc = signed("example.com", &b, pk(&c), NOW + 100);
+        assert_eq!(
+            decide(&[pk(&b), pk(&c)], Some(pk(&a)), &[ab, bc], NOW),
+            Some(Decision::Moved {
+                from: pk(&a),
+                to: pk(&b)
+            })
+        );
+    }
+
+    /// The record round-trips through its own text, and the parser rejects
+    /// the shapes SIP-40 calls foreign.
+    #[test]
+    fn a_handover_renders_and_parses() {
+        use crate::record::{Parsed, parse};
+        let (old, new) = (signer(1), signer(2));
+        let h = signed("example.com", &old, pk(&new), NOW + 100);
+        assert_eq!(parse(&h.render()), Parsed::Handover(h.clone()));
+        // from == to
+        let same = format!(
+            "v=sqex1h; from={}; to={}; until=1; sig={}",
+            pk(&old),
+            pk(&old),
+            bs58::encode(h.sig).into_string()
+        );
+        assert_eq!(parse(&same), Parsed::Foreign);
+        // a short signature
+        let short = format!(
+            "v=sqex1h; from={}; to={}; until=1; sig=abc",
+            pk(&old),
+            pk(&new)
+        );
+        assert_eq!(parse(&short), Parsed::Foreign);
+        // a missing tag
+        let missing = format!(
+            "v=sqex1h; from={}; to={}; sig={}",
+            pk(&old),
+            pk(&new),
+            bs58::encode(h.sig).into_string()
+        );
+        assert_eq!(parse(&missing), Parsed::Foreign);
+        // a duplicate tag
+        let dup = format!("{}; until=5", h.render());
+        assert_eq!(parse(&dup), Parsed::Foreign);
     }
 
     #[test]

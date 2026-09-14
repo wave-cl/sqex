@@ -117,7 +117,8 @@ async fn a_signed_zone_without_a_record_is_not_published_rather_than_unsigned() 
 async fn the_reference_exchange_is_discoverable() {
     let records = dns::lookup("squic.org")
         .await
-        .expect("squic.org publishes an exchange");
+        .expect("squic.org publishes an exchange")
+        .records;
     assert_eq!(records.len(), 1, "{records:?}");
     let r = &records[0];
     println!("squic.org -> {} at {:?}:{}", r.key, r.host, r.port);
