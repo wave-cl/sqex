@@ -127,8 +127,11 @@ pub fn changed_message(domain: &str, pinned: &PubKey, offered: &[PubKey]) -> Str
         "\nThis is either a key rotation you were not told about, or somebody \
          else answering for {domain}. Nothing will connect until you decide \
          which.\n\
-         \nIf you know the new key is genuine, remove the line for {domain} \
-         from {} and connect again.",
+         \nIf you know this is the same exchange under a new key, \
+         `sqex discover --replace {domain}` moves the pin and lets the chat \
+         store follow it. If it is a different exchange, or you want to start \
+         over, remove the line for {domain} from {} and connect again — \
+         conversations held under the old key will not be shown.",
         path().display()
     ));
     s

@@ -155,9 +155,26 @@ enum Cmd {
         /// The domain to look up. Omit to list what is already pinned.
         domain: Option<String>,
         /// Forget the key pinned for a domain, so the next connection is
-        /// treated as a first contact.
-        #[arg(long, value_name = "DOMAIN")]
+        /// treated as a first contact — **as if it were a different exchange**.
+        /// Anything a client holds under the old key (every conversation on
+        /// it) stays filed there and is not shown. For the same exchange
+        /// under a new key, use --replace.
+        #[arg(long, value_name = "DOMAIN", conflicts_with = "replace")]
         forget: Option<String>,
+        /// Move the pin for a domain to the key it publishes now, by hand,
+        /// recording the old key as the one it replaced — so the chat store
+        /// follows exactly as it does after a signed handover (SIP-40).
+        ///
+        /// This is the deliberate act SIP-33 asks for when a key changed and
+        /// no valid handover explains it: **you** are asserting that the key
+        /// DNS names today is the same exchange. Nothing here checks that,
+        /// which is why it is a flag you type and not a prompt you answer.
+        #[arg(long, value_name = "DOMAIN")]
+        replace: Option<String>,
+        /// With --replace, when the domain publishes more than one key: which
+        /// of them to pin. Must be one the zone publishes.
+        #[arg(long, value_name = "KEY", requires = "replace")]
+        key: Option<String>,
     },
 }
 
@@ -449,7 +466,20 @@ async fn run(cli: Cli) -> Result<(), String> {
         } => meet(&cli, &cfg, peer, *wait, *dry_run).await,
         Cmd::Mail { cmd } => mail(&cli, &cfg, cmd).await,
         Cmd::Session { cmd } => session(&cli, &cfg, cmd).await,
-        Cmd::Discover { domain, forget } => discover(domain.as_deref(), forget.as_deref()).await,
+        Cmd::Discover {
+            domain,
+            forget,
+            replace,
+            key,
+        } => {
+            discover(
+                domain.as_deref(),
+                forget.as_deref(),
+                replace.as_deref(),
+                key.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -460,17 +490,54 @@ async fn run(cli: Cli) -> Result<(), String> {
 /// **Read-only on the pin store unless `--forget` is given.** A diagnostic that
 /// pinned a key as a side effect would make a trust decision every time somebody
 /// ran it to see what was there; connecting is what pins.
-async fn discover(domain: Option<&str>, forget: Option<&str>) -> Result<(), String> {
+async fn discover(
+    domain: Option<&str>,
+    forget: Option<&str>,
+    replace: Option<&str>,
+    key: Option<&str>,
+) -> Result<(), String> {
     let path = sqex_discovery::known::path();
 
     if let Some(d) = forget {
         let mut store = sqex_discovery::Known::load(&path)?;
-        if store.remove(d) {
+        if let Some(old) = store.lookup(d) {
+            store.remove(d);
             store.save(&path)?;
-            println!("forgot {d}. The next connection to it is a first contact again.");
+            println!("forgot {d} ({old}). The next connection to it is a first contact again.");
+            println!(
+                "Conversations held under that key stay filed under it and will not be shown. \
+                 If {d} is the same exchange under a new key, `sqex discover --replace {d}` \
+                 instead: the pin moves and the chat store follows it."
+            );
         } else {
             println!("nothing was pinned for {d}");
         }
+        return Ok(());
+    }
+
+    if let Some(d) = replace {
+        let mut store = sqex_discovery::Known::load(&path)?;
+        let Some(old) = store.lookup(d) else {
+            return Err(format!(
+                "nothing is pinned for {d}, so there is nothing to replace — connecting will pin it"
+            ));
+        };
+        let published = sqex_discovery::dns::lookup(d)
+            .await
+            .map_err(|e| e.to_string())?;
+        let offered = published.offered();
+        let chosen = choose_replacement(&offered, key)?;
+        if chosen == old {
+            println!("{d} still publishes the pinned key {old}; nothing to replace.");
+            return Ok(());
+        }
+        store.add_moved(d, old, chosen, &format!("replaced by hand {}", today()));
+        store.save(&path)?;
+        println!("{d}: pin moved from {old} to {chosen}, by hand.");
+        println!(
+            "The chat store will re-file everything held under {old} on its next open. \
+             This was your assertion that the two are one exchange; nothing checked it."
+        );
         return Ok(());
     }
 
@@ -2164,6 +2231,53 @@ fn print_peers(v: &serde_json::Value) {
     }
 }
 
+/// Which of a domain's published keys `--replace` should pin: the only one,
+/// or the one named — which must be among them, because a key the zone does
+/// not publish is not "this exchange's key now", whatever the person meant.
+fn choose_replacement(offered: &[PubKey], key: Option<&str>) -> Result<PubKey, String> {
+    match (offered, key) {
+        ([], _) => Err("the domain publishes no key".into()),
+        ([only], None) => Ok(*only),
+        (many, None) => Err(format!(
+            "the domain publishes {} keys; say which with --key:\n{}",
+            many.len(),
+            many.iter()
+                .map(|k| format!("  {k}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+        (many, Some(k)) => {
+            let k: PubKey = k.parse().map_err(|_| format!("--key {k:?} is not a key"))?;
+            if many.contains(&k) {
+                Ok(k)
+            } else {
+                Err(format!(
+                    "{k} is not a key the domain publishes; the zone has to agree"
+                ))
+            }
+        }
+    }
+}
+
+fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// How a peer came to be on the list, as one readable clause.
 ///
 /// A seeded entry has no admin and carries "seed" as its label, so the obvious
@@ -2373,6 +2487,32 @@ mod tests {
     /// `seed  (added by seed)` — the label and the fallback saying the same
     /// word. A seeded peer and an administered one are different facts.
     #[test]
+    /// `--replace` pins the sole published key, needs `--key` when there are
+    /// several, and refuses a key the zone does not publish — the same "the
+    /// zone must agree" rule a signed handover has, kept for the manual path.
+    #[test]
+    fn a_replacement_must_be_a_key_the_zone_publishes() {
+        let (a, b) = (PubKey::new([1; 32]), PubKey::new([2; 32]));
+        assert_eq!(choose_replacement(&[a], None).unwrap(), a);
+        assert!(
+            choose_replacement(&[a, b], None)
+                .unwrap_err()
+                .contains("--key")
+        );
+        assert_eq!(
+            choose_replacement(&[a, b], Some(&b.to_string())).unwrap(),
+            b
+        );
+        let c = PubKey::new([3; 32]);
+        assert!(
+            choose_replacement(&[a, b], Some(&c.to_string()))
+                .unwrap_err()
+                .contains("zone has to agree")
+        );
+        assert!(choose_replacement(&[], None).is_err());
+    }
+
+    #[test]
     fn a_seeded_peer_reads_differently_from_an_administered_one() {
         assert_eq!(
             provenance(None, "seed"),
@@ -2383,6 +2523,7 @@ mod tests {
             provenance(Some("HR2vxdPD"), "indra.org"),
             "(indra.org, added by HR2vxdPD)"
         );
+        // (see also choose_replacement below)
         // A SIP-40 follow: the outgoing exchange key is who authorised it.
         // Rendered as "added by" that key, not as a seed -- the first live
         // rotation printed "seeded from config, not signed for" for an entry
