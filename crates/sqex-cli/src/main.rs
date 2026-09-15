@@ -2487,6 +2487,29 @@ mod tests {
     /// `seed  (added by seed)` — the label and the fallback saying the same
     /// word. A seeded peer and an administered one are different facts.
     #[test]
+    fn a_seeded_peer_reads_differently_from_an_administered_one() {
+        assert_eq!(
+            provenance(None, "seed"),
+            "(seeded from config, not signed for)",
+            "a seeded peer must not claim an administrator added it"
+        );
+        assert_eq!(
+            provenance(Some("HR2vxdPD"), "indra.org"),
+            "(indra.org, added by HR2vxdPD)"
+        );
+        // A SIP-40 follow: the outgoing exchange key is who authorised it.
+        // Rendered as "added by" that key, not as a seed -- the first live
+        // rotation printed "seeded from config, not signed for" for an entry
+        // the retiring key had signed for and the state file held.
+        assert_eq!(
+            provenance(Some("7tbBEPxK"), "trunk.exchange, SIP-40 handover"),
+            "(trunk.exchange, SIP-40 handover, added by 7tbBEPxK)"
+        );
+        // An administrator who gave no label still gets named, without a
+        // stray comma where the label would have been.
+        assert_eq!(provenance(Some("HR2vxdPD"), ""), "(added by HR2vxdPD)");
+    }
+
     /// `--replace` pins the sole published key, needs `--key` when there are
     /// several, and refuses a key the zone does not publish — the same "the
     /// zone must agree" rule a signed handover has, kept for the manual path.
@@ -2510,30 +2533,5 @@ mod tests {
                 .contains("zone has to agree")
         );
         assert!(choose_replacement(&[], None).is_err());
-    }
-
-    #[test]
-    fn a_seeded_peer_reads_differently_from_an_administered_one() {
-        assert_eq!(
-            provenance(None, "seed"),
-            "(seeded from config, not signed for)",
-            "a seeded peer must not claim an administrator added it"
-        );
-        assert_eq!(
-            provenance(Some("HR2vxdPD"), "indra.org"),
-            "(indra.org, added by HR2vxdPD)"
-        );
-        // (see also choose_replacement below)
-        // A SIP-40 follow: the outgoing exchange key is who authorised it.
-        // Rendered as "added by" that key, not as a seed -- the first live
-        // rotation printed "seeded from config, not signed for" for an entry
-        // the retiring key had signed for and the state file held.
-        assert_eq!(
-            provenance(Some("7tbBEPxK"), "trunk.exchange, SIP-40 handover"),
-            "(trunk.exchange, SIP-40 handover, added by 7tbBEPxK)"
-        );
-        // An administrator who gave no label still gets named, without a
-        // stray comma where the label would have been.
-        assert_eq!(provenance(Some("HR2vxdPD"), ""), "(added by HR2vxdPD)");
     }
 }
