@@ -123,12 +123,14 @@ pub async fn discover(domain: &str) -> Result<Found> {
             (k, Pin::First)
         }
         Decision::Moved { from, to } => {
-            // The old key goes into the comment: history a person can read,
-            // and nothing the store will ever authenticate against.
-            store.add(
+            // The old key is kept on the entry as history — nothing the
+            // store will ever authenticate against, but what a client store
+            // scoped by the old key needs in order to find its rows again.
+            store.add_moved(
                 domain,
+                from,
                 to,
-                &format!("moved from {from} {} (SIP-40 handover)", today()),
+                &format!("moved {} (SIP-40 handover)", today()),
             );
             store.save(&path).map_err(Error::Store)?;
             (to, Pin::Moved { from })

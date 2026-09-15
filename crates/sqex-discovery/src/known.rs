@@ -161,6 +161,12 @@ pub struct Entry {
     pub host: Option<String>,
     /// Where it answered last, newest first.
     pub addrs: Vec<SocketAddr>,
+    /// SIP-40: the key this pin was moved from by a signed handover, if it
+    /// ever was. **History, not a pin** — it authenticates nothing — kept so
+    /// a store scoped by the old key can find its rows again, and so the
+    /// change can be named to a person. Written as `moved-from=<key>` on the
+    /// line; an older build warns about the field and ignores it.
+    pub moved_from: Option<PubKey>,
     pub comment: String,
 }
 
@@ -215,7 +221,18 @@ impl Known {
             // build with neither still loads.
             let mut host = None;
             let mut addrs = Vec::new();
+            let mut moved_from = None;
             for field in parts {
+                if let Some(k) = field.strip_prefix("moved-from=") {
+                    match k.parse::<PubKey>() {
+                        Ok(k) => moved_from = Some(k),
+                        Err(_) => tracing::warn!(
+                            line = n + 1,
+                            "known_servers: ignoring a moved-from= that is not a key"
+                        ),
+                    }
+                    continue;
+                }
                 match field.parse::<SocketAddr>() {
                     Ok(a) => addrs.push(a),
                     Err(_) if host.is_none() && addrs.is_empty() => {
@@ -233,6 +250,7 @@ impl Known {
                 key,
                 host,
                 addrs,
+                moved_from,
                 comment,
             });
         }
@@ -259,8 +277,39 @@ impl Known {
             key,
             host: None,
             addrs: Vec::new(),
+            moved_from: None,
             comment: comment.to_string(),
         });
+    }
+
+    /// Move a domain's pin to `to` on a SIP-40 handover from `from`, keeping
+    /// the cached host and addresses (the exchange is where it was) and
+    /// recording where the pin came from.
+    pub fn add_moved(&mut self, domain: &str, from: PubKey, to: PubKey, comment: &str) {
+        let (host, addrs) = self
+            .get(domain)
+            .map(|e| (e.host.clone(), e.addrs.clone()))
+            .unwrap_or_default();
+        self.entries
+            .retain(|e| !e.domain.eq_ignore_ascii_case(domain));
+        self.entries.push(Entry {
+            domain: domain.to_string(),
+            key: to,
+            host,
+            addrs,
+            moved_from: Some(from),
+            comment: comment.to_string(),
+        });
+    }
+
+    /// The key a pin for `key` was moved from, if any entry says so. By key
+    /// rather than domain because the callers that need it — a store scoped
+    /// by exchange key — hold the key and not the name.
+    pub fn predecessor_of(&self, key: &PubKey) -> Option<PubKey> {
+        self.entries
+            .iter()
+            .find(|e| &e.key == key)
+            .and_then(|e| e.moved_from)
     }
 
     /// Remember where a domain answered, so the next start can go straight
@@ -322,6 +371,9 @@ impl Known {
             }
             for a in &e.addrs {
                 line += &format!("  {a}");
+            }
+            if let Some(from) = &e.moved_from {
+                line += &format!("  moved-from={from}");
             }
             if !e.comment.is_empty() {
                 line += &format!("  # {}", e.comment);
@@ -554,6 +606,31 @@ mod tests {
                 to: pk(&b)
             })
         );
+    }
+
+    /// A moved pin keeps where it came from, through a save and a load, and
+    /// answers `predecessor_of` by the new key. The cached host and addresses
+    /// survive the move: the exchange is where it was.
+    #[test]
+    fn a_moved_pin_remembers_its_predecessor_across_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_servers");
+        let mut k = Known::default();
+        k.add("example.com", key(1), "discovered");
+        k.remember("example.com", Some("ex.example.com"), addr("192.0.2.1:443"));
+        k.add_moved("example.com", key(1), key(2), "moved");
+        k.save(&path).unwrap();
+        let k = Known::load(&path).unwrap();
+        let e = k.get("example.com").unwrap();
+        assert_eq!(e.key, key(2));
+        assert_eq!(e.moved_from, Some(key(1)));
+        assert_eq!(e.host.as_deref(), Some("ex.example.com"));
+        assert_eq!(e.addrs, vec![addr("192.0.2.1:443")]);
+        assert_eq!(k.predecessor_of(&key(2)), Some(key(1)));
+        assert_eq!(k.predecessor_of(&key(1)), None);
+        // And the line says so, in a form an older build merely warns about.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&format!("moved-from={}", key(1))), "{text}");
     }
 
     /// The record round-trips through its own text, and the parser rejects

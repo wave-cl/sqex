@@ -717,7 +717,25 @@ async fn interface(mut chat: Chat, pinned_notice: Option<String>) -> Result<(), 
     // on is its decision, and a notice the user never sees because they happened
     // to land elsewhere is no notice at all. It expires in NOTE_LINGER either
     // way, so this shows once and leaves nothing behind.
-    if let Some(notice) = pinned_notice {
+    // SIP-40: the store re-filed history from a predecessor key. Said with
+    // the same weight as a pin change, because from the user's side it looked
+    // like every conversation on that exchange had vanished.
+    let followed = chat.followed_handover().map(|(from, done)| {
+        let mut s = format!(
+            "this exchange's key changed hands and your conversations followed it: {} \
+             rows re-filed from {from} (SIP-40).",
+            done.moved
+        );
+        if done.left > 0 {
+            s.push_str(&format!(
+                " {} rows were left under the old key because the new one already held \
+                 their place; nothing was dropped.",
+                done.left
+            ));
+        }
+        s
+    });
+    if let Some(notice) = pinned_notice.or(followed) {
         let at = std::time::Instant::now();
         for conv in open.iter_mut() {
             conv.note = Some((notice.clone(), at));

@@ -603,6 +603,10 @@ pub struct Chat {
     /// SIP-38 handle as `name@domain`. `None` when reached by a literal
     /// host+key, where there is no domain to show.
     domain: Option<String>,
+    /// SIP-40: set when opening this store found rows filed under a key the
+    /// pin store says this exchange's key was moved from, and re-filed them.
+    /// The interface should say so once; see [`Chat::followed_handover`].
+    followed: Option<(PubKey, crate::store::Followed)>,
     store: Store,
 }
 
@@ -648,6 +652,23 @@ impl Chat {
         // it would be one nobody could use to find out why. The first
         // operation that needs a scope reports it, in words.
         let _ = store.scope_to(&exchange);
+        // SIP-40. If the pin store says this key succeeded another, and this
+        // store still files anything under the other, the rows follow the
+        // pin — before the first poll, so the client never sees an empty
+        // exchange and starts a second history beside the real one. Runs on
+        // every open and is a no-op once nothing is left under the old key;
+        // a store that moved before this existed is repaired the same way.
+        let followed = sqex_discovery::Known::load(&sqex_discovery::known::path())
+            .ok()
+            .and_then(|k| k.predecessor_of(&exchange))
+            .filter(|from| store.holds_rows_for(from).unwrap_or(false))
+            .and_then(|from| match store.follow_handover(&from, &exchange) {
+                Ok(done) => Some((from, done)),
+                // Not fatal, for the same reason `scope_to` is not: a store
+                // that cannot be written to is reported by the first thing
+                // that needs it. The rows stay where they were.
+                Err(_) => None,
+            });
         let me = store.account().ok().flatten().unwrap_or(device);
         Chat {
             client,
@@ -657,6 +678,7 @@ impl Chat {
             told_about: HashMap::new(),
             bound_in: HashMap::new(),
             domain: None,
+            followed,
             endpoint: None,
             link: Link::Up,
             attempts: 0,
@@ -1133,6 +1155,13 @@ impl Chat {
 
     /// The domain this exchange was discovered under, so a SIP-38 handle can be
     /// shown as `name@domain`. Set once, after connecting.
+    /// SIP-40: what opening the store re-filed from a predecessor key, if
+    /// anything. For the interface to say once — the user's conversations
+    /// were briefly somewhere they could not see, and should know why.
+    pub fn followed_handover(&self) -> Option<(PubKey, crate::store::Followed)> {
+        self.followed.clone()
+    }
+
     pub fn set_domain(&mut self, domain: Option<String>) {
         self.domain = domain;
     }

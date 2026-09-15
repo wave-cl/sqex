@@ -598,6 +598,102 @@ fn claim(db: &Connection, exchange: &PubKey) -> Result<()> {
     }
 }
 
+/// What [`Store::follow_handover`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Followed {
+    /// Rows re-filed from the old key to the new, over every scoped table.
+    pub moved: usize,
+    /// Rows left under the old key because the new scope already held a row
+    /// with the same primary key, in a table where keeping both matters
+    /// (`channel_key`, `chain`, `incarnation`, `prekey`). Zero in any store
+    /// this has been designed for; reported rather than resolved because a
+    /// collision there is two histories, and choosing one silently is how a
+    /// SIP-17 counter gets reused.
+    pub left: usize,
+}
+
+/// The scoped tables, and whether a collision on a primary key may be
+/// resolved by dropping the old row. For the state tables the row under the
+/// new scope is simply newer — a cursor that moved on, a profile refetched,
+/// an entry the client re-received. For the key-material tables it is not
+/// a newer copy of the same thing but a second thing, and it stays.
+const SCOPED: &[(&str, bool)] = &[
+    ("channel_key", false),
+    ("message", true),
+    ("cursor", true),
+    ("chain", false),
+    ("incarnation", false),
+    ("seen", true),
+    ("channel_meta", true),
+    ("prekey", false),
+    ("profile", true),
+    ("handle", true),
+];
+
+/// SIP-40 §Consumers other than pins. A store that scopes every row by the
+/// exchange's key is a key held for a domain, and when a pin follows a
+/// handover the rows have to follow it too — or every conversation held
+/// under the old key looks empty, and the client, finding nothing under the
+/// new one, starts a fresh prekey pool and minted history beside the real
+/// one. That is what happened on the first live rotation, and this is the
+/// repair as well as the prevention: it runs whenever a store still holds
+/// rows under a key the pin store says was moved from, however long ago.
+///
+/// One transaction. `UPDATE OR IGNORE` moves every row whose primary key is
+/// free under the new scope; what collides is then either dropped (state
+/// tables — the new row is the newer fact) or left where it is and counted
+/// (key material — see [`Followed::left`]). The store's own claim of which
+/// exchange it belongs to moves with the rows.
+pub fn follow_handover(db: &Connection, from: &PubKey, to: &PubKey) -> Result<Followed> {
+    let (old, new) = (&from.as_bytes()[..], &to.as_bytes()[..]);
+    db.execute_batch("BEGIN IMMEDIATE")
+        .map_err(storage("begin following the handover"))?;
+    let outcome = (|| -> Result<Followed> {
+        let mut done = Followed::default();
+        for (table, droppable) in SCOPED {
+            done.moved += db
+                .execute(
+                    &format!("UPDATE OR IGNORE {table} SET exchange = ?1 WHERE exchange = ?2"),
+                    params![new, old],
+                )
+                .map_err(storage("re-file rows under the new key"))?;
+            if *droppable {
+                db.execute(
+                    &format!("DELETE FROM {table} WHERE exchange = ?1"),
+                    params![old],
+                )
+                .map_err(storage("drop rows the new scope already holds"))?;
+            } else {
+                let left: i64 = db
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE exchange = ?1"),
+                        params![old],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage("count rows left under the old key"))?;
+                done.left += left as usize;
+            }
+        }
+        db.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'exchange' AND value = ?2",
+            params![new, old],
+        )
+        .map_err(storage("move the store's claim"))?;
+        Ok(done)
+    })();
+    match outcome {
+        Ok(done) => {
+            db.execute_batch("COMMIT")
+                .map_err(storage("commit following the handover"))?;
+            Ok(done)
+        }
+        Err(e) => {
+            let _ = db.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Storage(String),
@@ -819,6 +915,34 @@ impl Store {
         claim(&self.db, exchange)?;
         self.exchange = Some(*exchange);
         Ok(())
+    }
+
+    /// Re-file everything held under `from` under `to` — SIP-40's handover,
+    /// applied to this store. See [`follow_handover`]. Returns what moved;
+    /// `moved == 0 && left == 0` means there was nothing under `from`, which
+    /// is the steady state after the first call.
+    pub fn follow_handover(&mut self, from: &PubKey, to: &PubKey) -> Result<Followed> {
+        follow_handover(&self.db, from, to)
+    }
+
+    /// Whether anything at all is filed under `exchange`. Cheap, and what a
+    /// caller asks before deciding a handover needs following.
+    pub fn holds_rows_for(&self, exchange: &PubKey) -> Result<bool> {
+        let scope = &exchange.as_bytes()[..];
+        for (table, _) in SCOPED {
+            let n: i64 = self
+                .db
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE exchange = ?1"),
+                    params![scope],
+                    |r| r.get(0),
+                )
+                .map_err(storage("count rows under a key"))?;
+            if n > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Which exchange this store is reading and writing for, if it has been
@@ -3048,6 +3172,86 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
         let mut a = Store::open(&seed(1), Some(&path)).unwrap();
         a.scope_to(&first).unwrap();
         assert_eq!(a.highest_epoch(&[7; 32]).unwrap(), 3);
+    }
+
+    /// SIP-40, and the shape the first live rotation left a real store in:
+    /// the conversation's key and history under the old exchange key, and a
+    /// client that had already connected under the new one and started
+    /// over -- a profile refetched, a cursor at zero. Following moves the
+    /// history, keeps the key, and lets the newer state win where the two
+    /// collide.
+    #[test]
+    fn following_a_handover_refiles_the_old_keys_rows_under_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let (old, new) = (PubKey::new([9; 32]), PubKey::new([10; 32]));
+        let key = ChannelKey::generate();
+        let alice = PubKey::new([2; 32]);
+
+        // The history, under the old key.
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&old).unwrap();
+        a.put_key(&[7; 32], 3, &key).unwrap();
+        a.put_profile(&alice, "Alice", "old title", 100).unwrap();
+        drop(a);
+
+        // The client, already started over under the new key: no channel
+        // key, but a fresher profile for the same account.
+        let mut b = Store::open(&seed(1), Some(&path)).unwrap();
+        b.scope_to(&new).unwrap();
+        assert_eq!(
+            b.highest_epoch(&[7; 32]).unwrap(),
+            0,
+            "precondition: empty under the new key"
+        );
+        b.put_profile(&alice, "Alice", "new title", 200).unwrap();
+        assert!(b.holds_rows_for(&old).unwrap());
+
+        let done = b.follow_handover(&old, &new).unwrap();
+        assert!(done.moved >= 1, "{done:?}");
+        assert_eq!(done.left, 0, "{done:?}");
+        // The key came across and opens under the new scope.
+        assert_eq!(b.highest_epoch(&[7; 32]).unwrap(), 3);
+        assert_eq!(b.key(&[7; 32], 3).unwrap(), Some(key));
+        // The collision on the profile went to the newer row.
+        assert_eq!(
+            b.profile(&alice).unwrap().map(|p| p.1),
+            Some("new title".to_string())
+        );
+        // Nothing is left under the old key, and a second follow is a no-op.
+        assert!(!b.holds_rows_for(&old).unwrap());
+        assert_eq!(b.follow_handover(&old, &new).unwrap(), Followed::default());
+    }
+
+    /// Negative control: a key-material collision is left, not resolved. Two
+    /// epoch-3 keys for one channel are two histories, and dropping either
+    /// silently is how a counter gets reused.
+    #[test]
+    fn a_colliding_channel_key_is_left_under_the_old_scope_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let (old, new) = (PubKey::new([9; 32]), PubKey::new([10; 32]));
+        let (k_old, k_new) = (ChannelKey::generate(), ChannelKey::generate());
+
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&old).unwrap();
+        a.put_key(&[7; 32], 3, &k_old).unwrap();
+        drop(a);
+        let mut b = Store::open(&seed(1), Some(&path)).unwrap();
+        b.scope_to(&new).unwrap();
+        b.put_key(&[7; 32], 3, &k_new).unwrap();
+
+        let done = b.follow_handover(&old, &new).unwrap();
+        assert_eq!(done.left, 1, "{done:?}");
+        assert_eq!(
+            b.key(&[7; 32], 3).unwrap(),
+            Some(k_new),
+            "the new scope's key stands"
+        );
+        assert!(
+            b.holds_rows_for(&old).unwrap(),
+            "the old one is still there to be looked at"
+        );
     }
 
     /// The whole reason the column exists.
