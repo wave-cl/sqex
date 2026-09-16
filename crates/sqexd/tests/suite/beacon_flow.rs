@@ -67,6 +67,7 @@ async fn beat(
         Beat {
             interval_secs: interval,
             withhold,
+            away: false,
         }
         .encode(),
     )
@@ -133,6 +134,7 @@ async fn an_anonymous_connection_cannot_beat() {
             Beat {
                 interval_secs: 60,
                 withhold: false,
+                away: false,
             }
             .encode(),
         )
@@ -204,6 +206,43 @@ async fn a_later_beat_updates_the_record() {
     handle.abort();
 }
 
+/// Away is carried on the beat and read back with it; the next beat
+/// without it is somebody back at the keyboard. An identity with no
+/// record is not away, since it is not anything.
+#[tokio::test]
+async fn away_is_beaten_and_read_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, handle) = bare_server(dir.path()).await;
+
+    let (_sk, seed, pk) = identity(71);
+    let mut c = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
+    let (code, _) = c
+        .post(
+            "/beacon/beat",
+            Beat {
+                interval_secs: 30,
+                withhold: false,
+                away: true,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "away is a known flag, not a reserved one");
+    let r = read(addr, &server_pub, None, pk).await;
+    assert!(r.found && r.away, "{r:?}");
+
+    beat(addr, &server_pub, &seed, 30, false).await;
+    let r = read(addr, &server_pub, None, pk).await;
+    assert!(r.found && !r.away, "back at the keyboard: {r:?}");
+
+    let (_sk, _seed, nobody) = identity(72);
+    let r = read(addr, &server_pub, None, nobody).await;
+    assert!(!r.found && !r.away);
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn a_malformed_beat_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -212,9 +251,10 @@ async fn a_malformed_beat_is_refused() {
     let (_sk, seed, _pk) = identity(61);
     let mut c = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
 
-    // A reserved flag bit set — SIP-4 says these MUST be zero.
+    // A reserved flag bit set — SIP-4 says these MUST be zero. Bit 1 is
+    // away and is not reserved; bit 2 is the first that is.
     let (code, _) = c
-        .post("/beacon/beat", vec![0x01, 0, 0, 0, 60, 0b10])
+        .post("/beacon/beat", vec![0x01, 0, 0, 0, 60, 0b100])
         .await
         .unwrap();
     assert_eq!(code, 400);

@@ -130,6 +130,7 @@ async fn what_an_identity_publishes_is_what_another_resolves() {
             Beat {
                 interval_secs: 60,
                 withhold: false,
+                away: false,
             }
             .encode(),
         )
@@ -266,6 +267,7 @@ async fn a_beat_keeps_an_expiring_publication_alive() {
             Beat {
                 interval_secs: 60,
                 withhold: false,
+                away: false,
             }
             .encode(),
         )

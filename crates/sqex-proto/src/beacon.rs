@@ -19,6 +19,12 @@ pub const TYPE_READ: u8 = 0x02;
 
 /// `flags` bit 0 — withhold this record from queries by other identities.
 pub const FLAG_WITHHOLD: u8 = 0b0000_0001;
+/// `flags` bit 1 — the identity is connected and beating, and nobody is at
+/// it. Presence rather than liveness: a consumer shows it apart from
+/// active and from absent, and never as absence.
+pub const FLAG_AWAY: u8 = 0b0000_0010;
+/// Every flag a beat may carry; the rest are reserved and MUST be zero.
+const FLAGS_KNOWN: u8 = FLAG_WITHHOLD | FLAG_AWAY;
 
 /// An identity asserting it is alive.
 ///
@@ -30,6 +36,8 @@ pub struct Beat {
     pub interval_secs: u32,
     /// Withhold the record from other identities' queries.
     pub withhold: bool,
+    /// Beating, and nobody at the keyboard.
+    pub away: bool,
 }
 
 impl Beat {
@@ -37,7 +45,14 @@ impl Beat {
         let mut out = Vec::with_capacity(6);
         out.push(TYPE_BEAT);
         out.extend_from_slice(&self.interval_secs.to_be_bytes());
-        out.push(if self.withhold { FLAG_WITHHOLD } else { 0 });
+        let mut flags = 0;
+        if self.withhold {
+            flags |= FLAG_WITHHOLD;
+        }
+        if self.away {
+            flags |= FLAG_AWAY;
+        }
+        out.push(flags);
         out
     }
 
@@ -53,8 +68,8 @@ impl Beat {
         }
         let interval_secs = u32::from_be_bytes(b[1..5].try_into().unwrap());
         let flags = b[5];
-        // SIP-4: bits other than 0 are reserved and MUST be zero.
-        if flags & !FLAG_WITHHOLD != 0 {
+        // SIP-4: bits other than 0 and 1 are reserved and MUST be zero.
+        if flags & !FLAGS_KNOWN != 0 {
             return Err(Error::Malformed(format!(
                 "reserved beat flags set: {flags:#010b}"
             )));
@@ -62,6 +77,7 @@ impl Beat {
         Ok(Beat {
             interval_secs,
             withhold: flags & FLAG_WITHHOLD != 0,
+            away: flags & FLAG_AWAY != 0,
         })
     }
 }
@@ -127,17 +143,23 @@ impl Read {
 
 /// What the exchange saw.
 ///
-/// `| found: u8 | last_seen: u64 | interval_secs: u32 | now: u64 |`
+/// `| found: u8 | last_seen: u64 | interval_secs: u32 | now: u64 | flags: u8 |`
 ///
 /// `now` is not redundant: a consumer's clock may be wrong, so staleness is
 /// `now - last_seen`, measured entirely in the exchange's own time. The
 /// exchange never reports up/down — that threshold belongs to the consumer.
+///
+/// `flags` carries the beat's `away` bit as recorded, and nothing else:
+/// `withhold` is answered by `found = 0`, never disclosed. An exchange from
+/// before the bit answers twenty-one bytes, which read as no flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reply {
     pub found: bool,
     pub last_seen: u64,
     pub interval_secs: u32,
     pub now: u64,
+    /// The last beat said nobody was at the keyboard.
+    pub away: bool,
 }
 
 impl Reply {
@@ -149,22 +171,24 @@ impl Reply {
             last_seen: 0,
             interval_secs: 0,
             now,
+            away: false,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(21);
+        let mut out = Vec::with_capacity(22);
         out.push(u8::from(self.found));
         out.extend_from_slice(&self.last_seen.to_be_bytes());
         out.extend_from_slice(&self.interval_secs.to_be_bytes());
         out.extend_from_slice(&self.now.to_be_bytes());
+        out.push(if self.away { FLAG_AWAY } else { 0 });
         out
     }
 
     pub fn decode(b: &[u8]) -> Result<Reply> {
-        if b.len() != 21 {
+        if b.len() != 21 && b.len() != 22 {
             return Err(Error::Malformed(format!(
-                "reply is {} bytes, want 21",
+                "reply is {} bytes, want 21 or 22",
                 b.len()
             )));
         }
@@ -173,6 +197,9 @@ impl Reply {
             last_seen: u64::from_be_bytes(b[1..9].try_into().unwrap()),
             interval_secs: u32::from_be_bytes(b[9..13].try_into().unwrap()),
             now: u64::from_be_bytes(b[13..21].try_into().unwrap()),
+            // Bits this reader does not know are ignored, as SIP-4's
+            // reserved bits are: a reply is a report, not a request.
+            away: b.get(21).is_some_and(|f| f & FLAG_AWAY != 0),
         })
     }
 
@@ -189,12 +216,23 @@ mod tests {
     #[test]
     fn beat_round_trip() {
         for withhold in [false, true] {
-            let b = Beat {
-                interval_secs: 60,
-                withhold,
-            };
-            assert_eq!(Beat::decode(&b.encode()).unwrap(), b);
+            for away in [false, true] {
+                let b = Beat {
+                    interval_secs: 60,
+                    withhold,
+                    away,
+                };
+                assert_eq!(Beat::decode(&b.encode()).unwrap(), b);
+            }
         }
+        // The bits are where SIP-4 puts them.
+        let raw = Beat {
+            interval_secs: 60,
+            withhold: true,
+            away: true,
+        }
+        .encode();
+        assert_eq!(raw[5], 0b0000_0011);
     }
 
     #[test]
@@ -202,9 +240,12 @@ mod tests {
         let mut raw = Beat {
             interval_secs: 60,
             withhold: false,
+            away: false,
         }
         .encode();
-        raw[5] = 0b0000_0010; // a reserved bit
+        raw[5] = 0b0000_0100; // a reserved bit, the first past away
+        assert!(Beat::decode(&raw).is_err());
+        raw[5] = 0b1000_0000;
         assert!(Beat::decode(&raw).is_err());
     }
 
@@ -233,18 +274,41 @@ mod tests {
 
     #[test]
     fn reply_round_trip_and_staleness() {
+        for away in [false, true] {
+            let r = Reply {
+                found: true,
+                last_seen: 1000,
+                interval_secs: 60,
+                now: 1180,
+                away,
+            };
+            assert_eq!(Reply::decode(&r.encode()).unwrap(), r);
+            assert_eq!(r.staleness(), 180, "three missed beats at a 60s interval");
+        }
+
+        let nf = Reply::not_found(500);
+        let back = Reply::decode(&nf.encode()).unwrap();
+        assert!(!back.found);
+        assert!(!back.away);
+        assert_eq!(back.now, 500);
+    }
+
+    /// An exchange from before the away bit answers twenty-one bytes, and
+    /// that reads as a reply with no flags -- not as a malformed one.
+    #[test]
+    fn a_reply_without_flags_is_an_old_exchange_not_a_broken_one() {
         let r = Reply {
             found: true,
             last_seen: 1000,
             interval_secs: 60,
             now: 1180,
+            away: true,
         };
-        assert_eq!(Reply::decode(&r.encode()).unwrap(), r);
-        assert_eq!(r.staleness(), 180, "three missed beats at a 60s interval");
-
-        let nf = Reply::not_found(500);
-        let back = Reply::decode(&nf.encode()).unwrap();
-        assert!(!back.found);
-        assert_eq!(back.now, 500);
+        let old = &r.encode()[..21];
+        let back = Reply::decode(old).unwrap();
+        assert!(back.found && !back.away);
+        assert_eq!(back.last_seen, 1000);
+        assert!(Reply::decode(&r.encode()[..20]).is_err());
+        assert!(Reply::decode(&[r.encode(), vec![0]].concat()).is_err());
     }
 }

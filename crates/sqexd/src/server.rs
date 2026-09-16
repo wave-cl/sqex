@@ -1273,7 +1273,10 @@ async fn route(
             Ok(beat) => match peer.identity {
                 None => no_identity("beating"),
                 Some(id) => {
-                    let now = server.beacons.record(id, beat.interval_secs, beat.withhold);
+                    let now =
+                        server
+                            .beacons
+                            .record(id, beat.interval_secs, beat.withhold, beat.away);
                     // SIP-28: a service proving it is alive should not have to
                     // separately prove its address is current. The window is
                     // extended by the interval it declared, so an identity that

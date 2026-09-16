@@ -29,6 +29,8 @@ struct Observation {
     interval_secs: u32,
     /// Withheld from queries by any identity other than its owner.
     withhold: bool,
+    /// Nobody at the keyboard, by the identity's own last word.
+    away: bool,
 }
 
 /// Every identity the exchange has seen beat.
@@ -44,7 +46,7 @@ impl Beacons {
 
     /// Record that `identity` beat now. Returns the time recorded, which the
     /// caller acknowledges so a beating identity learns the exchange's clock.
-    pub fn record(&self, identity: PubKey, interval_secs: u32, withhold: bool) -> u64 {
+    pub fn record(&self, identity: PubKey, interval_secs: u32, withhold: bool, away: bool) -> u64 {
         let now = now_unix();
         self.seen.lock().unwrap().insert(
             identity,
@@ -52,6 +54,7 @@ impl Beacons {
                 last_seen: now,
                 interval_secs,
                 withhold,
+                away,
             },
         );
         now
@@ -72,6 +75,7 @@ impl Beacons {
                 last_seen: o.last_seen,
                 interval_secs: o.interval_secs,
                 now,
+                away: o.away,
             },
             // Withheld records are reported exactly as absent ones: telling a
             // stranger "this exists but you may not see it" is itself the
@@ -102,13 +106,30 @@ mod tests {
     fn a_beat_is_readable() {
         let b = Beacons::new();
         let id = key(1);
-        let acked = b.record(id, 60, false);
+        let acked = b.record(id, 60, false, false);
 
         let r = b.read(&id, None);
         assert!(r.found);
         assert_eq!(r.interval_secs, 60);
         assert_eq!(r.last_seen, acked, "the ack reports the time recorded");
         assert!(r.now >= r.last_seen);
+    }
+
+    /// Away is the identity's own last word, and the next beat is the next
+    /// word: a beat without it is somebody back at the keyboard.
+    #[test]
+    fn away_is_what_the_last_beat_said() {
+        let b = Beacons::new();
+        let id = key(4);
+        b.record(id, 30, false, true);
+        assert!(b.read(&id, None).away);
+        b.record(id, 30, false, false);
+        assert!(!b.read(&id, None).away);
+        // And never disclosed for a record that is withheld: not found is
+        // not found.
+        b.record(id, 30, true, true);
+        let r = b.read(&id, Some(&key(5)));
+        assert!(!r.found && !r.away);
     }
 
     #[test]
@@ -124,7 +145,7 @@ mod tests {
         let b = Beacons::new();
         let me = key(1);
         let other = key(2);
-        b.record(me, 30, true);
+        b.record(me, 30, true, false);
 
         assert!(!b.read(&me, None).found, "hidden from an anonymous querier");
         assert!(
@@ -138,8 +159,8 @@ mod tests {
     fn a_later_beat_replaces_the_earlier_one() {
         let b = Beacons::new();
         let id = key(3);
-        b.record(id, 60, false);
-        b.record(id, 120, true); // re-declared interval and withhold
+        b.record(id, 60, false, false);
+        b.record(id, 120, true, false); // re-declared interval and withhold
         let r = b.read(&id, Some(&id));
         assert_eq!(r.interval_secs, 120);
         assert!(!b.read(&id, None).found, "withhold now applies");

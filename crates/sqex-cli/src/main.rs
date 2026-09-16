@@ -230,6 +230,9 @@ enum BeaconCmd {
         /// Withhold this record from queries by other identities.
         #[arg(long)]
         withhold: bool,
+        /// Say that nobody is at the keyboard: connected, and away.
+        #[arg(long)]
+        away: bool,
     },
     /// Ask when the exchange last saw an identity.
     Read {
@@ -1733,7 +1736,11 @@ async fn resolution(cli: &Cli, cfg: &Config, cmd: &ResolveCmd) -> Result<(), Str
 
 async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> {
     match cmd {
-        BeaconCmd::Beat { interval, withhold } => {
+        BeaconCmd::Beat {
+            interval,
+            withhold,
+            away,
+        } => {
             // Beating means connecting *as* the identity, so the transport
             // carries it (SIP-3). That needs the identity's seed, which only a
             // software identity has — a YubiKey cannot be a transport key.
@@ -1752,6 +1759,7 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             let beat = Beat {
                 interval_secs: *interval,
                 withhold: *withhold,
+                away: *away,
             };
             let (code, body) = client.post("/beacon/beat", beat.encode()).await?;
             if code != 200 {
@@ -1759,11 +1767,12 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
             }
             let ack = BeatAck::decode(&body).map_err(|e| e.to_string())?;
             println!(
-                "beat recorded for {} at {} (interval {}s{})",
+                "beat recorded for {} at {} (interval {}s{}{})",
                 PubKey::new(signer.public()),
                 ack.now,
                 interval,
-                if *withhold { ", withheld" } else { "" }
+                if *withhold { ", withheld" } else { "" },
+                if *away { ", away" } else { "" }
             );
             Ok(())
         }
@@ -1805,9 +1814,10 @@ async fn beacon(cli: &Cli, cfg: &Config, cmd: &BeaconCmd) -> Result<(), String> 
                 String::new()
             };
             println!(
-                "{target}: last seen {}s ago{missed}, declared interval {}s",
+                "{target}: last seen {}s ago{missed}, declared interval {}s{}",
                 r.staleness(),
-                r.interval_secs
+                r.interval_secs,
+                if r.away { ", away" } else { "" }
             );
             Ok(())
         }
