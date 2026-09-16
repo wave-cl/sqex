@@ -62,7 +62,7 @@ use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
     Forward as PeerForward, Forwarded, Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull,
-    PullBlob, PullEnvelopes, PullRecord, PullShape,
+    PullBlob, PullEnvelopes, PullRecord, PullShape, PullStanding,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -2084,13 +2084,28 @@ async fn route(
             (None, _) => no_identity("reading a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
-                match server.channels.info(
-                    &me,
-                    &device.unwrap_or(me),
-                    &req.channel,
-                    server.welcome.as_ref(),
-                ) {
-                    Ok(info) => (200, "application/octet-stream", info.encode()),
+                let device = device.unwrap_or(me);
+                match server
+                    .channels
+                    .info(&me, &device, &req.channel, server.welcome.as_ref())
+                {
+                    Ok(mut info) => {
+                        // SIP-43: where the device stands is the origin's to
+                        // say. A replica tracks no chains, and a device that
+                        // took this exchange's zero for an answer would sign
+                        // from zero and be refused where it counts.
+                        if let Some(origin) = server.channels.origin_of(&req.channel)
+                            && let Some(forwarder) = server.origins.get(&origin)
+                            && let Some(standing) = forwarder
+                                .standing(&server.exchange_seed, &req.channel, &device)
+                                .await
+                        {
+                            info.my_chain_seq = standing.next_chain;
+                            info.my_chain_head = standing.head;
+                            info.my_msg_seq = standing.msg_seq;
+                        }
+                        (200, "application/octet-stream", info.encode())
+                    }
                     Err(e) => refused(e),
                 }
             }
@@ -2517,6 +2532,22 @@ async fn route(
             {
                 match server.channels.shape_of(&req.channel) {
                     Ok(shape) => (200, "application/octet-stream", shape.encode()),
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+
+        // SIP-43: where a device stands in a channel, for a replica whose
+        // member asked it. Gated as a pull is.
+        ("POST", "/peer/standing") => match (peer.identity, PullStanding::decode(body)) {
+            (Some(who), Ok(req))
+                if server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+            {
+                match server.channels.device_standing(&req.channel, &req.device) {
+                    Ok(standing) => (200, "application/octet-stream", standing.encode()),
                     Err(_) => peering_refused(),
                 }
             }

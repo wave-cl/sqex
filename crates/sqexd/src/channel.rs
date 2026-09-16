@@ -2872,6 +2872,32 @@ impl Channels {
         Ok(())
     }
 
+    /// SIP-43: where a device stands in a channel this exchange orders, for
+    /// a replica whose member asks.
+    pub fn device_standing(
+        &self,
+        channel: &[u8; 32],
+        device: &PubKey,
+    ) -> Result<sqex_proto::peer::Standing, ChannelError> {
+        let db = self.db.lock().unwrap();
+        let (_, epoch, _, _) = channel_row(&db, channel)?;
+        let (next_chain, head) = chain_head(&db, channel, device)?;
+        let msg_seq: u64 = db
+            .query_row(
+                "SELECT msg_seq FROM high_water WHERE channel = ?1 AND device = ?2 AND epoch = ?3",
+                params![&channel[..], device.as_bytes(), epoch as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage("read high water"))?
+            .unwrap_or(0) as u64;
+        Ok(sqex_proto::peer::Standing {
+            next_chain,
+            head,
+            msg_seq,
+        })
+    }
+
     /// SIP-43: a channel's shape, for a peer that may pull it.
     pub fn shape_of(&self, channel: &[u8; 32]) -> Result<sqex_proto::peer::Shape, ChannelError> {
         let db = self.db.lock().unwrap();

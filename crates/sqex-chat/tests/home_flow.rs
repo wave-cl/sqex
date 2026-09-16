@@ -185,8 +185,26 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
         assert!(t.forged().is_empty(), "{:?}", t.forged());
     }
 
-    // Back at the origin: it holds the post, and the chain is one chain --
-    // a post here follows the one made through the replica.
+    // A store that remembers nothing, at the replica: the replica's `info`
+    // says where this device stands at the origin, so the client resumes
+    // from there rather than signing from zero.
+    {
+        let mut fresh = chat_at(
+            replica_addr,
+            replica_pub,
+            1,
+            &replica_dir.path().join("fresh.db"),
+        )
+        .await;
+        let posted = fresh
+            .send(&channel, "from a store that remembered nothing")
+            .await
+            .unwrap();
+        assert_eq!(posted.seq, posted_seq + 1);
+    }
+
+    // Back at the origin: it holds the posts, and the chain is one chain --
+    // a post here follows the ones made through the replica.
     let mut alice = chat_at(origin_addr, origin_pub, 1, &store).await;
     let mut at_origin = Timeline::new();
     let got = alice.poll(&channel, &mut at_origin, 0).await.unwrap();
@@ -205,6 +223,7 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
         vec![
             "from the origin",
             "posted at the replica",
+            "from a store that remembered nothing",
             "and back at the origin"
         ]
     );

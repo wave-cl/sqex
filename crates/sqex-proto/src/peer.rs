@@ -61,6 +61,10 @@ pub const TYPE_FORWARD: u8 = 0x06;
 /// SIP-43: what the constitution's digest covers and a replica cannot
 /// recover from it -- the channel's visibility, name and topic.
 pub const TYPE_SHAPE: u8 = 0x07;
+/// SIP-43: where a device stands at the origin -- its SIP-31 chain and its
+/// SIP-17 counter -- which a replica does not track and a device with a
+/// fresh store cannot otherwise learn.
+pub const TYPE_STANDING: u8 = 0x08;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -822,5 +826,96 @@ mod shape_tests {
         assert!(Shape::decode(&cut).is_err());
         let p = PullShape { channel: [3; 32] };
         assert_eq!(PullShape::decode(&p.encode()).unwrap(), p);
+    }
+}
+
+/// SIP-43: ask the origin where `device` stands in `channel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullStanding {
+    pub channel: [u8; 32],
+    pub device: PubKey,
+}
+
+impl PullStanding {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(65);
+        out.push(TYPE_STANDING);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(self.device.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullStanding> {
+        if b.len() != 65 {
+            return Err(Error::Malformed(format!(
+                "standing pull is {} bytes, want 65",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_STANDING {
+            return Err(Error::Malformed(format!(
+                "not a standing pull (type {:#x})",
+                b[0]
+            )));
+        }
+        Ok(PullStanding {
+            channel: b[1..33].try_into().unwrap(),
+            device: PubKey::new(b[33..65].try_into().unwrap()),
+        })
+    }
+}
+
+/// What the origin's own `Channel` would tell that device: the next chain
+/// position to sign at and the link to put in it, and the highest counter
+/// accepted at the current epoch. `| next_chain: u64 | head[32] | msg_seq: u64 |`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Standing {
+    pub next_chain: u64,
+    pub head: [u8; 32],
+    pub msg_seq: u64,
+}
+
+impl Standing {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(48);
+        out.extend_from_slice(&self.next_chain.to_be_bytes());
+        out.extend_from_slice(&self.head);
+        out.extend_from_slice(&self.msg_seq.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Standing> {
+        if b.len() != 48 {
+            return Err(Error::Malformed(format!(
+                "standing is {} bytes, want 48",
+                b.len()
+            )));
+        }
+        Ok(Standing {
+            next_chain: u64::from_be_bytes(b[..8].try_into().unwrap()),
+            head: b[8..40].try_into().unwrap(),
+            msg_seq: u64::from_be_bytes(b[40..48].try_into().unwrap()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod standing_tests {
+    use super::*;
+
+    #[test]
+    fn a_standing_round_trips() {
+        let p = PullStanding {
+            channel: [1; 32],
+            device: PubKey::new([2; 32]),
+        };
+        assert_eq!(PullStanding::decode(&p.encode()).unwrap(), p);
+        let s = Standing {
+            next_chain: 7,
+            head: [3; 32],
+            msg_seq: 9,
+        };
+        assert_eq!(Standing::decode(&s.encode()).unwrap(), s);
+        assert!(Standing::decode(&[0; 47]).is_err());
     }
 }

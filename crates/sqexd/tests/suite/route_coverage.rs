@@ -288,6 +288,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::pull_shape"),
         ReplicationPeer,
     ),
+    // SIP-43: a replica asking where a member stands, for its `info`.
+    (
+        "POST",
+        "/peer/standing",
+        Peer("replica::Forwarder::standing"),
+        ReplicationPeer,
+    ),
     // SIP-43: a replica carrying a member's post to the origin.
     (
         "POST",

@@ -738,6 +738,38 @@ impl Forwarder {
         }
     }
 
+    /// Ask the origin where `device` stands in `channel`, for an `info`
+    /// answered here: a replica tracks no chains, and a device with a fresh
+    /// store would otherwise sign from zero and be refused.
+    pub async fn standing(
+        &self,
+        seed: &[u8; 32],
+        channel: &[u8; 32],
+        device: &PubKey,
+    ) -> Option<sqex_proto::peer::Standing> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            *slot = Some(
+                H3Client::connect(self.addr, self.key.as_bytes(), seed)
+                    .await
+                    .ok()?,
+            );
+        }
+        let client = slot.as_mut().expect("just filled");
+        let req = sqex_proto::peer::PullStanding {
+            channel: *channel,
+            device: *device,
+        };
+        match client.post("/peer/standing", req.encode()).await {
+            Ok((200, body)) => sqex_proto::peer::Standing::decode(&body).ok(),
+            Ok(_) => None,
+            Err(_) => {
+                *slot = None;
+                None
+            }
+        }
+    }
+
     /// Carry a member's post to the origin and bring back its answer: the
     /// status and body the origin's own `/channel/post` gave. `Err` is the
     /// origin out of reach, or refusing this replica as a peer -- which to

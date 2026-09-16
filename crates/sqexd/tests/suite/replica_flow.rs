@@ -1768,6 +1768,38 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
     }
     assert!(seen, "the replica did not pull the post back");
 
+    // The replica's `info` says where this device stands *at the origin*:
+    // a replica tracks no chains, and a device with a fresh store would
+    // otherwise sign from zero. So a signer that remembers nothing resumes
+    // from the replica's answer and is accepted.
+    let here = s.info(&mut at_replica, channel).await;
+    let there = s.info(&mut a, channel).await;
+    assert_eq!(
+        here.my_chain_seq, there.my_chain_seq,
+        "the chain the replica reports"
+    );
+    assert_eq!(here.my_chain_head, there.my_chain_head);
+    assert_eq!(here.my_msg_seq, there.my_msg_seq);
+    let mut resumed = Chain {
+        seq: here.my_chain_seq,
+        head: here.my_chain_head,
+    };
+    let req = s.post_chained(
+        &mut resumed,
+        channel,
+        info.instance,
+        0,
+        here.my_msg_seq + 1,
+        b"from a store that remembered nothing".to_vec(),
+    );
+    let (code, body) = at_replica
+        .post("/channel/post", req.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let posted = Posted::decode(&body, req.receipts).unwrap();
+    chain = resumed;
+
     // Control: signed under the replica's own key, the origin refuses it as
     // forged -- the replica did not quietly re-sign or store it.
     let wrong = Signer::new(alice_seed, alice, replica_pub);
