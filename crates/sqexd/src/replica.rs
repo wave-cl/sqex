@@ -212,12 +212,14 @@ pub fn take_under(
             took.refused.push((e.seq, Refused::Diverged));
             continue;
         }
-        if store
-            .store_pulled(channel, e, &stamp.entry_hash, &stamp.head, &stamp.receipt)
-            .is_ok()
-        {
-            took.stored += 1;
-            held = Some((e.seq, stamp.head));
+        match store.store_pulled(channel, e, &stamp.entry_hash, &stamp.head, &stamp.receipt) {
+            Ok(true) => {
+                took.stored += 1;
+                held = Some((e.seq, stamp.head));
+            }
+            // Held already: verified when it first arrived.
+            Ok(false) => held = Some((e.seq, stamp.head)),
+            Err(_) => {}
         }
     }
     took
@@ -400,7 +402,7 @@ pub async fn pull_once(
             }
         }
         let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
-        let took = take_under(
+        let mut took = take_under(
             store,
             &origin.key,
             &origin.predecessors,
@@ -408,6 +410,62 @@ pub async fn pull_once(
             &pulled,
             &lookup,
         );
+
+        // **What was refused below the lowest entry held is asked for
+        // again.** A pull asks from the highest entry held, so an entry
+        // refused once -- under a key this replica had not been told of yet,
+        // say -- would never be asked for again, and the constitution among
+        // them would leave the channel underived for good. The origin says
+        // where its own copy starts; while this replica's starts later, the
+        // gap is pulled from the origin's first, and what is already held is
+        // ignored on the way in.
+        let lowest = store.lowest(channel);
+        if !took.equivocated && pulled.first > 0 && lowest > pulled.first {
+            let (code, body) = client
+                .post(
+                    "/peer/pull",
+                    Pull {
+                        channel: *channel,
+                        since: pulled.first - 1,
+                        max: MAX_PULL,
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code == 200
+                && let Ok(below) = Pulled::decode(&body)
+                && below.origin == origin.key
+            {
+                let mut creds: HashMap<PubKey, Option<PubKey>> = HashMap::new();
+                for e in &below.entries {
+                    if e.kind == KIND_MEMBER
+                        && e.device != e.account
+                        && !creds.contains_key(&e.device)
+                    {
+                        creds.insert(e.device, account_for(client, &e.device).await);
+                    }
+                }
+                let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
+                let again = take_under(
+                    store,
+                    &origin.key,
+                    &origin.predecessors,
+                    channel,
+                    &below,
+                    &lookup,
+                );
+                if again.stored > 0 {
+                    // The events just filled in come before the ones already
+                    // applied, so the roster is derived again from the top.
+                    if let Err(e) = store.rederive(channel) {
+                        tracing::warn!(error = ?e, "could not derive the roster again");
+                    }
+                }
+                took.stored += again.stored;
+                took.refused.extend(again.refused);
+                took.equivocated |= again.equivocated;
+            }
+        }
 
         // The rest of what a member needs to actually read this channel here.
         // Skipped when the origin has just been caught contradicting itself:

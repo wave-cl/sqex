@@ -3117,6 +3117,12 @@ impl Channels {
         window(&db, channel).1
     }
 
+    /// The lowest entry held for a channel, or 0 when none is.
+    pub fn lowest(&self, channel: &[u8; 32]) -> u64 {
+        let db = self.db.lock().unwrap();
+        window(&db, channel).0
+    }
+
     /// Store one verified entry pulled from an origin.
     ///
     /// The caller has already run SIP-31's and SIP-34's checks; this writes
@@ -3130,36 +3136,43 @@ impl Channels {
         entry_hash: &[u8; 32],
         head: &[u8; 32],
         receipt: &[u8; 64],
-    ) -> Result<(), ChannelError> {
+    ) -> Result<bool, ChannelError> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin store"))?;
-        tx.execute(
-            "INSERT OR IGNORE INTO entry (channel, seq, kind, account, device, posted,
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO entry (channel, seq, kind, account, device, posted,
                                 expires_after, epoch, msg_seq,
                                 chain_seq, prev, body_hash, sig, body,
                                 entry_hash, head, receipt)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            params![
-                &channel[..],
-                e.seq as i64,
-                e.kind as i64,
-                e.account.as_bytes(),
-                e.device.as_bytes(),
-                e.posted as i64,
-                e.expires_after as i64,
-                e.epoch as i64,
-                e.msg_seq as i64,
-                e.chain_seq as i64,
-                &e.prev[..],
-                &e.body_hash[..],
-                &e.sig[..],
-                &e.body,
-                &entry_hash[..],
-                &head[..],
-                &receipt[..],
-            ],
-        )
-        .map_err(storage("store pulled entry"))?;
+                params![
+                    &channel[..],
+                    e.seq as i64,
+                    e.kind as i64,
+                    e.account.as_bytes(),
+                    e.device.as_bytes(),
+                    e.posted as i64,
+                    e.expires_after as i64,
+                    e.epoch as i64,
+                    e.msg_seq as i64,
+                    e.chain_seq as i64,
+                    &e.prev[..],
+                    &e.body_hash[..],
+                    &e.sig[..],
+                    &e.body,
+                    &entry_hash[..],
+                    &head[..],
+                    &receipt[..],
+                ],
+            )
+            .map_err(storage("store pulled entry"))?;
+        if inserted == 0 {
+            // Held already, verified when it arrived. Nothing below is
+            // repeated: deriving a membership event twice, out of order,
+            // could undo a later one.
+            return Ok(false);
+        }
         // **Membership is derived here, from the signed action, and never from
         // a roster the origin sent.** SIP-35 is explicit: a replica works out
         // who may read a channel from the constitution event and the signed
@@ -3179,14 +3192,72 @@ impl Channels {
             }
         }
         // The replica's head follows the origin's, because it *is* the
-        // origin's: a replica never advances a head of its own.
+        // origin's: a replica never advances a head of its own. An entry
+        // filled in *below* what is held leaves the head where it was.
         tx.execute(
-            "UPDATE channel SET head = ?2, next_seq = MAX(next_seq, ?3) WHERE id = ?1",
+            "UPDATE channel SET head = CASE WHEN ?3 >= next_seq THEN ?2 ELSE head END,
+                                next_seq = MAX(next_seq, ?3) WHERE id = ?1",
             params![&channel[..], &head[..], (e.seq + 1) as i64],
         )
         .map_err(storage("advance replica head"))?;
         tx.commit().map_err(storage("commit store"))?;
         self.wake(channel);
+        Ok(true)
+    }
+
+    /// Derive a replicated channel's roster again, from every system entry
+    /// held, in order. For after a gap below the held range is filled: the
+    /// events in it were never applied, and applying them after the ones
+    /// above would undo whatever the ones above did. Only a replicated
+    /// channel: an origin's roster is its own record, not a derivation.
+    pub fn rederive(&self, channel: &[u8; 32]) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin rederive"))?;
+        let replicated: bool = tx
+            .query_row(
+                "SELECT 1 FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(storage("read replicated"))?
+            .unwrap_or(false);
+        if !replicated {
+            return Ok(());
+        }
+        let events: Vec<(Vec<u8>, i64)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT body, posted FROM entry WHERE channel = ?1 AND kind = ?2
+                     ORDER BY seq",
+                )
+                .map_err(storage("prepare rederive"))?;
+            let rows = stmt
+                .query_map(params![&channel[..], KIND_SYSTEM as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .map_err(storage("query rederive"))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage("read rederive"))?
+        };
+        tx.execute(
+            "DELETE FROM member WHERE channel = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("clear roster"))?;
+        let mut derivable = false;
+        for (body, posted) in events {
+            if let Ok(Some(sys)) = System::decode(&body) {
+                derive_membership(&tx, channel, &sys, posted as u64)?;
+                derivable |= sys.event == EVENT_CREATED;
+            }
+        }
+        tx.execute(
+            "UPDATE replicated SET derivable = ?2 WHERE channel = ?1",
+            params![&channel[..], i64::from(derivable)],
+        )
+        .map_err(storage("mark derivable"))?;
+        tx.commit().map_err(storage("commit rederive"))?;
         Ok(())
     }
 

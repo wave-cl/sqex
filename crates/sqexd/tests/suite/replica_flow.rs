@@ -498,6 +498,62 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
         "the roster was not derived from what verified under the predecessor"
     );
 
+    // **A gap below what is held is filled on the next pull.** A replica that
+    // refused the bottom of a channel -- under a key it had not been told of
+    // -- and stored the rest would ask from its highest entry forever, and
+    // the constitution would stay missing. Here the replica is handed only
+    // the tail; a pull then notices the origin's copy starts lower than its
+    // own, asks for what is below, and derives the roster again in order.
+    let replica_dir = tempfile::tempdir().unwrap();
+    std::fs::write(replica_dir.path().join("host_key"), hex::encode(peer_seed)).unwrap();
+    let gapped = bind_replica(replica_dir.path()).await;
+    let tail = Pulled {
+        entries: pulled.entries[pulled.entries.len() - 2..].to_vec(),
+        ..pulled.clone()
+    };
+    let took = take(gapped.channels(), &origin, &channel, &tail, &never);
+    assert_eq!(took.stored, 2);
+    assert!(gapped.channels().lowest(&channel) > 1);
+    assert!(
+        gapped
+            .channels()
+            .fetch(&alice, &alice, &channel, 0, false)
+            .is_err(),
+        "without the constitution the roster cannot be derived"
+    );
+    let spec = sqexd::replica::Origin {
+        key: origin,
+        addr,
+        channels: vec![channel],
+        interval: std::time::Duration::from_secs(1),
+        predecessors: Vec::new(),
+    };
+    let mut h3 = sqex_proto::h3::H3Client::connect(addr, &server_pub, &peer_seed)
+        .await
+        .unwrap();
+    let took = sqexd::replica::pull_once(&mut h3, &gapped, &spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        took[&channel].stored as usize,
+        pulled.entries.len() - 2,
+        "{took:?}"
+    );
+    assert_eq!(gapped.channels().lowest(&channel), 1);
+    assert_eq!(gapped.channels().highest(&channel), n);
+    assert!(
+        gapped
+            .channels()
+            .fetch(&alice, &alice, &channel, 0, false)
+            .is_ok(),
+        "the roster was not derived once the constitution arrived"
+    );
+    // And it is settled: the next pull has nothing to fill.
+    let took = sqexd::replica::pull_once(&mut h3, &gapped, &spec)
+        .await
+        .unwrap();
+    assert_eq!(took[&channel].stored, 0);
+
     // A tampered body. SIP-31 step 1 fails and the entry is not written.
     let mut forged = pulled.clone();
     let victim = forged
