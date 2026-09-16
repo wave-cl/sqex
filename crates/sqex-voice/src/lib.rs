@@ -15,6 +15,7 @@
 //! CLI now run the same loop rather than two that drift apart.
 
 pub mod audio;
+pub mod direct;
 pub mod engine;
 pub mod jitter;
 pub mod media;

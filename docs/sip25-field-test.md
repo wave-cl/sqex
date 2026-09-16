@@ -28,7 +28,31 @@ sqex --server ex.squic.org meet <peer-pubkey> --wait 30
   rule; a one-sided `meet` just waits and then reports nothing.
 - When both are waiting, the exchange tells each the other's *observed* address
   and a shared start time; both drop the exchange connection, reuse that local
-  port, punch, and (lower key dials / higher key listens) connect directly.
+  port, punch, and (lower key dials / higher key listens) connect directly. The
+  listener admits only the peer it was introduced to, and once connected the
+  two agree a SIP-12 key over the connection, so `meet` proves the whole of
+  what a call needs and not only the hole.
+
+### With audio
+
+The same flow carries a call. Both parties:
+
+```sh
+sqex-voice call <peer-pubkey> --direct --seconds 20
+```
+
+`connected directly to <addr> (SIP-25)` means the call is going between the
+two homes; `relayed by the exchange: …` means the introduction was made and the
+punch failed (or the peer never asked), and the call went through the exchange
+as SIP-12 always has. Either way there is audio: the fallback is the point.
+
+### In sigil
+
+A direct-message call in sigil does this by default. Place a call, answer it,
+and read the call bar: **direct** or **via exchange** (hover the second for
+why). The setting is in the Desktop pane — "Connect calls directly when
+possible" — and it discloses your address to the other person, which is what
+the introduction is.
 
 ## Reading the result
 - **Success:** a direct sQUIC connection establishes between the two homes with

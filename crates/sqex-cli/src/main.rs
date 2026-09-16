@@ -16,11 +16,10 @@ use sqex_proto::attest::{
     Query as AttestQuery,
 };
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
-use sqex_proto::h3::H3Client;
+use sqex_proto::direct;
 use sqex_proto::mailbox::{self, ById, Fetched, Listing, Send as MailSend, SendAck, State, Status};
 use sqex_proto::name::{self, ClaimAck};
 use sqex_proto::refusal::Refusal;
-use sqex_proto::rendezvous::{Introduce, Introduced};
 use sqex_proto::resolve::{
     Endpoint, KIND_DNS, KIND_IPV4, KIND_IPV6, MAX_HOST, Publish as ResolvePublish,
     Resolve as ResolveGet, Resolved, Successor as ResolveSuccessor,
@@ -1004,144 +1003,51 @@ async fn delete_one(client: &mut Client, id: u64) -> Result<bool, String> {
 
 // ---- rendezvous -------------------------------------------------------------
 
-/// A local port this process can hold and then hand to squic.
-///
-/// Bound, read back, released. Racy in principle, and the alternative — letting
-/// squic bind first and asking what it got — would mean the exchange connection
-/// and the peer connection could not share one, which is the whole point.
-fn pick_local_port() -> Result<SocketAddr, String> {
-    let probe = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    let addr = probe.local_addr().map_err(|e| e.to_string())?;
-    drop(probe);
-    Ok(addr)
-}
-
+/// The flow is `sqex_proto::direct`, which is also what a voice client
+/// runs: this is the field test for it, so it must be the same code.
 async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> Result<(), String> {
     let signer = load_software_identity(cli, cfg)?;
     let them = resolve_target(cli, cfg, peer).await?;
     let (addr, server) = endpoint(cli, cfg).await?;
+    let me = PubKey::new(signer.public());
 
-    // **One port for both connections, and that is the whole mechanism.** The
-    // address the exchange observes is the NAT mapping *this socket* made, and
-    // it is the address the peer will be given — so the connection that gets
-    // introduced and the connection that punches have to leave from the same
-    // place. `sqnr::Client` binds an ephemeral port with no way to choose, so
-    // this uses the small client in `sqex-proto::h3`, which can.
-    let ours = pick_local_port()?;
-    let mut client =
-        H3Client::connect_from(addr, server.as_bytes(), &signer.seed(), Some(ours)).await?;
-    let req = Introduce {
-        peer: them,
-        wait_secs: wait,
-    };
     // The request is a long poll and may sit for `wait` seconds by design.
-    let (code, body) = client
-        .post("/rendezvous/introduce", req.encode())
-        .await
-        .map_err(|e| e.to_string())?;
-    if code != 200 {
-        return Err(format!("introduction refused ({code}): {}", said(&body)));
-    }
-    let got = Introduced::decode(&body).map_err(|e| e.to_string())?;
-    if !got.ready {
+    let Some(intro) =
+        direct::introduce(addr, server.as_bytes(), &signer.seed(), them, wait).await?
+    else {
         // Deliberately says nothing about whether they asked. That would be a
         // signal about somebody who has not consented.
         println!("no introduction: both sides must ask, and this one has not completed");
         return Ok(());
-    }
-    let there = got.addr.ok_or("an introduction with no address")?;
-    println!("{them} was seen at {there}");
-    let lead = got.start_at.saturating_sub(got.now);
+    };
+    println!("{them} was seen at {}", intro.theirs);
     println!(
-        "  both sides were told to begin in {lead}s (exchange clock {})",
-        got.now
+        "  both sides were told to begin in {}s",
+        intro.lead.as_secs()
     );
     if dry_run {
         return Ok(());
     }
 
-    // Wait for the moment both sides were given. Measured as a delay from the
-    // exchange's own clock rather than as an absolute time on ours, because the
-    // three clocks do not agree and only one of them is shared.
-    tokio::time::sleep(std::time::Duration::from_secs(lead)).await;
-
-    // **The exchange connection is dropped here, and the port is reused.** A
-    // NAT keeps a mapping alive for tens of seconds after the last packet, so
-    // rebinding the same port lands in the same mapping — the one the peer was
-    // just told about. Holding the connection open instead would be better and
-    // is not possible: two QUIC endpoints cannot share a socket, and one that
-    // both dialled the exchange and accepted a peer is the dual-role endpoint
-    // SIP-25 still lacks.
-    drop(client);
-    // The OS does not release a port synchronously, and squic will refuse to
-    // bind one still held. Dropping the client aborts its driver, which is what
-    // actually lets go; this waits for the kernel to agree.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    // **Lower key dials, higher key listens.** Somebody has to do each, and the
-    // tiebreak is on bytes both sides already hold — the same one SIP-12 uses
-    // to decide which peer is `first`, so there is one convention and not two.
-    let me = PubKey::new(signer.public());
-    let dialing = me.as_bytes() < them.as_bytes();
-    let punch = vec![there];
-    let unreachable = "no direct connection. This needs endpoint-independent mapping at \
-                       both ends: symmetric NAT allocates a fresh external port per \
-                       destination, so the port the exchange saw is not the one the peer \
-                       sees. SIP-12 relays instead, and works behind it";
-
-    if dialing {
-        println!("  dialling {there} from {ours}");
-        match squic::dial(
-            there,
-            them.as_bytes(),
-            squic::Config {
-                local_bind: Some(ours),
-                punch,
-                client_key: Some(hex_seed(&signer.seed())),
-                advertise_identity: true,
-                handshake_timeout: Some(std::time::Duration::from_secs(10)),
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(conn) => {
-                println!("  connected directly to {}", conn.remote_address());
-                conn.close(0u32.into(), b"done");
-                Ok(())
-            }
-            Err(e) => Err(format!("{unreachable} ({e})")),
-        }
+    let budget = direct::Budget {
+        introduce_wait: wait,
+        handshake: std::time::Duration::from_secs(10),
+        accept: std::time::Duration::from_secs(15),
+    };
+    if direct::dials(&me, &them) {
+        println!("  dialling {} from {}", intro.theirs, intro.ours);
     } else {
-        println!("  listening on {ours} for {them}");
-        let listener = squic::listen(
-            ours,
-            &ed25519_dalek::SigningKey::from_bytes(&signer.seed()),
-            squic::Config {
-                punch,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|e| format!("cannot listen on {ours}: {e}"))?;
-        match tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await {
-            Ok(Some(incoming)) => match incoming.await {
-                Ok(conn) => {
-                    println!("  {} reached us directly", conn.remote_address());
-                    conn.close(0u32.into(), b"done");
-                    Ok(())
-                }
-                Err(e) => Err(format!("a peer arrived and the handshake failed: {e}")),
-            },
-            _ => Err(unreachable.to_string()),
-        }
+        println!("  listening on {} for {them}", intro.ours);
     }
-}
-
-/// squic takes a client key as hex, which is the one place this CLI has to
-/// speak that encoding.
-fn hex_seed(seed: &[u8; 32]) -> String {
-    seed.iter().map(|b| format!("{b:02x}")).collect()
+    let conn = direct::link(intro, &signer.seed(), them, budget).await?;
+    println!("  connected directly to {}", conn.remote_address());
+    // And the key, so the field test proves the whole of what a call needs
+    // and not only the hole.
+    let (_session, id) =
+        direct::agree(&conn, &signer.seed(), them, direct::dials(&me, &them)).await?;
+    println!("  agreed a session key (session {id}); the exchange was not party to it");
+    conn.close(0u32.into(), b"done");
+    Ok(())
 }
 
 // ---- attest -----------------------------------------------------------------

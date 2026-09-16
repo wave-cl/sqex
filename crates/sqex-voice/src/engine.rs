@@ -168,6 +168,15 @@ pub enum Event {
     /// Bluetooth profile warning. These used to be `eprintln!` inside the
     /// library, where no frontend could reach them.
     Device(String),
+    /// The call goes straight to the peer, at this address (SIP-25). Said
+    /// once, before the session comes up.
+    Direct { peer: SocketAddr },
+    /// A direct connection was wanted and the call is relayed instead,
+    /// for this reason. Said once, in place of `Direct`.
+    Relayed { why: String },
+    /// The path closed under the call: the peer hung up a direct
+    /// connection, or the connection to the exchange went. The call ends.
+    Closed { why: String },
 }
 
 impl Event {
@@ -251,7 +260,78 @@ impl Event {
             ),
             Event::Declined { peer } => format!("declined the call from {peer}."),
             Event::Device(msg) => msg.clone(),
+            Event::Direct { peer } => format!("connected directly to {peer} (SIP-25)."),
+            Event::Relayed { why } => format!("relayed by the exchange: {why}"),
+            Event::Closed { why } => format!("the connection closed ({why})."),
         }
+    }
+}
+
+/// What carries a call's datagrams.
+///
+/// Two things do: the connection to the exchange, which relays them to the
+/// peer (SIP-12), and a connection straight to the peer after an
+/// introduction (SIP-25). The media loop in [`call`] is the same over
+/// either -- the frames are sealed the same way under the same kind of key
+/// -- so it is written once, against this, rather than twice against two
+/// connection types that would drift apart.
+///
+/// `Send`, for the reason [`Report`] is.
+pub trait Carrier: Send {
+    /// The largest datagram the path will carry, or `None` if it carries
+    /// none -- in which case it cannot carry a call.
+    fn max_datagram_size(&self) -> Option<usize>;
+    fn send_datagram(&mut self, bytes: Vec<u8>) -> Result<(), String>;
+    fn read_datagram(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+    /// Tell whoever needs telling that the session is over: the exchange,
+    /// for a relayed one; the peer, for a direct one.
+    fn hang_up(&mut self, id: u64) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl Carrier for Client {
+    fn max_datagram_size(&self) -> Option<usize> {
+        Client::max_datagram_size(self)
+    }
+
+    fn send_datagram(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        Client::send_datagram(self, bytes)
+    }
+
+    async fn read_datagram(&mut self) -> Result<Vec<u8>, String> {
+        Client::read_datagram(self).await
+    }
+
+    async fn hang_up(&mut self, id: u64) {
+        let _ = self
+            .post("/session/close", BySession::close(id).encode())
+            .await;
+    }
+}
+
+/// A connection straight to the peer. The session id is not the exchange's
+/// to assign here, so the peer is told nothing but that the connection is
+/// closing.
+impl Carrier for quinn::Connection {
+    fn max_datagram_size(&self) -> Option<usize> {
+        quinn::Connection::max_datagram_size(self)
+    }
+
+    fn send_datagram(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        quinn::Connection::send_datagram(self, bytes::Bytes::from(bytes))
+            .map_err(|e| format!("send datagram: {e}"))
+    }
+
+    async fn read_datagram(&mut self) -> Result<Vec<u8>, String> {
+        quinn::Connection::read_datagram(self)
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| format!("read datagram: {e}"))
+    }
+
+    async fn hang_up(&mut self, _id: u64) {
+        self.close(0u32.into(), b"done");
     }
 }
 
@@ -685,8 +765,8 @@ impl Default for CallOpts {
 
 /// Hold a two-party call until the source ends, the deadline passes, or the
 /// future is dropped.
-pub async fn call(
-    mut client: Client,
+pub async fn call<C: Carrier>(
+    mut carrier: C,
     session: Session,
     id: u64,
     opts: CallOpts,
@@ -738,7 +818,7 @@ pub async fn call(
                         let sealed = session
                             .seal_datagram(seq, &media.encode())
                             .map_err(|e| e.to_string())?;
-                        client.send_datagram(
+                        carrier.send_datagram(
                             DatagramFrame { session_id: id, seq, ciphertext: sealed }.encode(),
                         )?;
                         if opts.rtt {
@@ -757,8 +837,19 @@ pub async fn call(
                 }
             },
 
-            got = client.read_datagram() => {
-                let bytes = got?;
+            got = carrier.read_datagram() => {
+                // The path closing under the call is the call ending, not
+                // a fault in it: on a direct connection it is the peer
+                // hanging up, and on a relayed one the exchange has gone,
+                // which no retry from inside this loop can mend. Say so,
+                // and finish the way a call finishes.
+                let bytes = match got {
+                    Ok(bytes) => bytes,
+                    Err(why) => {
+                        report.event(Event::Closed { why });
+                        break;
+                    }
+                };
                 let frame = DatagramFrame::decode(&bytes).map_err(|e| e.to_string())?;
                 if frame.session_id != id {
                     continue; // some other session on this connection
@@ -826,9 +917,7 @@ pub async fn call(
 
     report.event(Event::FinalStats(summary(&buffer, &rtt)));
     out.finish()?;
-    let _ = client
-        .post("/session/close", BySession::close(id).encode())
-        .await;
+    carrier.hang_up(id).await;
     Ok(())
 }
 

@@ -125,6 +125,12 @@ enum Cmd {
         /// reflects each frame under the sequence number it arrived with.
         #[arg(long)]
         rtt: bool,
+
+        /// Ask the exchange to introduce you (SIP-25) and carry the call
+        /// straight between the two of you, relayed only if that fails. Both
+        /// sides must pass it. Discloses your address to the peer.
+        #[arg(long)]
+        direct: bool,
     },
 
     /// Reflect a peer's frames straight back, so one person can measure a real
@@ -374,6 +380,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         bitrate,
         seconds,
         rtt,
+        ..
     } = cmd
         && peer.contains('@')
     {
@@ -404,8 +411,6 @@ async fn run(cli: Cli) -> Result<(), String> {
         return engine::echo(client, &signer, peer, cli.wait, &mut report).await;
     }
 
-    let (client, session, id) =
-        engine::establish(endpoint, &signer, peer, cli.wait, &mut report).await?;
     match cmd {
         Cmd::Call {
             source,
@@ -414,16 +419,37 @@ async fn run(cli: Cli) -> Result<(), String> {
             bitrate,
             seconds,
             rtt,
+            direct,
             ..
         } => {
-            engine::call(
-                client,
-                session,
-                id,
-                opts(&cli, source, sink, *jitter, *bitrate, *seconds, *rtt),
-                &mut report,
-            )
-            .await
+            let opts = opts(&cli, source, sink, *jitter, *bitrate, *seconds, *rtt);
+            // Direct first, when asked; the relayed session is the fallback,
+            // and the reason it is being used is said before it is.
+            if *direct {
+                match sqex_voice::direct::connect(
+                    endpoint,
+                    &signer.seed(),
+                    peer,
+                    sqex_voice::direct::Budget {
+                        introduce_wait: cli.wait.min(u16::MAX as u64) as u16,
+                        ..Default::default()
+                    },
+                    &mut report,
+                )
+                .await
+                {
+                    Ok(Some((conn, session, id))) => {
+                        return engine::call(conn, session, id, opts, &mut report).await;
+                    }
+                    Ok(None) => report.event(Event::Relayed {
+                        why: "the peer did not ask to be introduced".into(),
+                    }),
+                    Err(why) => report.event(Event::Relayed { why }),
+                }
+            }
+            let (client, session, id) =
+                engine::establish(endpoint, &signer, peer, cli.wait, &mut report).await?;
+            engine::call(client, session, id, opts, &mut report).await
         }
         Cmd::Echo { .. } => unreachable!("handled above"),
         Cmd::Room { .. } | Cmd::Answer { .. } => unreachable!("handled above"),

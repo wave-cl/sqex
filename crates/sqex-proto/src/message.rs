@@ -34,6 +34,14 @@ pub const TYPE_CALL_END: u8 = 0x07;
 
 /// SIP-36 `media` bit 0: audio.
 pub const MEDIA_AUDIO: u8 = 0x01;
+/// SIP-36 `media` bit 7: the caller will ask the exchange for a SIP-25
+/// introduction once the call is answered, so that it can go straight
+/// between the two of them rather than through the exchange. A callee that
+/// knows the bit asks too; one that does not ignores it, as every reserved
+/// bit is ignored, and the call is relayed as before. Not a kind of media:
+/// it says how the media will travel, which is the one thing about a call
+/// the invitation has to settle before anybody answers.
+pub const MEDIA_DIRECT: u8 = 0x80;
 
 pub const CALL_ANSWERED: u8 = 0x01;
 pub const CALL_DECLINED: u8 = 0x02;
@@ -1079,6 +1087,33 @@ mod call_tests {
                 "reserved bits are carried, not masked"
             );
         }
+    }
+
+    /// Bit 7 is the one reserved bit with a meaning: the caller will ask
+    /// for an introduction. It rides beside audio and is read back as
+    /// itself, and a call without it is a call that will be relayed.
+    #[test]
+    fn the_direct_bit_rides_beside_audio() {
+        assert_eq!(MEDIA_DIRECT & MEDIA_AUDIO, 0, "distinct bits");
+        let b = Body::Call {
+            media: MEDIA_AUDIO | MEDIA_DIRECT,
+            ring_secs: 1,
+            secret: [0; 32],
+        };
+        let Some(Body::Call { media, .. }) = Body::decode(&b.encode()).unwrap() else {
+            panic!("a call");
+        };
+        assert_ne!(media & MEDIA_DIRECT, 0);
+        assert_ne!(media & MEDIA_AUDIO, 0);
+        let plain = Body::Call {
+            media: MEDIA_AUDIO,
+            ring_secs: 1,
+            secret: [0; 32],
+        };
+        let Some(Body::Call { media, .. }) = Body::decode(&plain.encode()).unwrap() else {
+            panic!("a call");
+        };
+        assert_eq!(media & MEDIA_DIRECT, 0);
     }
 
     #[test]
