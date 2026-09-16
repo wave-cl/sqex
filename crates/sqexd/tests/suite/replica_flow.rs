@@ -1020,16 +1020,16 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         "the creator must be derived as the first admin"
     );
 
-    // A stranger is refused by the derived roster, and told what an origin
-    // would tell them: the room is public and they are not in it. The
-    // constitution's digest covers visibility without disclosing it, so a
-    // replica used to write every pulled channel as private and answer
-    // `NoSuchChannel`; SIP-43 has the origin state the shape.
+    // The room is public and the replica knows it (SIP-43's shape), so a
+    // stranger reads the copy as anyone may: what anybody may join, anybody
+    // may read a copy of. It used to be written as private and refused as
+    // if it were not there.
     let (_, stranger) = identity(143);
-    assert!(matches!(
-        whole.fetch(&stranger, &stranger, &channel, 0, false),
-        Err(ChannelError::NotAMember)
-    ));
+    assert!(
+        whole
+            .fetch(&stranger, &stranger, &channel, 0, false)
+            .is_ok()
+    );
     // A replica that has not been told the shape still conceals: a bare
     // store pulled into by hand, with nobody asking the origin.
     let unshaped = Channels::open(None, replica_key, Some(replica_sk.to_bytes())).unwrap();
@@ -1695,7 +1695,8 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
     assert_eq!(there.origin, origin);
     assert_eq!(there.domain, "");
 
-    // A stranger is not told where anything lives.
+    // The room is public, so a stranger may read the copy and be told
+    // where it lives -- as anybody may join it at the origin.
     let stranger_seed = identity(152).0;
     let mut stranger = Client::connect_as(replica_addr, &replica_pub, &stranger_seed)
         .await
@@ -1704,7 +1705,7 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
         .post("/channel/home", ByChannel { channel }.encode(TYPE_HOME))
         .await
         .unwrap();
-    assert_ne!(code, 200, "a stranger was told where the channel lives");
+    assert_eq!(code, 200, "a public room's home is no secret");
 
     // Alice's chain as the origin has it -- authorising spent a position.
     let info = s.info(&mut a, channel).await;
@@ -1831,4 +1832,145 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
         got.entries.is_empty(),
         "the replica stored a post the origin never ordered"
     );
+}
+
+/// **A welcome channel replicates.** The exchange seats it at startup and
+/// writes no `created` entry, so there is no constitution in its log and
+/// SIP-35's derivation had nothing to start from -- a replica refused it as
+/// underived for good. It is public, and a public channel's roster is its
+/// signed joins -- and a welcome seats without one, by SIP-31's own rule --
+/// so once the origin has stated the shape (SIP-43) the replica serves it
+/// to anyone identified, as a public room: what anybody may join, anybody
+/// may read a copy of. Posting still needs membership, at the origin.
+#[tokio::test]
+async fn a_welcome_channel_with_no_constitution_replicates_as_public() {
+    use sqex_proto::h3::H3Client;
+    use sqexd::channel::ChannelError;
+    use sqexd::replica::{Origin, pull_once};
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(
+        replica_dir.path().join("host_key"),
+        hex::encode(replica_sk.to_bytes()),
+    )
+    .unwrap();
+    let replica_key = PubKey::new(replica_pub);
+    let (alice_seed, alice) = identity(161);
+    let (bob_seed, bob) = identity(162);
+
+    // An origin with a welcome channel, founded by Alice as its first admin.
+    let key_path = origin_dir.path().join("host_key");
+    let (server_sk, _) = squic::generate_keypair();
+    std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{:?}]\n\
+         welcome_channel = \"general\"\nreplication_peers = [{:?}]\n",
+        key_path.to_string_lossy(),
+        origin_dir.path().join("sqex.state").to_string_lossy(),
+        alice.to_string(),
+        replica_key.to_string(),
+    );
+    let config_path = origin_dir.path().join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let bound = sqexd::bind(config, Some(config_path), signing_key)
+        .await
+        .unwrap();
+    let origin_addr = bound.local_addr;
+    let origin_pub = bound.public_key.to_bytes();
+    let origin = PubKey::new(origin_pub);
+    tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+
+    // Bob turns up and is seated in #general; Alice says something and
+    // authorises the replica.
+    let mut b = Client::connect_as(origin_addr, &origin_pub, &bob_seed)
+        .await
+        .unwrap();
+    let (code, body) = b
+        .post(
+            "/channel/mine",
+            sqex_proto::channel::Mine { offset: 0 }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let mine = sqex_proto::channel::Mines::decode(&body).unwrap();
+    let general = mine
+        .channels
+        .first()
+        .expect("bob was not seated in the welcome channel")
+        .channel;
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
+    let s = Signer::new(alice_seed, alice, origin_pub);
+    let info = s.info(&mut a, general).await;
+    let mut chain = Chain {
+        seq: info.my_chain_seq,
+        head: info.my_chain_head,
+    };
+    say(&mut a, &s, &mut chain, general, b"welcome, all").await;
+    let info = s.info(&mut a, general).await;
+    let action = s.action_at(
+        &info,
+        general,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &replica_key,
+        &[],
+    );
+    let (code, body) = a
+        .post(
+            "/channel/replicate",
+            ByAccount {
+                channel: general,
+                account: replica_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    let replica = bind_replica(replica_dir.path()).await;
+    let store = replica.channels();
+    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+        .await
+        .unwrap();
+    let spec = Origin {
+        key: origin,
+        addr: origin_addr,
+        channels: vec![general],
+        interval: std::time::Duration::from_secs(1),
+        predecessors: Vec::new(),
+    };
+    let took = pull_once(&mut client, &replica, &spec).await.unwrap();
+    assert!(took[&general].stored >= 2, "{took:?}");
+
+    // Served as a public room: to the member the origin seated without a
+    // signed trace, and to anyone else who asks by name.
+    let read = store
+        .fetch(&bob, &bob, &general, 0, false)
+        .expect("a seated member could not read the welcome channel at the replica");
+    assert!(read.entries.iter().any(|e| e.body == b"welcome, all"));
+    assert!(store.fetch(&alice, &alice, &general, 0, false).is_ok());
+    let (_, stranger) = identity(163);
+    assert!(
+        store
+            .fetch(&stranger, &stranger, &general, 0, false)
+            .is_ok()
+    );
+    // A private channel keeps SIP-35's rule: nothing without the roster.
+    let private = [163u8; 32];
+    assert!(matches!(
+        store.fetch(&stranger, &stranger, &private, 0, false),
+        Err(ChannelError::NoSuchChannel)
+    ));
 }

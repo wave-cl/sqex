@@ -1511,7 +1511,7 @@ impl Channels {
         // between two honest-looking servers.
         Channels::not_equivocated(&db, channel)?;
         Channels::derivable(&db, channel)?;
-        if role_of(&db, channel, caller).is_none() {
+        if !Self::readable_by(&db, channel, caller) {
             return Err(Self::unreadable(&db, channel));
         }
         // Before anything is read, so a caller asking an exchange that cannot
@@ -1907,7 +1907,7 @@ impl Channels {
         // roster, and serving one it could not derive would be the origin's
         // summary wearing this exchange's name.
         Channels::derivable(&db, channel)?;
-        if role_of(&db, channel, caller).is_none() && !is_admin(&db, channel, caller) {
+        if !Self::readable_by(&db, channel, caller) && !is_admin(&db, channel, caller) {
             return Err(Self::unreadable(&db, channel));
         }
         let (first, last) = window(&db, channel);
@@ -2854,9 +2854,19 @@ impl Channels {
         if n == 0 {
             return Err(ChannelError::NoSuchChannel);
         }
+        // A public channel's roster is whoever joined, every join a signed
+        // entry in the log: there is nothing a constitution would add that
+        // a reader needs, and an exchange's welcome channel never had one.
+        // SIP-35's refusal is for a private channel served on an unsigned
+        // roster, and that rule stands.
         db.execute(
-            "UPDATE replicated SET shaped = 1 WHERE channel = ?1",
-            params![&channel[..]],
+            "UPDATE replicated SET shaped = 1,
+                                   derivable = CASE WHEN ?2 = 1 THEN 1 ELSE derivable END
+             WHERE channel = ?1",
+            params![
+                &channel[..],
+                (shape.visibility == Visibility::Public) as i64
+            ],
         )
         .map_err(storage("mark shaped"))?;
         Ok(())
@@ -3245,7 +3255,15 @@ impl Channels {
             params![&channel[..]],
         )
         .map_err(storage("clear roster"))?;
-        let mut derivable = false;
+        let public: bool = tx
+            .query_row(
+                "SELECT visibility FROM channel WHERE id = ?1",
+                params![&channel[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage("read visibility"))?
+            == Visibility::Public as i64;
+        let mut derivable = public;
         for (body, posted) in events {
             if let Ok(Some(sys)) = System::decode(&body) {
                 derive_membership(&tx, channel, &sys, posted as u64)?;
@@ -4040,6 +4058,29 @@ impl Channels {
     /// Applied at **every** route that refuses a non-member, not only at
     /// `fetch`: an oracle closed on one route and left open on another is not
     /// closed, and `/channel/key/get` would have answered the same question.
+    /// Whether `caller` may read `channel` here: a member, or -- at a
+    /// replica -- anyone identified, for a public channel. SIP-16 makes a
+    /// public channel one anybody may join and stores it in the clear; a
+    /// replica cannot see everyone the origin seated (a welcome leaves no
+    /// signed trace, by SIP-31's own rule), and the origin's roster is the
+    /// origin's. A private channel is read against the derived roster only.
+    fn readable_by(db: &Connection, channel: &[u8; 32], caller: &PubKey) -> bool {
+        if role_of(db, channel, caller).is_some() {
+            return true;
+        }
+        matches!(visibility_of(db, channel), Ok(Visibility::Public))
+            && db
+                .query_row(
+                    "SELECT shaped FROM replicated WHERE channel = ?1",
+                    params![&channel[..]],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some_and(|shaped| shaped != 0)
+    }
+
     fn unreadable(db: &Connection, channel: &[u8; 32]) -> ChannelError {
         match visibility_of(db, channel) {
             Ok(Visibility::Public) => ChannelError::NotAMember,
@@ -4680,7 +4721,7 @@ impl Channels {
     pub fn cursors(&self, caller: &PubKey, channel: &[u8; 32]) -> Result<Marks, ChannelError> {
         let db = self.db.lock().unwrap();
         visibility_of(&db, channel)?;
-        if role_of(&db, channel, caller).is_none() {
+        if !Self::readable_by(&db, channel, caller) {
             return Err(Self::unreadable(&db, channel));
         }
         let mine: bool = db
