@@ -155,6 +155,17 @@ enum DeviceCmd {
     /// Runs on its own at startup; this is the same thing, said out loud, for
     /// when you want to know whether it worked.
     Reseal,
+    /// Trade history with your other devices (SIP-42).
+    ///
+    /// Waits for each of them to run the same, through a session the
+    /// exchange relays and cannot read; each side keeps what the other
+    /// holds that it lacks -- the signed entries, the keys that open them,
+    /// and the files they name -- checked exactly as a fetch is.
+    Sync {
+        /// How long to wait for a sibling to turn up, in seconds.
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
 }
 
 #[tokio::main]
@@ -404,6 +415,93 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                 .map_err(|e| e.to_string())?;
             println!("revoked {device}");
             println!("it keeps every key it already holds — rotate what matters");
+            Ok(())
+        }
+        DeviceCmd::Sync { wait } => {
+            use sqex_chat::sync::{Phase, Sync};
+            let me = chat.device();
+            let siblings: Vec<PubKey> = chat
+                .my_devices()
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|d| d.device)
+                .filter(|d| *d != me)
+                .collect();
+            if siblings.is_empty() {
+                println!("no other device is linked to this account");
+                return Ok(());
+            }
+            // One open toward each, all outstanding at once; the first to
+            // answer is synced with, then the next.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(*wait);
+            let mut pending: Vec<(PubKey, x25519_dalek::StaticSecret)> = siblings
+                .iter()
+                .map(|s| {
+                    (
+                        *s,
+                        x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng),
+                    )
+                })
+                .collect();
+            println!(
+                "waiting for {} other device(s) to run `device sync`…",
+                pending.len()
+            );
+            let mut synced = 0;
+            while !pending.is_empty() && std::time::Instant::now() < deadline {
+                let mut met = None;
+                for (i, (sibling, eph)) in pending.iter().enumerate() {
+                    if let Some(live) = chat
+                        .meet_sibling(eph, sibling)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        met = Some((i, live));
+                        break;
+                    }
+                }
+                let Some((i, (mut link, session))) = met else {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                };
+                let (sibling, _) = pending.remove(i);
+                println!("{sibling}  met");
+                let mut sync = Sync::new(session, sibling);
+                loop {
+                    match sync.step(chat, &mut link).await {
+                        Ok(true) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                        Ok(false) => break,
+                        Err(e) => {
+                            println!("{sibling}  {e}");
+                            break;
+                        }
+                    }
+                }
+                link.close().await;
+                let p = &sync.progress;
+                match sync.phase() {
+                    Phase::Finished => {
+                        synced += 1;
+                        println!(
+                            "{sibling}  took {} message(s), {} key(s), {} file(s) in {} channel(s); gave {}",
+                            p.entries_in,
+                            p.keys_in,
+                            p.blobs_in,
+                            p.channels_in.len(),
+                            p.entries_out
+                        );
+                    }
+                    _ => println!(
+                        "{sibling}  ended: {}",
+                        sync.why.as_deref().unwrap_or("no reason given")
+                    ),
+                }
+            }
+            for (sibling, _) in &pending {
+                println!("{sibling}  did not turn up");
+            }
+            println!("synced with {synced} device(s)");
             Ok(())
         }
     }

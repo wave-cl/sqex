@@ -28,6 +28,7 @@ pub mod attach;
 pub mod client;
 pub mod events;
 pub mod store;
+pub mod sync;
 
 pub use attach::{Prepared, describe, file_name, kind_of};
 pub use client::{Chat, ChatError, Conversation, Fetched, Link, Watch};

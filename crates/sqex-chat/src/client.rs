@@ -2152,7 +2152,150 @@ impl Chat {
             .encode(),
         )
         .await?;
+        // Kept, and acted on: the credential is what this device shows a
+        // sibling (SIP-42), and the account is what it is from now on.
+        self.store.set_credential(&credential.encode())?;
+        self.store.set_account(&credential.account)?;
+        self.me = credential.account;
         Ok(())
+    }
+
+    /// This device's own credential, if it has one: what it presents to a
+    /// sibling (SIP-42). A device that is its own account has none.
+    pub fn credential(&self) -> Option<Credential> {
+        self.store
+            .credential()
+            .ok()
+            .flatten()
+            .and_then(|b| Credential::decode(&b).ok())
+    }
+
+    /// The exchange's key, which every receipt here is under.
+    pub fn exchange_key(&self) -> PubKey {
+        self.exchange
+    }
+
+    /// One try at meeting one of this account's other devices (SIP-42):
+    /// a SIP-12 `open` toward `sibling` on this connection, offering
+    /// `ephemeral`. `None` while they have not opened toward us, or while
+    /// the exchange is out of reach; `Some` is the live session and the
+    /// link it runs on.
+    pub async fn meet_sibling(
+        &self,
+        ephemeral: &x25519_dalek::StaticSecret,
+        sibling: &PubKey,
+    ) -> Result<Option<(crate::sync::Relayed, sqex_proto::session::Session)>> {
+        let Some(client) = self.connection() else {
+            return Ok(None);
+        };
+        crate::sync::Relayed::meet(client, &self.seed, ephemeral, sibling).await
+    }
+
+    /// Whether the exchange lists `device` for this account today (SIP-42's
+    /// door checks the current list, not a remembered one), and the
+    /// exchange's clock, to judge a credential by. An account with no
+    /// linked device is its own device.
+    pub async fn sibling_listed(&mut self, device: &PubKey) -> Result<(bool, u64)> {
+        let body = self
+            .post("/device/list", ListDevices { account: self.me }.encode())
+            .await?;
+        let listed = Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let found = if listed.devices.is_empty() {
+            *device == self.me
+        } else {
+            listed
+                .devices
+                .iter()
+                .any(|d| d.device == *device && d.not_after >= listed.now)
+        };
+        Ok((found, listed.now))
+    }
+
+    /// What a sibling could be handed (SIP-42): every channel with signed
+    /// entries held, its instance, the range, and how many epoch keys.
+    pub fn held_for_siblings(&self) -> Result<Vec<crate::sync::Held>> {
+        let mut out = Vec::new();
+        for (channel, first, last) in self.store.entry_ranges()? {
+            let instance = self.store.incarnation(&channel)?.unwrap_or([0; 32]);
+            let epochs = self.store.keys_of(&channel)?.len() as u16;
+            out.push(crate::sync::Held {
+                channel,
+                instance,
+                first,
+                last,
+                epochs,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Take entries a sibling handed over (SIP-42): verified exactly as a
+    /// fetch is, folded into `timeline`, and kept -- signed, so they can be
+    /// handed on. Nothing here moves the fetch cursor. Returns how many
+    /// were new.
+    pub async fn import(
+        &mut self,
+        timeline: &mut Timeline,
+        channel: &[u8; 32],
+        instance: [u8; 32],
+        entries: &[Entry],
+    ) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        // Another incarnation of the channel is another conversation
+        // (SIP-16): merged, the numbers would collide. Not this device's to
+        // reset on a sibling's word; a fetch finds out and resets.
+        if let Some(known) = self.store.incarnation(channel)?
+            && known != instance
+        {
+            return Err(ChatError::Protocol(
+                "the sibling holds another incarnation of this channel".into(),
+            ));
+        }
+        let info = self.info(channel).await?;
+        if info.instance != instance {
+            return Err(ChatError::Protocol(
+                "the sibling's entries are from an incarnation the exchange does not serve".into(),
+            ));
+        }
+        let admins: Vec<PubKey> = info
+            .members
+            .iter()
+            .filter(|m| m.role == Role::Admin)
+            .map(|m| m.account)
+            .collect();
+        let bound = self.bindings(&members_of(&info)).await.unwrap_or_default();
+        let held = self.store.highest_entry(channel)?;
+        // Only what is new -- the rest was verified when it arrived -- and
+        // only what the exchange signed for. A fetch stores an unreceipted
+        // entry, because the exchange served it and may not do receipts;
+        // here the sibling served it, and its word about where the exchange
+        // put an entry counts for nothing. The signature is checked in the
+        // fold, as on a fetch.
+        let fresh: Vec<Entry> = entries
+            .iter()
+            .filter(|e| e.seq > held || !self.has_entry(channel, e.seq))
+            .filter(|e| {
+                matches!(
+                    Self::standing_for(self.exchange, channel, instance, e, None),
+                    Standing::Vouched | Standing::Unlinked
+                )
+            })
+            .cloned()
+            .collect();
+        let before = self.store.entry_count(channel)?;
+        self.fold_entries(timeline, channel, &info, &admins, &bound, &fresh, 0, true)?;
+        // What was kept, not what was offered: an entry that failed its
+        // checks was refused in there, silently to the sibling.
+        Ok((self.store.entry_count(channel)? - before) as usize)
+    }
+
+    fn has_entry(&self, channel: &[u8; 32], seq: u64) -> bool {
+        self.store
+            .entries_after(channel, seq.saturating_sub(1), 1)
+            .ok()
+            .is_some_and(|v| v.first().is_some_and(|(s, _)| *s == seq))
     }
 
     /// Hand the epoch in force to our own other devices.
@@ -3683,6 +3826,204 @@ impl Chat {
         })
     }
 
+    /// Open, verify, keep and fold a run of entries for `channel`: the loop
+    /// [`absorb`](Self::absorb) runs over a fetch, and the one
+    /// [`import`](Self::import) runs over what a sibling handed over
+    /// (SIP-42). Returns the highest `seq` seen. With `keep_signed`, each
+    /// receipted entry is kept as served, signatures and all, so a sibling
+    /// can be handed it in turn.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_entries(
+        &mut self,
+        timeline: &mut Timeline,
+        channel: &[u8; 32],
+        info: &ChannelInfo,
+        admins: &[PubKey],
+        bound: &HashMap<PubKey, Option<PubKey>>,
+        entries: &[Entry],
+        since: u64,
+        keep_signed: bool,
+    ) -> Result<u64> {
+        // The incarnation these entries were checked against, noted once so
+        // a device that only ever reads a channel still knows which one it
+        // holds -- SIP-42 hands history over by it. A change is not this
+        // function's to act on: `chain_at` resets on the exchange's word,
+        // before anything is signed into the new one.
+        if info.instance != [0u8; 32] && self.store.incarnation(channel)?.is_none() {
+            self.store.set_incarnation(channel, &info.instance, false)?;
+        }
+        let mut replay = self.store.replay_for(channel)?;
+        // SIP-31 chain state per device, over this run of entries. Continuity
+        // is claimed from the first entry seen from each device rather than
+        // backwards, because starting to read in the middle of a channel is
+        // ordinary and is not a gap anybody caused.
+        let mut seen_chains: HashMap<PubKey, (u64, [u8; 32])> = HashMap::new();
+        // SIP-34's linkage runs over the channel rather than over one device,
+        // so it is a single running value rather than a map: the head of the
+        // entry we checked last, if it was the one immediately before.
+        let mut last_head: Option<(u64, [u8; 32])> = None;
+        let mut last = since;
+        for e in entries {
+            last = last.max(e.seq);
+            if e.kind == KIND_MEMBER {
+                // SIP-17: a counter we have already seen under this key is
+                // either the exchange replaying or somebody else doing it, and
+                // it must not be decrypted.
+                if !replay.accept(&e.device, e.epoch, e.msg_seq) {
+                    continue;
+                }
+            }
+            let plain = if e.epoch == 0 {
+                // Epoch 0 is unsealed by construction: every entry in a public
+                // channel, and the exchange's own system entries everywhere.
+                Some(e.body.clone())
+            } else {
+                self.store
+                    .key(channel, e.epoch)
+                    .ok()
+                    .flatten()
+                    .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok())
+            };
+            // Kept, not cached. The counter may not be decrypted twice and the
+            // exchange serves an epoch key's envelope once, so a message not
+            // written here is one this client can never read again.
+            // Recorded only once it has actually been opened. SIP-17's rule is
+            // that a counter must not be *decrypted* twice; marking one seen on
+            // an attempt that failed would refuse the entry for good, which is
+            // exactly what happens to a device linked after the fact — it polls
+            // before its key arrives, and every message it could not read then
+            // stays unreadable forever.
+            if plain.is_some() && e.kind == KIND_MEMBER {
+                self.store
+                    .record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
+            }
+            // SIP-16 redaction leaves the entry with no body at all. That is
+            // a deleted message, not one this client could not open, and the
+            // difference has to be read off the entry rather than off `plain`:
+            // a sealed tombstone has nothing to unseal, so opening it fails
+            // exactly as a missing key does.
+            let tombstone = e.body.is_empty();
+            // SIP-31, before anything is stored or shown: an entry nobody
+            // signed for is not a message, and folding it first would put it in
+            // front of a reader while the check was still pending.
+            let verdict = Self::verdict_for(
+                self.exchange,
+                channel,
+                info.instance,
+                e,
+                &mut seen_chains,
+                bound,
+            );
+            // SIP-34, and separately: a receipt says where the exchange put the
+            // entry and nothing about who wrote it. Both are checked; a
+            // verifier doing only one has learned half of what it thinks.
+            let held = last_head
+                .filter(|(seq, _)| seq + 1 == e.seq)
+                .map(|(_, head)| head);
+            let standing = Self::standing_for(self.exchange, channel, info.instance, e, held);
+            if let Some(stamp) = &e.stamp {
+                last_head = Some((e.seq, stamp.head));
+            }
+            if verdict == Verdict::Forged {
+                // Not stored, not folded, and not counted as read. `history`
+                // rebuilds from this store without the signatures — they are
+                // not kept — so anything written here is taken on trust later,
+                // and the only way that stays honest is to write nothing that
+                // failed to verify now.
+                timeline.apply(
+                    &Received {
+                        seq: e.seq,
+                        account: e.account,
+                        posted: e.posted,
+                        kind: e.kind,
+                        tombstone,
+                        body: None,
+                        // Nobody vouched for it, so nothing is decoded from
+                        // it either.
+                        system: None,
+                        verdict,
+                        standing,
+                    },
+                    admins,
+                );
+                continue;
+            }
+            // SIP-42: the entry as served, signature and receipt included,
+            // so a sibling device can be handed history it can verify. Only
+            // a receipted one: without the receipt a copy could not be
+            // checked against the exchange's own word about its position.
+            if keep_signed && e.stamp.is_some() {
+                let mut raw = Vec::with_capacity(e.wire_len());
+                e.write_receipted(&mut raw);
+                self.store.put_entry(channel, e.seq, &raw)?;
+            }
+            self.store.put_message(
+                channel,
+                Kept {
+                    seq: e.seq,
+                    account: e.account,
+                    posted: e.posted,
+                    kind: e.kind,
+                    // Stored as empty rather than absent, so that reopening
+                    // this store still tells the two apart.
+                    plain: if tombstone {
+                        Some(&[][..])
+                    } else {
+                        plain.as_deref()
+                    },
+                },
+            )?;
+            // A tombstone fetched fresh must overwrite a body we already hold.
+            // `put_message` keeps what it has, which is right for a re-fetch
+            // and wrong for this.
+            if tombstone {
+                self.store.redact_message(channel, e.seq)?;
+            }
+            // An entry the exchange wrote itself carries SIP-16's `System`
+            // layout, not a SIP-19 body. Decoded here rather than dropped:
+            // membership and metadata changes are the exchange's own signed
+            // record and a reader should see them in the conversation.
+            let system = (e.kind == KIND_SYSTEM)
+                .then(|| {
+                    plain
+                        .as_deref()
+                        .and_then(|p| System::decode(p).ok().flatten())
+                })
+                .flatten();
+            let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
+            let redacts = match &body {
+                Some(Body::Redact { target }) => Some(*target),
+                _ => None,
+            };
+            timeline.apply(
+                &Received {
+                    seq: e.seq,
+                    account: e.account,
+                    posted: e.posted,
+                    kind: e.kind,
+                    tombstone,
+                    body,
+                    system,
+                    verdict,
+                    standing,
+                },
+                admins,
+            );
+            // The words go from disk as well as from the exchange. Gated on
+            // the fold having *honoured* the redaction rather than on having
+            // seen one: only the message's own account or an admin may delete
+            // it, and asking the timeline reuses that rule instead of keeping
+            // a second copy of it here — a forged redaction must not be able
+            // to make this client destroy somebody else's message.
+            if let Some(target) = redacts
+                && timeline.get(target).is_some_and(|m| m.redacted)
+            {
+                self.store.redact_message(channel, target)?;
+            }
+        }
+        Ok(last)
+    }
+
     /// Make a conversation out of what a fetch brought back.
     ///
     /// The other half of [`poll`](Self::poll), and the only half that needs
@@ -3786,16 +4127,6 @@ impl Chat {
             .map(|m| m.account)
             .collect();
 
-        let mut replay = self.store.replay_for(channel)?;
-        // SIP-31 chain state per device, over this run of entries. Continuity
-        // is claimed from the first entry seen from each device rather than
-        // backwards, because starting to read in the middle of a channel is
-        // ordinary and is not a gap anybody caused.
-        let mut seen_chains: HashMap<PubKey, (u64, [u8; 32])> = HashMap::new();
-        // SIP-34's linkage runs over the channel rather than over one device,
-        // so it is a single running value rather than a map: the head of the
-        // entry we checked last, if it was the one immediately before.
-        let mut last_head: Option<(u64, [u8; 32])> = None;
         // Fetched once for the batch rather than per entry: SIP-31's second
         // step needs a credential for every device that signed one, and the
         // members are who could have.
@@ -3810,156 +4141,16 @@ impl Chat {
                 fresh
             }
         };
-        let mut last = since;
-        for e in &entries.entries {
-            last = last.max(e.seq);
-            if e.kind == KIND_MEMBER {
-                // SIP-17: a counter we have already seen under this key is
-                // either the exchange replaying or somebody else doing it, and
-                // it must not be decrypted.
-                if !replay.accept(&e.device, e.epoch, e.msg_seq) {
-                    continue;
-                }
-            }
-            let plain = if e.epoch == 0 {
-                // Epoch 0 is unsealed by construction: every entry in a public
-                // channel, and the exchange's own system entries everywhere.
-                Some(e.body.clone())
-            } else {
-                self.store
-                    .key(channel, e.epoch)
-                    .ok()
-                    .flatten()
-                    .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok())
-            };
-            // Kept, not cached. The counter may not be decrypted twice and the
-            // exchange serves an epoch key's envelope once, so a message not
-            // written here is one this client can never read again.
-            // Recorded only once it has actually been opened. SIP-17's rule is
-            // that a counter must not be *decrypted* twice; marking one seen on
-            // an attempt that failed would refuse the entry for good, which is
-            // exactly what happens to a device linked after the fact — it polls
-            // before its key arrives, and every message it could not read then
-            // stays unreadable forever.
-            if plain.is_some() && e.kind == KIND_MEMBER {
-                self.store
-                    .record_seen(channel, &e.device, e.epoch, e.msg_seq)?;
-            }
-            // SIP-16 redaction leaves the entry with no body at all. That is
-            // a deleted message, not one this client could not open, and the
-            // difference has to be read off the entry rather than off `plain`:
-            // a sealed tombstone has nothing to unseal, so opening it fails
-            // exactly as a missing key does.
-            let tombstone = e.body.is_empty();
-            // SIP-31, before anything is stored or shown: an entry nobody
-            // signed for is not a message, and folding it first would put it in
-            // front of a reader while the check was still pending.
-            let verdict = Self::verdict_for(
-                self.exchange,
-                channel,
-                info.instance,
-                e,
-                &mut seen_chains,
-                &bound,
-            );
-            // SIP-34, and separately: a receipt says where the exchange put the
-            // entry and nothing about who wrote it. Both are checked; a
-            // verifier doing only one has learned half of what it thinks.
-            let held = last_head
-                .filter(|(seq, _)| seq + 1 == e.seq)
-                .map(|(_, head)| head);
-            let standing = Self::standing_for(self.exchange, channel, info.instance, e, held);
-            if let Some(stamp) = &e.stamp {
-                last_head = Some((e.seq, stamp.head));
-            }
-            if verdict == Verdict::Forged {
-                // Not stored, not folded, and not counted as read. `history`
-                // rebuilds from this store without the signatures — they are
-                // not kept — so anything written here is taken on trust later,
-                // and the only way that stays honest is to write nothing that
-                // failed to verify now.
-                timeline.apply(
-                    &Received {
-                        seq: e.seq,
-                        account: e.account,
-                        posted: e.posted,
-                        kind: e.kind,
-                        tombstone,
-                        body: None,
-                        // Nobody vouched for it, so nothing is decoded from
-                        // it either.
-                        system: None,
-                        verdict,
-                        standing,
-                    },
-                    &admins,
-                );
-                continue;
-            }
-            self.store.put_message(
-                channel,
-                Kept {
-                    seq: e.seq,
-                    account: e.account,
-                    posted: e.posted,
-                    kind: e.kind,
-                    // Stored as empty rather than absent, so that reopening
-                    // this store still tells the two apart.
-                    plain: if tombstone {
-                        Some(&[][..])
-                    } else {
-                        plain.as_deref()
-                    },
-                },
-            )?;
-            // A tombstone fetched fresh must overwrite a body we already hold.
-            // `put_message` keeps what it has, which is right for a re-fetch
-            // and wrong for this.
-            if tombstone {
-                self.store.redact_message(channel, e.seq)?;
-            }
-            // An entry the exchange wrote itself carries SIP-16's `System`
-            // layout, not a SIP-19 body. Decoded here rather than dropped:
-            // membership and metadata changes are the exchange's own signed
-            // record and a reader should see them in the conversation.
-            let system = (e.kind == KIND_SYSTEM)
-                .then(|| {
-                    plain
-                        .as_deref()
-                        .and_then(|p| System::decode(p).ok().flatten())
-                })
-                .flatten();
-            let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
-            let redacts = match &body {
-                Some(Body::Redact { target }) => Some(*target),
-                _ => None,
-            };
-            timeline.apply(
-                &Received {
-                    seq: e.seq,
-                    account: e.account,
-                    posted: e.posted,
-                    kind: e.kind,
-                    tombstone,
-                    body,
-                    system,
-                    verdict,
-                    standing,
-                },
-                &admins,
-            );
-            // The words go from disk as well as from the exchange. Gated on
-            // the fold having *honoured* the redaction rather than on having
-            // seen one: only the message's own account or an admin may delete
-            // it, and asking the timeline reuses that rule instead of keeping
-            // a second copy of it here — a forged redaction must not be able
-            // to make this client destroy somebody else's message.
-            if let Some(target) = redacts
-                && timeline.get(target).is_some_and(|m| m.redacted)
-            {
-                self.store.redact_message(channel, target)?;
-            }
-        }
+        let last = self.fold_entries(
+            timeline,
+            channel,
+            &info,
+            &admins,
+            &bound,
+            &entries.entries,
+            since,
+            receipts,
+        )?;
         if last > since {
             self.store.set_since(channel, last)?;
         }

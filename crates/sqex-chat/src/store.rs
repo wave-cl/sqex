@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS verified (
     account BLOB PRIMARY KEY,
     at      INTEGER NOT NULL
 );
+-- SIP-42: the entries as the exchange served them, signatures and receipts
+-- included, so a sibling device can be handed history it can verify. The
+-- `message` table is what this device read; this is the evidence it read
+-- it from. Kept from the day the client keeps it; nothing earlier is here.
+CREATE TABLE IF NOT EXISTS entry (
+    exchange BLOB    NOT NULL,
+    channel  BLOB    NOT NULL,
+    seq      INTEGER NOT NULL,
+    bytes    BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, seq)
+);
 -- The keys, sealed. Nothing else in this file needs protecting; these are the
 -- conversation.
 CREATE TABLE IF NOT EXISTS channel_key (
@@ -1144,6 +1155,121 @@ impl Store {
         Ok(e.unwrap_or(0) as u32)
     }
 
+    /// Every epoch key held for a channel, ascending by epoch (SIP-42 hands
+    /// them all to a sibling).
+    pub fn keys_of(&self, channel: &[u8; 32]) -> Result<Vec<(u32, ChannelKey)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT epoch, sealed FROM channel_key
+                 WHERE channel = ?1 AND exchange = ?2 ORDER BY epoch",
+            )
+            .map_err(storage("prepare keys"))?;
+        let rows = stmt
+            .query_map(params![&channel[..], self.scope()?], |r| {
+                Ok((r.get::<_, i64>(0)? as u32, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(storage("query keys"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (epoch, sealed) = row.map_err(storage("read keys"))?;
+            out.push((epoch, ChannelKey::new(self.unseal(&sealed)?)));
+        }
+        Ok(out)
+    }
+
+    // ---- signed entries (SIP-42) ----------------------------------------
+
+    /// Keep an entry as the exchange served it. Idempotent: an entry held is
+    /// kept as it was.
+    pub fn put_entry(&self, channel: &[u8; 32], seq: u64, bytes: &[u8]) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO entry (exchange, channel, seq, bytes) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel, seq) DO NOTHING",
+                params![self.scope()?, &channel[..], seq as i64, bytes],
+            )
+            .map_err(storage("keep entry"))?;
+        Ok(())
+    }
+
+    /// The entries held for a channel above `since`, ascending, at most
+    /// `max` of them.
+    pub fn entries_after(
+        &self,
+        channel: &[u8; 32],
+        since: u64,
+        max: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT seq, bytes FROM entry
+                 WHERE exchange = ?1 AND channel = ?2 AND seq > ?3
+                 ORDER BY seq LIMIT ?4",
+            )
+            .map_err(storage("prepare entries"))?;
+        let rows = stmt
+            .query_map(
+                params![self.scope()?, &channel[..], since as i64, max as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(storage("query entries"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read entries"))
+    }
+
+    /// The range of signed entries held per channel: `(channel, first,
+    /// last)` for every channel with any.
+    pub fn entry_ranges(&self) -> Result<Vec<([u8; 32], u64, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT channel, MIN(seq), MAX(seq) FROM entry
+                 WHERE exchange = ?1 GROUP BY channel",
+            )
+            .map_err(storage("prepare entry ranges"))?;
+        let rows = stmt
+            .query_map(params![self.scope()?], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(storage("query entry ranges"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read entry ranges"))
+    }
+
+    /// How many signed entries are held for a channel.
+    pub fn entry_count(&self, channel: &[u8; 32]) -> Result<u64> {
+        let n: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM entry WHERE exchange = ?1 AND channel = ?2",
+                params![self.scope()?, &channel[..]],
+                |r| r.get(0),
+            )
+            .map_err(storage("count entries"))?;
+        Ok(n as u64)
+    }
+
+    /// The highest signed entry held for a channel, or 0.
+    pub fn highest_entry(&self, channel: &[u8; 32]) -> Result<u64> {
+        let e: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT MAX(seq) FROM entry WHERE exchange = ?1 AND channel = ?2",
+                params![self.scope()?, &channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read highest entry"))?
+            .flatten();
+        Ok(e.unwrap_or(0) as u64)
+    }
+
     // ---- the prekey pool ------------------------------------------------
 
     /// Load the pool, or an empty one on first run.
@@ -1601,6 +1727,29 @@ impl Store {
                 params![account.as_bytes()],
             )
             .map_err(storage("set account"))?;
+        Ok(())
+    }
+
+    /// This device's SIP-20 credential from its account, kept so it can be
+    /// presented to a sibling (SIP-42). `None` for a device that is its own
+    /// account.
+    pub fn credential(&self) -> Result<Option<Vec<u8>>> {
+        self.db
+            .query_row("SELECT value FROM meta WHERE key = 'credential'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(storage("read credential"))
+    }
+
+    pub fn set_credential(&self, bytes: &[u8]) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('credential', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = ?1",
+                params![bytes],
+            )
+            .map_err(storage("set credential"))?;
         Ok(())
     }
 

@@ -85,6 +85,7 @@ sqex-chat whoami             # your identity, to give to somebody
 sqex-chat add <their-key>    # somebody you want to write to first
 sqex-chat                    # the conversations
 sqex-chat device link <key>  # authorise another of your own clients
+sqex-chat device sync        # trade history with them, past what the exchange keeps
 ```
 
 Inside: `/public <name>` makes a channel anybody may find, `/find [query]`
