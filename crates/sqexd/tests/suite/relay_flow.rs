@@ -780,6 +780,34 @@ async fn a_peer_added_by_an_administrator_works_without_a_restart() {
         "once peered, the call must reach the far exchange and ring"
     );
 
+    // SIP-46: the directory says so too, to anyone -- the stranger by key
+    // alone (its label is nobody's domain), Y by key and the domain it
+    // was labelled with, and never X itself.
+    let mut anyone = Client::connect(x_addr, &x_server_pub).await.unwrap();
+    let (code, body) = anyone.get("/exchange/peers").await.unwrap();
+    assert_eq!(code, 200, "the directory is open to anyone");
+    let listed = sqex_proto::exchange::Peers::decode(&body).unwrap();
+    let y = listed
+        .peers
+        .iter()
+        .find(|p| p.key == y_pub)
+        .expect("the peer just added is listed");
+    assert_eq!(y.domain, "y.test");
+    let s = listed
+        .peers
+        .iter()
+        .find(|p| p.key == stranger)
+        .expect("a seeded peer is listed");
+    assert_eq!(s.domain, "", "seeded without a domain");
+    assert!(
+        !listed
+            .peers
+            .iter()
+            .any(|p| p.key == PubKey::new(x_server_pub)),
+        "never itself"
+    );
+    assert_eq!(listed.peers.len(), 2);
+
     // And removing the peer closes it again, without a restart either.
     let (code, _) = admin_op(
         &mut admin_client,
@@ -789,6 +817,12 @@ async fn a_peer_added_by_an_administrator_works_without_a_restart() {
     )
     .await;
     assert_eq!(code, 200);
+    let (_, body) = anyone.get("/exchange/peers").await.unwrap();
+    let listed = sqex_proto::exchange::Peers::decode(&body).unwrap();
+    assert!(
+        !listed.peers.iter().any(|p| p.key == y_pub),
+        "a removed peer leaves the directory"
+    );
     // A third, fresh target for the same reason.
     let (_, b3) = identity(175);
     let (_, eph3) = ephemeral();

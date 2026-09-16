@@ -336,6 +336,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         SessionParty,
     ),
     ("GET", "/exchange/ping", Probe, Whitelisted),
+    ("GET", "/exchange/peers", Cli("sqex peers"), Anyone),
 ];
 
 /// Pull the dispatch arms out of `server.rs`.

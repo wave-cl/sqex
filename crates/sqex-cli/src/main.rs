@@ -131,6 +131,10 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AttestCmd,
     },
+    /// The exchanges this one federates with (SIP-46): each by key, and by
+    /// the domain it is reached at where the operator recorded one. A hint:
+    /// reach one by discovering its domain, and refuse it if the key differs.
+    Peers,
     /// The safety words for you and another identity (SIP-41): six words to
     /// compare with them in person or over a call. Nothing is sent unless
     /// you say the words matched.
@@ -474,6 +478,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
+        Cmd::Peers => peers(&cli, &cfg).await,
         Cmd::Meet {
             peer,
             wait,
@@ -2093,6 +2098,35 @@ async fn admin_name(cli: &Cli, cfg: &Config, cmd: &AdminNameCmd) -> Result<(), S
         }
         _ => println!("ok: {}", v["results"]),
     }
+    Ok(())
+}
+
+/// SIP-46: what this exchange federates with.
+async fn peers(cli: &Cli, cfg: &Config) -> Result<(), String> {
+    let (mut client, _server) = connect(cli, cfg).await?;
+    let (code, body) = client.get("/exchange/peers").await?;
+    if code == 404 {
+        return Err("this exchange has no peer directory (before sqex 0.62.0)".into());
+    }
+    if code != 200 {
+        return Err(format!("peers failed ({code}): {}", said(&body)));
+    }
+    let listed = sqex_proto::exchange::Peers::decode(&body).map_err(|e| e.to_string())?;
+    if listed.peers.is_empty() {
+        println!("federates with nobody");
+        return Ok(());
+    }
+    for p in &listed.peers {
+        if p.domain.is_empty() {
+            println!("{}  (no domain recorded)", p.key);
+        } else {
+            println!("{}  {}", p.key, p.domain);
+        }
+    }
+    println!(
+        "A hint, not an introduction: discover a domain (sqex discover) and refuse it if \
+         the key differs."
+    );
     Ok(())
 }
 

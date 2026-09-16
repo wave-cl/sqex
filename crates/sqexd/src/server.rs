@@ -10,7 +10,7 @@ use bytes::Buf;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 use sqex_proto::Op;
-use sqex_proto::exchange::Pong;
+use sqex_proto::exchange::{PeerEntry, Peers, Pong};
 use sqex_proto::refusal::{Code, Refusal};
 use sqnr_core::key::PubKey;
 use sqnr_core::{Error, Result, SignedTransaction};
@@ -433,6 +433,29 @@ impl Server {
 
     pub(crate) fn peers_with(&self, key: &PubKey) -> bool {
         self.state.lock().unwrap().peers_with(key)
+    }
+
+    /// SIP-46: the peer list as a directory. Never this exchange itself,
+    /// and a label only where it is a domain.
+    pub(crate) fn peer_directory(&self) -> Peers {
+        let me = self.public_key;
+        let peers = self
+            .state
+            .lock()
+            .unwrap()
+            .peer_list()
+            .into_iter()
+            .filter(|(k, _)| *k != me)
+            .map(|(key, entry)| PeerEntry {
+                key,
+                domain: entry
+                    .label
+                    .map(|l| l.trim().to_lowercase())
+                    .filter(|l| sqex_proto::exchange::is_domain(l))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        Peers { peers }
     }
 
     /// SIP-40 §Consumers other than pins: the relay-peer entry for `from`,
@@ -2646,6 +2669,14 @@ async fn route(
             }
         },
 
+        // SIP-46: the exchanges this one federates with, for anyone to read.
+        // The runtime peer list and nothing else; a peer's label is its
+        // domain when the label is a DNS name, and empty otherwise -- an
+        // operator's note is not a place to be reached.
+        ("GET", "/exchange/peers") => {
+            let peers = server.peer_directory();
+            (200, "application/octet-stream", peers.encode())
+        }
         // The route the whitelist gated before it gated everything: kept, and
         // its own check with it, as the smallest thing a listed peer can ask.
         ("GET", "/exchange/ping") => {
