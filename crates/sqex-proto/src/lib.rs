@@ -36,6 +36,7 @@ pub mod relay;
 pub mod rendezvous;
 pub mod resolve;
 pub mod room;
+pub mod safety;
 pub mod session;
 pub mod timeline;
 

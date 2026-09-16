@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS contact (
     label   TEXT NOT NULL,
     added   INTEGER NOT NULL
 );
+-- SIP-41: the keys whose safety words this person compared with their
+-- owner, and when. A fact this person established; nothing the exchange
+-- says puts a row here or takes one out.
+CREATE TABLE IF NOT EXISTS verified (
+    account BLOB PRIMARY KEY,
+    at      INTEGER NOT NULL
+);
 -- The keys, sealed. Nothing else in this file needs protecting; these are the
 -- conversation.
 CREATE TABLE IF NOT EXISTS channel_key (
@@ -1045,6 +1052,49 @@ impl Store {
             .map_err(storage("query contacts"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage("read contacts"))
+    }
+
+    // ---- verified (SIP-41) ---------------------------------------------
+
+    /// Mark a key verified: this person compared its safety words with its
+    /// owner. Marking again keeps the first time.
+    pub fn verify(&self, account: &PubKey, now: u64) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO verified (account, at) VALUES (?1, ?2)
+                 ON CONFLICT (account) DO NOTHING",
+                params![account.as_bytes(), now as i64],
+            )
+            .map_err(storage("verify"))?;
+        Ok(())
+    }
+
+    pub fn unverify(&self, account: &PubKey) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM verified WHERE account = ?1",
+                params![account.as_bytes()],
+            )
+            .map_err(storage("unverify"))?;
+        Ok(())
+    }
+
+    /// Every key this person verified, with when.
+    pub fn verified(&self) -> Result<Vec<(PubKey, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT account, at FROM verified ORDER BY at")
+            .map_err(storage("prepare verified"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, i64>(1)? as u64,
+                ))
+            })
+            .map_err(storage("query verified"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read verified"))
     }
 
     // ---- channel keys ---------------------------------------------------
@@ -2469,6 +2519,20 @@ mod tests {
         assert_eq!(got.len(), 2, "re-adding renamed rather than duplicated");
         s.remove_contact(&key(3)).unwrap();
         assert_eq!(s.contacts().unwrap().len(), 1);
+    }
+
+    /// A mark is kept with the time it was first made, is not made twice,
+    /// and is the person's to take back.
+    #[test]
+    fn verified_marks_round_trip_and_keep_their_first_time() {
+        let s = scoped(&seed(1), None);
+        assert!(s.verified().unwrap().is_empty());
+        s.verify(&key(2), 100).unwrap();
+        s.verify(&key(2), 200).unwrap();
+        s.verify(&key(3), 150).unwrap();
+        assert_eq!(s.verified().unwrap(), vec![(key(2), 100), (key(3), 150)]);
+        s.unverify(&key(2)).unwrap();
+        assert_eq!(s.verified().unwrap(), vec![(key(3), 150)]);
     }
 
     #[test]

@@ -58,6 +58,11 @@ pub const CLAIM_REVIEWED: u8 = 0x03;
 /// A signed statement like any other, because a withdrawal that anybody could
 /// make would be a way to silence an issuer.
 pub const CLAIM_REVOKES: u8 = 0x04;
+/// The issuer compared the subject's safety number with them (SIP-41): the
+/// two met, or spoke, and the words matched. The body is empty -- the
+/// number is recomputable by anybody holding both keys. Information for a
+/// reader deciding whom to compare words with; never a verification.
+pub const CLAIM_VERIFIED_IN_PERSON: u8 = 0x05;
 
 /// Bytes a claim body may occupy.
 pub const MAX_CLAIM: usize = 256;
@@ -218,6 +223,9 @@ impl Attestation {
             self.claim,
             CLAIM_OPERATES | CLAIM_KNOWN_AS | CLAIM_REVIEWED | CLAIM_REVOKES
         ) && std::str::from_utf8(&self.body).is_ok()
+            // SIP-41's claim carries nothing: a body would be a claim of
+            // another kind wearing its number.
+            || (self.claim == CLAIM_VERIFIED_IN_PERSON && self.body.is_empty())
     }
 
     pub fn write(&self, out: &mut Vec<u8>) {

@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sqex_proto::Op;
 use sqex_proto::attest::{
-    Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVIEWED, CLAIM_REVOKES, Held,
-    Query as AttestQuery,
+    Attestation, CLAIM_KNOWN_AS, CLAIM_OPERATES, CLAIM_REVIEWED, CLAIM_REVOKES,
+    CLAIM_VERIFIED_IN_PERSON, Held, Query as AttestQuery,
 };
 use sqex_proto::beacon::{Beat, BeatAck, Read, Reply};
 use sqex_proto::direct;
@@ -130,6 +130,18 @@ enum Cmd {
     Attest {
         #[command(subcommand)]
         cmd: AttestCmd,
+    },
+    /// The safety words for you and another identity (SIP-41): six words to
+    /// compare with them in person or over a call. Nothing is sent unless
+    /// you say the words matched.
+    Verify {
+        /// Their identity: base58, or name@domain.
+        peer: String,
+        /// Lodge a SIP-27 statement that you compared the words with them.
+        /// Tells the exchange, and anyone who reads it, that the two of you
+        /// are acquainted.
+        #[arg(long)]
+        attest: bool,
     },
     /// Public key resolution: say where this identity can be reached, or ask
     /// where another one is.
@@ -461,6 +473,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Whoami { add, forget } => whoami(&cli, &cfg, add.as_deref(), forget.as_deref()).await,
         Cmd::Resolve { cmd } => resolution(&cli, &cfg, cmd).await,
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
+        Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Meet {
             peer,
             wait,
@@ -1060,6 +1073,8 @@ fn claim_code(name: &str) -> Result<u8, String> {
         "operates" => Ok(CLAIM_OPERATES),
         "known-as" => Ok(CLAIM_KNOWN_AS),
         "reviewed" => Ok(CLAIM_REVIEWED),
+        // SIP-41's claim is made by `sqex verify --attest`, after the
+        // words were compared; it is not something to say by name.
         // Deliberately not a list with a gap in it: there is no negative claim
         // to name, and SIP-27 settles that in the conservative direction
         // because an unaccountable assertion that somebody misbehaved has no
@@ -1076,6 +1091,7 @@ fn claim_name(code: u8) -> &'static str {
         CLAIM_KNOWN_AS => "known as",
         CLAIM_REVIEWED => "reviewed",
         CLAIM_REVOKES => "withdrew a statement",
+        CLAIM_VERIFIED_IN_PERSON => "compared safety words with",
         _ => "unreadable",
     }
 }
@@ -1840,6 +1856,54 @@ fn load_software_identity(cli: &Cli, cfg: &Config) -> Result<sqnr_core::Software
     } else {
         identity::load(&path, None)
     }
+}
+
+// ---- verify (SIP-41) ----------------------------------------------------
+
+/// The six words for us and `peer`, and the code a camera reads; with
+/// `--attest`, a SIP-27 statement that the words were compared.
+async fn verify(cli: &Cli, cfg: &Config, peer: &str, attest: bool) -> Result<(), String> {
+    let me = own_identity(cli, cfg)?;
+    let them = resolve_target(cli, cfg, peer).await?;
+    if me == them {
+        return Err("the words are for two people".into());
+    }
+    let words = sqex_proto::safety::words_for(&me, &them);
+    println!("you   {me}");
+    println!("them  {them}");
+    println!();
+    println!("    {}", words.join("  "));
+    println!();
+    println!("  code {}", sqex_proto::safety::code(&me, &them));
+    println!(
+        "Read these to each other, or scan the code. They match on both sides or \
+         they do not; nothing here can tell you which."
+    );
+    if !attest {
+        return Ok(());
+    }
+    let signer = load_software_identity(cli, cfg)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let a = Attestation::sign(
+        &signer.seed(),
+        &them,
+        CLAIM_VERIFIED_IN_PERSON,
+        Vec::new(),
+        now,
+        now + 365 * 86_400,
+    );
+    let (addr, server) = endpoint(cli, cfg).await?;
+    let mut client = Client::connect_as(addr, server.as_bytes(), &signer.seed()).await?;
+    let (code_out, body) = client.post("/attest/lodge", a.encode()).await?;
+    if code_out != 200 {
+        return Err(format!("lodge refused ({code_out}): {}", said(&body)));
+    }
+    println!("lodged: you compared safety words with {them}");
+    println!("  digest {}", bs58::encode(a.digest()).into_string());
+    Ok(())
 }
 
 /// This caller's own Ed25519 identity, without needing to decrypt it.
