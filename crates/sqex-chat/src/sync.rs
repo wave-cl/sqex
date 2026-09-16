@@ -555,15 +555,29 @@ impl Sync {
                 // we know or do not know at all. One message, so its arrival
                 // is the whole list.
                 let mut wants = Vec::new();
+                let ranges = chat.store().entry_ranges()?;
                 for h in &theirs {
                     let known = chat.store().incarnation(&h.channel)?;
                     if known.is_some_and(|k| k != h.instance) {
                         continue;
                     }
-                    let mine = chat.store().highest_entry(&h.channel)?;
+                    // From where this side lacks nothing of theirs: its own
+                    // top when its copy starts at or before theirs, and
+                    // from under their first otherwise -- a device that
+                    // fetched only the exchange's newest holds the top of
+                    // the channel and none of what came before it.
+                    let mine = ranges
+                        .iter()
+                        .find(|(c, _, _)| *c == h.channel)
+                        .map(|(_, first, last)| (*first, *last));
+                    let since = match mine {
+                        None => 0,
+                        Some((first, last)) if first <= h.first => last,
+                        Some(_) => h.first.saturating_sub(1),
+                    };
                     let my_epochs = chat.store().keys_of(&h.channel)?.len();
-                    if h.last > mine || usize::from(h.epochs) > my_epochs {
-                        wants.push((h.channel, mine));
+                    if h.last > since || usize::from(h.epochs) > my_epochs {
+                        wants.push((h.channel, since));
                     }
                 }
                 self.queue(&Message::Want(wants))?;

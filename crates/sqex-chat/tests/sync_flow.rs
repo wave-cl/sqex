@@ -200,6 +200,24 @@ async fn a_new_device_gets_the_history_its_sibling_holds() {
     let (_, alice_key) = identity(1);
     let (_, bob_key) = identity(2);
 
+    // The exchange forgets all but its newest entry, and the laptop reads
+    // that one from it: the top of the channel and nothing below. What
+    // follows can only have come from the phone.
+    phone
+        .set_retention(&channel, sqex_proto::channel::MIN_RETENTION, 1)
+        .await
+        .unwrap();
+    let mut t = Timeline::new();
+    let _ = laptop.poll(&channel, &mut t, 0).await;
+    let mut t = Timeline::new();
+    let _ = phone.poll(&channel, &mut t, 0).await;
+    assert_eq!(
+        laptop.store().highest_entry(&channel).unwrap(),
+        phone.store().highest_entry(&channel).unwrap()
+    );
+    assert_eq!(laptop.store().entry_count(&channel).unwrap(), 1);
+    let cursor = laptop.store().cursor(&channel).unwrap();
+
     // Nobody resealed to the laptop: the key comes with the history.
     let (xp, xl) = run_both(&mut phone, &mut laptop).await;
     assert_eq!(xp.phase(), Phase::Finished, "{:?}", xp.why);
@@ -208,10 +226,13 @@ async fn a_new_device_gets_the_history_its_sibling_holds() {
     assert_eq!(xl.progress.messages_in, 3, "{:?}", xl.progress);
     assert!(xl.progress.keys_in >= 1, "{:?}", xl.progress);
     assert_eq!(xp.progress.entries_in, 0, "the phone had nothing to learn");
-    assert_eq!(xp.progress.entries_out, xl.progress.entries_in);
+    // Served from the bottom, since the laptop's copy started above the
+    // phone's: the one entry it already held went over and was not kept
+    // twice.
+    assert_eq!(xp.progress.entries_out, xl.progress.entries_in + 1);
 
     // The laptop holds the signed entries, the key, and can read the
-    // conversation from its own store -- without having fetched a thing.
+    // conversation from its own store -- which the exchange no longer has.
     assert_eq!(
         laptop.store().entry_count(&channel).unwrap(),
         phone.store().entry_count(&channel).unwrap()
@@ -221,7 +242,7 @@ async fn a_new_device_gets_the_history_its_sibling_holds() {
     assert_eq!(said(&history), vec!["one", "two", "three"]);
 
     // And the cursor did not move: the sibling is not the exchange.
-    assert_eq!(laptop.store().cursor(&channel).unwrap().0, 0);
+    assert_eq!(laptop.store().cursor(&channel).unwrap(), cursor);
 
     // A second sync has nothing to carry.
     let (xp, xl) = run_both(&mut phone, &mut laptop).await;
