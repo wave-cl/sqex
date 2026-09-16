@@ -887,6 +887,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
             addr: origin.addr,
             channels: origin.channels.clone(),
             interval: origin.interval,
+            predecessors: origin.predecessors.clone(),
         };
         tracing::info!(
             origin = %origin.origin,

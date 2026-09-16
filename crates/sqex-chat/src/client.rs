@@ -343,6 +343,24 @@ impl From<StoreError> for ChatError {
 
 type Result<T> = std::result::Result<T, ChatError>;
 
+/// SIP-40: the keys `exchange` succeeded, newest first, as far back as the
+/// pin store remembers. Empty for a key that never moved or is not pinned.
+fn predecessors_of(exchange: &PubKey) -> Vec<PubKey> {
+    let Ok(known) = sqex_discovery::Known::load(&sqex_discovery::known::path()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut at = *exchange;
+    while let Some(from) = known.predecessor_of(&at) {
+        if out.contains(&from) || from == *exchange || out.len() > 8 {
+            break;
+        }
+        out.push(from);
+        at = from;
+    }
+    out
+}
+
 /// Everybody a channel key must reach.
 fn members_of(info: &ChannelInfo) -> Vec<PubKey> {
     info.members.iter().map(|m| m.account).collect()
@@ -611,6 +629,10 @@ pub struct Chat {
     /// verifies under, and it is this connection's exchange only for a
     /// channel that lives here.
     homes: HashMap<[u8; 32], Home>,
+    /// SIP-40: the keys each exchange held before its current one, as the
+    /// pin store remembers them, newest first. What was signed under them
+    /// still verifies under them and under nothing else.
+    predecessors: HashMap<PubKey, Vec<PubKey>>,
     /// Which device belongs to which account, per channel, for the same.
     bound_in: HashMap<[u8; 32], (Bindings, std::time::Instant)>,
     /// The domain this exchange was discovered under (SIP-33), for rendering a
@@ -684,10 +706,13 @@ impl Chat {
                 Err(_) => None,
             });
         let me = store.account().ok().flatten().unwrap_or(device);
+        let mut predecessors = HashMap::new();
+        predecessors.insert(exchange, predecessors_of(&exchange));
         Chat {
             client,
             seed,
             exchange,
+            predecessors,
             receipts: AtomicBool::new(true),
             told_about: HashMap::new(),
             homes: HashMap::new(),
@@ -741,6 +766,28 @@ impl Chat {
     /// The key is the one **this client pinned**, never one taken from the
     /// response or from the connection — a receipt checked under a key the
     /// sender chose proves only that the sender is self-consistent.
+    /// [`standing_for`](Self::standing_for) under the first of `keys` whose
+    /// receipt verifies. SIP-40: nothing already signed is re-signed, so an
+    /// entry receipted before a handover verifies under the key the exchange
+    /// held then, and a holder of the moved-from key as history can check
+    /// it. `keys` is the current key first, then its predecessors.
+    fn standing_under(
+        keys: &[PubKey],
+        channel: &[u8; 32],
+        instance: [u8; 32],
+        e: &Entry,
+        held: Option<[u8; 32]>,
+    ) -> Standing {
+        let mut last = Standing::Unclaimed;
+        for key in keys {
+            last = Self::standing_for(*key, channel, instance, e, held);
+            if last != Standing::Repudiated {
+                return last;
+            }
+        }
+        last
+    }
+
     fn standing_for(
         exchange: PubKey,
         channel: &[u8; 32],
@@ -808,7 +855,7 @@ impl Chat {
     /// A system entry carries no signature of its own; its actor's is inside
     /// the body, and the exchange verified it before writing the row.
     fn verdict_for(
-        exchange: PubKey,
+        keys: &[PubKey],
         channel: &[u8; 32],
         instance: [u8; 32],
         e: &Entry,
@@ -818,33 +865,46 @@ impl Chat {
         if e.kind == KIND_SYSTEM {
             return Verdict::Valid;
         }
-        let terms = EntryTerms {
-            place: Place {
-                exchange,
-                instance,
-                channel: *channel,
-            },
-            account: e.account,
-            device: e.device,
-            epoch: e.epoch,
-            msg_seq: e.msg_seq,
-            expires_after: e.expires_after,
-            chain_seq: e.chain_seq,
-            prev: e.prev,
-            body: &e.body,
-        };
-        // A tombstone's body is gone, so the hash it committed to is the only
-        // thing left to check against — which is exactly why the commitment is
-        // to the hash and not the bytes.
-        let signed = if e.body.is_empty() && e.body_hash != Sha256::digest(&[] as &[u8]).as_slice()
-        {
-            verify_entry_hashed(&terms, &e.body_hash, &e.sig)
-        } else {
-            verify_entry(&terms, &e.sig)
-        };
-        if !signed {
-            return Verdict::Forged;
+        // SIP-31 binds the exchange into the signature, and SIP-40 re-signs
+        // nothing: an entry from before a handover names the key the
+        // exchange held then. Checked under the current key first, then
+        // each predecessor the pin store remembers; the one that verifies
+        // is the one the chain link is computed under, so a chain that
+        // crosses the handover still links.
+        let mut terms = None;
+        for key in keys {
+            let candidate = EntryTerms {
+                place: Place {
+                    exchange: *key,
+                    instance,
+                    channel: *channel,
+                },
+                account: e.account,
+                device: e.device,
+                epoch: e.epoch,
+                msg_seq: e.msg_seq,
+                expires_after: e.expires_after,
+                chain_seq: e.chain_seq,
+                prev: e.prev,
+                body: &e.body,
+            };
+            // A tombstone's body is gone, so the hash it committed to is the
+            // only thing left to check against — which is exactly why the
+            // commitment is to the hash and not the bytes.
+            let signed =
+                if e.body.is_empty() && e.body_hash != Sha256::digest(&[] as &[u8]).as_slice() {
+                    verify_entry_hashed(&candidate, &e.body_hash, &e.sig)
+                } else {
+                    verify_entry(&candidate, &e.sig)
+                };
+            if signed {
+                terms = Some(candidate);
+                break;
+            }
         }
+        let Some(terms) = terms else {
+            return Verdict::Forged;
+        };
         // Step two. An account with no registered device *is* its own device
         // (SIP-22), so a self-signed entry needs no credential — that is the
         // ordinary single-client case and not an unattributed one.
@@ -2307,7 +2367,7 @@ impl Chat {
             .filter(|e| e.seq > held || !self.has_entry(channel, e.seq))
             .filter(|e| {
                 matches!(
-                    Self::standing_for(self.exchange_of(channel), channel, instance, e, None),
+                    Self::standing_under(&self.keys_of(channel), channel, instance, e, None),
                     Standing::Vouched | Standing::Unlinked
                 )
             })
@@ -3051,6 +3111,9 @@ impl Chat {
             Err(e) => return Err(e),
         };
         self.store.set_home(channel, &home.origin);
+        self.predecessors
+            .entry(home.origin)
+            .or_insert_with(|| predecessors_of(&home.origin));
         self.homes.insert(*channel, home.clone());
         Ok(home)
     }
@@ -3062,6 +3125,18 @@ impl Chat {
             .get(channel)
             .map(|h| h.origin)
             .unwrap_or(self.exchange)
+    }
+
+    /// The keys a channel's signatures and receipts may verify under: the
+    /// exchange that orders it, then the keys that exchange held before
+    /// (SIP-40).
+    fn keys_of(&self, channel: &[u8; 32]) -> Vec<PubKey> {
+        let current = self.exchange_of(channel);
+        let mut keys = vec![current];
+        if let Some(older) = self.predecessors.get(&current) {
+            keys.extend(older.iter().copied());
+        }
+        keys
     }
 
     /// Whether a channel lives at another exchange than this connection's.
@@ -3932,6 +4007,7 @@ impl Chat {
             self.store.set_incarnation(channel, &info.instance, false)?;
         }
         let mut replay = self.store.replay_for(channel)?;
+        let keys = self.keys_of(channel);
         // SIP-31 chain state per device, over this run of entries. Continuity
         // is claimed from the first entry seen from each device rather than
         // backwards, because starting to read in the middle of a channel is
@@ -3985,22 +4061,15 @@ impl Chat {
             // SIP-31, before anything is stored or shown: an entry nobody
             // signed for is not a message, and folding it first would put it in
             // front of a reader while the check was still pending.
-            let verdict = Self::verdict_for(
-                self.exchange_of(channel),
-                channel,
-                info.instance,
-                e,
-                &mut seen_chains,
-                bound,
-            );
+            let verdict =
+                Self::verdict_for(&keys, channel, info.instance, e, &mut seen_chains, bound);
             // SIP-34, and separately: a receipt says where the exchange put the
             // entry and nothing about who wrote it. Both are checked; a
             // verifier doing only one has learned half of what it thinks.
             let held = last_head
                 .filter(|(seq, _)| seq + 1 == e.seq)
                 .map(|(_, head)| head);
-            let standing =
-                Self::standing_for(self.exchange_of(channel), channel, info.instance, e, held);
+            let standing = Self::standing_under(&keys, channel, info.instance, e, held);
             if let Some(stamp) = &e.stamp {
                 last_head = Some((e.seq, stamp.head));
             }
@@ -4532,6 +4601,51 @@ mod tests {
         );
     }
 
+    /// SIP-40: an entry signed and receipted under the key the exchange held
+    /// before a handover verifies under that key as a predecessor, and only
+    /// there -- and the chain link is taken under the key that verified, so
+    /// the next entry, signed under the successor, still links.
+    #[test]
+    fn what_was_signed_under_a_predecessor_still_verifies_under_it() {
+        let (_, old) = dev(9);
+        let (_, new) = dev(10);
+        let e0 = entry_at(0, 0, GENESIS, b"before the handover");
+        let mut chain = HashMap::new();
+        let bound = HashMap::new();
+        assert_eq!(
+            Chat::verdict_for(&[new], &[7u8; 32], [4u8; 32], &e0, &mut chain, &bound),
+            Verdict::Forged,
+            "the successor alone cannot verify what the predecessor signed"
+        );
+        let mut chain = HashMap::new();
+        assert_eq!(
+            Chat::verdict_for(&[new, old], &[7u8; 32], [4u8; 32], &e0, &mut chain, &bound),
+            Verdict::Valid
+        );
+        // The head recorded is the link under the key that verified.
+        assert_eq!(
+            chain[&dev(1).1],
+            (1, link_of(0, GENESIS, b"before the handover"))
+        );
+        // A receipt the old key issued: repudiated under the new key alone,
+        // vouched for once the old key is offered as history.
+        let good = stamped(e0, HEAD_GENESIS);
+        assert_eq!(
+            Chat::standing_under(&[new], &[7u8; 32], [4u8; 32], &good, Some(HEAD_GENESIS)),
+            Standing::Repudiated
+        );
+        assert_eq!(
+            Chat::standing_under(
+                &[new, old],
+                &[7u8; 32],
+                [4u8; 32],
+                &good,
+                Some(HEAD_GENESIS)
+            ),
+            Standing::Vouched
+        );
+    }
+
     /// The chain link an entry produces, so a test can build the next one.
     fn link_of(chain_seq: u64, prev: [u8; 32], body: &[u8]) -> [u8; 32] {
         let (_, device) = dev(1);
@@ -4560,7 +4674,7 @@ mod tests {
         let bound = HashMap::new();
         entries
             .iter()
-            .map(|e| Chat::verdict_for(exchange, &[7u8; 32], [4u8; 32], e, &mut chain, &bound))
+            .map(|e| Chat::verdict_for(&[exchange], &[7u8; 32], [4u8; 32], e, &mut chain, &bound))
             .collect()
     }
 

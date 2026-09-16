@@ -464,6 +464,40 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
     assert!(took.refused.is_empty(), "{took:?}");
     assert_eq!(store.origin_of(&channel), Some(origin));
 
+    // SIP-40: the origin hands its key to a successor and re-signs nothing.
+    // A replica that pins the successor alone refuses every entry from
+    // before -- the constitution with them, leaving nothing to derive a
+    // roster from -- and one told the predecessor takes them all, and
+    // understands the channel as the successor's.
+    let successor = PubKey::new([0xAB; 32]);
+    let forgetful = Channels::open(None, PubKey::new([0xEE; 32]), None).unwrap();
+    let took = take(&forgetful, &successor, &channel, &pulled, &never);
+    assert_eq!(took.stored, 0, "{took:?}");
+    assert!(
+        took.refused
+            .iter()
+            .all(|(_, why)| *why == Refused::Repudiated),
+        "{took:?}"
+    );
+    let remembering = Channels::open(None, PubKey::new([0xEE; 32]), None).unwrap();
+    let took = sqexd::replica::take_under(
+        &remembering,
+        &successor,
+        &[origin],
+        &channel,
+        &pulled,
+        &never,
+    );
+    assert_eq!(took.stored, n, "{took:?}");
+    assert!(took.refused.is_empty(), "{took:?}");
+    assert_eq!(remembering.origin_of(&channel), Some(successor));
+    assert!(
+        remembering
+            .fetch(&alice, &alice, &channel, 0, false)
+            .is_ok(),
+        "the roster was not derived from what verified under the predecessor"
+    );
+
     // A tampered body. SIP-31 step 1 fails and the entry is not written.
     let mut forged = pulled.clone();
     let victim = forged
@@ -771,6 +805,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
         addr: origin_addr,
         channels: vec![channel],
         interval: std::time::Duration::from_secs(1),
+        predecessors: Vec::new(),
     };
 
     let took = pull_once(&mut client, &replica, &spec).await.unwrap();
@@ -897,6 +932,7 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         addr: origin_addr,
         channels: vec![channel],
         interval: std::time::Duration::from_secs(1),
+        predecessors: Vec::new(),
     };
 
     // From the beginning: the constitution arrives, so the roster is derived.
@@ -1194,6 +1230,7 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
         addr: origin_addr,
         channels: vec![channel],
         interval: std::time::Duration::from_secs(1),
+        predecessors: Vec::new(),
     };
     let took = pull_once(&mut client, &replica, &spec).await.unwrap();
     assert!(took.get(&channel).unwrap().stored > 0);
@@ -1347,6 +1384,7 @@ async fn a_peer_acting_for_an_account_pulls_only_that_accounts_channels() {
             addr: origin_addr,
             channels: vec![hers],
             interval: std::time::Duration::from_secs(1),
+            predecessors: Vec::new(),
         },
     )
     .await
@@ -1367,6 +1405,7 @@ async fn a_peer_acting_for_an_account_pulls_only_that_accounts_channels() {
             addr: origin_addr,
             channels: vec![his],
             interval: std::time::Duration::from_secs(1),
+            predecessors: Vec::new(),
         },
     )
     .await

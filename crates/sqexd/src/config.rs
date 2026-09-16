@@ -265,6 +265,10 @@ pub struct FileOrigin {
     /// optional, and empty means "by key alone".
     #[serde(default)]
     pub domain: String,
+    /// SIP-40: base58 keys the origin held before `origin`, newest first,
+    /// for entries receipted and signed before its handover.
+    #[serde(default)]
+    pub predecessors: Vec<String>,
 }
 
 fn default_pull_interval() -> u64 {
@@ -307,6 +311,8 @@ pub struct OriginConfig {
     pub interval: std::time::Duration,
     /// SIP-43: where the origin is reached, lowercased; empty when unknown.
     pub domain: String,
+    /// SIP-40: the origin's earlier keys, newest first.
+    pub predecessors: Vec<PubKey>,
 }
 
 impl FileConfig {
@@ -409,6 +415,15 @@ impl FileConfig {
                     r.interval_secs.max(sqex_proto::peer::PEER_MIN_INTERVAL),
                 ),
                 domain: r.domain.trim().to_lowercase(),
+                predecessors: r
+                    .predecessors
+                    .iter()
+                    .map(|k| {
+                        k.parse::<PubKey>()
+                            .map_err(|e| format!("replicate: bad predecessor {k:?}: {e}"))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Error::Malformed)?,
             });
         }
 

@@ -79,6 +79,10 @@ pub struct Origin {
     pub addr: SocketAddr,
     pub channels: Vec<[u8; 32]>,
     pub interval: std::time::Duration,
+    /// SIP-40: the keys the origin held before `key`, newest first. What it
+    /// signed under them verifies under them; a replica that forgets them
+    /// refuses everything from before the handover.
+    pub predecessors: Vec<PubKey>,
 }
 
 /// Why an entry was refused. Kept apart from the storage errors because these
@@ -124,6 +128,27 @@ pub fn take(
     pulled: &Pulled,
     credentials: &dyn Fn(&PubKey) -> Option<PubKey>,
 ) -> Took {
+    take_under(store, origin, &[], channel, pulled, credentials)
+}
+
+/// [`take`], with the keys the origin held before its current one (SIP-40).
+///
+/// Nothing already signed is re-signed at a handover: an entry from before
+/// it carries a receipt under the key the origin held then, and a signature
+/// whose SIP-31 place names that key. Each is checked under the current key
+/// first and then each predecessor, and the one that verifies is the one
+/// the entry is understood under. A replica that only knew the successor
+/// refused every entry from before the handover -- including the
+/// constitution, which left it unable to derive a roster for a channel that
+/// had merely been around longer than the key.
+pub fn take_under(
+    store: &Channels,
+    origin: &PubKey,
+    predecessors: &[PubKey],
+    channel: &[u8; 32],
+    pulled: &Pulled,
+    credentials: &dyn Fn(&PubKey) -> Option<PubKey>,
+) -> Took {
     let mut took = Took::default();
     // Marked replicated before anything is written, so an entry can never land
     // in a channel this exchange would then treat as its own — and so every
@@ -134,11 +159,14 @@ pub fn take(
     {
         return took;
     }
-    let place = Place {
-        exchange: *origin,
-        instance: pulled.instance,
-        channel: *channel,
-    };
+    let places: Vec<Place> = std::iter::once(origin)
+        .chain(predecessors.iter())
+        .map(|key| Place {
+            exchange: *key,
+            instance: pulled.instance,
+            channel: *channel,
+        })
+        .collect();
     // The head of the entry before the first in this batch, where we hold it.
     // `None` is a gap, which is ordinary; it is not a divergence.
     let mut held: Option<(u64, [u8; 32])> = last_head(store, channel);
@@ -148,17 +176,22 @@ pub fn take(
             took.refused.push((e.seq, Refused::Unclaimed));
             continue;
         };
-        let terms = ReceiptTerms {
-            place,
-            seq: e.seq,
-            posted: e.posted,
-            entry_hash: stamp.entry_hash,
-            head: stamp.head,
-        };
-        if !receipt::verify(&terms, &stamp.receipt) {
+        let Some(place) = places.iter().find(|place| {
+            receipt::verify(
+                &ReceiptTerms {
+                    place: **place,
+                    seq: e.seq,
+                    posted: e.posted,
+                    entry_hash: stamp.entry_hash,
+                    head: stamp.head,
+                },
+                &stamp.receipt,
+            )
+        }) else {
             took.refused.push((e.seq, Refused::Repudiated));
             continue;
-        }
+        };
+        let place = *place;
         // Two receipts that verify under one origin key, naming one position
         // and differing in content. SIP-34 makes this 376 self-contained bytes
         // a stranger can check.
@@ -367,7 +400,14 @@ pub async fn pull_once(
             }
         }
         let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
-        let took = take(store, &origin.key, channel, &pulled, &lookup);
+        let took = take_under(
+            store,
+            &origin.key,
+            &origin.predecessors,
+            channel,
+            &pulled,
+            &lookup,
+        );
 
         // The rest of what a member needs to actually read this channel here.
         // Skipped when the origin has just been caught contradicting itself:
