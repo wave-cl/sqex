@@ -2305,7 +2305,8 @@ impl Chat {
         Ok((self.store.entry_count(channel)? - before) as usize)
     }
 
-    fn has_entry(&self, channel: &[u8; 32], seq: u64) -> bool {
+    /// Whether a signed copy of the entry at `seq` is held.
+    pub fn has_entry(&self, channel: &[u8; 32], seq: u64) -> bool {
         self.store
             .entries_after(channel, seq.saturating_sub(1), 1)
             .ok()

@@ -205,6 +205,7 @@ async fn a_new_device_gets_the_history_its_sibling_holds() {
     assert_eq!(xp.phase(), Phase::Finished, "{:?}", xp.why);
     assert_eq!(xl.phase(), Phase::Finished, "{:?}", xl.why);
     assert!(xl.progress.entries_in >= 3, "{:?}", xl.progress);
+    assert_eq!(xl.progress.messages_in, 3, "{:?}", xl.progress);
     assert!(xl.progress.keys_in >= 1, "{:?}", xl.progress);
     assert_eq!(xp.progress.entries_in, 0, "the phone had nothing to learn");
     assert_eq!(xp.progress.entries_out, xl.progress.entries_in);

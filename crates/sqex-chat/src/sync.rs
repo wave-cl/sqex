@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use sqex_proto::channel::Entry;
+use sqex_proto::channel::{Entry, KIND_MEMBER};
 use sqex_proto::channel_key::ChannelKey;
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
 use sqex_proto::refusal::{Code, Refusal};
@@ -305,7 +305,10 @@ pub enum Phase {
 /// What a sync did, for the person: counted, not narrated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Progress {
+    /// Entries kept, of every kind.
     pub entries_in: usize,
+    /// Of those, the ones somebody wrote: what a person would call messages.
+    pub messages_in: usize,
     pub entries_out: usize,
     pub keys_in: usize,
     pub blobs_in: usize,
@@ -590,8 +593,17 @@ impl Sync {
                 entries,
             } => {
                 let timeline = self.timelines.entry(channel).or_default();
+                let posts: Vec<u64> = entries
+                    .iter()
+                    .filter(|e| e.kind == KIND_MEMBER && !chat.has_entry(&channel, e.seq))
+                    .map(|e| e.seq)
+                    .collect();
                 let n = chat.import(timeline, &channel, instance, &entries).await?;
                 self.progress.entries_in += n;
+                self.progress.messages_in += posts
+                    .iter()
+                    .filter(|seq| chat.has_entry(&channel, **seq))
+                    .count();
                 if n > 0 {
                     self.progress.channels_in.insert(channel);
                 }

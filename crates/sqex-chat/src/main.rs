@@ -484,8 +484,8 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                     Phase::Finished => {
                         synced += 1;
                         println!(
-                            "{sibling}  took {} message(s), {} key(s), {} file(s) in {} channel(s); gave {}",
-                            p.entries_in,
+                            "{sibling}  took {} message(s), {} key(s), {} file(s) in {} channel(s); gave {} entries",
+                            p.messages_in,
                             p.keys_in,
                             p.blobs_in,
                             p.channels_in.len(),
