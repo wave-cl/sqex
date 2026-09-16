@@ -3008,19 +3008,26 @@ impl Channels {
     /// cannot derive membership refuses the channel rather than falling back
     /// on the origin's summary.**
     fn derivable(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
-        let row: Option<(Vec<u8>, i64)> = db
+        // A public channel the origin has described (SIP-43) needs no
+        // constitution: it is served as public, whatever the roster. Read
+        // here rather than only written at the moment the shape arrived, so
+        // a row shaped before this rule existed is served too.
+        let row: Option<(Vec<u8>, i64, i64, i64)> = db
             .query_row(
-                "SELECT origin, derivable FROM replicated WHERE channel = ?1",
+                "SELECT r.origin, r.derivable, r.shaped, c.visibility
+                 FROM replicated r JOIN channel c ON c.id = r.channel
+                 WHERE r.channel = ?1",
                 params![&channel[..]],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(storage("read derivable"))?;
         match row {
             // Not replicated: this exchange wrote the roster itself.
             None => Ok(()),
-            Some((_, 1)) => Ok(()),
-            Some((origin, _)) => Err(ChannelError::Underived(PubKey::new(
+            Some((_, 1, _, _)) => Ok(()),
+            Some((_, _, 1, v)) if v == Visibility::Public as i64 => Ok(()),
+            Some((origin, ..)) => Err(ChannelError::Underived(PubKey::new(
                 origin.try_into().unwrap_or([0; 32]),
             ))),
         }
