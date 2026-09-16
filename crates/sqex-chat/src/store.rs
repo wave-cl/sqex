@@ -376,6 +376,15 @@ pub struct Store {
     /// is not a merge but a collision, and under SIP-17 a reused counter costs
     /// the confidentiality of two messages.
     exchange: Option<PubKey>,
+    /// SIP-43: channels that live at another exchange than this store's, by
+    /// the key of the one that orders them. What a device *signs* for such a
+    /// channel -- its SIP-31 chain position and its SIP-17 message counter --
+    /// is a fact about the origin, not about the connection it was learned
+    /// over, so those rows are filed under the origin's key: the same device
+    /// reaching the channel from two exchanges must find one chain and one
+    /// counter. Learned per session from `/channel/home`; not persisted,
+    /// since nothing is signed before the channel has been looked at.
+    homes: std::cell::RefCell<std::collections::HashMap<[u8; 32], PubKey>>,
 }
 
 /// Grow an older store to carry an exchange on every row that needs one.
@@ -915,6 +924,7 @@ impl Store {
             cipher,
             assets,
             exchange: None,
+            homes: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         store.sweep_assets()?;
         Ok(store)
@@ -981,6 +991,26 @@ impl Store {
             None => Err(StoreError::Storage(
                 "this store has not been told which exchange it is for".into(),
             )),
+        }
+    }
+
+    /// SIP-43: note that `channel` is ordered by `origin`. A channel that
+    /// lives at this store's own exchange needs no note.
+    pub fn set_home(&self, channel: &[u8; 32], origin: &PubKey) {
+        let mut homes = self.homes.borrow_mut();
+        if self.exchange.as_ref() == Some(origin) {
+            homes.remove(channel);
+        } else {
+            homes.insert(*channel, *origin);
+        }
+    }
+
+    /// The key what this device signs for `channel` is filed under: the
+    /// origin's where the channel lives elsewhere, this store's otherwise.
+    fn signing_scope(&self, channel: &[u8; 32]) -> Result<Vec<u8>> {
+        match self.homes.borrow().get(channel) {
+            Some(origin) => Ok(origin.as_bytes().to_vec()),
+            None => self.scope(),
         }
     }
 
@@ -2166,23 +2196,31 @@ impl Store {
     // ---- cursors --------------------------------------------------------
 
     pub fn cursor(&self, channel: &[u8; 32]) -> Result<(u64, u64, u32)> {
-        Ok(self
+        // Two facts in one row, scoped two ways: `since` is how far *this
+        // connection's* exchange has been read, and the counter is what this
+        // device has signed at the channel's origin (SIP-43). They coincide
+        // for a channel that lives here, and part for one that does not.
+        let since: u64 = self
             .db
             .query_row(
-                "SELECT since, msg_seq, epoch FROM cursor
-                 WHERE channel = ?1 AND exchange = ?2",
+                "SELECT since FROM cursor WHERE channel = ?1 AND exchange = ?2",
                 params![&channel[..], self.scope()?],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)? as u64,
-                        r.get::<_, i64>(1)? as u64,
-                        r.get::<_, i64>(2)? as u32,
-                    ))
-                },
+                |r| r.get::<_, i64>(0),
             )
             .optional()
             .map_err(storage("read cursor"))?
-            .unwrap_or((0, 0, 0)))
+            .unwrap_or(0) as u64;
+        let (msg_seq, epoch) = self
+            .db
+            .query_row(
+                "SELECT msg_seq, epoch FROM cursor WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.signing_scope(channel)?],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u32)),
+            )
+            .optional()
+            .map_err(storage("read counter"))?
+            .unwrap_or((0, 0));
+        Ok((since, msg_seq, epoch))
     }
 
     /// Read this channel again from the beginning.
@@ -2217,7 +2255,7 @@ impl Store {
             .db
             .query_row(
                 "SELECT chain_seq, head FROM chain WHERE channel = ?1 AND exchange = ?2",
-                params![&channel[..], self.scope()?],
+                params![&channel[..], self.signing_scope(channel)?],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
@@ -2242,7 +2280,12 @@ impl Store {
                  ON CONFLICT (exchange, channel) DO UPDATE SET
                      chain_seq = MAX(chain_seq, ?2),
                      head      = CASE WHEN ?2 >= chain_seq THEN ?3 ELSE head END",
-                params![&channel[..], chain_seq as i64, &head[..], self.scope()?],
+                params![
+                    &channel[..],
+                    chain_seq as i64,
+                    &head[..],
+                    self.signing_scope(channel)?
+                ],
             )
             .map_err(storage("set chain"))?;
         Ok(())
@@ -2261,7 +2304,12 @@ impl Store {
                  ON CONFLICT (exchange, channel) DO UPDATE SET
                      msg_seq = CASE WHEN ?2 > epoch THEN ?3 ELSE MAX(msg_seq, ?3) END,
                      epoch   = MAX(epoch, ?2)",
-                params![&channel[..], epoch as i64, msg_seq as i64, self.scope()?],
+                params![
+                    &channel[..],
+                    epoch as i64,
+                    msg_seq as i64,
+                    self.signing_scope(channel)?
+                ],
             )
             .map_err(storage("set msg_seq"))?;
         Ok(())

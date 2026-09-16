@@ -13,7 +13,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_proto::channel::{ByAccount, Role, TYPE_REPLICATE, TYPE_UNREPLICATE, Visibility};
+use sqex_proto::channel::{
+    ByAccount, Entries, Fetch, Role, TYPE_REPLICATE, TYPE_UNREPLICATE, Visibility,
+};
 use sqex_proto::entry_sig::Place;
 use sqex_proto::peer::{Hello, Hi, PEER_VERSION, Pull, Pulled};
 use sqex_proto::receipt::{self, ReceiptTerms};
@@ -926,19 +928,35 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
         "the creator must be derived as the first admin"
     );
 
-    // A stranger is refused by the derived roster — and told the channel is
-    // not here at all.
-    //
-    // `NoSuchChannel` rather than `NotAMember`, and the difference is the
-    // replica's own honesty: a pulled channel row is written
-    // `Visibility::Private` unconditionally, because the signed `created`
-    // system entry carries no visibility and a replica cannot know. Not
-    // knowing, it conceals; saying "this exists and you are not in it" would
-    // assert something it cannot check. An origin still answers `NotAMember`
-    // for a channel it knows to be public.
+    // A stranger is refused by the derived roster, and told what an origin
+    // would tell them: the room is public and they are not in it. The
+    // constitution's digest covers visibility without disclosing it, so a
+    // replica used to write every pulled channel as private and answer
+    // `NoSuchChannel`; SIP-43 has the origin state the shape.
     let (_, stranger) = identity(143);
     assert!(matches!(
         whole.fetch(&stranger, &stranger, &channel, 0, false),
+        Err(ChannelError::NotAMember)
+    ));
+    // A replica that has not been told the shape still conceals: a bare
+    // store pulled into by hand, with nobody asking the origin.
+    let unshaped = Channels::open(None, replica_key, Some(replica_sk.to_bytes())).unwrap();
+    let (_, body) = client
+        .post(
+            "/peer/pull",
+            sqex_proto::peer::Pull {
+                channel,
+                since: 0,
+                max: 64,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    let pulled = Pulled::decode(&body).unwrap();
+    sqexd::replica::take(&unshaped, &origin, &channel, &pulled, &|_| None);
+    assert!(matches!(
+        unshaped.fetch(&stranger, &stranger, &channel, 0, false),
         Err(ChannelError::NoSuchChannel)
     ));
 
@@ -1362,5 +1380,360 @@ async fn a_peer_acting_for_an_account_pulls_only_that_accounts_channels() {
         store.origin_of(&his),
         None,
         "and must not end up holding it"
+    );
+}
+
+/// A second exchange that serves clients *and* replicates `channel` from the
+/// origin at `origin_addr`, pulling every second.
+/// An origin whose listener the test keeps, so it can be taken away.
+async fn server_in_closable(
+    dir: &Path,
+    peers: &[PubKey],
+) -> (SocketAddr, [u8; 32], std::sync::Arc<squic::ServerListener>) {
+    let list = peers
+        .iter()
+        .map(|p| format!("{:?}", p.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_path = dir.join("host_key");
+    if !key_path.exists() {
+        let (server_sk, _) = squic::generate_keypair();
+        std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    }
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\nreplication_peers = [{list}]\n",
+        key_path.to_string_lossy(),
+        dir.join("sqex.state").to_string_lossy(),
+    );
+    let config_path = dir.join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let bound = sqexd::bind(config, Some(config_path), signing_key)
+        .await
+        .unwrap();
+    let addr = bound.local_addr;
+    let server_pub = bound.public_key.to_bytes();
+    let listener = std::sync::Arc::clone(&bound.listener);
+    tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+    (addr, server_pub, listener)
+}
+
+async fn server_replicating(
+    dir: &Path,
+    origin: PubKey,
+    origin_addr: SocketAddr,
+    channel: [u8; 32],
+    domain: &str,
+) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
+    let key_path = dir.join("host_key");
+    if !key_path.exists() {
+        let (server_sk, _) = squic::generate_keypair();
+        std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    }
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\n\n[[replicate]]\norigin = {:?}\naddr = {:?}\n\
+         channels = [{:?}]\ninterval_secs = 1\ndomain = {:?}\n",
+        key_path.to_string_lossy(),
+        dir.join("sqex.state").to_string_lossy(),
+        origin.to_string(),
+        origin_addr.to_string(),
+        bs58::encode(channel).into_string(),
+        domain,
+    );
+    let config_path = dir.join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let bound = sqexd::bind(config, Some(config_path), signing_key)
+        .await
+        .unwrap();
+    let addr = bound.local_addr;
+    let server_pub = bound.public_key.to_bytes();
+    let handle = tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+    (addr, server_pub, handle)
+}
+
+/// Read a channel above `since` as a member, with receipts.
+async fn fetch_above(c: &mut Client, channel: [u8; 32], since: u64) -> Entries {
+    let (code, body) = c
+        .post(
+            "/channel/fetch",
+            Fetch {
+                channel,
+                since,
+                wait_secs: 0,
+                receipts: true,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "fetch refused: {}", common::said(&body));
+    Entries::decode(&body, true).unwrap()
+}
+
+/// **SIP-43: a member posts where they are, and the origin orders it.**
+///
+/// Alice's channel lives at the origin; a second exchange replicates it and
+/// serves it. Alice connects to the second exchange, asks where the channel
+/// lives, signs under the origin, and posts *there*. The replica stores
+/// nothing and assigns nothing: the origin's answer -- with the origin's
+/// `seq` and receipt -- comes back through it, the origin holds the entry,
+/// and the replica pulls it back within the second. Then the controls: a
+/// post signed under the replica's own key is refused by the origin as
+/// forged, a stranger is refused as a stranger, and with the origin gone
+/// the member is told `origin_away` and nothing is invented.
+#[tokio::test]
+async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
+    use sqex_proto::channel::{ByChannel, Home, Posted, TYPE_HOME};
+    use sqex_proto::refusal::{Code, Refusal};
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(
+        replica_dir.path().join("host_key"),
+        hex::encode(replica_sk.to_bytes()),
+    )
+    .unwrap();
+    let replica_key = PubKey::new(replica_pub);
+
+    let (origin_addr, origin_pub, origin_listener) =
+        server_in_closable(origin_dir.path(), &[replica_key]).await;
+    let origin = PubKey::new(origin_pub);
+    let (alice_seed, alice) = identity(151);
+    let channel = [151u8; 32];
+
+    // The channel, at the origin, authorised to the replica.
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
+    let s = Signer::new(alice_seed, alice, origin_pub);
+    let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
+    say(&mut a, &s, &mut chain, channel, b"from the origin").await;
+    let info = s.info(&mut a, channel).await;
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &replica_key,
+        &[],
+    );
+    let (code, body) = a
+        .post(
+            "/channel/replicate",
+            ByAccount {
+                channel,
+                account: replica_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // The replica comes up and catches up.
+    let (replica_addr, replica_pub2, _rh) = server_replicating(
+        replica_dir.path(),
+        origin,
+        origin_addr,
+        channel,
+        "origin.example",
+    )
+    .await;
+    assert_eq!(replica_pub2, replica_pub);
+    let mut at_replica = Client::connect_as(replica_addr, &replica_pub, &alice_seed)
+        .await
+        .unwrap();
+    let caught_up = {
+        let mut c = Client::connect_as(replica_addr, &replica_pub, &alice_seed)
+            .await
+            .unwrap();
+        let mut ok = false;
+        for _ in 0..50 {
+            let (code, _) = c
+                .post(
+                    "/channel/info",
+                    ByChannel { channel }.encode(sqex_proto::channel::TYPE_INFO),
+                )
+                .await
+                .unwrap();
+            if code == 200 {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        ok
+    };
+    assert!(caught_up, "the replica never pulled the channel");
+
+    // Where does it live? At the origin, reached by the domain the operator
+    // recorded; and the origin says of itself that it is the origin.
+    let (code, body) = at_replica
+        .post("/channel/home", ByChannel { channel }.encode(TYPE_HOME))
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let home = Home::decode(&body).unwrap();
+    assert_eq!(home.origin, origin);
+    assert_eq!(home.domain, "origin.example");
+    let (code, body) = a
+        .post("/channel/home", ByChannel { channel }.encode(TYPE_HOME))
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let there = Home::decode(&body).unwrap();
+    assert_eq!(there.origin, origin);
+    assert_eq!(there.domain, "");
+
+    // A stranger is not told where anything lives.
+    let stranger_seed = identity(152).0;
+    let mut stranger = Client::connect_as(replica_addr, &replica_pub, &stranger_seed)
+        .await
+        .unwrap();
+    let (code, _) = stranger
+        .post("/channel/home", ByChannel { channel }.encode(TYPE_HOME))
+        .await
+        .unwrap();
+    assert_ne!(code, 200, "a stranger was told where the channel lives");
+
+    // Alice's chain as the origin has it -- authorising spent a position.
+    let info = s.info(&mut a, channel).await;
+    chain = Chain {
+        seq: info.my_chain_seq,
+        head: info.my_chain_head,
+    };
+
+    // The post, at the replica, signed under the origin. The answer is the
+    // origin's: a position after everything the origin holds.
+    let before = s.info(&mut a, channel).await.last;
+    let req = s.post_chained(
+        &mut chain,
+        channel,
+        info.instance,
+        0,
+        0,
+        b"posted at the replica".to_vec(),
+    );
+    let (code, body) = at_replica
+        .post("/channel/post", req.encode())
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        200,
+        "the replica refused the post: {}",
+        common::said(&body)
+    );
+    let posted = Posted::decode(&body, req.receipts).unwrap();
+    assert_eq!(posted.seq, before + 1, "the origin did not order it next");
+
+    // The origin holds it, receipted under its own key.
+    let read = fetch_above(&mut a, channel, before).await;
+    assert!(
+        read.entries
+            .iter()
+            .any(|e| e.body == b"posted at the replica" && e.seq == posted.seq),
+        "the origin does not hold the forwarded post: {:?}",
+        read.entries.iter().map(|e| e.seq).collect::<Vec<_>>()
+    );
+
+    // And the replica pulls it back promptly, so it reads where it was
+    // written.
+    let mut reader = Client::connect_as(replica_addr, &replica_pub, &alice_seed)
+        .await
+        .unwrap();
+    let mut seen = false;
+    for _ in 0..30 {
+        let got = fetch_above(&mut reader, channel, before).await;
+        if got
+            .entries
+            .iter()
+            .any(|e| e.body == b"posted at the replica")
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(seen, "the replica did not pull the post back");
+
+    // Control: signed under the replica's own key, the origin refuses it as
+    // forged -- the replica did not quietly re-sign or store it.
+    let wrong = Signer::new(alice_seed, alice, replica_pub);
+    let mut wrong_chain = Chain {
+        seq: chain.seq,
+        head: chain.head,
+    };
+    let req = wrong.post_chained(
+        &mut wrong_chain,
+        channel,
+        info.instance,
+        0,
+        0,
+        b"signed for the wrong exchange".to_vec(),
+    );
+    let (code, body) = at_replica
+        .post("/channel/post", req.encode())
+        .await
+        .unwrap();
+    assert_ne!(code, 200, "a post signed under the replica was accepted");
+    let r = Refusal::decode(&body).unwrap();
+    assert_eq!(r.code, Code::BadSignature, "{r:?}");
+    let after = s.info(&mut a, channel).await.last;
+    assert_eq!(after, posted.seq, "something was stored anyway");
+
+    // Control: a stranger's post is refused by the origin as a stranger's,
+    // through the replica, exactly as it would be at the origin.
+    let (stranger_seed, stranger_key) = identity(152);
+    let t = Signer::new(stranger_seed, stranger_key, origin_pub);
+    let mut t_chain = Chain::default();
+    let req = t.post_chained(&mut t_chain, channel, info.instance, 0, 0, b"hi".to_vec());
+    let (code, _) = stranger.post("/channel/post", req.encode()).await.unwrap();
+    assert_ne!(code, 200, "a stranger posted through the replica");
+
+    // Control: with the origin gone, the member is told so and nothing is
+    // queued or invented.
+    origin_listener.close(quinn::VarInt::from_u32(0), b"gone");
+    let req = s.post_chained(
+        &mut chain,
+        channel,
+        info.instance,
+        0,
+        0,
+        b"while the origin is away".to_vec(),
+    );
+    let mut said = None;
+    for _ in 0..20 {
+        let (code, body) = at_replica
+            .post("/channel/post", req.encode())
+            .await
+            .unwrap();
+        if code == 503 {
+            said = Some(Refusal::decode(&body).unwrap());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let said = said.expect("the replica never said the origin was away");
+    assert_eq!(said.code, Code::OriginAway);
+    let got = fetch_above(&mut reader, channel, posted.seq).await;
+    assert!(
+        got.entries.is_empty(),
+        "the replica stored a post the origin never ordered"
     );
 }

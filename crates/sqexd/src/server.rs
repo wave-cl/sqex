@@ -43,11 +43,12 @@ use sqex_proto::blob_store::{
 use sqex_proto::channel::{
     Ack as ChannelAck, ByAccount as ChannelByAccount, ByChannel, ByChannelSigned, ByTarget,
     Create as ChannelCreate, Created, Cursor as ChannelCursor, Directory as ChannelDirectory,
-    Fetch as ChannelFetch, Invite as ChannelInvite, Invitee, List as ChannelList,
+    Fetch as ChannelFetch, Home, Invite as ChannelInvite, Invitee, List as ChannelList,
     Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain, SignalOut,
     TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_EQUIVOCATION as CH_EQUIVOCATION,
-    TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE, TYPE_REDACT as CH_REDACT,
-    TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE, TYPE_UNREPLICATE as CH_UNREPLICATE,
+    TYPE_HOME as CH_HOME, TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
+    TYPE_REDACT as CH_REDACT, TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE,
+    TYPE_UNREPLICATE as CH_UNREPLICATE,
 };
 use sqex_proto::channel_key::{Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING};
 use sqex_proto::device::{
@@ -60,7 +61,8 @@ use sqex_proto::mailbox::{
 use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
-    Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull, PullBlob, PullEnvelopes, PullRecord,
+    Forward as PeerForward, Forwarded, Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull,
+    PullBlob, PullEnvelopes, PullRecord, PullShape,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -295,6 +297,8 @@ pub struct Server {
     /// ordinary SIP-3 one and an exchange's identity is that key.
     replicate: Vec<OriginConfig>,
     exchange_seed: [u8; 32],
+    /// SIP-43: the way to each origin for a member's post, by origin key.
+    origins: HashMap<PubKey, Arc<crate::replica::Forwarder>>,
 }
 
 impl Server {
@@ -429,6 +433,21 @@ impl Server {
         peer.acts_for
             .iter()
             .any(|a| self.channels.is_member(channel, a))
+    }
+
+    /// SIP-43: whether a peer may carry `account`'s post into `channel`. A
+    /// full replica may for a channel authorised to it; a peer acting for
+    /// accounts may for one of them.
+    fn may_forward(
+        &self,
+        peer: &crate::config::ReplicationPeer,
+        channel: &[u8; 32],
+        account: &PubKey,
+    ) -> bool {
+        if peer.acts_for.is_empty() {
+            return self.channels.replicates_to(channel, &peer.key);
+        }
+        peer.acts_for.contains(account)
     }
 
     pub(crate) fn peers_with(&self, key: &PubKey) -> bool {
@@ -697,6 +716,20 @@ pub async fn bind_with(
         replication_peers: config.replication_peers.clone(),
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
+        origins: config
+            .replicate
+            .iter()
+            .map(|o| {
+                (
+                    o.origin,
+                    Arc::new(crate::replica::Forwarder::new(
+                        o.origin,
+                        o.addr,
+                        o.domain.clone(),
+                    )),
+                )
+            })
+            .collect(),
         transport: Arc::clone(&listener),
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
@@ -861,10 +894,12 @@ pub async fn serve(bound: Bound) -> Result<()> {
             channels = origin.channels.len(),
             "replicating"
         );
+        let forwarder = Arc::clone(&server.origins[&origin.origin]);
         tokio::spawn(crate::replica::run(
             Arc::clone(&server),
             server.exchange_seed,
             task,
+            forwarder,
         ));
     }
 
@@ -1984,25 +2019,65 @@ async fn route(
         ("POST", "/channel/post") => match (account, ChannelPost::decode(body)) {
             (None, _) => no_identity("posting to a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server.channels.post(
-                &me,
+            (Some(me), Ok(req)) => {
                 // The device is what SIP-17 derives the sealing subkey from and
                 // what counts its own messages, so it is carried separately.
-                &device.unwrap_or(me),
-                &req,
-            ) {
-                Ok(posted) => {
-                    server.tell(
-                        &req.channel,
-                        EventKind::Channel {
-                            channel: req.channel,
-                            last_seq: posted.seq,
-                        },
-                    );
-                    (200, "application/octet-stream", posted.encode())
+                let device = device.unwrap_or(me);
+                // SIP-43: a channel that lives elsewhere is posted to here
+                // and ordered there. Nothing is stored on the way; the
+                // origin's answer is the member's answer.
+                if let Some(origin) = server.channels.origin_of(&req.channel) {
+                    let Some(forwarder) = server.origins.get(&origin) else {
+                        return refuse(421, Code::Replicated, None);
+                    };
+                    return match forwarder
+                        .forward(&server.exchange_seed, &device, &req)
+                        .await
+                    {
+                        Ok(answer) => (answer.status, "application/octet-stream", answer.body),
+                        Err(e) => {
+                            tracing::warn!(origin = %origin, "forward failed: {e}");
+                            refuse(503, Code::OriginAway, None)
+                        }
+                    };
                 }
-                Err(e) => refused(e),
-            },
+                let (status, body) = post_here(server, &me, &device, &req);
+                (status, "application/octet-stream", body)
+            }
+        },
+        // SIP-43: where a channel lives. Answered to anyone who may read it,
+        // which is what `info` decides.
+        ("POST", "/channel/home") => match (account, ByChannel::decode(body, CH_HOME)) {
+            (None, _) => no_identity("asking where a channel lives"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if let Err(e) = server.channels.info(
+                    &me,
+                    &device.unwrap_or(me),
+                    &req.channel,
+                    server.welcome.as_ref(),
+                ) {
+                    return refused(e);
+                }
+                let home = match server.channels.origin_of(&req.channel) {
+                    Some(origin) => Home {
+                        origin,
+                        domain: server
+                            .origins
+                            .get(&origin)
+                            .map(|f| f.domain.clone())
+                            .unwrap_or_default(),
+                    },
+                    // This exchange orders it. No domain: the member is
+                    // connected here already, and the exchange does not
+                    // know its own name -- SIP-33 gives that to clients.
+                    None => Home {
+                        origin: server.public_key,
+                        domain: String::new(),
+                    },
+                };
+                (200, "application/octet-stream", home.encode())
+            }
         },
         ("POST", "/channel/info") => match (account, ByChannel::decode(body, CH_INFO)) {
             (None, _) => no_identity("reading a channel"),
@@ -2426,6 +2501,47 @@ async fn route(
                     // anything still wrong is this exchange's problem.
                     Err(_) => peering_refused(),
                 }
+            }
+            _ => peering_refused(),
+        },
+
+        // SIP-43: a channel's shape, for a peer that may pull it. The
+        // constitution's digest covers visibility, name and topic; the
+        // origin states them so a replica need not guess private.
+        ("POST", "/peer/channel") => match (peer.identity, PullShape::decode(body)) {
+            (Some(who), Ok(req))
+                if server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+            {
+                match server.channels.shape_of(&req.channel) {
+                    Ok(shape) => (200, "application/octet-stream", shape.encode()),
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+
+        // SIP-43: a member's post carried by a replica. The gate is SIP-35's:
+        // a peer on the list, authorised for the channel or acting for the
+        // poster, and one refusal for everything else. The account is this
+        // exchange's own reading of the device; the replica's word is not
+        // asked for.
+        ("POST", "/peer/forward") => match (peer.identity, PeerForward::decode(body)) {
+            (Some(who), Ok(req)) => {
+                let account = server.devices.account_for(&req.device);
+                let allowed = server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_forward(p, &req.post.channel, &account));
+                if !allowed {
+                    return peering_refused();
+                }
+                let (status, body) = post_here(server, &account, &req.device, &req.post);
+                (
+                    200,
+                    "application/octet-stream",
+                    Forwarded { status, body }.encode(),
+                )
             }
             _ => peering_refused(),
         },
@@ -3029,6 +3145,34 @@ fn open_regardless(path: &str) -> bool {
 
 fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
     refuse(e.status(), e.code(), None)
+}
+
+/// Order a post at this exchange and say what became of it: the status and
+/// body `/channel/post` answers a member with. One function, because SIP-43
+/// has the same answer travel back through a replica, and a forwarded post
+/// must get exactly what a direct one would.
+fn post_here(
+    server: &Server,
+    account: &PubKey,
+    device: &PubKey,
+    req: &ChannelPost,
+) -> (u16, Vec<u8>) {
+    match server.channels.post(account, device, req) {
+        Ok(posted) => {
+            server.tell(
+                &req.channel,
+                EventKind::Channel {
+                    channel: req.channel,
+                    last_seq: posted.seq,
+                },
+            );
+            (200, posted.encode())
+        }
+        Err(e) => {
+            let (status, _, body) = refused(e);
+            (status, body)
+        }
+    }
 }
 
 /// A fetch that answers at once when there is something, and otherwise holds

@@ -11,11 +11,11 @@ use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
     EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
     EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
-    EVENT_UNREPLICATE, Entries, Entry, Fetch, Invite, Invitee, KIND_MEMBER, KIND_SYSTEM, List,
-    Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark, Marks, Membership,
-    Mine, Mines, Post, Posted, Retain, Role, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION,
-    TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_UNREPLICATE,
-    Visibility, constitution, direct_message_id,
+    EVENT_UNREPLICATE, Entries, Entry, Fetch, Home, Invite, Invitee, KIND_MEMBER, KIND_SYSTEM,
+    List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark, Marks,
+    Membership, Mine, Mines, Post, Posted, Retain, Role, System, TYPE_CLOSE, TYPE_CURSORS,
+    TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE,
+    TYPE_REPLICATE, TYPE_UNREPLICATE, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
@@ -235,6 +235,9 @@ pub enum ChatError {
     /// them at all. Not an error in the conversation — the channel exists and
     /// they are in it — but nothing can be said until they start their client.
     NotReady(PubKey),
+    /// SIP-43: the conversation lives at another exchange, and this one could
+    /// not reach it to order the post. Nothing was sent; the draft stands.
+    OriginAway,
 }
 
 /// Turn a refused response into the error a caller can act on.
@@ -256,6 +259,7 @@ fn classify(path: &str, code: u16, body: &[u8]) -> ChatError {
             // may rotate: SIP-17 lets a member rekey after revoking one of its
             // own devices, and only the exchange holds the facts to judge it.
             RefusalCode::NotAnAdmin => ChatError::NotAnAdmin,
+            RefusalCode::OriginAway => ChatError::OriginAway,
             _ => ChatError::Refused(code, r),
         },
         // An exchange older than this client, where refusals were JSON and a
@@ -314,6 +318,11 @@ impl std::fmt::Display for ChatError {
                  {} bytes and anybody holding the exchange's key can check it",
                 p.seq,
                 sqex_proto::receipt::EQUIVOCATION_LEN
+            ),
+            ChatError::OriginAway => write!(
+                f,
+                "this conversation lives at another exchange, which cannot be reached right now; \
+                 nothing was sent"
             ),
             ChatError::NotReady(who) => write!(
                 f,
@@ -597,6 +606,11 @@ pub struct Chat {
     /// What the exchange last said about a channel, and when, for polling
     /// only. See [`Chat::poll`]'s use of it and `POLL_TTL`.
     told_about: HashMap<[u8; 32], (ChannelInfo, std::time::Instant)>,
+    /// SIP-43: where each channel lives, asked once. The exchange that orders
+    /// a channel is the one every signature on it names and every receipt
+    /// verifies under, and it is this connection's exchange only for a
+    /// channel that lives here.
+    homes: HashMap<[u8; 32], Home>,
     /// Which device belongs to which account, per channel, for the same.
     bound_in: HashMap<[u8; 32], (Bindings, std::time::Instant)>,
     /// The domain this exchange was discovered under (SIP-33), for rendering a
@@ -676,6 +690,7 @@ impl Chat {
             exchange,
             receipts: AtomicBool::new(true),
             told_about: HashMap::new(),
+            homes: HashMap::new(),
             bound_in: HashMap::new(),
             domain: None,
             followed,
@@ -928,7 +943,7 @@ impl Chat {
     /// Where a signature for `channel` must be made, given what `info` told us.
     fn place(&self, channel: &[u8; 32], info: &ChannelInfo) -> Place {
         Place {
-            exchange: self.exchange,
+            exchange: self.exchange_of(channel),
             instance: info.instance,
             channel: *channel,
         }
@@ -1895,7 +1910,7 @@ impl Chat {
             match self.take_prekey_for(*who).await {
                 Ok(p) => envelopes.push(sign_envelope(
                     &self.seed,
-                    &self.exchange,
+                    &self.exchange_of(channel),
                     &instance,
                     channel,
                     epoch,
@@ -2010,7 +2025,7 @@ impl Chat {
                 ..env.clone()
             };
             if !verify_envelope(
-                &self.exchange,
+                &self.exchange_of(channel),
                 &instance,
                 channel,
                 env.from_epoch,
@@ -2292,7 +2307,7 @@ impl Chat {
             .filter(|e| e.seq > held || !self.has_entry(channel, e.seq))
             .filter(|e| {
                 matches!(
-                    Self::standing_for(self.exchange, channel, instance, e, None),
+                    Self::standing_for(self.exchange_of(channel), channel, instance, e, None),
                     Standing::Vouched | Standing::Unlinked
                 )
             })
@@ -2350,7 +2365,7 @@ impl Chat {
             };
             let envelope = sign_envelope(
                 &self.seed,
-                &self.exchange,
+                &self.exchange_of(channel),
                 &info.instance,
                 channel,
                 info.epoch,
@@ -2574,7 +2589,7 @@ impl Chat {
         let (chain_seq, prev) = self.store.chain(channel)?;
         let terms = ActionTerms {
             place: Place {
-                exchange: self.exchange,
+                exchange: self.exchange_of(channel),
                 instance,
                 channel: *channel,
             },
@@ -2823,7 +2838,7 @@ impl Chat {
             let p = self.take_prekey_for(device).await?;
             envelopes.push(sign_envelope(
                 &self.seed,
-                &self.exchange,
+                &self.exchange_of(channel),
                 &info.instance,
                 channel,
                 info.epoch,
@@ -3004,7 +3019,56 @@ impl Chat {
                 ByChannel { channel: *channel }.encode(TYPE_INFO),
             )
             .await?;
-        ChannelInfo::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+        let info = ChannelInfo::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        // SIP-43: where it lives, learned with the first look and kept. Before
+        // anything is signed or verified for it, since both name the origin.
+        if !self.homes.contains_key(channel) {
+            self.home(channel).await?;
+        }
+        Ok(info)
+    }
+
+    /// SIP-43: where a channel lives -- the exchange that orders it, and the
+    /// domain it is reached by when the operator recorded one. This
+    /// connection's exchange, where it does not answer the question: an
+    /// exchange from before SIP-43 is the origin of everything it serves.
+    pub async fn home(&mut self, channel: &[u8; 32]) -> Result<Home> {
+        if let Some(h) = self.homes.get(channel) {
+            return Ok(h.clone());
+        }
+        let home = match self
+            .post(
+                "/channel/home",
+                ByChannel { channel: *channel }.encode(TYPE_HOME),
+            )
+            .await
+        {
+            Ok(body) => Home::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?,
+            Err(ChatError::NoChatHere(_)) => Home {
+                origin: self.exchange,
+                domain: String::new(),
+            },
+            Err(e) => return Err(e),
+        };
+        self.store.set_home(channel, &home.origin);
+        self.homes.insert(*channel, home.clone());
+        Ok(home)
+    }
+
+    /// The exchange a channel's signatures name and its receipts verify
+    /// under: its origin where that is known, this one otherwise.
+    pub fn exchange_of(&self, channel: &[u8; 32]) -> PubKey {
+        self.homes
+            .get(channel)
+            .map(|h| h.origin)
+            .unwrap_or(self.exchange)
+    }
+
+    /// Whether a channel lives at another exchange than this connection's.
+    pub fn homed_elsewhere(&self, channel: &[u8; 32]) -> Option<&Home> {
+        self.homes
+            .get(channel)
+            .filter(|h| h.origin != self.exchange)
     }
 
     /// Seal a message and post it.
@@ -3922,7 +3986,7 @@ impl Chat {
             // signed for is not a message, and folding it first would put it in
             // front of a reader while the check was still pending.
             let verdict = Self::verdict_for(
-                self.exchange,
+                self.exchange_of(channel),
                 channel,
                 info.instance,
                 e,
@@ -3935,7 +3999,8 @@ impl Chat {
             let held = last_head
                 .filter(|(seq, _)| seq + 1 == e.seq)
                 .map(|(_, head)| head);
-            let standing = Self::standing_for(self.exchange, channel, info.instance, e, held);
+            let standing =
+                Self::standing_for(self.exchange_of(channel), channel, info.instance, e, held);
             if let Some(stamp) = &e.stamp {
                 last_head = Some((e.seq, stamp.head));
             }

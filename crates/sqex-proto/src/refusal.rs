@@ -104,6 +104,9 @@ pub enum Code {
     /// uploading it again, which gives the public copy its own key and leaves
     /// the private one's audience alone.
     WouldPublish,
+    /// SIP-43: the channel lives at another exchange, and that exchange cannot
+    /// be reached to order the post. Nothing was stored; try later.
+    OriginAway,
     /// SIP-35: this exchange holds two receipts for one position from the
     /// channel's origin, and will present neither branch as the conversation.
     Equivocated,
@@ -196,6 +199,7 @@ impl Code {
             Code::Equivocated => 59,
             Code::TooManyEndpoints => 60,
             Code::WouldPublish => 61,
+            Code::OriginAway => 62,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -276,6 +280,7 @@ impl Code {
             59 => Code::Equivocated,
             60 => Code::TooManyEndpoints,
             61 => Code::WouldPublish,
+            62 => Code::OriginAway,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -381,6 +386,7 @@ impl Code {
 
             Code::Storage => "storage",
             Code::WouldPublish => "would_publish",
+            Code::OriginAway => "origin_away",
 
             Code::Unknown(_) => "unknown",
         }
@@ -450,6 +456,7 @@ impl Code {
         Code::RoomFull,
         Code::Storage,
         Code::WouldPublish,
+        Code::OriginAway,
     ];
 }
 

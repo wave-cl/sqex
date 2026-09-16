@@ -281,6 +281,22 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::pull_profiles"),
         ReplicationPeer,
     ),
+    // SIP-43: a replica asking what a channel looks like.
+    (
+        "POST",
+        "/peer/channel",
+        Peer("replica::pull_shape"),
+        ReplicationPeer,
+    ),
+    // SIP-43: a replica carrying a member's post to the origin.
+    (
+        "POST",
+        "/peer/forward",
+        Peer("replica::Forwarder::forward"),
+        ReplicationPeer,
+    ),
+    // SIP-43: where a channel lives, asked once per channel before signing.
+    ("POST", "/channel/home", Chat("Chat::home"), Member),
     // Reached when a fetch is refused with `equivocated`: the client asks for
     // the evidence rather than reporting a bare refusal.
     (
@@ -536,6 +552,7 @@ fn the_authorization_surface_holds_its_shape() {
         "/channel/key/get",
         "/channel/cursors",
         "/channel/equivocation",
+        "/channel/home",
     ] {
         assert_eq!(who(path), &Member, "{path} is a read of a channel");
     }

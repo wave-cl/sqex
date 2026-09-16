@@ -56,6 +56,11 @@ pub const TYPE_PULL: u8 = 0x02;
 pub const TYPE_ENVELOPES: u8 = 0x03;
 pub const TYPE_BLOB: u8 = 0x04;
 pub const TYPE_RECORD: u8 = 0x05;
+/// SIP-43: a member's post, carried from a replica to the origin.
+pub const TYPE_FORWARD: u8 = 0x06;
+/// SIP-43: what the constitution's digest covers and a replica cannot
+/// recover from it -- the channel's visibility, name and topic.
+pub const TYPE_SHAPE: u8 = 0x07;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -603,5 +608,219 @@ impl PullRecord {
         Ok(PullRecord {
             account: PubKey::new(b[1..33].try_into().unwrap()),
         })
+    }
+}
+
+/// SIP-43: a post a member made at a replica, carried to the origin as the
+/// member sent it. `device` is the transport identity it arrived on; the
+/// origin resolves the account from its own registry and takes nothing else
+/// on the replica's word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forward {
+    pub device: PubKey,
+    pub post: crate::channel::Post,
+}
+
+impl Forward {
+    pub fn encode(&self) -> Vec<u8> {
+        let post = self.post.encode();
+        let mut out = Vec::with_capacity(33 + post.len());
+        out.push(TYPE_FORWARD);
+        out.extend_from_slice(self.device.as_bytes());
+        out.extend_from_slice(&post);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Forward> {
+        if b.len() < 33 {
+            return Err(Error::Malformed(format!(
+                "forward is {} bytes, want at least 33",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_FORWARD {
+            return Err(Error::Malformed(format!(
+                "not a forward (type {:#x})",
+                b[0]
+            )));
+        }
+        Ok(Forward {
+            device: PubKey::new(b[1..33].try_into().unwrap()),
+            post: crate::channel::Post::decode(&b[33..])?,
+        })
+    }
+}
+
+/// The origin's answer to a forwarded post: what its own `/channel/post`
+/// would have said to that member, status and body, for the replica to hand
+/// back unaltered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forwarded {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl Forwarded {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.body.len());
+        out.extend_from_slice(&self.status.to_be_bytes());
+        out.extend_from_slice(&self.body);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Forwarded> {
+        if b.len() < 2 {
+            return Err(Error::Malformed("forwarded answer cut short".into()));
+        }
+        Ok(Forwarded {
+            status: u16::from_be_bytes([b[0], b[1]]),
+            body: b[2..].to_vec(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    /// A forward carries the post exactly as the member sent it, and an
+    /// answer carries the origin's status and body exactly as it gave them.
+    #[test]
+    fn a_forward_and_its_answer_round_trip() {
+        let post = crate::channel::Post {
+            channel: [1; 32],
+            epoch: 2,
+            msg_seq: 3,
+            expires_after: 0,
+            chain_seq: 4,
+            prev: [5; 32],
+            sig: [6; 64],
+            receipts: true,
+            body: b"hello".to_vec(),
+        };
+        let f = Forward {
+            device: PubKey::new([7; 32]),
+            post,
+        };
+        assert_eq!(Forward::decode(&f.encode()).unwrap(), f);
+        let mut wrong = f.encode();
+        wrong[0] = TYPE_PULL;
+        assert!(Forward::decode(&wrong).is_err());
+        assert!(Forward::decode(&[TYPE_FORWARD; 10]).is_err());
+
+        let a = Forwarded {
+            status: 421,
+            body: vec![1, 2, 3],
+        };
+        assert_eq!(Forwarded::decode(&a.encode()).unwrap(), a);
+        assert!(Forwarded::decode(&[1]).is_err());
+    }
+}
+
+/// SIP-43: ask the origin for a channel's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullShape {
+    pub channel: [u8; 32],
+}
+
+impl PullShape {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_SHAPE);
+        out.extend_from_slice(&self.channel);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullShape> {
+        if b.len() != 33 {
+            return Err(Error::Malformed(format!(
+                "shape pull is {} bytes, want 33",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_SHAPE {
+            return Err(Error::Malformed(format!(
+                "not a shape pull (type {:#x})",
+                b[0]
+            )));
+        }
+        Ok(PullShape {
+            channel: b[1..33].try_into().unwrap(),
+        })
+    }
+}
+
+/// A channel's shape as its origin holds it: SIP-32's constitution covers
+/// these in a digest a replica cannot invert, so the origin states them. A
+/// private channel's name and topic are empty here as they are there.
+///
+/// `| visibility: u8 | name_len: u8 | name | topic_len: u16 | topic |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    pub visibility: crate::channel::Visibility,
+    pub name: String,
+    pub topic: String,
+}
+
+impl Shape {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.name.len() + self.topic.len());
+        out.push(self.visibility as u8);
+        out.push(self.name.len().min(255) as u8);
+        out.extend_from_slice(&self.name.as_bytes()[..self.name.len().min(255)]);
+        let topic = &self.topic.as_bytes()[..self.topic.len().min(u16::MAX as usize)];
+        out.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        out.extend_from_slice(topic);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Shape> {
+        let short = || Error::Malformed("shape cut short".into());
+        let visibility = crate::channel::Visibility::from_u8(*b.first().ok_or_else(short)?)?;
+        let name_len = *b.get(1).ok_or_else(short)? as usize;
+        let name = b.get(2..2 + name_len).ok_or_else(short)?;
+        let at = 2 + name_len;
+        let topic_len =
+            u16::from_be_bytes(b.get(at..at + 2).ok_or_else(short)?.try_into().unwrap()) as usize;
+        let topic = b.get(at + 2..at + 2 + topic_len).ok_or_else(short)?;
+        if b.len() != at + 2 + topic_len {
+            return Err(Error::Malformed("shape has trailing bytes".into()));
+        }
+        let text = |x: &[u8], what: &str| {
+            std::str::from_utf8(x)
+                .map(|s| s.to_string())
+                .map_err(|_| Error::Malformed(format!("{what} is not UTF-8")))
+        };
+        Ok(Shape {
+            visibility,
+            name: text(name, "name")?,
+            topic: text(topic, "topic")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    #[test]
+    fn a_shape_round_trips_and_a_cut_one_is_refused() {
+        let s = Shape {
+            visibility: crate::channel::Visibility::Public,
+            name: "town square".into(),
+            topic: "everything".into(),
+        };
+        assert_eq!(Shape::decode(&s.encode()).unwrap(), s);
+        let empty = Shape {
+            visibility: crate::channel::Visibility::Private,
+            name: String::new(),
+            topic: String::new(),
+        };
+        assert_eq!(Shape::decode(&empty.encode()).unwrap(), empty);
+        let mut cut = s.encode();
+        cut.pop();
+        assert!(Shape::decode(&cut).is_err());
+        let p = PullShape { channel: [3; 32] };
+        assert_eq!(PullShape::decode(&p.encode()).unwrap(), p);
     }
 }

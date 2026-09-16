@@ -57,8 +57,8 @@ use sqex_proto::credential::SCOPE_CHAT;
 use sqex_proto::device::{Devices, ListDevices};
 use sqex_proto::entry_sig::{EntryTerms, Place, link, verify_entry, verify_entry_hashed};
 use sqex_proto::peer::{
-    BLOB_LIST, Hello, Hi, MAX_PULL, PEER_VERSION, Pull, PullBlob, PullEnvelopes, PullRecord,
-    Pulled, PulledBlob, PulledEnvelopes,
+    BLOB_LIST, Forward, Forwarded, Hello, Hi, MAX_PULL, PEER_VERSION, Pull, PullBlob,
+    PullEnvelopes, PullRecord, Pulled, PulledBlob, PulledEnvelopes,
 };
 use sqex_proto::profile::Got as ProfileGot;
 use sqex_proto::receipt::{self, Branch, Equivocation, ReceiptTerms};
@@ -373,6 +373,7 @@ pub async fn pull_once(
         // Skipped when the origin has just been caught contradicting itself:
         // there is no point accumulating more from a party already refused.
         if !took.equivocated {
+            pull_shape(client, store, channel).await;
             pull_envelopes(client, store, origin, channel, &pulled.instance).await;
             pull_blobs(client, store, channel).await;
             pull_profiles(client, server, store, channel).await;
@@ -380,6 +381,34 @@ pub async fn pull_once(
         all.insert(*channel, took);
     }
     Ok(all)
+}
+
+/// SIP-43: ask the origin once what a channel looks like -- public or
+/// private, and its name and topic -- which the constitution's digest
+/// covers and this replica cannot recover from it. Until answered the row
+/// reads as private and unnamed; an origin from before SIP-43 refuses the
+/// route, and the row stays so.
+async fn pull_shape(client: &mut H3Client, store: &Channels, channel: &[u8; 32]) {
+    if store.shape_known(channel) {
+        return;
+    }
+    let Ok((200, body)) = client
+        .post(
+            "/peer/channel",
+            sqex_proto::peer::PullShape { channel: *channel }.encode(),
+        )
+        .await
+    else {
+        return;
+    };
+    match sqex_proto::peer::Shape::decode(&body) {
+        Ok(shape) => {
+            if let Err(e) = store.take_shape(channel, &shape) {
+                tracing::warn!(error = ?e, "could not record a channel's shape");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "the origin's shape did not decode"),
+    }
 }
 
 /// Pull a channel's SIP-17 key envelopes and keep the ones that verify.
@@ -582,10 +611,99 @@ pub async fn account_for(client: &mut H3Client, device: &PubKey) -> Option<PubKe
 ///
 /// Redials on failure rather than giving up: an origin that is down is an
 /// availability problem, and outliving one is half the reason to replicate.
+/// SIP-43: this replica's way to an origin for a member's post, and the
+/// nudge that makes the pull loop fetch the answer back promptly.
+///
+/// Its own connection rather than the pull loop's, so a post never waits
+/// behind a pull and a pull never behind a post; brought up on first use and
+/// dropped on the first transport error, so the next post redials. One post
+/// at a time per origin -- they are small, and ordering the origin's
+/// answers is the origin's job, not this lock's.
+pub struct Forwarder {
+    pub key: PubKey,
+    pub addr: SocketAddr,
+    /// Where the origin is reached by SIP-33, for `/channel/home`.
+    pub domain: String,
+    client: tokio::sync::Mutex<Option<H3Client>>,
+    /// Rung after a post the origin took, so the entry is pulled now.
+    pub poke: tokio::sync::Notify,
+}
+
+impl Forwarder {
+    pub fn new(key: PubKey, addr: SocketAddr, domain: String) -> Forwarder {
+        Forwarder {
+            key,
+            addr,
+            domain,
+            client: tokio::sync::Mutex::new(None),
+            poke: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Carry a member's post to the origin and bring back its answer: the
+    /// status and body the origin's own `/channel/post` gave. `Err` is the
+    /// origin out of reach, or refusing this replica as a peer -- which to
+    /// the member is the same thing, and is said as `origin_away`.
+    pub async fn forward(
+        &self,
+        seed: &[u8; 32],
+        device: &PubKey,
+        post: &sqex_proto::channel::Post,
+    ) -> std::result::Result<Forwarded, String> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            *slot = Some(
+                H3Client::connect(self.addr, self.key.as_bytes(), seed)
+                    .await
+                    .map_err(|e| format!("dial the origin: {e}"))?,
+            );
+        }
+        let client = slot.as_mut().expect("just filled");
+        let req = Forward {
+            device: *device,
+            post: post.clone(),
+        };
+        let answer = client.post("/peer/forward", req.encode()).await;
+        let (code, body) = match answer {
+            Ok(a) => a,
+            Err(e) => {
+                // The connection is suspect; the next post starts a new one.
+                *slot = None;
+                return Err(format!("the origin did not answer: {e}"));
+            }
+        };
+        if code != 200 {
+            // SIP-35's uniform peering refusal, or an origin from before
+            // SIP-43: either way it cannot be reached for this.
+            return Err(format!("the origin refused the forward ({code})"));
+        }
+        let forwarded = Forwarded::decode(&body).map_err(|e| e.to_string())?;
+        if forwarded.status == 200 {
+            self.poke.notify_one();
+        }
+        Ok(forwarded)
+    }
+}
+
 /// Waits its interval between pulls, floored by SIP-35 at `PEER_MIN_INTERVAL`
 /// — a replica that hammered an origin would be a worse citizen than one that
-/// lagged.
-pub async fn run(server: Arc<crate::server::Server>, seed: [u8; 32], origin: Origin) {
+/// lagged -- or less, when a post this replica forwarded was taken and the
+/// member who wrote it is waiting to read it back.
+pub async fn run(
+    server: Arc<crate::server::Server>,
+    seed: [u8; 32],
+    origin: Origin,
+    forwarder: Arc<Forwarder>,
+) {
+    let pause = |interval: std::time::Duration| {
+        let forwarder = Arc::clone(&forwarder);
+        async move {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = forwarder.poke.notified() => {}
+            }
+        }
+    };
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
@@ -602,11 +720,11 @@ pub async fn run(server: Arc<crate::server::Server>, seed: [u8; 32], origin: Ori
                         }
                         Ok(took) => report(&origin, &took),
                     }
-                    tokio::time::sleep(origin.interval).await;
+                    pause(origin.interval).await;
                 }
             }
         }
-        tokio::time::sleep(origin.interval).await;
+        pause(origin.interval).await;
     }
 }
 

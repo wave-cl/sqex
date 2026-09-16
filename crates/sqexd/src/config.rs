@@ -260,6 +260,11 @@ pub struct FileOrigin {
     /// Seconds between pulls. Clamped up to SIP-35's `PEER_MIN_INTERVAL`.
     #[serde(default = "default_pull_interval")]
     pub interval_secs: u64,
+    /// SIP-43: the domain the origin is reached by (SIP-33), told to a
+    /// member who asks where a channel lives. A hint beside the pinned key;
+    /// optional, and empty means "by key alone".
+    #[serde(default)]
+    pub domain: String,
 }
 
 fn default_pull_interval() -> u64 {
@@ -300,6 +305,8 @@ pub struct OriginConfig {
     pub addr: SocketAddr,
     pub channels: Vec<[u8; 32]>,
     pub interval: std::time::Duration,
+    /// SIP-43: where the origin is reached, lowercased; empty when unknown.
+    pub domain: String,
 }
 
 impl FileConfig {
@@ -401,6 +408,7 @@ impl FileConfig {
                 interval: std::time::Duration::from_secs(
                     r.interval_secs.max(sqex_proto::peer::PEER_MIN_INTERVAL),
                 ),
+                domain: r.domain.trim().to_lowercase(),
             });
         }
 

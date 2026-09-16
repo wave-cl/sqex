@@ -85,6 +85,8 @@ pub const TYPE_REPLICATE: u8 = 0x15;
 pub const TYPE_UNREPLICATE: u8 = 0x16;
 /// SIP-35: ask for the proof that this exchange's origin equivocated.
 pub const TYPE_EQUIVOCATION: u8 = 0x17;
+/// SIP-43: ask where a channel lives -- which exchange orders it.
+pub const TYPE_HOME: u8 = 0x18;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.
@@ -616,6 +618,43 @@ impl ByChannel {
         }
         Ok(ByChannel {
             channel: b[1..33].try_into().unwrap(),
+        })
+    }
+}
+
+/// SIP-43: where a channel lives. `origin` is the key of the exchange that
+/// orders it -- the answering exchange's own where it is the origin -- and
+/// `domain` is where that exchange is reached by SIP-33, as the operator
+/// recorded it, or empty. The domain is a hint; the key is what it must
+/// resolve to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    pub origin: PubKey,
+    pub domain: String,
+}
+
+impl Home {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33 + self.domain.len());
+        out.extend_from_slice(self.origin.as_bytes());
+        out.push(self.domain.len().min(255) as u8);
+        out.extend_from_slice(&self.domain.as_bytes()[..self.domain.len().min(255)]);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Home> {
+        want(b, 33, "home")?;
+        let len = b[32] as usize;
+        if b.len() != 33 + len {
+            return Err(Error::Malformed(format!(
+                "home is {} bytes, want {}",
+                b.len(),
+                33 + len
+            )));
+        }
+        Ok(Home {
+            origin: PubKey::new(b[..32].try_into().unwrap()),
+            domain: utf8(&b[33..], "domain")?.to_string(),
         })
     }
 }

@@ -530,7 +530,13 @@ CREATE TABLE IF NOT EXISTS replicated (
     -- origin's key. It stops accepting entries for the channel and **does not
     -- choose** between the branches: picking one silently converts evidence
     -- into a disagreement between two honest-looking servers.
-    equivocation BLOB
+    equivocation BLOB,
+    -- SIP-43: whether the origin has been asked for the channel's shape --
+    -- visibility, name, topic -- which the constitution's digest covers and
+    -- a replica cannot recover. Until it has, the row says private and
+    -- unnamed, which is the safe reading and the wrong one for a public
+    -- channel.
+    shaped INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS high_water (
     channel BLOB    NOT NULL,
@@ -653,6 +659,8 @@ impl Channels {
         // be shown to be derivable is refused rather than served, which is
         // where SIP-35 wants the failure to land.
         add_column(&db, "replicated", "derivable", "INTEGER NOT NULL DEFAULT 0")?;
+        // SIP-43, the same way. `0` asks the origin once on the next pull.
+        add_column(&db, "replicated", "shaped", "INTEGER NOT NULL DEFAULT 0")?;
         // SIP-31's columns are deliberately *not* added this way, and carry no
         // defaults. A database predating them is wiped rather than migrated,
         // because a default would make an unsigned entry representable — and
@@ -2807,6 +2815,71 @@ impl Channels {
     pub fn is_member(&self, channel: &[u8; 32], account: &PubKey) -> bool {
         let db = self.db.lock().unwrap();
         role_of(&db, channel, account).is_some()
+    }
+
+    /// SIP-43: whether the origin has told this replica the channel's shape.
+    pub fn shape_known(&self, channel: &[u8; 32]) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT shaped FROM replicated WHERE channel = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some_and(|s| s != 0)
+    }
+
+    /// SIP-43: record a channel's shape as its origin stated it. Only for a
+    /// channel replicated here -- an origin's own row is its own business.
+    pub fn take_shape(
+        &self,
+        channel: &[u8; 32],
+        shape: &sqex_proto::peer::Shape,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        let n = db
+            .execute(
+                "UPDATE channel SET visibility = ?2, name = ?3, topic = ?4
+                 WHERE id = ?1 AND id IN (SELECT channel FROM replicated)",
+                params![
+                    &channel[..],
+                    shape.visibility as i64,
+                    &shape.name,
+                    &shape.topic
+                ],
+            )
+            .map_err(storage("take shape"))?;
+        if n == 0 {
+            return Err(ChannelError::NoSuchChannel);
+        }
+        db.execute(
+            "UPDATE replicated SET shaped = 1 WHERE channel = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("mark shaped"))?;
+        Ok(())
+    }
+
+    /// SIP-43: a channel's shape, for a peer that may pull it.
+    pub fn shape_of(&self, channel: &[u8; 32]) -> Result<sqex_proto::peer::Shape, ChannelError> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT visibility, name, topic FROM channel WHERE id = ?1",
+            params![&channel[..]],
+            |r| {
+                Ok(sqex_proto::peer::Shape {
+                    visibility: Visibility::from_u8(r.get::<_, i64>(0)? as u8)
+                        .unwrap_or(Visibility::Private),
+                    name: r.get(1)?,
+                    topic: r.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(storage("read shape"))?
+        .ok_or(ChannelError::NoSuchChannel)
     }
 
     pub fn replicates_to(&self, channel: &[u8; 32], peer: &PubKey) -> bool {
