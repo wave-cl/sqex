@@ -115,12 +115,20 @@ async fn link_device(
     second
 }
 
+/// A session loop is a spawned task, so what it awaits must be `Send`.
+/// `Chat` is not `Sync`, and a future holding `&Chat` across an await is
+/// exactly what sigil's loop cannot hold. Checked here, where the
+/// signature lives, rather than found in the consumer.
+fn assert_send<T: Send>(t: T) -> T {
+    t
+}
+
 /// Both devices open toward each other until the exchange has them met.
 async fn meet(a: &Chat, b: &Chat) -> ((Relayed, Session), (Relayed, Session)) {
     let ea = StaticSecret::random_from_rng(rand_core::OsRng);
     let eb = StaticSecret::random_from_rng(rand_core::OsRng);
     for _ in 0..100 {
-        let ra = a.meet_sibling(&ea, &b.device()).await.unwrap();
+        let ra = assert_send(a.meet_sibling(&ea, &b.device())).await.unwrap();
         let rb = b.meet_sibling(&eb, &a.device()).await.unwrap();
         if let (Some(x), Some(y)) = (ra, rb) {
             return (x, y);
@@ -139,7 +147,7 @@ async fn run_both(a: &mut Chat, b: &mut Chat) -> (Sync, Sync) {
     // As a client would: step while there is something to do, close the
     // session once this side is done, and take the link ending as the end.
     for _ in 0..2000 {
-        if !over(xa.phase()) && !xa.step(a, &mut la).await.unwrap_or(false) {
+        if !over(xa.phase()) && !assert_send(xa.step(a, &mut la)).await.unwrap_or(false) {
             la.close().await;
         }
         if !over(xb.phase()) && !xb.step(b, &mut lb).await.unwrap_or(false) {

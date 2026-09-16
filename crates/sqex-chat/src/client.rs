@@ -2180,15 +2180,29 @@ impl Chat {
     /// `ephemeral`. `None` while they have not opened toward us, or while
     /// the exchange is out of reach; `Some` is the live session and the
     /// link it runs on.
-    pub async fn meet_sibling(
+    ///
+    /// Returns a future that borrows nothing from this client, so a session
+    /// loop that is itself a spawned task can await it: `Chat` holds a
+    /// SQLite connection and is not `Sync`, and an `async fn` on `&self`
+    /// would hold `&Chat` across the await.
+    pub fn meet_sibling(
         &self,
         ephemeral: &x25519_dalek::StaticSecret,
         sibling: &PubKey,
-    ) -> Result<Option<(crate::sync::Relayed, sqex_proto::session::Session)>> {
-        let Some(client) = self.connection() else {
-            return Ok(None);
-        };
-        crate::sync::Relayed::meet(client, &self.seed, ephemeral, sibling).await
+    ) -> impl std::future::Future<
+        Output = Result<Option<(crate::sync::Relayed, sqex_proto::session::Session)>>,
+    > + Send
+    + 'static {
+        let client = self.connection();
+        let seed = self.seed;
+        let ephemeral = ephemeral.clone();
+        let sibling = *sibling;
+        async move {
+            let Some(client) = client else {
+                return Ok(None);
+            };
+            crate::sync::Relayed::meet(client, &seed, &ephemeral, &sibling).await
+        }
     }
 
     /// Whether the exchange lists `device` for this account today (SIP-42's
