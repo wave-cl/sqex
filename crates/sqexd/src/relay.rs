@@ -425,6 +425,23 @@ pub async fn place_call(
         },
     };
 
+    // SIP-59: the account may live elsewhere now. Its exchange is asked
+    // once, as it was asked for the name, and the call is placed at the
+    // home it names where that is a peer too -- one hop, never chased.
+    let (peer_key, peer_addr) = if by_key.is_none()
+        && let Some((home, home_domain)) =
+            home_at(peer_addr, &peer_key, &server.relay.seed, &account).await
+        && home != peer_key
+        && !home_domain.is_empty()
+    {
+        match find_peer(server, &home_domain).await {
+            Ok((found, addr)) if found == home && server.peers_with(&found) => (found, addr),
+            _ => return CallAck::rejected(relay::REASON_UNREACHABLE, now),
+        }
+    } else {
+        (peer_key, peer_addr)
+    };
+
     if ensure_link(server, peer_key, peer_addr).await.is_err() {
         return CallAck::rejected(relay::REASON_UNREACHABLE, now);
     }
@@ -932,6 +949,27 @@ async fn resolve_name_at(
     }
     let resolved = name::Resolved::decode(&body).ok()?;
     resolved.found.then_some(resolved.account)
+}
+
+/// SIP-59: where an exchange says an account lives -- another exchange's
+/// key and domain hint. `None` where it says "here", does not know, or is
+/// from before SIP-59.
+async fn home_at(
+    addr: SocketAddr,
+    key: &PubKey,
+    seed: &[u8; 32],
+    account: &PubKey,
+) -> Option<(PubKey, String)> {
+    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
+    let (status, body) = client
+        .post("/account/home", account.as_bytes().to_vec())
+        .await
+        .ok()?;
+    if status != 200 {
+        return None;
+    }
+    let homed = sqex_proto::home::Homed::decode(&body).ok()?;
+    (homed.home != *key).then_some((homed.home, homed.domain))
 }
 
 fn dial_config(seed: &[u8; 32]) -> SquicConfig {

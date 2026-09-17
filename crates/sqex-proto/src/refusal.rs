@@ -152,6 +152,11 @@ pub enum Code {
     // now saying how many seconds to wait.
     /// Muted in this channel: reads, may not write.
     Muted,
+    /// SIP-59: this account lives at another exchange now; the detail is
+    /// the home's key in base58, then a space and its domain hint. The
+    /// key's services -- mailbox, prekeys, resolution, wake, backup -- are
+    /// handed off there.
+    Moved,
 
     // SIP-5 mailbox.
     RecipientFull,
@@ -228,6 +233,7 @@ impl Code {
             Code::OriginReachable => 66,
             Code::NotAReplica => 67,
             Code::Muted => 68,
+            Code::Moved => 69,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -315,6 +321,7 @@ impl Code {
             66 => Code::OriginReachable,
             67 => Code::NotAReplica,
             68 => Code::Muted,
+            69 => Code::Moved,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -427,6 +434,7 @@ impl Code {
             Code::OriginReachable => "origin_reachable",
             Code::NotAReplica => "not_a_replica",
             Code::Muted => "muted",
+            Code::Moved => "moved",
 
             Code::Unknown(_) => "unknown",
         }
@@ -503,6 +511,7 @@ impl Code {
         Code::OriginReachable,
         Code::NotAReplica,
         Code::Muted,
+        Code::Moved,
     ];
 }
 

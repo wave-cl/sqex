@@ -883,3 +883,76 @@ async fn a_findable_peer_that_is_not_allowlisted_is_still_refused() {
     x_h.abort();
     y_h.abort();
 }
+
+/// SIP-59: Bob moved from Y to Z. Alice, at X, still calls `bob@y.test`;
+/// X asks Y where Bob lives and rings him at Z.
+#[tokio::test]
+async fn a_call_follows_a_callee_who_moved_home() {
+    let dir_x = tempfile::tempdir().unwrap();
+    let dir_y = tempfile::tempdir().unwrap();
+    let dir_z = tempfile::tempdir().unwrap();
+    let (xk, x_pub) = identity(150);
+    let (yk, y_pub) = identity(151);
+    let (zk, z_pub) = identity(152);
+    let (x_key, y_key, z_key) = (
+        SigningKey::from_bytes(&xk),
+        SigningKey::from_bytes(&yk),
+        SigningKey::from_bytes(&zk),
+    );
+    let (y_addr, y_server_pub, y_h) = relay_server(dir_y.path(), &y_key, &[x_pub], &[]).await;
+    let (z_addr, z_server_pub, z_h) = relay_server(dir_z.path(), &z_key, &[x_pub], &[]).await;
+    let (x_addr, x_server_pub, x_h) = relay_server(
+        dir_x.path(),
+        &x_key,
+        &[y_pub, z_pub],
+        &[("y.test", y_pub, y_addr), ("z.test", z_pub, z_addr)],
+    )
+    .await;
+
+    let (a_seed, _) = identity(153);
+    let (b_seed, b_id) = identity(154);
+    let mut alice = Client::connect_as(x_addr, &x_server_pub, &a_seed)
+        .await
+        .unwrap();
+    // Bob tells Y he lives at Z, and listens at Z.
+    let mut bob_at_y = Client::connect_as(y_addr, &y_server_pub, &b_seed)
+        .await
+        .unwrap();
+    let mv = sqex_proto::home::Move::sign(
+        &b_seed,
+        &z_pub,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    let (code, _) = bob_at_y
+        .post(
+            "/account/move",
+            sqex_proto::home::Moving {
+                mv,
+                domain: "z.test".into(),
+                origins: vec![],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let bob_at_z = Client::connect_as(z_addr, &z_server_pub, &b_seed)
+        .await
+        .unwrap();
+    let mut ring = subscribe(&bob_at_z).await;
+
+    let (_, eph) = ephemeral();
+    let target = format!("{b_id}@y.test");
+    let ack = call(&mut alice, &target, eph).await;
+    assert_eq!(ack.state, CallState::Ringing, "reason {}", ack.reason);
+    let (_, caller) = next_crosscall(&mut ring).await;
+    let (_, a_id) = identity(153);
+    assert_eq!(caller, a_id, "the ring at Bob's new home names the caller");
+
+    x_h.abort();
+    y_h.abort();
+    z_h.abort();
+}

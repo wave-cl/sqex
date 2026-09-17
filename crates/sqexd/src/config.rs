@@ -227,6 +227,11 @@ pub struct FileConfig {
     /// Default 60.
     #[serde(default)]
     pub directory_secs: Option<u64>,
+    /// SIP-59: seconds between pulls for the accounts homed here, from the
+    /// origins their channels live at. A move and a forwarded post pull at
+    /// once regardless. Default 30.
+    #[serde(default)]
+    pub home_secs: Option<u64>,
     /// SIP-56: rate limits, per account. Each is `[n, seconds]`: n in any
     /// window of that many seconds, refilling steadily; `[0, 0]` is
     /// unlimited. Omitted ones take SIP-56's defaults.
@@ -366,6 +371,8 @@ pub struct Config {
     pub rehome_away_secs: u64,
     /// SIP-55: seconds between reads of each peer's directory.
     pub directory_secs: u64,
+    /// SIP-59: seconds between pulls for the accounts homed here.
+    pub home_secs: u64,
     /// SIP-56: the rate limits.
     pub limits: crate::limits::Limits,
 }
@@ -571,6 +578,7 @@ impl FileConfig {
                 .unwrap_or(sqex_proto::backup::DEFAULT_QUOTA),
             rehome_away_secs: self.rehome_away_secs.unwrap_or(300),
             directory_secs: self.directory_secs.unwrap_or(60).max(1),
+            home_secs: self.home_secs.unwrap_or(30).max(1),
             limits: self.limits.resolve(),
         })
     }

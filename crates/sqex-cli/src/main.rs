@@ -159,6 +159,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WakeCmd,
     },
+    /// Where an account lives (SIP-59): sign the statement that an exchange
+    /// is this account's home -- with whatever signs for the account, a
+    /// YubiKey included -- and ask an exchange where an account is.
+    Home {
+        #[command(subcommand)]
+        cmd: HomeCmd,
+    },
     /// The safety words for you and another identity (SIP-41): six words to
     /// compare with them in person or over a call. Nothing is sent unless
     /// you say the words matched.
@@ -362,6 +369,35 @@ enum DeviceCmd {
     },
     /// Sign a revocation of `key`. Printed base58; nothing is sent.
     Revoke { key: String },
+}
+
+#[derive(Subcommand)]
+enum HomeCmd {
+    /// Sign a Move naming `home` as this account's exchange from now.
+    /// Printed base58; nothing is sent. Give it to `sqex-chat move
+    /// --signed`, or present it yourself with `sqex home present`.
+    Sign {
+        /// The new home's exchange key, base58.
+        home: String,
+    },
+    /// Present a signed Move at the exchange this command connects to,
+    /// optionally saying where the account's channels live.
+    Present {
+        /// The Move, base58, as `home sign` printed it.
+        signed: String,
+        /// The home's domain, a hint for whoever reads the record.
+        #[arg(long, default_value = "")]
+        domain: String,
+        /// An origin the account's channels live at, as `key` or
+        /// `key=domain`; repeat for each. Meaningful at the home only.
+        #[arg(long = "origin")]
+        origins: Vec<String>,
+    },
+    /// Where an account lives, as the exchange has it. Yours if omitted.
+    Show {
+        /// The account, base58 or name@domain.
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -603,6 +639,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Peers => peers(&cli, &cfg).await,
         Cmd::Succession { cmd } => succession(&cli, &cfg, cmd).await,
+        Cmd::Home { cmd } => home(&cli, &cfg, cmd).await,
         Cmd::Device { cmd } => device(&cli, &cfg, cmd).await,
         Cmd::Wake { cmd } => wake(&cli, &cfg, cmd).await,
         Cmd::Meet {
@@ -2505,6 +2542,113 @@ async fn device(cli: &Cli, cfg: &Config, cmd: &DeviceCmd) -> Result<(), String> 
                  (`sqex admin device revoke`), or to any device of the account.",
                 revocation.account
             );
+            Ok(())
+        }
+    }
+}
+
+/// SIP-59: an account's home -- signed here with whatever signs for the
+/// account, presented anywhere, asked of any exchange.
+async fn home(cli: &Cli, cfg: &Config, cmd: &HomeCmd) -> Result<(), String> {
+    use sqex_proto::home::{Homed, Move, Moved, Moving};
+    match cmd {
+        HomeCmd::Sign { home } => {
+            let home: PubKey = home.parse().map_err(|e| format!("bad key: {e}"))?;
+            let backend = signing_backend(cli, cfg).await?;
+            let account = backend.public();
+            let issued = now_secs();
+            if backend.is_yubikey() {
+                eprintln!("touch the YubiKey to sign the move");
+            }
+            let signature = backend
+                .sign(&Move::to_sign(&account, &home, issued))
+                .await?;
+            let mv = Move::from_signature(account, home, issued, signature);
+            if !mv.verify() {
+                return Err("the move does not verify".into());
+            }
+            println!("{}", b58(&mv.encode()));
+            eprintln!("a move: {account} lives at {home} from {issued}. Present it with");
+            eprintln!("`sqex-chat move <domain> --signed <this>` or `sqex home present <this>`.");
+            Ok(())
+        }
+        HomeCmd::Present {
+            signed,
+            domain,
+            origins,
+        } => {
+            let raw = bs58::decode(signed.trim())
+                .into_vec()
+                .map_err(|e| format!("bad move: {e}"))?;
+            let mv = Move::decode(&raw).map_err(|e| e.to_string())?;
+            if !mv.verify() {
+                return Err("the move does not verify".into());
+            }
+            let mut hints = Vec::new();
+            for o in origins {
+                let (key, dom) = o.split_once('=').unwrap_or((o.as_str(), ""));
+                let key: PubKey = key.parse().map_err(|e| format!("bad origin {o}: {e}"))?;
+                hints.push((key, dom.to_string()));
+            }
+            let (mut client, server) = connect(cli, cfg).await?;
+            let (code, body) = client
+                .post(
+                    "/account/move",
+                    Moving {
+                        mv,
+                        domain: domain.clone(),
+                        origins: hints,
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("present failed ({code}): {}", said(&body)));
+            }
+            let moved = Moved::decode(&body).map_err(|e| e.to_string())?;
+            let role = if mv.home == server {
+                "the home"
+            } else {
+                "a former home or origin"
+            };
+            println!("recorded at {server} ({role})");
+            if !moved.peered && mv.home != server {
+                println!(
+                    "note: this exchange does not list {} as a replication peer, so the \
+                     home's pulls from it will be refused until its operator adds it",
+                    mv.home
+                );
+            }
+            Ok(())
+        }
+        HomeCmd::Show { account } => {
+            let account = match account {
+                Some(a) => resolve_target(cli, cfg, a).await?,
+                None => PubKey::new(load_software_identity(cli, cfg)?.public()),
+            };
+            let (mut client, server) = connect(cli, cfg).await?;
+            let (code, body) = client
+                .post("/account/home", account.as_bytes().to_vec())
+                .await?;
+            match code {
+                200 => {
+                    let h = Homed::decode(&body).map_err(|e| e.to_string())?;
+                    let at = if !h.domain.is_empty() {
+                        format!("{} ({})", h.domain, h.home)
+                    } else if h.home == server {
+                        format!("here ({})", h.home)
+                    } else {
+                        h.home.to_string()
+                    };
+                    if h.since == 0 {
+                        println!("{account} lives at {at}, as far as this exchange knows");
+                    } else {
+                        println!("{account} lives at {at} since {}", h.since);
+                    }
+                }
+                404 => println!("{account}: not known here"),
+                _ => return Err(format!("show failed ({code}): {}", said(&body))),
+            }
             Ok(())
         }
     }

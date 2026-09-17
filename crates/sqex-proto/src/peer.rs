@@ -76,6 +76,14 @@ pub const TYPE_SIGNALS: u8 = 0x0b;
 pub const SIGNAL_LOG: usize = 256;
 /// SIP-57: a replica asks the origin what was redacted since a time.
 pub const TYPE_TOMBSTONES: u8 = 0x0c;
+/// SIP-59: an account's home asks an origin which channels the account is
+/// in there.
+pub const TYPE_MINE: u8 = 0x0d;
+/// SIP-59: a forward wrapped with the device's credential, for a device
+/// the origin may never have seen.
+pub const TYPE_CARRIED: u8 = 0x0e;
+/// SIP-59: the home carries an account's Move to an origin.
+pub const TYPE_MOVED: u8 = 0x0f;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -1216,5 +1224,190 @@ mod forward_action_tests {
         assert_eq!(ForwardAction::decode(&f.encode()).unwrap(), f);
         assert!(ForwardAction::decode(&[TYPE_FORWARD_ACTION; 20]).is_err());
         assert!(ForwardAction::decode(&[0]).is_err());
+    }
+}
+
+/// SIP-59: the home of an account asks an origin which of the channels it
+/// orders the account is a present member of. `| type = 0x0d | account[32] |`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullMine {
+    pub account: PubKey,
+}
+
+impl PullMine {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_MINE);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullMine> {
+        if b.len() != 33 || b[0] != TYPE_MINE {
+            return Err(Error::Malformed("not a mine pull".into()));
+        }
+        Ok(PullMine {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-59: the origin's answer. `| now: u64 | count: u16 | count × channel[32] |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mine {
+    pub now: u64,
+    pub channels: Vec<[u8; 32]>,
+}
+
+impl Mine {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.channels.len() * 32);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.channels.len().min(u16::MAX as usize) as u16).to_be_bytes());
+        for c in self.channels.iter().take(u16::MAX as usize) {
+            out.extend_from_slice(c);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Mine> {
+        let short = || Error::Malformed("mine cut short".into());
+        let now = u64::from_be_bytes(b.get(0..8).ok_or_else(short)?.try_into().unwrap());
+        let count =
+            u16::from_be_bytes(b.get(8..10).ok_or_else(short)?.try_into().unwrap()) as usize;
+        if b.len() != 10 + count * 32 {
+            return Err(short());
+        }
+        let channels = (0..count)
+            .map(|i| b[10 + i * 32..42 + i * 32].try_into().unwrap())
+            .collect();
+        Ok(Mine { now, channels })
+    }
+}
+
+/// SIP-59: a forward for a device the origin may never have seen, with the
+/// device's SIP-20 credential as the home holds it. `inner` is a `Forward`
+/// or a `ForwardAction` exactly as SIP-43 sends it.
+/// `| type = 0x0e | cred_len: u16 | credential | inner |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carried {
+    pub credential: crate::credential::Credential,
+    pub inner: Vec<u8>,
+}
+
+impl Carried {
+    pub fn encode(&self) -> Vec<u8> {
+        let cred = self.credential.encode();
+        let mut out = Vec::with_capacity(3 + cred.len() + self.inner.len());
+        out.push(TYPE_CARRIED);
+        out.extend_from_slice(&(cred.len() as u16).to_be_bytes());
+        out.extend_from_slice(&cred);
+        out.extend_from_slice(&self.inner);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Carried> {
+        let short = || Error::Malformed("carried forward cut short".into());
+        if b.first() != Some(&TYPE_CARRIED) {
+            return Err(Error::Malformed("not a carried forward".into()));
+        }
+        let len = u16::from_be_bytes(b.get(1..3).ok_or_else(short)?.try_into().unwrap()) as usize;
+        let cred = b.get(3..3 + len).ok_or_else(short)?;
+        let credential = crate::credential::Credential::decode(cred)?;
+        let inner = b[3 + len..].to_vec();
+        if inner.is_empty() {
+            return Err(short());
+        }
+        Ok(Carried { credential, inner })
+    }
+}
+
+/// SIP-59: the home carries an account's Move to an origin over the
+/// peering link. `| type = 0x0f | Move | dom_len: u8 | domain |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMoved {
+    pub mv: crate::home::Move,
+    pub domain: String,
+}
+
+impl PeerMoved {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + crate::home::MOVE_LEN + self.domain.len());
+        out.push(TYPE_MOVED);
+        self.mv.write(&mut out);
+        let d = self.domain.as_bytes();
+        out.push(d.len().min(255) as u8);
+        out.extend_from_slice(&d[..d.len().min(255)]);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PeerMoved> {
+        let short = || Error::Malformed("peer move cut short".into());
+        if b.first() != Some(&TYPE_MOVED) {
+            return Err(Error::Malformed("not a peer move".into()));
+        }
+        let mut at = 1;
+        let mv = crate::home::Move::read(b, &mut at)?;
+        let len = *b.get(at).ok_or_else(short)? as usize;
+        at += 1;
+        let domain = b.get(at..at + len).ok_or_else(short)?;
+        if at + len != b.len() {
+            return Err(Error::Malformed("trailing bytes after a peer move".into()));
+        }
+        Ok(PeerMoved {
+            mv,
+            domain: String::from_utf8(domain.to_vec())
+                .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod home_peer_tests {
+    use super::*;
+
+    #[test]
+    fn the_home_messages_round_trip() {
+        let p = PullMine {
+            account: PubKey::new([4; 32]),
+        };
+        assert_eq!(PullMine::decode(&p.encode()).unwrap(), p);
+        assert!(PullMine::decode(&p.encode()[..32]).is_err());
+
+        let m = Mine {
+            now: 3,
+            channels: vec![[1; 32], [2; 32]],
+        };
+        assert_eq!(Mine::decode(&m.encode()).unwrap(), m);
+        assert!(Mine::decode(&m.encode()[..40]).is_err());
+
+        let seed = [7u8; 32];
+        let device = PubKey::new([8; 32]);
+        let credential = crate::credential::Credential::issue(
+            &seed,
+            &device,
+            crate::credential::SCOPE_CHAT,
+            10,
+            20,
+        )
+        .unwrap();
+        let c = Carried {
+            credential,
+            inner: vec![TYPE_FORWARD, 1, 2, 3],
+        };
+        assert_eq!(Carried::decode(&c.encode()).unwrap(), c);
+        let mut empty = c.encode();
+        empty.truncate(empty.len() - 4);
+        assert!(Carried::decode(&empty).is_err());
+
+        let mv = crate::home::Move::sign(&seed, &PubKey::new([9; 32]), 5);
+        let pm = PeerMoved {
+            mv,
+            domain: "home.example".into(),
+        };
+        assert_eq!(PeerMoved::decode(&pm.encode()).unwrap(), pm);
+        let mut trailing = pm.encode();
+        trailing.push(0);
+        assert!(PeerMoved::decode(&trailing).is_err());
     }
 }

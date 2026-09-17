@@ -791,6 +791,7 @@ impl Forwarder {
         &self,
         seed: &[u8; 32],
         device: &PubKey,
+        carry: Option<&sqex_proto::credential::Credential>,
         path: &str,
         body: &[u8],
     ) -> std::result::Result<Forwarded, String> {
@@ -808,7 +809,10 @@ impl Forwarder {
             path: path.to_string(),
             body: body.to_vec(),
         };
-        let (code, body) = match client.post("/peer/forward", req.encode()).await {
+        let (code, body) = match client
+            .post("/peer/forward", carried(carry, req.encode()))
+            .await
+        {
             Ok(a) => a,
             Err(e) => {
                 *slot = None;
@@ -865,6 +869,7 @@ impl Forwarder {
         &self,
         seed: &[u8; 32],
         device: &PubKey,
+        carry: Option<&sqex_proto::credential::Credential>,
         post: &sqex_proto::channel::Post,
     ) -> std::result::Result<Forwarded, String> {
         let mut slot = self.client.lock().await;
@@ -880,7 +885,9 @@ impl Forwarder {
             device: *device,
             post: post.clone(),
         };
-        let answer = client.post("/peer/forward", req.encode()).await;
+        let answer = client
+            .post("/peer/forward", carried(carry, req.encode()))
+            .await;
         let (code, body) = match answer {
             Ok(a) => a,
             Err(e) => {
@@ -899,6 +906,22 @@ impl Forwarder {
             self.poke.notify_one();
         }
         Ok(forwarded)
+    }
+}
+
+/// SIP-59: a forward for a device with a credential goes wrapped in it, so
+/// an origin that never saw the device can still bind it to its account.
+/// An account acting as its own device has nothing to carry, and the
+/// forward goes as SIP-43 sends it -- which an origin from before SIP-59
+/// still understands.
+fn carried(carry: Option<&sqex_proto::credential::Credential>, inner: Vec<u8>) -> Vec<u8> {
+    match carry {
+        Some(credential) => sqex_proto::peer::Carried {
+            credential: credential.clone(),
+            inner,
+        }
+        .encode(),
+        None => inner,
     }
 }
 
@@ -987,6 +1010,121 @@ pub async fn run_moved(
                     }
                     Ok(took) => report(&task, &took),
                 },
+            }
+        }
+    }
+}
+
+/// SIP-59: pull for the accounts homed here. Each origin an account's Move
+/// named is found by its domain hint and checked against the key; the Move
+/// is carried to it (idempotent -- an origin that holds it already says
+/// stale, and that is fine), it is asked which of its channels the account
+/// is in, and those are pulled as any origin's are. Channels a configured
+/// origin already pulls, and channels this exchange orders itself, are
+/// left out. Runs at once when an account moves here, and on `interval`
+/// otherwise.
+pub async fn run_homed(
+    server: Arc<crate::server::Server>,
+    seed: [u8; 32],
+    configured: Vec<(PubKey, Vec<[u8; 32]>)>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = server.homed.notified() => {}
+        }
+        let me = server.public_key;
+        for (origin, domain, accounts) in server.devices.homed_here(&me) {
+            if origin == me {
+                continue;
+            }
+            let addr = match server.forwarder(&origin) {
+                Some(f) => f.addr,
+                None => {
+                    if domain.is_empty() {
+                        continue;
+                    }
+                    let Ok(found) = server.relay_find(&domain).await else {
+                        tracing::debug!(%domain, "cannot find an account's origin");
+                        continue;
+                    };
+                    if found.0 != origin {
+                        tracing::warn!(%domain, expected = %origin, found = %found.0, "an origin's domain names another key");
+                        continue;
+                    }
+                    server.add_forwarder(origin, found.1, domain.clone());
+                    found.1
+                }
+            };
+            let mut client = match H3Client::connect(addr, origin.as_bytes(), &seed).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(origin = %origin, error = %e, "cannot reach an account's origin");
+                    continue;
+                }
+            };
+            let already: Vec<[u8; 32]> = configured
+                .iter()
+                .filter(|(k, _)| *k == origin)
+                .flat_map(|(_, cs)| cs.iter().copied())
+                .collect();
+            let mut channels: Vec<[u8; 32]> = Vec::new();
+            for account in &accounts {
+                if let Some((mv, home_domain)) = server.devices.move_of(account) {
+                    let carried = sqex_proto::peer::PeerMoved {
+                        mv,
+                        domain: home_domain,
+                    };
+                    match client.post("/peer/moved", carried.encode()).await {
+                        Ok((200, _)) | Ok((409, _)) => {}
+                        Ok((code, _)) => {
+                            tracing::debug!(origin = %origin, account = %account, code, "the origin did not take the move")
+                        }
+                        Err(e) => {
+                            tracing::warn!(origin = %origin, error = %e, "carrying a move failed");
+                            break;
+                        }
+                    }
+                }
+                let ask = sqex_proto::peer::PullMine { account: *account };
+                match client.post("/peer/mine", ask.encode()).await {
+                    Ok((200, body)) => {
+                        if let Ok(mine) = sqex_proto::peer::Mine::decode(&body) {
+                            for c in mine.channels {
+                                if !already.contains(&c)
+                                    && !channels.contains(&c)
+                                    && !server.channels().orders(&c)
+                                {
+                                    channels.push(c);
+                                }
+                            }
+                        }
+                    }
+                    Ok((code, _)) => {
+                        tracing::debug!(origin = %origin, account = %account, code, "the origin refused a mine pull")
+                    }
+                    Err(e) => {
+                        tracing::warn!(origin = %origin, error = %e, "a mine pull failed");
+                        break;
+                    }
+                }
+            }
+            if channels.is_empty() {
+                continue;
+            }
+            let task = Origin {
+                key: origin,
+                addr,
+                channels,
+                interval,
+                predecessors: Vec::new(),
+            };
+            match pull_once(&mut client, &server, &task).await {
+                Err(e) => {
+                    tracing::warn!(origin = %origin, error = %e, "pull for a homed account failed")
+                }
+                Ok(took) => report(&task, &took),
             }
         }
     }

@@ -162,7 +162,27 @@ CREATE TABLE IF NOT EXISTS wake (
     expires  INTEGER NOT NULL,
     woken    INTEGER NOT NULL DEFAULT 0
 );
+-- SIP-59: where an account lives, by its own signed statement -- the
+-- latest Move presented here, whether it names this exchange or another.
+-- `home` equal to this exchange's key means the account is homed here.
+CREATE TABLE IF NOT EXISTS home (
+    account BLOB PRIMARY KEY,
+    home    BLOB NOT NULL,
+    domain  TEXT NOT NULL,
+    issued  INTEGER NOT NULL,
+    sig     BLOB NOT NULL
+);
+-- SIP-59: where an account homed here said its channels live -- the hints
+-- its Move came with, one row per origin. Only meaningful for accounts
+-- whose `home` row names this exchange.
+CREATE TABLE IF NOT EXISTS home_origin (
+    account BLOB NOT NULL,
+    origin  BLOB NOT NULL,
+    domain  TEXT NOT NULL,
+    PRIMARY KEY (account, origin)
+);
 CREATE INDEX IF NOT EXISTS device_by_account ON device (account);
+CREATE INDEX IF NOT EXISTS home_by_home ON home (home);
 "#;
 
 /// How far ahead of us an account's clock may be on a revocation.
@@ -699,6 +719,179 @@ impl Registry {
             .ok()
             .flatten()
             .unwrap_or(*device)
+    }
+
+    /// SIP-59: the credential a registered device presented, if it is one
+    /// and the registration carries one. `None` for an account acting as
+    /// its own device, which has nothing to carry.
+    pub fn credential_of(&self, device: &PubKey) -> Option<Credential> {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT credential FROM device WHERE device = ?1 AND not_after >= ?2",
+            params![device.as_bytes(), now as i64],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|c| !c.is_empty())
+        .and_then(|c| Credential::decode(&c).ok())
+    }
+
+    /// SIP-59: record an account's Move. `Ok(false)` when one at least as
+    /// new is already here (the statement is not stale on its own terms,
+    /// only superseded). The origin hints replace the last ones whenever
+    /// the Move names this exchange, and are dropped when it does not.
+    pub fn record_move(
+        &self,
+        mv: &sqex_proto::home::Move,
+        domain: &str,
+        origins: &[(PubKey, String)],
+        me: &PubKey,
+    ) -> Result<bool, DeviceError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin move"))?;
+        let held: Option<i64> = tx
+            .query_row(
+                "SELECT issued FROM home WHERE account = ?1",
+                params![mv.account.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read home"))?;
+        if let Some(issued) = held
+            && mv.issued <= issued as u64
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO home (account, home, domain, issued, sig) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (account) DO UPDATE SET home = ?2, domain = ?3, issued = ?4, sig = ?5",
+            params![
+                mv.account.as_bytes(),
+                mv.home.as_bytes(),
+                domain,
+                mv.issued as i64,
+                &mv.sig[..],
+            ],
+        )
+        .map_err(storage("record move"))?;
+        tx.execute(
+            "DELETE FROM home_origin WHERE account = ?1",
+            params![mv.account.as_bytes()],
+        )
+        .map_err(storage("clear origins"))?;
+        if mv.home == *me {
+            for (origin, domain) in origins {
+                tx.execute(
+                    "INSERT OR REPLACE INTO home_origin (account, origin, domain) VALUES (?1, ?2, ?3)",
+                    params![mv.account.as_bytes(), origin.as_bytes(), domain],
+                )
+                .map_err(storage("record origin"))?;
+            }
+        }
+        tx.commit().map_err(storage("commit move"))?;
+        Ok(true)
+    }
+
+    /// SIP-59: the home on record for an account -- key, domain hint,
+    /// `issued` -- if a Move was ever presented here.
+    pub fn home_of(&self, account: &PubKey) -> Option<(PubKey, String, u64)> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT home, domain, issued FROM home WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| {
+                Ok((
+                    PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// SIP-59: the Move on record, as presented, for carrying on.
+    pub fn move_of(&self, account: &PubKey) -> Option<(sqex_proto::home::Move, String)> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT home, domain, issued, sig FROM home WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| {
+                let sig: Vec<u8> = r.get(3)?;
+                Ok((
+                    sqex_proto::home::Move {
+                        account: *account,
+                        home: PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                        issued: r.get::<_, i64>(2)? as u64,
+                        sig: sig.try_into().unwrap_or([0; 64]),
+                    },
+                    r.get::<_, String>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// SIP-59: where an account that is not here has gone -- its home's key
+    /// and domain hint, when the home on record is not `me`.
+    pub fn away(&self, account: &PubKey, me: &PubKey) -> Option<(PubKey, String)> {
+        self.home_of(account)
+            .filter(|(home, _, _)| home != me)
+            .map(|(home, domain, _)| (home, domain))
+    }
+
+    /// SIP-59: the accounts whose home on record is `peer`.
+    pub fn homed_at(&self, peer: &PubKey) -> Vec<PubKey> {
+        let db = self.db.lock().unwrap();
+        db.prepare("SELECT account FROM home WHERE home = ?1")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![peer.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(|r| r.ok())
+                            .filter_map(|a| a.try_into().ok().map(PubKey::new))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    /// SIP-59: the origins the accounts homed here named, grouped by
+    /// origin with the domain hint each came with, and the accounts that
+    /// named it.
+    pub fn homed_here(&self, me: &PubKey) -> Vec<(PubKey, String, Vec<PubKey>)> {
+        let db = self.db.lock().unwrap();
+        let mut by: std::collections::BTreeMap<(Vec<u8>, String), Vec<PubKey>> =
+            std::collections::BTreeMap::new();
+        if let Ok(mut st) = db.prepare(
+            "SELECT o.account, o.origin, o.domain FROM home_origin o
+             JOIN home h ON h.account = o.account WHERE h.home = ?1",
+        ) && let Ok(rows) = st.query_map(params![me.as_bytes()], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) {
+            for (account, origin, domain) in rows.flatten() {
+                if let Ok(a) = <[u8; 32]>::try_from(account.as_slice()) {
+                    by.entry((origin, domain)).or_default().push(PubKey::new(a));
+                }
+            }
+        }
+        by.into_iter()
+            .filter_map(|((o, d), accounts)| {
+                o.try_into().ok().map(|o| (PubKey::new(o), d, accounts))
+            })
+            .collect()
     }
 }
 

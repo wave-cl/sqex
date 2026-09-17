@@ -2942,6 +2942,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing-subscriber",
  "unicode-width 0.2.0",
  "x25519-dalek",
 ]

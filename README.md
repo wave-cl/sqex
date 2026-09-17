@@ -92,6 +92,8 @@ sqex device link <key>       # sign a credential for a device, offline (--yubike
 sqex admin device register   # an administrator carries it to an exchange the key cannot reach
 sqex-chat backup key         # 24 words that open a sealed copy of this store at the exchange
 sqex-chat backup now         # write the copy; `backup restore <words>` on a fresh machine
+sqex-chat move <domain>      # make another exchange your home; your conversations follow
+sqex home sign <key>         # the same statement signed offline (--yubikey works)
 ```
 
 Inside: `/public <name>` makes a channel anybody may find, `/find [query]`

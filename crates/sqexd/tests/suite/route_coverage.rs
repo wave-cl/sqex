@@ -362,6 +362,29 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Cli("sqex succession show"),
         Identity,
     ),
+    // SIP-59: an account's own signed statement of where it lives, from
+    // whoever carries it; and where an account lives, to anybody.
+    ("POST", "/account/move", Chat("sqex-chat move"), Identity),
+    (
+        "POST",
+        "/account/home",
+        Chat("Chat::account_home"),
+        Identity,
+    ),
+    // SIP-59: the home asks an origin which channels an account is in
+    // there, and carries the account's Move to it.
+    (
+        "POST",
+        "/peer/mine",
+        Peer("replica::run_homed"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/moved",
+        Peer("replica::run_homed"),
+        ReplicationPeer,
+    ),
     // SIP-48: the account's sealed backup. Written by its devices; read by
     // them, or by the account that succeeded it.
     ("POST", "/backup/write", Chat("Chat::backup"), SelfOnly),

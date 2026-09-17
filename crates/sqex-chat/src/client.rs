@@ -247,6 +247,25 @@ pub enum ChatError {
     /// held is that key's now, and this device is nobody's until it is
     /// linked to it.
     Succeeded(Option<PubKey>),
+    /// SIP-59: the account this concerns lives at another exchange now --
+    /// its key, and the domain it is reached by where the refusing exchange
+    /// knew one. This exchange hands the key's services off there.
+    Moved(Option<PubKey>, String),
+}
+
+/// SIP-59: what a move did.
+#[derive(Debug, Clone)]
+pub struct Moved {
+    pub mv: sqex_proto::home::Move,
+    /// Whether the exchange left lists the new home as a peer: without
+    /// that, the home's pulls from it are refused and its operator must be
+    /// asked.
+    pub peered_here: bool,
+    pub peered_at_home: bool,
+    /// Store rows re-filed under the new home.
+    pub refiled: usize,
+    /// Rows that could not follow because the new scope already held them.
+    pub left: usize,
 }
 
 /// Turn a refused response into the error a caller can act on.
@@ -271,6 +290,11 @@ fn classify(path: &str, code: u16, body: &[u8]) -> ChatError {
             RefusalCode::OriginAway => ChatError::OriginAway,
             RefusalCode::Succeeded => {
                 ChatError::Succeeded(r.detail.as_deref().and_then(|d| d.parse().ok()))
+            }
+            RefusalCode::Moved => {
+                let detail = r.detail.clone().unwrap_or_default();
+                let (key, domain) = detail.split_once(' ').unwrap_or((detail.as_str(), ""));
+                ChatError::Moved(key.parse().ok(), domain.to_string())
             }
             _ => ChatError::Refused(code, r),
         },
@@ -351,6 +375,17 @@ impl std::fmt::Display for ChatError {
                 "this conversation lives at another exchange, which cannot be reached right now; \
                  nothing was sent"
             ),
+            ChatError::Moved(key, domain) => {
+                let at = match (key, domain.is_empty()) {
+                    (_, false) => domain.clone(),
+                    (Some(k), true) => k.to_string(),
+                    (None, true) => "another exchange".to_string(),
+                };
+                write!(
+                    f,
+                    "that account moved to {at}; this exchange hands its services off there"
+                )
+            }
             ChatError::NotReady(who) => write!(
                 f,
                 "{who} has not started their client yet, so there is nowhere to send a \
@@ -3576,6 +3611,139 @@ impl Chat {
         Ok(Stranded::decode(&body)
             .map_err(|e| ChatError::Protocol(e.to_string()))?
             .entries)
+    }
+
+    // ---- SIP-59: moving home ----------------------------------------------
+
+    /// Sign the statement that `home` is this account's exchange from now.
+    /// Only the account key signs it: a linked device holds a credential,
+    /// not the account, and is told to have the account sign (`sqex home
+    /// sign`, which can drive a hardware key).
+    pub fn sign_move(&self, home: &PubKey) -> Result<sqex_proto::home::Move> {
+        if self.me != self.device {
+            return Err(ChatError::Protocol(format!(
+                "this client acts for {} and cannot sign for it; run `sqex home sign {home}` \
+                 with the account's key and pass the result with --signed",
+                self.me
+            )));
+        }
+        Ok(sqex_proto::home::Move::sign(&self.seed, home, now_secs()))
+    }
+
+    /// Where this account's channels live, as this client knows: this
+    /// exchange first, then every other origin among its channels, each
+    /// with the domain this client has for it.
+    pub async fn origins_of_mine(&mut self) -> Result<Vec<(PubKey, String)>> {
+        let mut out = vec![(self.exchange, self.domain.clone().unwrap_or_default())];
+        let mine = self.mine().await?;
+        for m in mine {
+            let home = match self.home(&m.channel).await {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if !out.iter().any(|(k, _)| *k == home.origin) {
+                out.push((home.origin, home.domain.clone()));
+            }
+            if out.len() >= sqex_proto::home::MAX_ORIGINS {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Present a Move here, whoever signed it.
+    pub async fn present_move(
+        &mut self,
+        moving: &sqex_proto::home::Moving,
+    ) -> Result<sqex_proto::home::Moved> {
+        let body = self.post("/account/move", moving.encode()).await?;
+        sqex_proto::home::Moved::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// Where an account lives, as this exchange has it.
+    pub async fn account_home(&mut self, account: &PubKey) -> Result<sqex_proto::home::Homed> {
+        let body = self
+            .post("/account/home", account.as_bytes().to_vec())
+            .await?;
+        sqex_proto::home::Homed::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// Move this account's home to the exchange at `addr` with key `home`,
+    /// reached by `domain`: sign the Move (or take one signed elsewhere),
+    /// register this device there if it is a linked one, present the Move
+    /// there with where the channels live and here without, and re-file
+    /// the store under the new home. Afterwards this `Chat` is still
+    /// connected to the old exchange; the caller starts again against the
+    /// new one, which is where the store now says it belongs.
+    pub async fn move_home(
+        &mut self,
+        addr: SocketAddr,
+        home: &PubKey,
+        domain: &str,
+        signed: Option<sqex_proto::home::Move>,
+    ) -> Result<Moved> {
+        if *home == self.exchange {
+            return Err(ChatError::Protocol(
+                "that is already this account's home".into(),
+            ));
+        }
+        let mv = match signed {
+            Some(m) if m.account == self.me && m.home == *home && m.verify() => m,
+            Some(_) => {
+                return Err(ChatError::Protocol(
+                    "the signed move is not this account's, or does not name that home".into(),
+                ));
+            }
+            None => self.sign_move(home)?,
+        };
+        let origins = self.origins_of_mine().await?;
+
+        let mut there = Client::connect_as(addr, home.as_bytes(), &self.seed)
+            .await
+            .map_err(|e| ChatError::Transport(format!("could not reach {domain}: {e}")))?;
+        if let Some(credential) = self.credential() {
+            let (code, body) = there
+                .post("/device/register", Register { credential }.encode())
+                .await
+                .map_err(|e| ChatError::Transport(e.to_string()))?;
+            if code != 200 {
+                return Err(classify("/device/register", code, &body));
+            }
+        }
+        let moving = sqex_proto::home::Moving {
+            mv,
+            domain: domain.to_string(),
+            origins,
+        };
+        let (code, body) = there
+            .post("/account/move", moving.encode())
+            .await
+            .map_err(|e| ChatError::Transport(e.to_string()))?;
+        if code != 200 {
+            return Err(classify("/account/move", code, &body));
+        }
+        let at_home = sqex_proto::home::Moved::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+
+        // Told here too, so the gate opens before the home's first pull
+        // rather than after its carry; the home carries it on to the rest.
+        let here = self
+            .present_move(&sqex_proto::home::Moving {
+                mv,
+                domain: domain.to_string(),
+                origins: Vec::new(),
+            })
+            .await?;
+
+        let from = self.exchange;
+        let refiled = self.store.move_home(&from, home)?;
+        Ok(Moved {
+            mv,
+            peered_here: here.peered,
+            peered_at_home: at_home.peered,
+            refiled: refiled.moved,
+            left: refiled.left,
+        })
     }
 
     /// Whether a channel lives at another exchange than this connection's.

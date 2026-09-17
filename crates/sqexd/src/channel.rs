@@ -3158,6 +3158,79 @@ impl Channels {
         role_of(&db, channel, account).is_some()
     }
 
+    /// SIP-59: whether `account` is a present member of anything this
+    /// exchange orders -- one of the ways an exchange knows an account at
+    /// all. A copy's derived roster does not count: the account is known
+    /// to the origin, not here.
+    pub fn has_memberships(&self, account: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM member m WHERE m.account = ?1 AND m.present = 1
+               AND NOT EXISTS (SELECT 1 FROM replicated r WHERE r.channel = m.channel)
+             LIMIT 1",
+            params![account.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// SIP-59: the channels this exchange **orders** that `account` is a
+    /// present member of -- what its home asks for. Copies are left out:
+    /// the home asks their origins itself.
+    pub fn ordered_with(&self, account: &PubKey) -> Vec<[u8; 32]> {
+        let db = self.db.lock().unwrap();
+        db.prepare(
+            "SELECT m.channel FROM member m
+             WHERE m.account = ?1 AND m.present = 1
+               AND NOT EXISTS (SELECT 1 FROM replicated r WHERE r.channel = m.channel)
+             ORDER BY m.channel",
+        )
+        .ok()
+        .and_then(|mut st| {
+            st.query_map(params![account.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .filter_map(|c| c.try_into().ok())
+                        // SIP-53: a channel that moved away from here is
+                        // ordered elsewhere now, whatever its row says.
+                        .filter(|c| moved_to(&db, c).is_none())
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+    }
+
+    /// SIP-59: whether this exchange orders `channel` itself -- it is here
+    /// and not a copy.
+    pub fn orders(&self, channel: &[u8; 32]) -> bool {
+        let db = self.db.lock().unwrap();
+        let here: bool = db
+            .query_row(
+                "SELECT 1 FROM channel WHERE channel = ?1",
+                params![&channel[..]],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some();
+        here && moved_to(&db, channel).is_none()
+            && db
+                .query_row(
+                    "SELECT 1 FROM replicated WHERE channel = ?1",
+                    params![&channel[..]],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_none()
+    }
+
     /// SIP-44: `successor` takes `account`'s place in every channel it is a
     /// present member of, role and all, and each channel's log says so in an
     /// entry carrying the will's signature. Returns the channels touched.
@@ -4194,6 +4267,12 @@ impl Channels {
             params![&channel[..]],
         )
         .map_err(storage("clear roster"))?;
+        // The epoch is derived with the roster, from the same entries.
+        tx.execute(
+            "UPDATE channel SET epoch = 0 WHERE id = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("clear epoch"))?;
         let public: bool = tx
             .query_row(
                 "SELECT visibility FROM channel WHERE id = ?1",
@@ -5587,6 +5666,18 @@ fn derive_membership(
         }
         EVENT_PROMOTED => present(Role::Admin)?,
         EVENT_DEMOTED => present(Role::Member)?,
+        // SIP-17: a rotation advances the epoch by exactly one, and the
+        // entry's `arg` (the epoch) is never served -- so the epoch a copy
+        // reports is the count of rotations it holds. Without this a copy
+        // said 0 for every private channel, and a client posting through
+        // it (SIP-43, SIP-59) minted epoch 1 again over the one in force.
+        EVENT_ROTATED => {
+            db.execute(
+                "UPDATE channel SET epoch = epoch + 1, epoch_at = ?2 WHERE id = ?1",
+                params![&channel[..], posted as i64],
+            )
+            .map_err(storage("derive rotation"))?;
+        }
         // Presence and authority are different things here exactly as they are
         // at an origin: leaving a public channel does not surrender a role.
         EVENT_LEFT | EVENT_REMOVED => {

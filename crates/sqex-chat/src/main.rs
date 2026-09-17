@@ -131,6 +131,31 @@ enum Cmd {
         #[arg(long, default_value = "")]
         label: String,
     },
+    /// Make another exchange this account's home (SIP-59).
+    ///
+    /// Signs the statement, tells the new home where your channels live so
+    /// it pulls them and carries what you say back, tells the exchange you
+    /// are leaving so it points senders and callers on, and re-files this
+    /// store under the new home so your history reads there. Start against
+    /// the new home afterwards; the exchange you left goes on serving the
+    /// conversations that live there through the copy your home holds.
+    Move {
+        /// The new home's domain (SIP-33), or host:port with --home-key.
+        home: String,
+        /// The new home's base58 key, for a literal address instead of a
+        /// domain.
+        #[arg(long)]
+        home_key: Option<String>,
+        /// A Move signed elsewhere -- `sqex home sign`, for an account
+        /// whose key this client does not hold -- base58.
+        #[arg(long)]
+        signed: Option<String>,
+    },
+    /// Where an account lives, as this exchange has it (SIP-59).
+    Home {
+        /// The account, base58, or a name here. Yours if omitted.
+        who: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +305,41 @@ async fn run(cli: Cli) -> Result<(), String> {
     if let Some(Cmd::Backup { cmd }) = &cli.cmd {
         return backup_command(&mut chat, cmd).await;
     }
+    if let Some(Cmd::Move {
+        home,
+        home_key,
+        signed,
+    }) = &cli.cmd
+    {
+        return move_command(&mut chat, home, home_key.as_deref(), signed.as_deref()).await;
+    }
+    if let Some(Cmd::Home { who }) = &cli.cmd {
+        let account = match who {
+            None => chat.me,
+            Some(w) => match w.parse::<PubKey>() {
+                Ok(k) => k,
+                Err(_) => chat.resolve_name(w).await.map_err(|e| e.to_string())?,
+            },
+        };
+        let h = chat
+            .account_home(&account)
+            .await
+            .map_err(|e| e.to_string())?;
+        let here = h.home == chat.exchange_key();
+        let at = if !h.domain.is_empty() {
+            format!("{} ({})", h.domain, h.home)
+        } else if here {
+            format!("here ({})", h.home)
+        } else {
+            h.home.to_string()
+        };
+        if h.since == 0 {
+            println!("{account} lives at {at}, as far as this exchange knows");
+        } else {
+            println!("{account} lives at {at} since {}", h.since);
+        }
+        return Ok(());
+    }
 
     if let Some(Cmd::Admit { label }) = &cli.cmd {
         chat.request_admission(label)
@@ -399,6 +459,87 @@ async fn backup_command(chat: &mut Chat, cmd: &BackupCmd) -> Result<(), String> 
             Ok(())
         }
     }
+}
+
+/// SIP-59: `sqex-chat move`. Find the new home, hand the move to the
+/// library, and say what to do next.
+async fn move_command(
+    chat: &mut Chat,
+    home: &str,
+    home_key: Option<&str>,
+    signed: Option<&str>,
+) -> Result<(), String> {
+    let (addr, key, domain) = match home_key {
+        Some(k) => {
+            let key: PubKey = k.trim().parse().map_err(|e| format!("bad home key: {e}"))?;
+            (resolve_one_sync(home)?, key, String::new())
+        }
+        None => {
+            let (domain, _) = split_port(home);
+            if domain.parse::<std::net::IpAddr>().is_ok() {
+                return Err(format!(
+                    "{domain} is an address, not a domain, and an address cannot be \
+                     discovered; give --home-key with it"
+                ));
+            }
+            let (server, candidates, _) = sqex_discovery::candidates(domain)
+                .await
+                .map_err(|e| e.to_string())?;
+            let first = candidates
+                .first()
+                .ok_or_else(|| format!("no address for {domain}"))?;
+            (first.addr, server, domain.to_string())
+        }
+    };
+    let signed = match signed {
+        Some(b) => {
+            let raw = bs58::decode(b.trim())
+                .into_vec()
+                .map_err(|e| format!("bad signed move: {e}"))?;
+            Some(sqex_proto::home::Move::decode(&raw).map_err(|e| e.to_string())?)
+        }
+        None => None,
+    };
+    let old = chat.domain().map(str::to_string);
+    let done = chat
+        .move_home(addr, &key, &domain, signed)
+        .await
+        .map_err(|e| e.to_string())?;
+    let new_name = if domain.is_empty() {
+        key.to_string()
+    } else {
+        domain.clone()
+    };
+    println!(
+        "moved: {} lives at {new_name} from {}",
+        done.mv.account, done.mv.issued
+    );
+    println!(
+        "{} store row(s) now filed under the new home{}",
+        done.refiled,
+        if done.left > 0 {
+            format!(
+                "; {} left behind because the new home already held them",
+                done.left
+            )
+        } else {
+            String::new()
+        }
+    );
+    if !done.peered_here {
+        println!(
+            "note: {} does not list {new_name} as a replication peer, so the home's pulls \
+             from it will be refused until its operator adds it",
+            old.unwrap_or_else(|| "the exchange you left".into())
+        );
+    }
+    if domain.is_empty() {
+        println!("start again with --server-host {home} --server-key {key}");
+    } else {
+        println!("start again with --server {domain}");
+    }
+    println!("prekeys are published there on first start; run `backup now` there if you keep one");
+    Ok(())
 }
 
 /// Whether a credential was written for this client.

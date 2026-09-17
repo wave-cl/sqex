@@ -656,6 +656,9 @@ pub struct Followed {
 const SCOPED: &[(&str, bool)] = &[
     ("channel_key", false),
     ("message", true),
+    ("entry", true),
+    ("timed", true),
+    ("asset", true),
     ("cursor", true),
     ("chain", false),
     ("incarnation", false),
@@ -665,6 +668,17 @@ const SCOPED: &[(&str, bool)] = &[
     ("profile", true),
     ("handle", true),
 ];
+
+/// SIP-59: the tables that follow a *move* -- everything filed by the
+/// connection's exchange. `chain` and `incarnation` are filed by the
+/// **origin** that orders each channel (SIP-43, `signing_scope`) and stay
+/// where they are: a channel that lived at the old home still lives there
+/// after its member moved, and the member's chain there goes on.
+fn moving_tables() -> impl Iterator<Item = &'static (&'static str, bool)> {
+    SCOPED
+        .iter()
+        .filter(|(t, _)| *t != "chain" && *t != "incarnation")
+}
 
 /// SIP-40 §Consumers other than pins. A store that scopes every row by the
 /// exchange's key is a key held for a domain, and when a pin follows a
@@ -681,12 +695,27 @@ const SCOPED: &[(&str, bool)] = &[
 /// (key material — see [`Followed::left`]). The store's own claim of which
 /// exchange it belongs to moves with the rows.
 pub fn follow_handover(db: &Connection, from: &PubKey, to: &PubKey) -> Result<Followed> {
+    refile(db, from, to, SCOPED.iter())
+}
+
+/// SIP-59: the store's half of a move -- what was held under the old home
+/// is held under the new, chains excepted (see [`moving_tables`]).
+pub fn move_home(db: &Connection, from: &PubKey, to: &PubKey) -> Result<Followed> {
+    refile(db, from, to, moving_tables())
+}
+
+fn refile<'a>(
+    db: &Connection,
+    from: &PubKey,
+    to: &PubKey,
+    tables: impl Iterator<Item = &'a (&'a str, bool)>,
+) -> Result<Followed> {
     let (old, new) = (&from.as_bytes()[..], &to.as_bytes()[..]);
     db.execute_batch("BEGIN IMMEDIATE")
         .map_err(storage("begin following the handover"))?;
     let outcome = (|| -> Result<Followed> {
         let mut done = Followed::default();
-        for (table, droppable) in SCOPED {
+        for (table, droppable) in tables {
             done.moved += db
                 .execute(
                     &format!("UPDATE OR IGNORE {table} SET exchange = ?1 WHERE exchange = ?2"),
@@ -960,6 +989,15 @@ impl Store {
     /// is the steady state after the first call.
     pub fn follow_handover(&mut self, from: &PubKey, to: &PubKey) -> Result<Followed> {
         follow_handover(&self.db, from, to)
+    }
+
+    /// SIP-59: re-file what this store holds under `from` -- the home it
+    /// is leaving -- under `to`, and claim `to` as its exchange. Chains
+    /// stay filed by origin. See [`move_home`].
+    pub fn move_home(&mut self, from: &PubKey, to: &PubKey) -> Result<Followed> {
+        let done = move_home(&self.db, from, to)?;
+        self.exchange = Some(*to);
+        Ok(done)
     }
 
     /// Whether anything at all is filed under `exchange`. Cheap, and what a
