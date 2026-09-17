@@ -49,7 +49,7 @@ use sqex_proto::channel::{
     TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_EQUIVOCATION as CH_EQUIVOCATION,
     TYPE_HOME as CH_HOME, TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
     TYPE_REDACT as CH_REDACT, TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE,
-    TYPE_UNREPLICATE as CH_UNREPLICATE,
+    TYPE_STRANDED as CH_STRANDED, TYPE_UNREPLICATE as CH_UNREPLICATE,
 };
 use sqex_proto::channel_key::{Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING};
 use sqex_proto::device::{
@@ -306,11 +306,20 @@ pub struct Server {
     /// SIP-47: when the earliest device credential the whitelist admits
     /// runs out -- the one moment the door changes with nobody at it.
     admission_expiry: Mutex<Option<u64>>,
+    /// SIP-53: when each origin was last reached, so a replica can say how
+    /// long one has been away. An origin never reached counts from start.
+    contacts: Mutex<HashMap<PubKey, u64>>,
+    /// SIP-53: how long an origin must be out of reach before a replica
+    /// takes a rehome to itself.
+    pub(crate) rehome_away_secs: u64,
     /// SIP-45: whether `http://` to loopback is an acceptable endpoint --
     /// for the tests, which stand a listener up there.
     wake_loopback: bool,
     /// SIP-43: the way to each origin for a member's post, by origin key.
-    origins: HashMap<PubKey, Arc<crate::replica::Forwarder>>,
+    /// SIP-43: one forwarder per origin this exchange replicates from --
+    /// the configured ones, and (SIP-53) any an origin moved to, added as
+    /// they are learned.
+    origins: RwLock<HashMap<PubKey, Arc<crate::replica::Forwarder>>>,
     /// SIP-43: uploads this replica is carrying to an origin, by the number
     /// it gave the client: the origin, the origin's number, and whose it is.
     carried_uploads: Mutex<HashMap<u64, (PubKey, u64, PubKey)>>,
@@ -413,6 +422,50 @@ impl Server {
             closed = gone,
             "transport whitelist enabled"
         );
+    }
+
+    /// SIP-43/53: the forwarder toward `origin`, configured or learned.
+    pub(crate) fn forwarder(&self, origin: &PubKey) -> Option<Arc<crate::replica::Forwarder>> {
+        self.origins.read().unwrap().get(origin).cloned()
+    }
+
+    /// SIP-53: a forwarder toward an origin learned from a rehome.
+    pub(crate) fn add_forwarder(&self, origin: PubKey, addr: std::net::SocketAddr, domain: String) {
+        self.origins
+            .write()
+            .unwrap()
+            .entry(origin)
+            .or_insert_with(|| Arc::new(crate::replica::Forwarder::new(origin, addr, domain)));
+    }
+
+    /// SIP-53: where a domain's exchange is, by the relay's finder.
+    pub(crate) async fn relay_find(
+        self: &Arc<Self>,
+        domain: &str,
+    ) -> std::result::Result<(PubKey, std::net::SocketAddr), String> {
+        crate::relay::find_by_domain(self, domain).await
+    }
+
+    /// SIP-53: note that `origin` answered just now.
+    pub(crate) fn reached(&self, origin: &PubKey) {
+        self.contacts.lock().unwrap().insert(*origin, now_unix());
+    }
+
+    /// SIP-53: how long `origin` has been out of reach -- since it last
+    /// answered, or since this exchange started where it never has.
+    pub(crate) fn away_secs(&self, origin: &PubKey) -> u64 {
+        let since = self
+            .contacts
+            .lock()
+            .unwrap()
+            .get(origin)
+            .copied()
+            .unwrap_or(0);
+        if since == 0 {
+            self.started.elapsed().as_secs()
+        } else {
+            now_unix().saturating_sub(since)
+        }
     }
 
     /// SIP-47: a device was registered or revoked, or a credential the
@@ -773,20 +826,24 @@ pub async fn bind_with(
         wake_loopback: config.wake_loopback,
         carried_uploads: Mutex::new(HashMap::new()),
         next_carried: AtomicU64::new(0),
-        origins: config
-            .replicate
-            .iter()
-            .map(|o| {
-                (
-                    o.origin,
-                    Arc::new(crate::replica::Forwarder::new(
+        origins: RwLock::new(
+            config
+                .replicate
+                .iter()
+                .map(|o| {
+                    (
                         o.origin,
-                        o.addr,
-                        o.domain.clone(),
-                    )),
-                )
-            })
-            .collect(),
+                        Arc::new(crate::replica::Forwarder::new(
+                            o.origin,
+                            o.addr,
+                            o.domain.clone(),
+                        )),
+                    )
+                })
+                .collect(),
+        ),
+        contacts: Mutex::new(HashMap::new()),
+        rehome_away_secs: config.rehome_away_secs,
         transport: Arc::clone(&listener),
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
@@ -960,12 +1017,32 @@ pub async fn serve(bound: Bound) -> Result<()> {
             channels = origin.channels.len(),
             "replicating"
         );
-        let forwarder = Arc::clone(&server.origins[&origin.origin]);
+        let forwarder = server
+            .forwarder(&origin.origin)
+            .expect("a configured origin has a forwarder");
         tokio::spawn(crate::replica::run(
             Arc::clone(&server),
             server.exchange_seed,
             task,
             forwarder,
+        ));
+    }
+
+    // SIP-53: channels whose origin moved somewhere this exchange was not
+    // configured for are pulled from wherever the rehome said.
+    {
+        let configured: Vec<PubKey> = server.replicate.iter().map(|o| o.origin).collect();
+        let interval = server
+            .replicate
+            .iter()
+            .map(|o| o.interval)
+            .min()
+            .unwrap_or(std::time::Duration::from_secs(30));
+        tokio::spawn(crate::replica::run_moved(
+            Arc::clone(&server),
+            server.exchange_seed,
+            configured,
+            interval,
         ));
     }
 
@@ -2196,7 +2273,7 @@ async fn route(
                 // and ordered there. Nothing is stored on the way; the
                 // origin's answer is the member's answer.
                 if let Some(origin) = server.channels.origin_of(&req.channel) {
-                    let Some(forwarder) = server.origins.get(&origin) else {
+                    let Some(forwarder) = server.forwarder(&origin) else {
                         return refuse(421, Code::Replicated, None);
                     };
                     return match forwarder
@@ -2216,6 +2293,91 @@ async fn route(
         },
         // SIP-43: where a channel lives. Answered to anyone who may read it,
         // which is what `info` decides.
+        // SIP-53: an admin moves the channel's origin -- from the origin, a
+        // planned move to a replica; from a replica, to itself, its origin
+        // being gone.
+        ("POST", "/channel/rehome") => match (who, sqex_proto::channel::Rehome::decode(body)) {
+            (None, _) => no_identity("moving a channel's origin"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some((me, dev)), Ok(req)) => {
+                let away = server
+                    .channels
+                    .origin_of(&req.channel)
+                    .map(|o| server.away_secs(&o));
+                match server.channels.rehome(
+                    &me,
+                    &dev,
+                    &req.channel,
+                    &req.subject,
+                    &req.domain,
+                    &req.action,
+                    away,
+                    server.rehome_away_secs,
+                ) {
+                    Ok(seq) => {
+                        server.tell_others(
+                            &req.channel,
+                            &me,
+                            EventKind::Channel {
+                                channel: req.channel,
+                                last_seq: seq,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(ChannelError::OriginReachable(secs)) => {
+                        let e = ChannelError::OriginReachable(secs);
+                        refuse(e.status(), e.code(), Some(&secs.to_string()))
+                    }
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        // SIP-53: a rehome carried by a client to an exchange that has not
+        // seen it -- another replica, or the old origin come back.
+        ("POST", "/channel/rehomed") => match (account, sqex_proto::channel::Rehomed::decode(body))
+        {
+            (None, _) => no_identity("carrying a rehome"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if let Err(e) = server.channels.info(
+                    &me,
+                    &device.unwrap_or(me),
+                    &req.channel,
+                    server.welcome.as_ref(),
+                ) {
+                    return refused(e);
+                }
+                match server
+                    .channels
+                    .adopt_rehome(&req.channel, &req.entry, &req.domain)
+                {
+                    Ok(_) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        // SIP-53: the caller's own entries stranded here past a rehome.
+        ("POST", "/channel/stranded") => match (account, ByChannel::decode(body, CH_STRANDED)) {
+            (None, _) => no_identity("asking after stranded entries"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => (
+                200,
+                "application/octet-stream",
+                sqex_proto::channel::Stranded {
+                    entries: server.channels.stranded_for(&req.channel, &me),
+                }
+                .encode(),
+            ),
+        },
         ("POST", "/channel/home") => match (account, ByChannel::decode(body, CH_HOME)) {
             (None, _) => no_identity("asking where a channel lives"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -2229,19 +2391,23 @@ async fn route(
                     return refused(e);
                 }
                 let home = match server.channels.origin_of(&req.channel) {
+                    // The domain: the forwarder's where one is up, else the
+                    // hint a rehome carried (SIP-53).
                     Some(origin) => Home {
                         origin,
                         domain: server
-                            .origins
-                            .get(&origin)
+                            .forwarder(&origin)
                             .map(|f| f.domain.clone())
+                            .or_else(|| server.channels.moved_to(&req.channel).map(|(_, d)| d))
                             .unwrap_or_default(),
+                        former: server.channels.former_origins(&req.channel),
                     },
                     // This exchange orders it. No domain: the member is
                     // connected here already, and the exchange does not
                     // know its own name -- SIP-33 gives that to clients.
                     None => Home {
                         origin: server.public_key,
+                        former: server.channels.former_origins(&req.channel),
                         domain: String::new(),
                     },
                 };
@@ -2263,7 +2429,7 @@ async fn route(
                         // took this exchange's zero for an answer would sign
                         // from zero and be refused where it counts.
                         if let Some(origin) = server.channels.origin_of(&req.channel)
-                            && let Some(forwarder) = server.origins.get(&origin)
+                            && let Some(forwarder) = server.forwarder(&origin)
                             && let Some(standing) = forwarder
                                 .standing(&server.exchange_seed, &req.channel, &device)
                                 .await
@@ -2722,6 +2888,26 @@ async fn route(
             _ => peering_refused(),
         },
 
+        // SIP-53: the new origin, or another replica, telling this exchange
+        // a channel moved. Gated as a pull is.
+        ("POST", "/peer/rehomed") => {
+            match (peer.identity, sqex_proto::channel::Rehomed::decode(body)) {
+                (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                    match server
+                        .channels
+                        .adopt_rehome(&req.channel, &req.entry, &req.domain)
+                    {
+                        Ok(_) => (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        ),
+                        Err(_) => peering_refused(),
+                    }
+                }
+                _ => peering_refused(),
+            }
+        }
         // SIP-43: a member's post carried by a replica. The gate is SIP-35's:
         // a peer on the list, authorised for the channel or acting for the
         // poster, and one refusal for everything else. The account is this
@@ -3597,7 +3783,7 @@ async fn forward_action(
     body: &[u8],
 ) -> Option<(u16, &'static str, Vec<u8>)> {
     let origin = server.channels.origin_of(channel)?;
-    let Some(forwarder) = server.origins.get(&origin) else {
+    let Some(forwarder) = server.forwarder(&origin) else {
         return Some(refuse(421, Code::Replicated, None));
     };
     Some(
@@ -3743,7 +3929,7 @@ async fn carry_blob(
         "/blob/begin" => {
             let req = BlobBegin::decode(body).ok()?;
             let origin = server.channels.origin_of(&req.channel)?;
-            let Some(forwarder) = server.origins.get(&origin) else {
+            let Some(forwarder) = server.forwarder(&origin) else {
                 return Some(refuse(421, Code::Replicated, None));
             };
             let answer = match forwarder
@@ -3791,7 +3977,7 @@ async fn carry_blob(
                 let (s, t, b) = refuse(403, Code::NotYours, None);
                 return Some((s, t, b));
             }
-            let Some(forwarder) = server.origins.get(&origin) else {
+            let Some(forwarder) = server.forwarder(&origin) else {
                 return Some(refuse(421, Code::Replicated, None));
             };
             // The same bytes with the origin's number in place of ours.
@@ -3828,7 +4014,7 @@ async fn carry_blob(
             };
             let req = ByChannelBlob::decode(body, type_byte).ok()?;
             let origin = server.channels.origin_of(&req.channel)?;
-            let Some(forwarder) = server.origins.get(&origin) else {
+            let Some(forwarder) = server.forwarder(&origin) else {
                 return Some(refuse(421, Code::Replicated, None));
             };
             Some(

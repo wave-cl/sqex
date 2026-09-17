@@ -87,6 +87,12 @@ pub const TYPE_UNREPLICATE: u8 = 0x16;
 pub const TYPE_EQUIVOCATION: u8 = 0x17;
 /// SIP-43: ask where a channel lives -- which exchange orders it.
 pub const TYPE_HOME: u8 = 0x18;
+/// SIP-53: an admin moves the channel's origin.
+pub const TYPE_REHOME: u8 = 0x19;
+/// SIP-53: what of one's own an exchange stranded past a rehome.
+pub const TYPE_STRANDED: u8 = 0x1b;
+/// SIP-53: a rehome entry carried to an exchange that has not seen it.
+pub const TYPE_REHOMED: u8 = 0x1a;
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.
@@ -134,6 +140,11 @@ pub const EVENT_UNREPLICATE: u8 = 0x0c;
 /// will's signature under `actor`, so a reader checks the succession itself
 /// rather than taking the exchange's word for it.
 pub const EVENT_SUCCEEDED: u8 = 0x0d;
+/// SIP-53: `actor` moved the channel's origin to `subject`, an exchange.
+/// The last entry of the old regime: signed under the outgoing origin,
+/// receipted by the incoming one, and every entry after it is both under
+/// the new. `arg` is empty; the receipt's `posted` is when.
+pub const EVENT_REHOMED: u8 = 0x0e;
 
 /// The body of an entry the exchange wrote itself.
 ///
@@ -182,7 +193,7 @@ impl System {
                 b.len()
             )));
         }
-        if b[0] == 0 || b[0] > EVENT_SUCCEEDED {
+        if b[0] == 0 || b[0] > EVENT_REHOMED {
             return Ok(None);
         }
         Ok(Some(System {
@@ -636,30 +647,62 @@ impl ByChannel {
 pub struct Home {
     pub origin: PubKey,
     pub domain: String,
+    /// SIP-53: the exchanges that ordered the channel before `origin`,
+    /// oldest first, each with the position its regime ended at -- the seq
+    /// of the rehome that moved the channel on. Empty where it never moved,
+    /// and absent (empty) from an exchange before SIP-53.
+    pub former: Vec<(u64, PubKey)>,
 }
 
 impl Home {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(33 + self.domain.len());
+        let mut out = Vec::with_capacity(34 + self.domain.len() + self.former.len() * 40);
         out.extend_from_slice(self.origin.as_bytes());
         out.push(self.domain.len().min(255) as u8);
         out.extend_from_slice(&self.domain.as_bytes()[..self.domain.len().min(255)]);
+        if !self.former.is_empty() {
+            out.push(self.former.len().min(255) as u8);
+            for (ended, key) in self.former.iter().take(255) {
+                out.extend_from_slice(&ended.to_be_bytes());
+                out.extend_from_slice(key.as_bytes());
+            }
+        }
         out
     }
 
     pub fn decode(b: &[u8]) -> Result<Home> {
         want(b, 33, "home")?;
         let len = b[32] as usize;
-        if b.len() != 33 + len {
+        if b.len() < 33 + len {
             return Err(Error::Malformed(format!(
-                "home is {} bytes, want {}",
+                "home is {} bytes, want at least {}",
                 b.len(),
                 33 + len
             )));
         }
+        let domain = utf8(&b[33..33 + len], "domain")?.to_string();
+        let rest = &b[33 + len..];
+        let former = if rest.is_empty() {
+            Vec::new()
+        } else {
+            let count = rest[0] as usize;
+            if rest.len() != 1 + count * 40 {
+                return Err(Error::Malformed("home's history cut short".into()));
+            }
+            (0..count)
+                .map(|i| {
+                    let at = 1 + i * 40;
+                    (
+                        u64::from_be_bytes(rest[at..at + 8].try_into().unwrap()),
+                        PubKey::new(rest[at + 8..at + 40].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        };
         Ok(Home {
             origin: PubKey::new(b[..32].try_into().unwrap()),
-            domain: utf8(&b[33..], "domain")?.to_string(),
+            domain,
+            former,
         })
     }
 }
@@ -982,6 +1025,146 @@ impl ByAccount {
             account: PubKey::new(b[33..65].try_into().unwrap()),
             action: Action::read(b, 65),
         })
+    }
+}
+
+/// SIP-53: `POST /channel/rehome`. The action is over event `0x0e` with
+/// `subject` and an empty `arg`, signed under the channel's current origin.
+/// `domain` is a hint to where `subject` is reached, unsigned as SIP-43's is.
+///
+/// `| type: u8 = 0x19 | channel[32] | subject[32] | dom_len: u8 | domain | action |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rehome {
+    pub channel: [u8; 32],
+    pub subject: PubKey,
+    pub domain: String,
+    pub action: Action,
+}
+
+impl Rehome {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(66 + self.domain.len() + ACTION_LEN);
+        out.push(TYPE_REHOME);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(self.subject.as_bytes());
+        out.push(self.domain.len() as u8);
+        out.extend_from_slice(self.domain.as_bytes());
+        self.action.write(&mut out);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Rehome> {
+        if b.len() < 66 || b[0] != TYPE_REHOME {
+            return Err(Error::Malformed("not a rehome".into()));
+        }
+        let len = b[65] as usize;
+        if b.len() != 66 + len + ACTION_LEN {
+            return Err(Error::Malformed("rehome cut short".into()));
+        }
+        let domain = std::str::from_utf8(&b[66..66 + len])
+            .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?
+            .to_string();
+        Ok(Rehome {
+            channel: b[1..33].try_into().unwrap(),
+            subject: PubKey::new(b[33..65].try_into().unwrap()),
+            domain,
+            action: Action::read(b, 66 + len),
+        })
+    }
+}
+
+/// SIP-53: `POST /channel/rehomed` and `/peer/rehomed`: the rehome entry,
+/// receipted by the new origin, carried to an exchange that has not seen
+/// it -- another replica, or the old origin come back.
+///
+/// `| type: u8 = 0x1a | channel[32] | dom_len: u8 | domain | entry (receipted) |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rehomed {
+    pub channel: [u8; 32],
+    pub domain: String,
+    pub entry: Entry,
+}
+
+impl Rehomed {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(34 + self.domain.len() + 256);
+        out.push(TYPE_REHOMED);
+        out.extend_from_slice(&self.channel);
+        out.push(self.domain.len() as u8);
+        out.extend_from_slice(self.domain.as_bytes());
+        self.entry.write_receipted(&mut out);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Rehomed> {
+        if b.len() < 34 || b[0] != TYPE_REHOMED {
+            return Err(Error::Malformed("not a carried rehome".into()));
+        }
+        let len = b[33] as usize;
+        if b.len() < 34 + len {
+            return Err(Error::Malformed("carried rehome cut short".into()));
+        }
+        let domain = std::str::from_utf8(&b[34..34 + len])
+            .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?
+            .to_string();
+        let mut at = 34 + len;
+        let entry = Entry::read_receipted(b, &mut at)?;
+        if at != b.len() {
+            return Err(Error::Malformed("trailing bytes after the entry".into()));
+        }
+        Ok(Rehomed {
+            channel: b[1..33].try_into().unwrap(),
+            domain,
+            entry,
+        })
+    }
+}
+
+/// SIP-53: the caller's own entries an exchange ordered past a fork it
+/// then lost, answered to `POST /channel/stranded` (a `ByChannel` of type
+/// `0x1b`). The bodies as posted, so a client can post them again.
+///
+/// `| count: u16 | count × (seq: u64 | posted: u64 | len: u32 | body) |`
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Stranded {
+    pub entries: Vec<(u64, u64, Vec<u8>)>,
+}
+
+impl Stranded {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.entries.len() * 24);
+        out.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
+        for (seq, posted, body) in &self.entries {
+            out.extend_from_slice(&seq.to_be_bytes());
+            out.extend_from_slice(&posted.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Stranded> {
+        if b.len() < 2 {
+            return Err(Error::Malformed("stranded cut short".into()));
+        }
+        let count = u16::from_be_bytes([b[0], b[1]]) as usize;
+        let mut at = 2;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if at + 20 > b.len() {
+                return Err(Error::Malformed("stranded cut short".into()));
+            }
+            let seq = u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+            let posted = u64::from_be_bytes(b[at + 8..at + 16].try_into().unwrap());
+            let len = u32::from_be_bytes(b[at + 16..at + 20].try_into().unwrap()) as usize;
+            at += 20;
+            if at + len > b.len() {
+                return Err(Error::Malformed("stranded cut short".into()));
+            }
+            entries.push((seq, posted, b[at..at + len].to_vec()));
+            at += len;
+        }
+        Ok(Stranded { entries })
     }
 }
 

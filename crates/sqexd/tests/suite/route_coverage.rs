@@ -295,6 +295,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::Forwarder::standing"),
         ReplicationPeer,
     ),
+    // SIP-53: the new origin telling a peer the channel moved.
+    (
+        "POST",
+        "/peer/rehomed",
+        Peer("replica::pull_once, the new origin telling the old"),
+        ReplicationPeer,
+    ),
     // SIP-43: a replica carrying a member's post to the origin.
     (
         "POST",
@@ -347,6 +354,26 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/wake/forget", Cli("sqex wake forget"), SelfOnly),
     // SIP-43: where a channel lives, asked once per channel before signing.
     ("POST", "/channel/home", Chat("Chat::home"), Member),
+    // SIP-53: an admin moves the origin; a member carries the rehome to an
+    // exchange that has not seen it; an author asks after what was stranded.
+    (
+        "POST",
+        "/channel/rehome",
+        Chat("Chat::rehome"),
+        ChannelAdmin,
+    ),
+    (
+        "POST",
+        "/channel/rehomed",
+        Chat("Chat::carry_rehome"),
+        Member,
+    ),
+    (
+        "POST",
+        "/channel/stranded",
+        Chat("Chat::stranded_entries"),
+        SelfOnly,
+    ),
     // Reached when a fetch is refused with `equivocated`: the client asks for
     // the evidence rather than reporting a bare refusal.
     (
@@ -370,7 +397,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     (
         "POST",
         "/channel/key/missing",
-        Chat("Chat::stranded"),
+        Chat("Chat::stranded_entries"),
         Member,
     ),
     ("POST", "/channel/cursor", Chat("Chat::mark_read"), Member),

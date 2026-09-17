@@ -10,12 +10,13 @@ use sqex_proto::blob::Attachment;
 use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
     EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
-    EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
+    EVENT_REHOMED, EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
     EVENT_UNREPLICATE, Entries, Entry, Fetch, Home, Invite, Invitee, KIND_MEMBER, KIND_SYSTEM,
     List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark, Marks,
-    Membership, Mine, Mines, Post, Posted, Retain, Role, System, TYPE_CLOSE, TYPE_CURSORS,
-    TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE,
-    TYPE_REPLICATE, TYPE_UNREPLICATE, Visibility, constitution, direct_message_id,
+    Membership, Mine, Mines, Post, Posted, Rehome, Rehomed, Retain, Role, Stranded, System,
+    TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE,
+    TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_STRANDED, TYPE_UNREPLICATE, Visibility,
+    constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
@@ -693,6 +694,10 @@ pub struct Chat {
     /// verifies under, and it is this connection's exchange only for a
     /// channel that lives here.
     homes: HashMap<[u8; 32], Home>,
+    /// SIP-53: the exchanges a channel was ordered by before its current
+    /// origin, newest first. What they signed and receipted verifies under
+    /// them, as a key's predecessors do (SIP-40).
+    former: HashMap<[u8; 32], Vec<PubKey>>,
     /// SIP-40: the keys each exchange held before its current one, as the
     /// pin store remembers them, newest first. What was signed under them
     /// still verifies under them and under nothing else.
@@ -780,6 +785,7 @@ impl Chat {
             receipts: AtomicBool::new(true),
             told_about: HashMap::new(),
             homes: HashMap::new(),
+            former: HashMap::new(),
             bound_in: HashMap::new(),
             domain: None,
             followed,
@@ -3236,9 +3242,23 @@ impl Chat {
             Err(ChatError::NoChatHere(_)) => Home {
                 origin: self.exchange,
                 domain: String::new(),
+                former: Vec::new(),
             },
             Err(e) => return Err(e),
         };
+        // SIP-53: what earlier origins signed and receipted verifies under
+        // them.
+        for (_, f) in &home.former {
+            if *f != home.origin {
+                let former = self.former.entry(*channel).or_default();
+                if !former.contains(f) {
+                    former.push(*f);
+                }
+                self.predecessors
+                    .entry(*f)
+                    .or_insert_with(|| predecessors_of(f));
+            }
+        }
         self.store.set_home(channel, &home.origin);
         self.predecessors
             .entry(home.origin)
@@ -3265,7 +3285,140 @@ impl Chat {
         if let Some(older) = self.predecessors.get(&current) {
             keys.extend(older.iter().copied());
         }
+        // SIP-53: and every exchange that ordered the channel before.
+        if let Some(former) = self.former.get(channel) {
+            for f in former {
+                keys.push(*f);
+                if let Some(older) = self.predecessors.get(f) {
+                    keys.extend(older.iter().copied());
+                }
+            }
+        }
         keys
+    }
+
+    /// SIP-53: the channel's origin is `subject` from here. The one it had
+    /// is kept as a former origin, and signing moves to the new one.
+    fn moved_origin(&mut self, channel: &[u8; 32], subject: &PubKey) {
+        let was = self.exchange_of(channel);
+        if was == *subject {
+            return;
+        }
+        let former = self.former.entry(*channel).or_default();
+        if !former.contains(&was) {
+            former.insert(0, was);
+        }
+        let domain = self
+            .homes
+            .get(channel)
+            .filter(|h| h.origin == *subject)
+            .map(|h| h.domain.clone())
+            .unwrap_or_default();
+        self.homes.insert(
+            *channel,
+            Home {
+                origin: *subject,
+                domain,
+                former: Vec::new(),
+            },
+        );
+        self.store.set_home(channel, subject);
+        self.predecessors
+            .entry(*subject)
+            .or_insert_with(|| predecessors_of(subject));
+    }
+
+    /// SIP-53: move the channel's origin to `subject` -- an exchange it is
+    /// replicated to, from the origin; or the exchange this client is at,
+    /// from a replica whose origin is gone. Signed under the origin the
+    /// channel has now; from here it is `subject`'s.
+    pub async fn rehome(
+        &mut self,
+        channel: &[u8; 32],
+        subject: &PubKey,
+        domain: &str,
+    ) -> Result<()> {
+        let info = self.info(channel).await?;
+        let (action, head) = self.sign_action_at(channel, &info, EVENT_REHOMED, subject, &[])?;
+        self.post(
+            "/channel/rehome",
+            Rehome {
+                channel: *channel,
+                subject: *subject,
+                domain: domain.to_string(),
+                action,
+            }
+            .encode(),
+        )
+        .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
+        self.moved_origin(channel, subject);
+        if let Some(h) = self.homes.get_mut(channel) {
+            h.domain = domain.to_string();
+        }
+        Ok(())
+    }
+
+    /// SIP-53: carry a rehome this client holds to the exchange it is at,
+    /// which has not seen it -- another replica, or the old origin come
+    /// back. The exchange verifies it and follows, or refuses.
+    pub async fn carry_rehome(&mut self, channel: &[u8; 32]) -> Result<bool> {
+        let Some(entry) = self.rehome_entry(channel)? else {
+            return Ok(false);
+        };
+        let domain = self
+            .homes
+            .get(channel)
+            .map(|h| h.domain.clone())
+            .unwrap_or_default();
+        self.post(
+            "/channel/rehomed",
+            Rehomed {
+                channel: *channel,
+                domain,
+                entry,
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// SIP-53: the latest rehome entry this client holds for a channel,
+    /// receipted, if any.
+    fn rehome_entry(&self, channel: &[u8; 32]) -> Result<Option<Entry>> {
+        let raw = self.store.entries_after(channel, 0, usize::MAX)?;
+        let mut found = None;
+        for (_, b) in &raw {
+            let mut at = 0;
+            if let Ok(e) = Entry::read_receipted(b, &mut at)
+                && e.kind == KIND_SYSTEM
+                && System::decode(&e.body)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.event == EVENT_REHOMED)
+            {
+                found = Some(e);
+            }
+        }
+        Ok(found)
+    }
+
+    /// SIP-53: this client's own entries an exchange ordered past a fork
+    /// it lost. The bodies as posted, to be posted again.
+    pub async fn stranded_entries(
+        &mut self,
+        channel: &[u8; 32],
+    ) -> Result<Vec<(u64, u64, Vec<u8>)>> {
+        let body = self
+            .post(
+                "/channel/stranded",
+                ByChannel { channel: *channel }.encode(TYPE_STRANDED),
+            )
+            .await?;
+        Ok(Stranded::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .entries)
     }
 
     /// Whether a channel lives at another exchange than this connection's.
@@ -4310,6 +4463,14 @@ impl Chat {
                         .and_then(|p| System::decode(p).ok().flatten())
                 })
                 .flatten();
+            // SIP-53: the origin moved. From here the channel's signatures
+            // and receipts are under the new origin's key, and what came
+            // before verifies under the old one, kept as a former origin.
+            if let Some(sys) = &system
+                && sys.event == EVENT_REHOMED
+            {
+                self.moved_origin(channel, &sys.subject);
+            }
             let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
             let redacts = match &body {
                 Some(Body::Redact { target }) => Some(*target),

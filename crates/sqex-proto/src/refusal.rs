@@ -140,6 +140,14 @@ pub enum Code {
     /// A manifest naming a blob the account does not hold and may not fetch.
     NotHeld,
 
+    // SIP-53 origin succession.
+    /// A rehome at a replica whose origin was reached too recently to be
+    /// gone; the detail says how long ago.
+    OriginReachable,
+    /// A rehome naming an exchange that is not the channel's replica -- or,
+    /// at a replica, not this exchange.
+    NotAReplica,
+
     // SIP-5 mailbox.
     RecipientFull,
     RecipientQuota,
@@ -212,6 +220,8 @@ impl Code {
             Code::Succeeded => 63,
             Code::StaleGeneration => 64,
             Code::NotHeld => 65,
+            Code::OriginReachable => 66,
+            Code::NotAReplica => 67,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -296,6 +306,8 @@ impl Code {
             63 => Code::Succeeded,
             64 => Code::StaleGeneration,
             65 => Code::NotHeld,
+            66 => Code::OriginReachable,
+            67 => Code::NotAReplica,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -405,6 +417,8 @@ impl Code {
             Code::Succeeded => "succeeded",
             Code::StaleGeneration => "stale_generation",
             Code::NotHeld => "not_held",
+            Code::OriginReachable => "origin_reachable",
+            Code::NotAReplica => "not_a_replica",
 
             Code::Unknown(_) => "unknown",
         }
@@ -478,6 +492,8 @@ impl Code {
         Code::Succeeded,
         Code::StaleGeneration,
         Code::NotHeld,
+        Code::OriginReachable,
+        Code::NotAReplica,
     ];
 }
 

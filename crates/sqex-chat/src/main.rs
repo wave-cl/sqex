@@ -2285,6 +2285,17 @@ async fn handle_key(
                     }),
                     Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
                 },
+                Command::Rehome(key, domain) => match key.parse::<PubKey>() {
+                    Ok(to) => chat.rehome(&channel, &to, &domain).await.map(|()| {
+                        Some(format!(
+                            "this conversation is ordered by {} from here. Everyone in it \
+                             will see the move in the log; what was said before still \
+                             verifies under the exchange that ordered it then",
+                            short(&to)
+                        ))
+                    }),
+                    Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
+                },
                 Command::Rotate => chat.rotate(&channel).await.map(|epoch| {
                     Some(format!(
                         "rotated to epoch {epoch} — everyone here has the new key, \
@@ -2657,6 +2668,10 @@ enum Command {
     /// channel. `bool` is false for `/unreplicate`, which ends the
     /// subscription and recalls nothing.
     Replicate(String, bool),
+    /// SIP-53: `/rehome <exchange key> [domain]` — move where this channel
+    /// is ordered: to a replica, from its origin; or to the exchange this
+    /// client is at, when the origin is gone.
+    Rehome(String, String),
     /// `/name <name>` — rename, as a sealed entry the exchange cannot read.
     Name(String),
     /// `/topic <text>` — set what this channel is for, likewise sealed.
@@ -2799,6 +2814,16 @@ impl Command {
             "/replicate" => Command::Unknown(
                 "/replicate needs an exchange's public key. It lets that exchange hold a \
                  copy of this conversation, and cannot be undone"
+                    .into(),
+            ),
+            "/rehome" if !first.is_empty() => {
+                let domain = rest.split_whitespace().nth(1).unwrap_or("").to_string();
+                Command::Rehome(first.to_string(), domain)
+            }
+            "/rehome" => Command::Unknown(
+                "/rehome needs an exchange's public key: a replica of this channel, or the \
+                 exchange you are at if the origin is gone. A domain after it says where \
+                 that exchange is reached"
                     .into(),
             ),
             "/unreplicate" if !first.is_empty() => Command::Replicate(first.to_string(), false),

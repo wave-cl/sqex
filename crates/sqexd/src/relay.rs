@@ -868,6 +868,15 @@ pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
     }
 }
 
+/// SIP-53: find an exchange by domain, as a call would -- SIP-33 discovery
+/// in a deployment, the fixed map in a test.
+pub async fn find_by_domain(
+    server: &Arc<Server>,
+    domain: &str,
+) -> Result<(PubKey, SocketAddr), String> {
+    find_peer(server, domain).await
+}
+
 /// The address of a live link to `key`, bringing one up by the domain the
 /// peer list records for it where there is none. `None` when the key is
 /// not a peer, has no domain on record, or cannot be reached.

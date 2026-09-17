@@ -39,13 +39,13 @@ use sqex_proto::blob_store::{
 };
 use sqex_proto::channel::{
     ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
-    EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED, EVENT_RENAMED,
-    EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_SUCCEEDED, EVENT_UNREPLICATE, Entries,
-    Entry, Invitee, KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH, MAX_BATCH_BYTES,
-    MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
-    MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark,
-    Marks, Member, Membership, Mines, Post, Posted, Public, Receipted, Retain, Role, SIGNAL_TTL,
-    Signalled, System, Tip, Visibility, constitution, direct_message_id,
+    EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REHOMED, EVENT_REMOVED,
+    EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_SUCCEEDED,
+    EVENT_UNREPLICATE, Entries, Entry, Invitee, KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH,
+    MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES,
+    MAX_MEMBERS, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN,
+    MIN_RETENTION, Mark, Marks, Member, Membership, Mines, Post, Posted, Public, Receipted, Retain,
+    Role, SIGNAL_TTL, Signalled, System, Tip, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded, verify_envelope,
@@ -145,6 +145,12 @@ pub enum ChannelError {
     StaleGeneration(u64),
     /// SIP-48: a manifest naming a blob the account neither holds nor may fetch.
     NotHeld,
+    /// SIP-53: a rehome at a replica whose origin was reached this many
+    /// seconds ago -- too recently to be gone.
+    OriginReachable(u64),
+    /// SIP-53: the named exchange holds no `0x0b` for the channel, or a
+    /// replica was asked to make some other exchange the origin.
+    NotAReplica,
     Storage,
 }
 
@@ -183,6 +189,8 @@ impl ChannelError {
             ChannelError::LastAdmin => "last_admin",
             ChannelError::StaleGeneration(_) => "stale_generation",
             ChannelError::NotHeld => "not_held",
+            ChannelError::OriginReachable(_) => "origin_reachable",
+            ChannelError::NotAReplica => "not_a_replica",
             ChannelError::Storage => "storage",
         }
     }
@@ -224,6 +232,8 @@ impl ChannelError {
             ChannelError::Equivocated => Code::Equivocated,
             ChannelError::StaleGeneration(_) => Code::StaleGeneration,
             ChannelError::NotHeld => Code::NotHeld,
+            ChannelError::OriginReachable(_) => Code::OriginReachable,
+            ChannelError::NotAReplica => Code::NotAReplica,
             ChannelError::Storage => Code::Storage,
         }
     }
@@ -251,7 +261,10 @@ impl ChannelError {
             // itself is contradictory, and saying so is the whole point.
             ChannelError::Equivocated => 409,
             // SIP-48: another device wrote first; the detail says where it got to.
-            ChannelError::StaleGeneration(_) | ChannelError::NotHeld => 409,
+            ChannelError::StaleGeneration(_)
+            | ChannelError::NotHeld
+            | ChannelError::OriginReachable(_)
+            | ChannelError::NotAReplica => 409,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
@@ -550,6 +563,26 @@ CREATE TABLE IF NOT EXISTS replicated (
     -- channel.
     shaped INTEGER NOT NULL DEFAULT 0
 );
+-- SIP-53: the exchanges that have ordered this channel, each from the
+-- position after the rehome that moved it there. Row 0 (from_seq 1) is the
+-- exchange that created it, written when the history is first needed.
+CREATE TABLE IF NOT EXISTS origin_history (
+    channel  BLOB    NOT NULL,
+    from_seq INTEGER NOT NULL,
+    origin   BLOB    NOT NULL,
+    moved_at INTEGER NOT NULL,
+    PRIMARY KEY (channel, from_seq)
+);
+-- SIP-53: entries this exchange ordered past a fork it then lost. Kept for
+-- their authors for a while; never served as the conversation.
+CREATE TABLE IF NOT EXISTS stranded (
+    channel  BLOB    NOT NULL,
+    seq      INTEGER NOT NULL,
+    account  BLOB    NOT NULL,
+    body     BLOB    NOT NULL,
+    posted   INTEGER NOT NULL,
+    PRIMARY KEY (channel, seq)
+);
 CREATE TABLE IF NOT EXISTS high_water (
     channel BLOB    NOT NULL,
     device  BLOB    NOT NULL,
@@ -678,6 +711,14 @@ impl Channels {
         add_column(&db, "entry", "entry_hash", "BLOB NOT NULL DEFAULT x''")?;
         add_column(&db, "entry", "head", "BLOB NOT NULL DEFAULT x''")?;
         add_column(&db, "entry", "receipt", "BLOB NOT NULL DEFAULT x''")?;
+        // SIP-53: a hint to where a replicated channel's origin is reached,
+        // for an origin learned from a rehome rather than from configuration.
+        add_column(
+            &db,
+            "replicated",
+            "origin_domain",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
         // SIP-35's `replicated` shipped in 0.31.0 without `derivable`, which
         // was added to the `CREATE TABLE` body in 0.32.0 — where it did nothing
         // for the exchanges that already had the table, because `CREATE TABLE
@@ -3017,6 +3058,7 @@ impl Channels {
             next_chain,
             head,
             msg_seq,
+            moved: moved_to(&db, channel),
         })
     }
 
@@ -3051,6 +3093,444 @@ impl Channels {
         .ok()
         .flatten()
         .is_some()
+    }
+
+    /// SIP-53: move the channel's origin.
+    ///
+    /// At the origin, a planned move: `subject` must hold a surviving
+    /// `0x0b`, the entry is ordered and receipted here, and the channel is
+    /// closed to writes from there -- `replicated` names `subject`, so every
+    /// write route refuses with it and `/channel/home` answers it.
+    ///
+    /// At a replica, the origin is gone: `subject` must be this exchange,
+    /// the origin must have been out of reach for `away_secs` at least
+    /// `min_away`, the roster must be derivable, and no rehome may have been
+    /// taken within `REHOME_MIN_SECS`. The action is verified under the
+    /// outgoing origin and the entry receipted under this one; from there
+    /// this exchange is the origin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehome(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        channel: &[u8; 32],
+        subject: &PubKey,
+        domain: &str,
+        action: &Action,
+        away_secs: Option<u64>,
+        min_away: u64,
+    ) -> Result<u64, ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin rehome"))?;
+        let (_, retention, _, _) = channel_row(&tx, channel)?;
+        if !is_admin(&tx, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        if let Some((_, last)) = last_rehome(&tx, channel)
+            && now.saturating_sub(last) < REHOME_MIN_SECS
+        {
+            return Err(ChannelError::OriginReachable(0));
+        }
+        let place = self.place(&tx, channel)?;
+        let outgoing = origin_row(&tx, channel)
+            .map(|(o, _)| o)
+            .unwrap_or(self.exchange);
+        let seq = match origin_row(&tx, channel) {
+            None => {
+                // The origin: a planned move to a replica it authorised.
+                if *subject == self.exchange {
+                    return Err(ChannelError::NotAReplica);
+                }
+                let authorised: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM replica WHERE channel = ?1 AND peer = ?2",
+                        params![&channel[..], subject.as_bytes()],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(storage("check replica"))?
+                    .unwrap_or(false);
+                if !authorised {
+                    return Err(ChannelError::NotAReplica);
+                }
+                let seq = write_system(
+                    &tx,
+                    &place,
+                    channel,
+                    EVENT_REHOMED,
+                    subject,
+                    caller,
+                    device,
+                    &[],
+                    action,
+                    now,
+                    self.exchange_seed.as_ref(),
+                )?;
+                tx.execute(
+                    "INSERT INTO replicated (channel, origin, window_secs, derivable, shaped, origin_domain)
+                     VALUES (?1, ?2, ?3, 1, 1, ?4)
+                     ON CONFLICT (channel) DO UPDATE SET origin = ?2, origin_domain = ?4",
+                    params![&channel[..], subject.as_bytes(), retention as i64, domain],
+                )
+                .map_err(storage("close to writes"))?;
+                seq
+            }
+            Some((old_origin, _)) => {
+                // A replica: only to itself, and only of an origin that is gone.
+                if *subject != self.exchange {
+                    return Err(ChannelError::NotAReplica);
+                }
+                match away_secs {
+                    Some(a) if a >= min_away => {}
+                    Some(a) => return Err(ChannelError::OriginReachable(a)),
+                    None => return Err(ChannelError::OriginReachable(0)),
+                }
+                let derivable: bool = tx
+                    .query_row(
+                        "SELECT derivable FROM replicated WHERE channel = ?1",
+                        params![&channel[..]],
+                        |r| r.get::<_, i64>(0).map(|d| d != 0),
+                    )
+                    .optional()
+                    .map_err(storage("read derivable"))?
+                    .unwrap_or(false);
+                if !derivable {
+                    return Err(ChannelError::Underived(old_origin));
+                }
+                let old_place = Place {
+                    exchange: old_origin,
+                    ..place
+                };
+                // The origin's log is what this exchange holds of it; the
+                // rehome goes after the last entry held, and the head chains
+                // from it. The chains are rebuilt first: the admin's action
+                // takes a step on theirs, which a replica never tracked.
+                rebuild_standing(&tx, channel)?;
+                let seq = write_system_between(
+                    &tx,
+                    &old_place,
+                    &place,
+                    channel,
+                    EVENT_REHOMED,
+                    subject,
+                    caller,
+                    device,
+                    &[],
+                    action,
+                    now,
+                    self.exchange_seed.as_ref(),
+                )?;
+                tx.execute(
+                    "DELETE FROM replicated WHERE channel = ?1",
+                    params![&channel[..]],
+                )
+                .map_err(storage("become the origin"))?;
+                seq
+            }
+        };
+        record_origin(&tx, channel, seq + 1, subject, &outgoing, now)?;
+        tx.commit().map_err(storage("commit rehome"))?;
+        self.wake(channel);
+        Ok(seq)
+    }
+
+    /// SIP-53: a rehome entry, receipted by the new origin, carried here by
+    /// a client or a peer. Verified against what this exchange holds: the
+    /// receipt under `subject`, the head chaining from the entry before, and
+    /// the actor an admin. Then this exchange follows: a replica switches
+    /// its origin; the old origin becomes a replica, stranding whatever it
+    /// ordered past the fork. Two rehomes for one fork settle on the earlier
+    /// `posted`, then the lower `subject`.
+    pub fn adopt_rehome(
+        &self,
+        channel: &[u8; 32],
+        e: &Entry,
+        domain: &str,
+    ) -> Result<bool, ChannelError> {
+        let now = now_unix();
+        let Some(stamp) = e.stamp else {
+            return Err(ChannelError::NoReceipts);
+        };
+        let Ok(Some(sys)) = System::decode(&e.body) else {
+            return Err(ChannelError::SystemEntry);
+        };
+        if e.kind != KIND_SYSTEM || sys.event != EVENT_REHOMED {
+            return Err(ChannelError::SystemEntry);
+        }
+        let subject = sys.subject;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin adopt rehome"))?;
+        let place = self.place(&tx, channel)?;
+        // Already there: idempotent.
+        if let Some((current, _)) = origin_row(&tx, channel)
+            && current == subject
+        {
+            return Ok(false);
+        }
+        if subject == self.exchange {
+            return Ok(false);
+        }
+        if !is_admin(&tx, channel, &sys.actor) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        let new_place = Place {
+            exchange: subject,
+            ..place
+        };
+        if !receipt::verify(
+            &ReceiptTerms {
+                place: new_place,
+                seq: e.seq,
+                posted: e.posted,
+                entry_hash: stamp.entry_hash,
+                head: stamp.head,
+            },
+            &stamp.receipt,
+        ) {
+            return Err(ChannelError::BadSignature);
+        }
+        // The head must chain from the entry before it, where held.
+        if e.seq > 1 {
+            let prev: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT head FROM entry WHERE channel = ?1 AND seq = ?2",
+                    params![&channel[..], (e.seq - 1) as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("read head before"))?;
+            if let Some(prev) = prev {
+                let prev: [u8; 32] = prev.try_into().unwrap_or(HEAD_GENESIS);
+                if receipt::advance(&prev, &stamp.entry_hash) != stamp.head {
+                    return Err(ChannelError::BrokenChain);
+                }
+            }
+        }
+        // Another rehome for the same fork, already taken: the earlier
+        // `posted` wins, then the lower subject.
+        if let Some((from_seq, moved_at)) = last_rehome(&tx, channel)
+            && from_seq == e.seq + 1
+        {
+            let ours = (
+                moved_at,
+                origin_row(&tx, channel)
+                    .map(|(o, _)| o)
+                    .unwrap_or(self.exchange),
+            );
+            let theirs = (e.posted, subject);
+            if ours <= theirs {
+                return Ok(false);
+            }
+        }
+        let outgoing = origin_row(&tx, channel)
+            .map(|(o, _)| o)
+            .unwrap_or(self.exchange);
+        // What this exchange ordered past the fork is stranded.
+        let stranded = tx
+            .execute(
+                "INSERT OR IGNORE INTO stranded (channel, seq, account, body, posted)
+                 SELECT channel, seq, account, body, posted FROM entry
+                 WHERE channel = ?1 AND seq >= ?2 AND kind = ?3",
+                params![&channel[..], e.seq as i64, KIND_MEMBER as i64],
+            )
+            .map_err(storage("strand"))?;
+        tx.execute(
+            "DELETE FROM entry WHERE channel = ?1 AND seq >= ?2",
+            params![&channel[..], e.seq as i64],
+        )
+        .map_err(storage("truncate at the fork"))?;
+        if stranded > 0 {
+            tracing::warn!(
+                channel = %bs58::encode(channel).into_string(),
+                stranded,
+                "entries ordered past a rehome are stranded"
+            );
+        }
+        let (_, retention, _, _) = channel_row(&tx, channel)?;
+        tx.execute(
+            "INSERT INTO replicated (channel, origin, window_secs, derivable, shaped, origin_domain)
+             VALUES (?1, ?2, ?3, 1, 1, ?4)
+             ON CONFLICT (channel) DO UPDATE SET origin = ?2, origin_domain = ?4",
+            params![&channel[..], subject.as_bytes(), retention as i64, domain],
+        )
+        .map_err(storage("follow the rehome"))?;
+        // The rehome entry itself, as pulled: the origin's word, receipted.
+        tx.execute(
+            "INSERT OR IGNORE INTO entry (channel, seq, kind, account, device, posted,
+                                expires_after, epoch, msg_seq,
+                                chain_seq, prev, body_hash, sig, body,
+                                entry_hash, head, receipt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                &channel[..],
+                e.seq as i64,
+                e.kind as i64,
+                e.account.as_bytes(),
+                e.device.as_bytes(),
+                e.posted as i64,
+                e.expires_after as i64,
+                e.epoch as i64,
+                e.msg_seq as i64,
+                e.chain_seq as i64,
+                &e.prev[..],
+                &e.body_hash[..],
+                &e.sig[..],
+                &e.body,
+                &stamp.entry_hash[..],
+                &stamp.head[..],
+                &stamp.receipt[..],
+            ],
+        )
+        .map_err(storage("store rehome entry"))?;
+        tx.execute(
+            "UPDATE channel SET head = ?2, next_seq = ?3 WHERE id = ?1",
+            params![&channel[..], &stamp.head[..], (e.seq + 1) as i64],
+        )
+        .map_err(storage("head at the rehome"))?;
+        record_origin(&tx, channel, e.seq + 1, &subject, &outgoing, now)?;
+        tx.commit().map_err(storage("commit adopt rehome"))?;
+        self.wake(channel);
+        Ok(true)
+    }
+
+    /// SIP-53: the rehome entry that made this exchange the origin of
+    /// `channel`, receipted, for telling an exchange that has not seen it.
+    pub fn my_rehome(&self, channel: &[u8; 32]) -> Option<Entry> {
+        let (from_seq, _) = {
+            let db = self.db.lock().unwrap();
+            last_rehome(&db, channel)?
+        };
+        if !self
+            .origin_history(channel)
+            .last()
+            .is_some_and(|o| *o == self.exchange)
+        {
+            return None;
+        }
+        let pulled = self.pull(channel, from_seq.checked_sub(2)?, 1).ok()?;
+        pulled.entries.into_iter().find(|e| e.seq + 1 == from_seq)
+    }
+
+    /// SIP-53: the domain hint for a replicated channel's origin.
+    pub fn set_origin_domain(&self, channel: &[u8; 32], domain: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE replicated SET origin_domain = ?2 WHERE channel = ?1",
+            params![&channel[..], domain],
+        );
+    }
+
+    /// SIP-53: every exchange that has ordered `channel`, for verifying
+    /// entries from before a move. The creator where the history has none.
+    pub fn origin_history(&self, channel: &[u8; 32]) -> Vec<PubKey> {
+        let db = self.db.lock().unwrap();
+        let mut out: Vec<PubKey> = db
+            .prepare("SELECT origin FROM origin_history WHERE channel = ?1 ORDER BY from_seq")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![&channel[..]], |r| r.get::<_, Vec<u8>>(0))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(|r| r.ok())
+                            .filter_map(|b| b.try_into().ok().map(PubKey::new))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default();
+        out.dedup();
+        out
+    }
+
+    /// SIP-53: the exchanges that ordered `channel` before its current
+    /// origin, oldest first, each with the position its regime ended at.
+    pub fn former_origins(&self, channel: &[u8; 32]) -> Vec<(u64, PubKey)> {
+        let db = self.db.lock().unwrap();
+        let rows: Vec<(u64, PubKey)> = db
+            .prepare(
+                "SELECT from_seq, origin FROM origin_history WHERE channel = ?1 ORDER BY from_seq",
+            )
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![&channel[..]], |r| {
+                    Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?))
+                })
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .filter_map(|(f, o)| o.try_into().ok().map(|o| (f, PubKey::new(o))))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        // The history records each origin from the position after its
+        // rehome. The exchange before each rehome ended at that rehome;
+        // the first origin is the creator, which the history only names
+        // when it has moved on -- so it is the row `from_seq` 1, written
+        // when a channel first moves.
+        let mut out = Vec::new();
+        for pair in rows.windows(2) {
+            let (_, earlier) = pair[0];
+            let (from, _) = pair[1];
+            out.push((from - 1, earlier));
+        }
+        out
+    }
+
+    /// SIP-53: where a channel's origin moved to, if it has -- for a peer
+    /// or a client that was pulling from here.
+    pub fn moved_to(&self, channel: &[u8; 32]) -> Option<(PubKey, String)> {
+        let db = self.db.lock().unwrap();
+        moved_to(&db, channel)
+    }
+
+    /// SIP-53: the replicated channels whose origin is not in `configured`,
+    /// grouped by origin with the domain hint each was learned with.
+    pub fn moved_channels(&self, configured: &[PubKey]) -> Vec<(PubKey, String, Vec<[u8; 32]>)> {
+        let db = self.db.lock().unwrap();
+        let mut by: std::collections::BTreeMap<(Vec<u8>, String), Vec<[u8; 32]>> =
+            std::collections::BTreeMap::new();
+        if let Ok(mut st) = db.prepare("SELECT channel, origin, origin_domain FROM replicated")
+            && let Ok(rows) = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+        {
+            for (channel, origin, domain) in rows.flatten() {
+                let Ok(o) = <[u8; 32]>::try_from(origin.as_slice()) else {
+                    continue;
+                };
+                if configured.contains(&PubKey::new(o)) {
+                    continue;
+                }
+                if let Ok(c) = <[u8; 32]>::try_from(channel.as_slice()) {
+                    by.entry((origin, domain)).or_default().push(c);
+                }
+            }
+        }
+        by.into_iter()
+            .filter_map(|((o, d), cs)| o.try_into().ok().map(|o| (PubKey::new(o), d, cs)))
+            .collect()
+    }
+
+    /// SIP-53: an author's stranded entries here.
+    pub fn stranded_for(&self, channel: &[u8; 32], account: &PubKey) -> Vec<(u64, u64, Vec<u8>)> {
+        let db = self.db.lock().unwrap();
+        db.prepare(
+            "SELECT seq, posted, body FROM stranded WHERE channel = ?1 AND account = ?2 ORDER BY seq",
+        )
+        .ok()
+        .and_then(|mut st| {
+            st.query_map(params![&channel[..], account.as_bytes()], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get(2)?))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
     }
 
     /// SIP-35: adopt a channel as a replica of `origin`.
@@ -3354,6 +3834,49 @@ impl Channels {
                     params![&channel[..]],
                 )
                 .map_err(storage("mark derivable"))?;
+            }
+            // SIP-35's authorisations, kept at a replica too: should this
+            // exchange become the origin (SIP-53), they are what it serves
+            // the other replicas under.
+            match sys.event {
+                EVENT_REPLICATE => {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO replica (channel, peer) VALUES (?1, ?2)",
+                        params![&channel[..], sys.subject.as_bytes()],
+                    )
+                    .map_err(storage("derive authorisation"))?;
+                }
+                EVENT_UNREPLICATE => {
+                    tx.execute(
+                        "DELETE FROM replica WHERE channel = ?1 AND peer = ?2",
+                        params![&channel[..], sys.subject.as_bytes()],
+                    )
+                    .map_err(storage("derive withdrawal"))?;
+                }
+                _ => {}
+            }
+            // SIP-53: the origin moved. To this exchange: it is the origin
+            // from here, and stops pulling. Elsewhere: follow, with the
+            // domain to be learned from the origin's standing.
+            if sys.event == EVENT_REHOMED {
+                let outgoing = origin_row(&tx, channel)
+                    .map(|(o, _)| o)
+                    .unwrap_or(self.exchange);
+                if sys.subject == self.exchange {
+                    tx.execute(
+                        "DELETE FROM replicated WHERE channel = ?1",
+                        params![&channel[..]],
+                    )
+                    .map_err(storage("become the origin"))?;
+                    rebuild_standing(&tx, channel)?;
+                } else {
+                    tx.execute(
+                        "UPDATE replicated SET origin = ?2, origin_domain = '' WHERE channel = ?1",
+                        params![&channel[..], sys.subject.as_bytes()],
+                    )
+                    .map_err(storage("follow the rehome"))?;
+                }
+                record_origin(&tx, channel, e.seq + 1, &sys.subject, &outgoing, e.posted)?;
             }
         }
         // The replica's head follows the origin's, because it *is* the
@@ -4898,8 +5421,52 @@ fn write_system(
     action: &Action,
     now: u64,
     seed: Option<&[u8; 32]>,
-) -> Result<(), ChannelError> {
-    let action_input = check_action(db, place, actor, actor_device, event, subject, arg, action)?;
+) -> Result<u64, ChannelError> {
+    write_system_between(
+        db,
+        place,
+        place,
+        channel,
+        event,
+        subject,
+        actor,
+        actor_device,
+        arg,
+        action,
+        now,
+        seed,
+    )
+}
+
+/// [`write_system`] with the action verified at one place and the receipt
+/// issued at another: SIP-53's rehome entry, signed under the outgoing
+/// origin and receipted by the incoming one. Everywhere else the two are
+/// the same place. Returns the position written.
+#[allow(clippy::too_many_arguments)]
+fn write_system_between(
+    db: &Connection,
+    action_place: &Place,
+    place: &Place,
+    channel: &[u8; 32],
+    event: u8,
+    subject: &PubKey,
+    actor: &PubKey,
+    actor_device: &PubKey,
+    arg: &[u8],
+    action: &Action,
+    now: u64,
+    seed: Option<&[u8; 32]>,
+) -> Result<u64, ChannelError> {
+    let action_input = check_action(
+        db,
+        action_place,
+        actor,
+        actor_device,
+        event,
+        subject,
+        arg,
+        action,
+    )?;
     let seq: u64 = db
         .query_row(
             "SELECT next_seq FROM channel WHERE id = ?1",
@@ -4971,6 +5538,148 @@ fn write_system(
         params![&channel[..], (seq + 1) as i64],
     )
     .map_err(storage("bump next_seq"))?;
+    Ok(seq)
+}
+
+/// SIP-53: at least this long between rehomes of one channel.
+pub const REHOME_MIN_SECS: u64 = 3600;
+/// SIP-53: stranded entries are kept this long for their authors.
+pub const STRANDED_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The `replicated` row's origin and domain hint, if this is a replica.
+fn origin_row(db: &Connection, channel: &[u8; 32]) -> Option<(PubKey, String)> {
+    db.query_row(
+        "SELECT origin, origin_domain FROM replicated WHERE channel = ?1",
+        params![&channel[..]],
+        |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|(o, d)| o.try_into().ok().map(|o| (PubKey::new(o), d)))
+}
+
+/// SIP-53: where the origin went, if the history says it moved from here
+/// or from the origin this replica follows.
+fn moved_to(db: &Connection, channel: &[u8; 32]) -> Option<(PubKey, String)> {
+    let (origin, domain) = origin_row(db, channel)?;
+    let moved = db
+        .query_row(
+            "SELECT 1 FROM origin_history WHERE channel = ?1 AND origin = ?2",
+            params![&channel[..], origin.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some();
+    moved.then_some((origin, domain))
+}
+
+/// SIP-53: the last rehome of a channel: the position after it, and when.
+fn last_rehome(db: &Connection, channel: &[u8; 32]) -> Option<(u64, u64)> {
+    db.query_row(
+        "SELECT from_seq, moved_at FROM origin_history WHERE channel = ?1 AND from_seq > 1
+         ORDER BY from_seq DESC LIMIT 1",
+        params![&channel[..]],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// SIP-53: a replica tracks no chains and no message counters -- the origin
+/// did. Becoming the origin, it rebuilds both from the entries it holds:
+/// every entry's `entry_hash` is the link its device's next step chains
+/// from, and the highest `msg_seq` per device and epoch is what a nonce
+/// must not repeat.
+fn rebuild_standing(db: &Connection, channel: &[u8; 32]) -> Result<(), ChannelError> {
+    type Row = (i64, Vec<u8>, i64, Vec<u8>, Vec<u8>, i64, i64);
+    let rows: Vec<Row> = {
+        let mut stmt = db
+            .prepare(
+                "SELECT kind, device, chain_seq, entry_hash, body, epoch, msg_seq FROM entry
+                 WHERE channel = ?1 ORDER BY seq",
+            )
+            .map_err(storage("prepare rebuild"))?;
+        let rows = stmt
+            .query_map(params![&channel[..]], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .map_err(storage("query rebuild"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read rebuild"))?
+    };
+    db.execute(
+        "DELETE FROM chain WHERE channel = ?1",
+        params![&channel[..]],
+    )
+    .map_err(storage("clear chains"))?;
+    for (kind, device, chain_seq, entry_hash, body, epoch, msg_seq) in rows {
+        // A system entry's actor and step are inside its body; the row's
+        // device is zero. A succession's `chain_seq` is a timestamp, not a
+        // step, and takes none.
+        let (device, chain_seq) = if kind == KIND_SYSTEM as i64 {
+            match System::decode(&body) {
+                Ok(Some(sys)) if sys.event != EVENT_SUCCEEDED => {
+                    (sys.actor_device.as_bytes().to_vec(), sys.chain_seq as i64)
+                }
+                _ => continue,
+            }
+        } else {
+            (device, chain_seq)
+        };
+        db.execute(
+            "INSERT INTO chain (channel, device, chain_seq, head) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (channel, device) DO UPDATE SET chain_seq = ?3, head = ?4",
+            // The row holds the last step taken; `chain_head` adds one.
+            params![&channel[..], device, chain_seq, entry_hash],
+        )
+        .map_err(storage("rebuild chain"))?;
+        if kind == KIND_MEMBER as i64 {
+            db.execute(
+                "INSERT INTO high_water (channel, device, epoch, msg_seq) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (channel, device, epoch)
+                 DO UPDATE SET msg_seq = MAX(msg_seq, excluded.msg_seq)",
+                params![&channel[..], device, epoch, msg_seq],
+            )
+            .map_err(storage("rebuild high water"))?;
+        }
+    }
+    Ok(())
+}
+
+fn record_origin(
+    db: &Connection,
+    channel: &[u8; 32],
+    from_seq: u64,
+    origin: &PubKey,
+    outgoing: &PubKey,
+    now: u64,
+) -> Result<(), ChannelError> {
+    // The first move also records who ordered the channel until now, as
+    // the history's first row, so a reader can verify what came before.
+    db.execute(
+        "INSERT OR IGNORE INTO origin_history (channel, from_seq, origin, moved_at)
+         VALUES (?1, 1, ?2, 0)",
+        params![&channel[..], outgoing.as_bytes()],
+    )
+    .map_err(storage("record the creator"))?;
+    db.execute(
+        "INSERT OR REPLACE INTO origin_history (channel, from_seq, origin, moved_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![&channel[..], from_seq as i64, origin.as_bytes(), now as i64],
+    )
+    .map_err(storage("record origin"))?;
     Ok(())
 }
 

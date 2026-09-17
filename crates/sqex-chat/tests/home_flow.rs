@@ -309,3 +309,104 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
     );
     assert!(at_origin.forged().is_empty());
 }
+
+/// SIP-53: the admin moves the channel to the replica. A client that read
+/// it before the move and reads on after it holds entries under two
+/// origins and judges none of them forged; its posts go to the new origin;
+/// and a fresh client learns the whole history, move included, from the
+/// log alone.
+#[tokio::test]
+async fn a_channel_moves_to_its_replica_and_readers_follow_the_log() {
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(
+        replica_dir.path().join("host_key"),
+        hex::encode(replica_sk.to_bytes()),
+    )
+    .unwrap();
+    let replica_key = PubKey::new(replica_pub);
+    let (origin_addr, origin_pub) = origin_in(origin_dir.path(), &[replica_key]).await;
+    let origin = PubKey::new(origin_pub);
+    let store = origin_dir.path().join("alice.db");
+
+    let channel;
+    {
+        let mut alice = chat_at(origin_addr, origin_pub, 3, &store).await;
+        channel = alice.create_public("moving house", "").await.unwrap();
+        alice.send(&channel, "one").await.unwrap();
+        alice.replicate(&channel, &replica_key, true).await.unwrap();
+    }
+    let (replica_addr, _) = replica_in(replica_dir.path(), origin, origin_addr, channel).await;
+
+    // Alice, at the replica, reads what the origin ordered.
+    let mut here = chat_at(replica_addr, replica_pub, 3, &store).await;
+    let mut t = Timeline::new();
+    let mut caught_up = false;
+    for _ in 0..50 {
+        if let Ok(got) = here.poll(&channel, &mut t, 0).await
+            && said(&got.timeline) == ["one"]
+        {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(caught_up);
+    assert_eq!(here.exchange_of(&channel), origin);
+
+    // She moves it here, from the origin: signed under the origin, and from
+    // then on the channel is this exchange's.
+    {
+        let mut at_origin = chat_at(origin_addr, origin_pub, 3, &store).await;
+        at_origin
+            .rehome(&channel, &replica_key, "replica.example")
+            .await
+            .unwrap();
+        assert_eq!(at_origin.exchange_of(&channel), replica_key);
+        // The origin refuses her next post and says where the channel went.
+        let refused = at_origin.send(&channel, "too late").await;
+        assert!(
+            refused.is_err(),
+            "the old origin took a post after the move"
+        );
+    }
+
+    // The client at the replica sees the move arrive in the log, switches
+    // its signing to the new origin, and posts there.
+    let mut moved = false;
+    for _ in 0..50 {
+        let _ = here.poll(&channel, &mut t, 0).await;
+        if here.exchange_of(&channel) == replica_key {
+            moved = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(moved, "the client never saw the move");
+    assert!(
+        t.forged().is_empty(),
+        "forged after the move: {:?}",
+        t.forged()
+    );
+    here.send(&channel, "two").await.unwrap();
+    let got = here.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), ["one", "two"]);
+    assert!(t.forged().is_empty(), "{:?}", t.forged());
+
+    // A client with no memory of the channel reads it whole at the new
+    // origin: entries under the old key, the move, entries under the new,
+    // and judges none of them forged.
+    let mut fresh = chat_at(
+        replica_addr,
+        replica_pub,
+        3,
+        &replica_dir.path().join("alice-fresh.db"),
+    )
+    .await;
+    let mut t2 = Timeline::new();
+    let got = fresh.poll(&channel, &mut t2, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), ["one", "two"]);
+    assert!(t2.forged().is_empty(), "{:?}", t2.forged());
+    assert_eq!(fresh.exchange_of(&channel), replica_key);
+}

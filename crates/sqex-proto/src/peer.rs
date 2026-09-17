@@ -871,11 +871,15 @@ impl PullStanding {
 /// What the origin's own `Channel` would tell that device: the next chain
 /// position to sign at and the link to put in it, and the highest counter
 /// accepted at the current epoch. `| next_chain: u64 | head[32] | msg_seq: u64 |`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Standing {
     pub next_chain: u64,
     pub head: [u8; 32],
     pub msg_seq: u64,
+    /// SIP-53: where the channel's origin went, if it has: the new origin's
+    /// key and a hint to its domain. Absent on an exchange from before
+    /// SIP-53, which is what a 48-byte answer means.
+    pub moved: Option<(PubKey, String)>,
 }
 
 impl Standing {
@@ -884,20 +888,37 @@ impl Standing {
         out.extend_from_slice(&self.next_chain.to_be_bytes());
         out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.msg_seq.to_be_bytes());
+        if let Some((to, domain)) = &self.moved {
+            out.extend_from_slice(to.as_bytes());
+            out.push(domain.len() as u8);
+            out.extend_from_slice(domain.as_bytes());
+        }
         out
     }
 
     pub fn decode(b: &[u8]) -> Result<Standing> {
-        if b.len() != 48 {
+        if b.len() < 48 {
             return Err(Error::Malformed(format!(
-                "standing is {} bytes, want 48",
+                "standing is {} bytes, want at least 48",
                 b.len()
             )));
         }
+        let moved = if b.len() == 48 {
+            None
+        } else {
+            if b.len() < 81 || b.len() != 81 + b[80] as usize {
+                return Err(Error::Malformed("standing's move cut short".into()));
+            }
+            let domain = std::str::from_utf8(&b[81..])
+                .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?
+                .to_string();
+            Some((PubKey::new(b[48..80].try_into().unwrap()), domain))
+        };
         Ok(Standing {
             next_chain: u64::from_be_bytes(b[..8].try_into().unwrap()),
             head: b[8..40].try_into().unwrap(),
             msg_seq: u64::from_be_bytes(b[40..48].try_into().unwrap()),
+            moved,
         })
     }
 }
@@ -917,9 +938,17 @@ mod standing_tests {
             next_chain: 7,
             head: [3; 32],
             msg_seq: 9,
+            moved: None,
         };
         assert_eq!(Standing::decode(&s.encode()).unwrap(), s);
         assert!(Standing::decode(&[0; 47]).is_err());
+        // SIP-53: with the move, and an older reader's 48 bytes without.
+        let m = Standing {
+            moved: Some((PubKey::new([5; 32]), "y.test".into())),
+            ..s.clone()
+        };
+        assert_eq!(Standing::decode(&m.encode()).unwrap(), m);
+        assert_eq!(Standing::decode(&m.encode()[..48]).unwrap(), s);
     }
 }
 

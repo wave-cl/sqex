@@ -361,9 +361,32 @@ pub async fn pull_once(
         // entries is not the party we pinned and nothing it says is checkable.
         return Err("the origin reported an identity we did not pin".into());
     }
+    // SIP-53: answered, so not away.
+    server.reached(&origin.key);
 
     let mut all = HashMap::new();
     for channel in &origin.channels {
+        // SIP-53: a channel this origin no longer orders -- moved to another
+        // exchange, or to this one -- is not pulled from here.
+        match store.origin_of(channel) {
+            Some(o) if o == origin.key => {}
+            Some(_) => continue,
+            None if store.origin_history(channel).contains(&server.public_key) => {
+                // This exchange took the channel over while the origin was
+                // gone; the origin is back, and is told. It follows or it
+                // refuses; either way it is not pulled from.
+                if let Some(e) = store.my_rehome(channel) {
+                    let carried = sqex_proto::channel::Rehomed {
+                        channel: *channel,
+                        domain: String::new(),
+                        entry: e,
+                    };
+                    let _ = client.post("/peer/rehomed", carried.encode()).await;
+                }
+                continue;
+            }
+            None => {}
+        }
         // **Stop pulling a channel this origin has already contradicted itself
         // about.** SIP-35 requires it, and the reason is not squeamishness:
         // continuing would accumulate history from a party already caught
@@ -404,14 +427,20 @@ pub async fn pull_once(
             }
         }
         let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
-        let mut took = take_under(
-            store,
-            &origin.key,
-            &origin.predecessors,
-            channel,
-            &pulled,
-            &lookup,
-        );
+        // SIP-53: what earlier origins signed and receipted verifies under
+        // them, as SIP-40's predecessors do.
+        let mut predecessors = origin.predecessors.clone();
+        predecessors.extend(store.origin_history(channel));
+        let mut took = take_under(store, &origin.key, &predecessors, channel, &pulled, &lookup);
+        // SIP-53: a rehome among what was pulled moved the channel. Where it
+        // went is asked of the origin, which recorded the hint, so the task
+        // for moved channels can find it.
+        if store.origin_of(channel) != Some(origin.key)
+            && let Some((to, domain)) = standing_moved(client, channel, &server.public_key).await
+            && store.origin_of(channel) == Some(to)
+        {
+            store.set_origin_domain(channel, &domain);
+        }
 
         // **What was refused below the lowest entry held is asked for
         // again.** A pull asks from the highest entry held, so an entry
@@ -448,14 +477,7 @@ pub async fn pull_once(
                     }
                 }
                 let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
-                let again = take_under(
-                    store,
-                    &origin.key,
-                    &origin.predecessors,
-                    channel,
-                    &below,
-                    &lookup,
-                );
+                let again = take_under(store, &origin.key, &predecessors, channel, &below, &lookup);
                 if again.stored > 0 {
                     // The events just filled in come before the ones already
                     // applied, so the roster is derived again from the top.
@@ -917,6 +939,70 @@ pub async fn run(
             }
         }
         pause(origin.interval).await;
+    }
+}
+
+/// SIP-53: pull the channels whose origin was learned from a rehome rather
+/// than from configuration -- another replica's, or the old origin's own,
+/// once it follows. Each is found by SIP-33 discovery of the domain the
+/// rehome carried, checked against the key, and pulled as any origin is.
+pub async fn run_moved(
+    server: Arc<crate::server::Server>,
+    seed: [u8; 32],
+    configured: Vec<PubKey>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        for (origin, domain, channels) in server.channels().moved_channels(&configured) {
+            if domain.is_empty() {
+                continue;
+            }
+            let Ok(found) = server.relay_find(&domain).await else {
+                tracing::debug!(%domain, "cannot find a moved origin");
+                continue;
+            };
+            if found.0 != origin {
+                tracing::warn!(%domain, expected = %origin, found = %found.0, "a moved origin's domain names another key");
+                continue;
+            }
+            server.add_forwarder(origin, found.1, domain.clone());
+            let task = Origin {
+                key: origin,
+                addr: found.1,
+                channels,
+                interval,
+                predecessors: Vec::new(),
+            };
+            match H3Client::connect(task.addr, task.key.as_bytes(), &seed).await {
+                Err(e) => {
+                    tracing::warn!(origin = %origin, error = %e, "cannot reach a moved origin")
+                }
+                Ok(mut client) => match pull_once(&mut client, &server, &task).await {
+                    Err(e) => {
+                        tracing::warn!(origin = %origin, error = %e, "pull from a moved origin failed")
+                    }
+                    Ok(took) => report(&task, &took),
+                },
+            }
+        }
+    }
+}
+
+/// SIP-53: ask an origin where a channel went, via the standing it answers
+/// for any device -- here this exchange's own key.
+async fn standing_moved(
+    client: &mut H3Client,
+    channel: &[u8; 32],
+    me: &PubKey,
+) -> Option<(PubKey, String)> {
+    let req = sqex_proto::peer::PullStanding {
+        channel: *channel,
+        device: *me,
+    };
+    match client.post("/peer/standing", req.encode()).await {
+        Ok((200, body)) => sqex_proto::peer::Standing::decode(&body).ok()?.moved,
+        _ => None,
     }
 }
 
