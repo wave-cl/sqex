@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-chat"
-version = "0.64.5"
+version = "0.64.6"
 dependencies = [
  "bs58",
  "chacha20poly1305",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-cli"
-version = "0.64.5"
+version = "0.64.6"
 dependencies = [
  "bs58",
  "clap",
@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-discovery"
-version = "0.64.5"
+version = "0.64.6"
 dependencies = [
  "bs58",
  "dirs",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-proto"
-version = "0.64.5"
+version = "0.64.6"
 dependencies = [
  "bs58",
  "bytes",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "sqex-voice"
-version = "0.64.5"
+version = "0.64.6"
 dependencies = [
  "bytes",
  "clap",
@@ -2859,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "sqexd"
-version = "0.64.5"
+version = "0.64.6"
 dependencies = [
  "bs58",
  "bytes",
