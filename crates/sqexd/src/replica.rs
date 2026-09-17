@@ -829,6 +829,27 @@ impl Forwarder {
         Ok(forwarded)
     }
 
+    /// SIP-60: carry an account's Move to the origin ahead of an act made
+    /// for it, so the acts-for gate is open when the act arrives. Best
+    /// effort and idempotent: an origin holding it already says stale.
+    pub async fn carry_move(&self, seed: &[u8; 32], mv: &sqex_proto::home::Move, domain: &str) {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            *slot = match H3Client::connect(self.addr, self.key.as_bytes(), seed).await {
+                Ok(c) => Some(c),
+                Err(_) => return,
+            };
+        }
+        let client = slot.as_mut().expect("just filled");
+        let req = sqex_proto::peer::PeerMoved {
+            mv: *mv,
+            domain: domain.to_string(),
+        };
+        if client.post("/peer/moved", req.encode()).await.is_err() {
+            *slot = None;
+        }
+    }
+
     /// Ask the origin where `device` stands in `channel`, for an `info`
     /// answered here: a replica tracks no chains, and a device with a fresh
     /// store would otherwise sign from zero and be refused.
@@ -1039,23 +1060,11 @@ pub async fn run_homed(
             if origin == me {
                 continue;
             }
-            let addr = match server.forwarder(&origin) {
-                Some(f) => f.addr,
-                None => {
-                    if domain.is_empty() {
-                        continue;
-                    }
-                    let Ok(found) = server.relay_find(&domain).await else {
-                        tracing::debug!(%domain, "cannot find an account's origin");
-                        continue;
-                    };
-                    if found.0 != origin {
-                        tracing::warn!(%domain, expected = %origin, found = %found.0, "an origin's domain names another key");
-                        continue;
-                    }
-                    server.add_forwarder(origin, found.1, domain.clone());
-                    found.1
-                }
+            // By the hint the account gave, or by whatever else this
+            // exchange knows the origin by (SIP-60's `reach`).
+            let Some((addr, _)) = server.reach_by(&origin, &domain).await else {
+                tracing::debug!(%origin, %domain, "cannot find an account's origin");
+                continue;
             };
             let mut client = match H3Client::connect(addr, origin.as_bytes(), &seed).await {
                 Ok(c) => c,

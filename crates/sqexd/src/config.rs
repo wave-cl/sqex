@@ -232,6 +232,12 @@ pub struct FileConfig {
     /// once regardless. Default 30.
     #[serde(default)]
     pub home_secs: Option<u64>,
+    /// SIP-60: the domain this exchange is published under (SIP-33), told
+    /// to another exchange as the hint to find this one by. Optional: a
+    /// peer that already lists this exchange with a domain label needs no
+    /// hint.
+    #[serde(default)]
+    pub domain: Option<String>,
     /// SIP-56: rate limits, per account. Each is `[n, seconds]`: n in any
     /// window of that many seconds, refilling steadily; `[0, 0]` is
     /// unlimited. Omitted ones take SIP-56's defaults.
@@ -373,6 +379,8 @@ pub struct Config {
     pub directory_secs: u64,
     /// SIP-59: seconds between pulls for the accounts homed here.
     pub home_secs: u64,
+    /// SIP-60: this exchange's own domain, lowercased; `None` when unknown.
+    pub domain: Option<String>,
     /// SIP-56: the rate limits.
     pub limits: crate::limits::Limits,
 }
@@ -579,6 +587,11 @@ impl FileConfig {
             rehome_away_secs: self.rehome_away_secs.unwrap_or(300),
             directory_secs: self.directory_secs.unwrap_or(60).max(1),
             home_secs: self.home_secs.unwrap_or(30).max(1),
+            domain: self
+                .domain
+                .as_deref()
+                .map(|d| d.trim().to_ascii_lowercase())
+                .filter(|d| !d.is_empty()),
             limits: self.limits.resolve(),
         })
     }

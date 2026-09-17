@@ -486,6 +486,9 @@ async fn a_former_home_hands_off_the_keys_services_and_a_move_back_reopens_them(
         .await
         .unwrap();
     expect_moved(code, &body, "mailbox send");
+    // SIP-60: a prekey is not refused but taken at the home and handed on;
+    // here the home is not running, so the answer is "none", and never a
+    // prekey from a pool at the wrong exchange.
     let (code, body) = b
         .post(
             "/prekey/take",
@@ -493,7 +496,8 @@ async fn a_former_home_hands_off_the_keys_services_and_a_move_back_reopens_them(
         )
         .await
         .unwrap();
-    expect_moved(code, &body, "prekey take");
+    assert_eq!(code, 404, "prekey take: {}", common::said(&body));
+    assert_eq!(Refusal::decode(&body).unwrap().code, Code::NoPrekey);
     let (code, body) = b
         .post(
             "/resolve/get",

@@ -297,6 +297,12 @@ async fn run(cli: Cli) -> Result<(), String> {
     chat.top_up_prekeys()
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
+    // SIP-60: say where this account lives, once, so its exchange can act
+    // for it when another exchange puts it in a channel. Not fatal: an
+    // exchange from before SIP-59 has no such record to keep.
+    if let Err(e) = chat.ensure_home().await {
+        eprintln!("note: could not record this exchange as home: {e}");
+    }
 
     // The rest of `device` needs the exchange.
     if let Some(Cmd::Device { cmd }) = &cli.cmd {
@@ -3457,19 +3463,19 @@ async fn add_contact(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, typed
 /// this client is connected to is refused rather than silently resolved against
 /// the wrong one.
 async fn resolve_peer(chat: &mut Chat, typed: &str) -> Result<PubKey, ChatError> {
+    // SIP-60: `label@domain` naming another exchange is located through
+    // this one -- key or name -- and the person's home is remembered, so
+    // the conversation is opened where it lives.
+    if let Some((label, domain)) = typed.trim().rsplit_once('@')
+        && !label.is_empty()
+        && !domain.is_empty()
+        && chat.domain() != Some(domain)
+    {
+        return chat.locate(typed).await.map(|l| l.account);
+    }
     match sqex_proto::name::classify(typed).map_err(|e| ChatError::Protocol(e.to_string()))? {
         sqex_proto::name::Target::Key(k) => Ok(k),
-        sqex_proto::name::Target::Named { name, domain } => {
-            if let Some(d) = domain
-                && chat.domain() != Some(d.as_str())
-            {
-                return Err(ChatError::Protocol(format!(
-                    "connected to {}, so cannot resolve names at {d} — reconnect with --server {d}",
-                    chat.domain().unwrap_or("a literal address")
-                )));
-            }
-            chat.resolve_name(&name).await
-        }
+        sqex_proto::name::Target::Named { name, .. } => chat.resolve_name(&name).await,
     }
 }
 

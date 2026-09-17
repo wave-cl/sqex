@@ -45,6 +45,7 @@ mod moving_flow;
 mod name_flow;
 mod private_channel_flow;
 mod profile_flow;
+mod reaching_flow;
 mod receipt_flow;
 mod rehome_flow;
 mod relay_flow;

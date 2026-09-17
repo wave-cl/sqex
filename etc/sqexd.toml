@@ -134,6 +134,12 @@ seed_relay_peers = [
 # replication peer for the pulls to be served.
 # home_secs = 30
 
+# SIP-60: the domain this exchange is published under (SIP-33). Told to
+# another exchange as the hint to find this one by, when this exchange puts
+# one of its accounts in a channel here. Optional: a peer that already
+# lists this exchange with a domain label needs no hint.
+# domain = "example.com"
+
 # SIP-56: rate limits, per account, on what costs the exchange and its
 # members something. Each is [n, seconds]: n in any window of that many
 # seconds, refilling steadily; [0, 0] is unlimited. Omitted ones take the

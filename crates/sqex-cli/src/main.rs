@@ -398,6 +398,13 @@ enum HomeCmd {
         /// The account, base58 or name@domain.
         account: Option<String>,
     },
+    /// Find somebody at another exchange through this one (SIP-60): their
+    /// key, their home, their devices. The exchange remembers where they
+    /// live, so a conversation with them is opened where it belongs.
+    Locate {
+        /// `name@domain` or `key@domain`.
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2617,6 +2624,53 @@ async fn home(cli: &Cli, cfg: &Config, cmd: &HomeCmd) -> Result<(), String> {
                     "note: this exchange does not list {} as a replication peer, so the \
                      home's pulls from it will be refused until its operator adds it",
                     mv.home
+                );
+            }
+            Ok(())
+        }
+        HomeCmd::Locate { target } => {
+            let (mut client, _server) = connect(cli, cfg).await?;
+            let (code, body) = client
+                .post(
+                    "/account/locate",
+                    sqex_proto::locate::Locate {
+                        target: target.clone(),
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!("locate failed ({code}): {}", said(&body)));
+            }
+            let found = sqex_proto::locate::Located::decode(&body).map_err(|e| e.to_string())?;
+            println!("{target}");
+            println!("  account {}", found.account);
+            println!("  home    {} ({})", found.domain, found.home);
+            if found.devices.devices.is_empty() {
+                println!("  devices none registered (the account is its own device)");
+            }
+            for d in &found.devices.devices {
+                let ok = d
+                    .credential
+                    .as_ref()
+                    .map(|c| {
+                        c.verify(
+                            &found.account,
+                            sqex_proto::credential::SCOPE_CHAT,
+                            found.devices.now,
+                        )
+                        .is_ok()
+                    })
+                    .unwrap_or(false);
+                println!(
+                    "  device  {} until {} {}",
+                    d.device,
+                    d.not_after,
+                    if ok {
+                        "(credential verifies)"
+                    } else {
+                        "(no verifiable credential)"
+                    }
                 );
             }
             Ok(())

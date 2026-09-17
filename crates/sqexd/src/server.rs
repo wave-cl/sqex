@@ -43,10 +43,10 @@ use sqex_proto::blob_store::{
 };
 use sqex_proto::channel::{
     Ack as ChannelAck, ByAccount as ChannelByAccount, ByChannel, ByChannelSigned, ByTarget,
-    Create as ChannelCreate, Created, Cursor as ChannelCursor, Directory as ChannelDirectory,
-    Fetch as ChannelFetch, Home, Invite as ChannelInvite, Invitee, List as ChannelList,
-    Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain, SignalOut,
-    TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_DISMISS as CH_DISMISS,
+    Create as ChannelCreate, CreateAt, Created, Cursor as ChannelCursor,
+    Directory as ChannelDirectory, Fetch as ChannelFetch, Home, Invite as ChannelInvite, Invitee,
+    List as ChannelList, Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain,
+    SignalOut, TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_DISMISS as CH_DISMISS,
     TYPE_EQUIVOCATION as CH_EQUIVOCATION, TYPE_HOME as CH_HOME, TYPE_INFO as CH_INFO,
     TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE, TYPE_MUTE as CH_MUTE, TYPE_REDACT as CH_REDACT,
     TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE, TYPE_REPORTS as CH_REPORTS,
@@ -58,6 +58,7 @@ use sqex_proto::device::{
 };
 use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
 use sqex_proto::home::Moving;
+use sqex_proto::locate::{Locate, Located};
 use sqex_proto::mailbox::{
     ById, Fetched, Send as MailSend, SendAck, TYPE_DELETE, TYPE_FETCH, TYPE_STATUS,
 };
@@ -65,8 +66,8 @@ use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
     Carried, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi, Mine,
-    PEER_VERSION, PeerMoved, Pull as PeerPull, PullBlob, PullEnvelopes, PullMine, PullRecord,
-    PullShape, PullStanding,
+    PEER_VERSION, PeerInvited, PeerMoved, Pull as PeerPull, PullBlob, PullEnvelopes, PullMine,
+    PullRecord, PullShape, PullStanding,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -326,6 +327,8 @@ pub struct Server {
     pub(crate) directory_secs: u64,
     /// SIP-59: seconds between pulls for the accounts homed here.
     pub(crate) home_secs: u64,
+    /// SIP-60: this exchange's own domain, if the operator said.
+    domain: Option<String>,
     /// SIP-45: whether `http://` to loopback is an acceptable endpoint --
     /// for the tests, which stand a listener up there.
     wake_loopback: bool,
@@ -512,6 +515,93 @@ impl Server {
         domain: &str,
     ) -> std::result::Result<(PubKey, std::net::SocketAddr), String> {
         crate::relay::find_by_domain(self, domain).await
+    }
+
+    /// SIP-60: where another exchange is reached -- the forwarder toward it
+    /// if there is one, otherwise by the domain this exchange has for it
+    /// (a Move or a learned home naming it, or the peer directory),
+    /// discovered and checked against the key. Brings up a forwarder for
+    /// it, since whatever comes next goes through one.
+    pub(crate) async fn reach(
+        self: &Arc<Self>,
+        key: &PubKey,
+    ) -> Option<(std::net::SocketAddr, String)> {
+        self.reach_by(key, "").await
+    }
+
+    /// [`Self::reach`] with a domain hint tried first -- the one an
+    /// account's Move or an origin's telling came with.
+    pub(crate) async fn reach_by(
+        self: &Arc<Self>,
+        key: &PubKey,
+        hint: &str,
+    ) -> Option<(std::net::SocketAddr, String)> {
+        if let Some(f) = self.forwarder(key) {
+            return Some((f.addr, f.domain.clone()));
+        }
+        let hint = hint.trim().to_ascii_lowercase();
+        let domain = (!hint.is_empty())
+            .then_some(hint)
+            .or_else(|| self.devices.domain_of_exchange(key))
+            .or_else(|| {
+                self.peer_directory()
+                    .peers
+                    .into_iter()
+                    .find(|p| p.key == *key)
+                    .map(|p| p.domain)
+                    .filter(|d| !d.is_empty())
+            })?;
+        let (found, addr) = self.relay_find(&domain).await.ok()?;
+        if found != *key {
+            tracing::warn!(%domain, expected = %key, found = %found, "a domain names another key");
+            return None;
+        }
+        self.add_forwarder(*key, addr, domain.clone());
+        Some((addr, domain))
+    }
+
+    /// SIP-60: after writing a membership for `account`, tell its home --
+    /// where that is another exchange -- off the request path. Best
+    /// effort: a home that cannot be reached was not told, and the member
+    /// finds the channel the way they always could.
+    pub(crate) fn tell_home(self: &Arc<Self>, account: PubKey, channel: [u8; 32]) {
+        let Some((home, _)) = self.devices.where_is(&account, &self.public_key) else {
+            return;
+        };
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            let Some((addr, _)) = server.reach(&home).await else {
+                tracing::debug!(%account, %home, "cannot reach a member's home to tell it");
+                return;
+            };
+            let mine = server.own_domain();
+            let Ok(mut client) =
+                sqex_proto::h3::H3Client::connect(addr, home.as_bytes(), &server.exchange_seed)
+                    .await
+            else {
+                return;
+            };
+            let req = sqex_proto::peer::PeerInvited {
+                account,
+                channel,
+                domain: mine,
+            };
+            match client.post("/peer/invited", req.encode()).await {
+                Ok((200, _)) => tracing::info!(%account, %home, "told a member's home"),
+                Ok((code, _)) => {
+                    tracing::debug!(%account, %home, code, "a home did not take the telling")
+                }
+                Err(e) => tracing::debug!(%account, %home, error = %e, "telling a home failed"),
+            }
+        });
+    }
+
+    /// SIP-60: this exchange's own domain, as far as it knows one -- what
+    /// it tells a home to find it by. The peer directory never lists this
+    /// exchange, so it comes from the SIP-33 record the operator configured
+    /// in `domain`, or is empty.
+    pub(crate) fn own_domain(&self) -> String {
+        self.domain.clone().unwrap_or_default()
     }
 
     /// SIP-53: note that `origin` answered just now.
@@ -943,6 +1033,7 @@ pub async fn bind_with(
         directories: crate::directory::Directories::default(),
         directory_secs: config.directory_secs,
         home_secs: config.home_secs,
+        domain: config.domain.clone(),
         transport: Arc::clone(&listener),
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
@@ -1820,11 +1911,66 @@ async fn route(
                 record_move(server, &moving.mv, &moving.domain, &moving.origins)
             }
         },
+        // SIP-60: find somebody at another exchange -- their key, their
+        // home, their devices -- on the client's behalf, and remember
+        // where they live.
+        ("POST", "/account/locate") => match (peer.identity, Locate::decode(body)) {
+            (None, _) => no_identity("locating an account"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(_), Ok(req)) => locate(server, &req).await,
+        },
+        // SIP-60: a create for a channel that lives at another exchange --
+        // a direct message at the lower key's home -- carried there as the
+        // creator's own signed act, after the creator's Move.
+        ("POST", "/channel/create_at") => match (who, CreateAt::decode(body)) {
+            (None, _) => no_identity("creating a channel elsewhere"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some((me, dev)), Ok(req)) => {
+                if req.origin == server.public_key {
+                    return Box::pin(route(server, method, "/channel/create", &req.create, peer))
+                        .await;
+                }
+                let Some((_, domain)) = server.reach(&req.origin).await else {
+                    return refuse(503, Code::OriginAway, None);
+                };
+                let Some(forwarder) = server.forwarder(&req.origin) else {
+                    return refuse(503, Code::OriginAway, None);
+                };
+                if let Some((mv, home_domain)) = server.devices.move_of(&me)
+                    && mv.home == server.public_key
+                {
+                    forwarder
+                        .carry_move(&server.exchange_seed, &mv, &home_domain)
+                        .await;
+                }
+                match forwarder
+                    .action(
+                        &server.exchange_seed,
+                        &dev,
+                        server.devices.credential_of(&dev).as_ref(),
+                        "/channel/create",
+                        &req.create,
+                    )
+                    .await
+                {
+                    Ok(answer) => {
+                        if answer.status == 200 {
+                            server.homed.notify_one();
+                        }
+                        (answer.status, "application/octet-stream", answer.body)
+                    }
+                    Err(e) => {
+                        tracing::warn!(origin = %req.origin, %domain, "create-at failed: {e}");
+                        refuse(503, Code::OriginAway, None)
+                    }
+                }
+            }
+        },
         // SIP-59: where an account lives, as this exchange has it.
         ("POST", "/account/home") => match (peer.identity, sqex_proto::home::asked(body)) {
             (None, _) => no_identity("asking an account's home"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(_), Ok(account)) => match server.devices.home_of(&account) {
+            (Some(_), Ok(asked)) => match server.devices.home_of(&asked) {
                 Some((home, domain, since)) => (
                     200,
                     "application/octet-stream",
@@ -1835,9 +1981,12 @@ async fn route(
                     }
                     .encode(),
                 ),
-                None if server.devices.has_devices(&account)
-                    || server.channels.has_memberships(&account)
-                    || !server.names.names_for(&account).is_empty() =>
+                // Known here: the caller itself, which is connected here,
+                // or an account with devices, names or memberships here.
+                None if account == Some(asked)
+                    || server.devices.has_devices(&asked)
+                    || server.channels.has_memberships(&asked)
+                    || !server.names.names_for(&asked).is_empty() =>
                 {
                     (
                         200,
@@ -2185,6 +2334,24 @@ async fn route(
         ("POST", "/device/list") => match ListDevices::decode(body) {
             Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(req) => match server.devices.list(&req.account) {
+                // SIP-60: an account with no devices here whose home is
+                // elsewhere is listed as its home lists it.
+                Ok(list) if list.devices.is_empty() => {
+                    if let Some((home, _)) =
+                        server.devices.where_is(&req.account, &server.public_key)
+                        && let Some((addr, _)) = server.reach(&home).await
+                        && let Some(theirs) = crate::relay::devices_at(
+                            addr,
+                            &home,
+                            &server.exchange_seed,
+                            &req.account,
+                        )
+                        .await
+                    {
+                        return (200, "application/octet-stream", theirs.encode());
+                    }
+                    (200, "application/octet-stream", list.encode())
+                }
                 Ok(list) => (200, "application/octet-stream", list.encode()),
                 Err(e) => refuse(e.status(), e.code(), None),
             },
@@ -2345,15 +2512,40 @@ async fn route(
         ("POST", "/prekey/take") => match (device, PrekeyTake::decode(body)) {
             (None, _) => no_identity("taking a prekey"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            // SIP-59: the device's account lives elsewhere; its pool is there.
+            // SIP-60: the device's account lives elsewhere; its pool is
+            // there, and one prekey is taken there and handed on once.
             (Some(_), Ok(req))
                 if server
-                    .moved_away(&server.devices.account_for(&req.device))
+                    .devices
+                    .where_is(&server.devices.account_for(&req.device), &server.public_key)
                     .is_some() =>
             {
-                server
-                    .moved_away(&server.devices.account_for(&req.device))
-                    .unwrap()
+                let (home, _) = server
+                    .devices
+                    .where_is(&server.devices.account_for(&req.device), &server.public_key)
+                    .unwrap();
+                match server.reach(&home).await {
+                    Some((addr, _)) => match crate::relay::take_prekey_at(
+                        addr,
+                        &home,
+                        &server.exchange_seed,
+                        &req.device,
+                    )
+                    .await
+                    {
+                        Some((status, body)) => (status, "application/octet-stream", body),
+                        None => refuse(
+                            404,
+                            Code::NoPrekey,
+                            Some("the device's home did not answer"),
+                        ),
+                    },
+                    None => refuse(
+                        404,
+                        Code::NoPrekey,
+                        Some("the device's home cannot be reached"),
+                    ),
+                }
             }
             (Some(_), Ok(req)) => (
                 200,
@@ -2408,6 +2600,13 @@ async fn route(
                                 what: MEMBER_JOINED,
                             },
                         );
+                        // SIP-60: and so does the home of anybody invited
+                        // who lives at another exchange.
+                        if created {
+                            for inv in &req.invites {
+                                server.tell_home(inv.account, req.channel);
+                            }
+                        }
                         (
                             200,
                             "application/octet-stream",
@@ -2855,6 +3054,7 @@ async fn route(
                                 what: MEMBER_JOINED,
                             },
                         );
+                        server.tell_home(guest.account, channel);
                         (
                             200,
                             "application/octet-stream",
@@ -2968,6 +3168,13 @@ async fn route(
             (None, _) => no_identity("publishing channel keys"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
+                // SIP-60: a rotation made at a copy is the member's own
+                // signed act with the envelopes it sealed, carried to the
+                // origin as a post is -- without it a member reading a
+                // sealed channel through a copy could never re-key it.
+                if let Some(answer) = forward_action(server, &dev, &req.channel, path, body).await {
+                    return answer;
+                }
                 // A device is resolved to its account here rather than inside
                 // the channel store, which keeps that store free of any
                 // knowledge of the registry.
@@ -3346,6 +3553,30 @@ async fn route(
             }
             _ => peering_refused(),
         },
+        // SIP-60: an origin says it put one of the accounts homed here in a
+        // channel. Acted on only for an account whose own Move names this
+        // exchange: the origin hint is kept and the home task pulls, carrying
+        // the Move first.
+        ("POST", "/peer/invited") => match (peer.identity, PeerInvited::decode(body)) {
+            (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                let domain = req.domain.trim().to_ascii_lowercase();
+                if server
+                    .devices
+                    .add_home_origin(&req.account, &who, &domain, &server.public_key)
+                {
+                    tracing::info!(account = %req.account, origin = %who, "told of a channel at another exchange");
+                    server.homed.notify_one();
+                } else {
+                    tracing::debug!(account = %req.account, origin = %who, "told of a channel for an account with no move here");
+                }
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
         // SIP-59: a forward wrapped with the device's credential, for a
         // device this origin may never have seen. Verified under the
         // account the credential names and registered as the account's
@@ -3644,6 +3875,83 @@ async fn route(
                         }
                         blob_here(server, &account, &req.path, &req.body)
                     }
+                    // SIP-60: a rotation from a copy -- the member's signed
+                    // action and the envelopes it sealed.
+                    "/channel/key/put" => match KeyPut::decode(&req.body) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            let account_of = |d: &PubKey| server.devices.account_for(d);
+                            let revoked_since =
+                                |a: &PubKey, since: u64| server.devices.revoked_since(a, since);
+                            match server.channels.put_keys(
+                                &account,
+                                &req.device,
+                                &r,
+                                &account_of,
+                                &revoked_since,
+                            ) {
+                                Ok(ack) => (200, ack.encode()),
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
+                        }
+                        _ => return peering_refused(),
+                    },
+                    // SIP-60: a create carried from the creator's home -- a
+                    // direct message at the lower key's home. The creator's
+                    // own signed act, under the acts-for gate for the creator.
+                    "/channel/create" => match ChannelCreate::decode(&req.body) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.acts_for(p, &account)) =>
+                        {
+                            let blocked =
+                                |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
+                            match server
+                                .limit(crate::limits::Kind::Creates, &account, [0; 32])
+                                .and_then(|()| {
+                                    server.channels.create(&account, &req.device, &r, &blocked)
+                                }) {
+                                Ok((created, epoch, instance)) => {
+                                    server.tell(
+                                        &r.channel,
+                                        EventKind::Membership {
+                                            channel: r.channel,
+                                            account,
+                                            what: MEMBER_JOINED,
+                                        },
+                                    );
+                                    if created {
+                                        server.tell_home(account, r.channel);
+                                        for inv in &r.invites {
+                                            server.tell_home(inv.account, r.channel);
+                                        }
+                                    }
+                                    (
+                                        200,
+                                        Created {
+                                            created,
+                                            epoch,
+                                            instance,
+                                            now: now_unix(),
+                                        }
+                                        .encode(),
+                                    )
+                                }
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
+                        }
+                        _ => return peering_refused(),
+                    },
                     // SIP-59: the account's signed withdrawal of one of its
                     // devices, carried by its home to an origin that
                     // registered the device from a carried credential. Only
@@ -4868,6 +5176,63 @@ fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
 ///
 /// It carries no detail for the same reason. A detail string is a reply that
 /// varies.
+/// SIP-60: locate `label@domain` -- the domain's exchange, the label
+/// resolved there, the account's home (followed once), its devices as the
+/// home lists them -- and remember where the account lives.
+async fn locate(server: &Arc<Server>, req: &Locate) -> (u16, &'static str, Vec<u8>) {
+    let Some((label, domain)) = req.split() else {
+        return refuse(400, Code::Malformed, Some("a target is label@domain"));
+    };
+    let domain = domain.trim().to_ascii_lowercase();
+    let Ok((key, addr)) = crate::relay::find_peer(server, &domain).await else {
+        return refuse(404, Code::NotFound, Some("no exchange for that domain"));
+    };
+    if !server.peers_with(&key) {
+        return refuse(403, Code::NotAuthorised, Some("not a federated domain"));
+    }
+    let seed = server.exchange_seed;
+    let account = match label.parse::<PubKey>() {
+        Ok(k) => k,
+        Err(_) => match crate::relay::resolve_name_at(addr, &key, &seed, label).await {
+            Some(a) => a,
+            None => return refuse(404, Code::NotFound, Some("no such name there")),
+        },
+    };
+    // The home, followed once where the domain's exchange says the account
+    // moved on -- as a call is placed (SIP-59).
+    let (mut home, mut home_domain, mut home_addr) = (key, domain.clone(), addr);
+    if let Some((h, d)) = crate::relay::home_at(addr, &key, &seed, &account).await
+        && h != key
+        && !d.is_empty()
+        && let Ok((found, a)) = crate::relay::find_peer(server, &d).await
+        && found == h
+        && server.peers_with(&h)
+    {
+        (home, home_domain, home_addr) = (h, d, a);
+    }
+    let devices = crate::relay::devices_at(home_addr, &home, &seed, &account)
+        .await
+        .unwrap_or(sqex_proto::device::Devices {
+            now: now_unix(),
+            devices: Vec::new(),
+        });
+    if home != server.public_key {
+        server.devices.learn_home(&account, &home, &home_domain);
+        server.add_forwarder(home, home_addr, home_domain.clone());
+    }
+    (
+        200,
+        "application/octet-stream",
+        Located {
+            account,
+            home,
+            domain: home_domain,
+            devices,
+        }
+        .encode(),
+    )
+}
+
 /// SIP-59: carry an account's signed device revocation to every origin its
 /// home pulls from, off the request path -- the answer here is the home's,
 /// and an origin out of reach learns when the credential runs out.

@@ -730,6 +730,9 @@ pub struct Chat {
     /// verifies under, and it is this connection's exchange only for a
     /// channel that lives here.
     homes: HashMap<[u8; 32], Home>,
+    /// SIP-60: where people this client located live -- their home's key
+    /// and domain -- for opening a direct message where it belongs.
+    located: HashMap<PubKey, (PubKey, String)>,
     /// SIP-57: the timer this client puts on what it sends, per channel;
     /// seconds, none where unset.
     timers: HashMap<[u8; 32], u32>,
@@ -824,6 +827,7 @@ impl Chat {
             receipts: AtomicBool::new(true),
             told_about: HashMap::new(),
             homes: HashMap::new(),
+            located: HashMap::new(),
             former: HashMap::new(),
             timers: HashMap::new(),
             bound_in: HashMap::new(),
@@ -1177,7 +1181,17 @@ impl Chat {
     /// again — this time for a `joined` rather than an `added`, which is the
     /// event that actually gets written, and which we could not have known to
     /// sign for before asking.
-    async fn create_signed(&mut self, mut req: Create) -> Result<Created> {
+    async fn create_signed(&mut self, req: Create) -> Result<Created> {
+        self.create_signed_at(req, None).await
+    }
+
+    /// [`Self::create_signed`], for a channel that is to live at `origin`
+    /// (SIP-60): signed under it, carried by this exchange.
+    async fn create_signed_at(
+        &mut self,
+        mut req: Create,
+        origin: Option<PubKey>,
+    ) -> Result<Created> {
         let instance = {
             use rand_core::RngCore;
             let mut b = [0u8; 32];
@@ -1188,7 +1202,20 @@ impl Chat {
         let (actions, _head) = self.actions_for_create(&req, instance)?;
         req.actions = actions;
 
-        let out = self.post("/channel/create", req.encode()).await?;
+        let out = match origin {
+            Some(origin) => {
+                self.post(
+                    "/channel/create_at",
+                    sqex_proto::channel::CreateAt {
+                        origin,
+                        create: req.encode(),
+                    }
+                    .encode(),
+                )
+                .await?
+            }
+            None => self.post("/channel/create", req.encode()).await?,
+        };
         let ack = Created::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))?;
         if ack.created || ack.instance == instance || ack.instance == [0u8; 32] {
             return Ok(ack);
@@ -1205,7 +1232,20 @@ impl Chat {
             self.sign_action_at(&req.channel, &info, EVENT_JOINED, &self.me, &[])?;
         req.instance = ack.instance;
         req.actions = vec![action];
-        let out = self.post("/channel/create", req.encode()).await?;
+        let out = match origin {
+            Some(origin) => {
+                self.post(
+                    "/channel/create_at",
+                    sqex_proto::channel::CreateAt {
+                        origin,
+                        create: req.encode(),
+                    }
+                    .encode(),
+                )
+                .await?
+            }
+            None => self.post("/channel/create", req.encode()).await?,
+        };
         Created::decode(&out).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
@@ -1243,6 +1283,9 @@ impl Chat {
             if public { &req.name } else { "" },
             if public { &req.topic } else { "" },
         );
+        // SIP-60: under the exchange the channel is to live at, which is
+        // this one unless `open_dm` said otherwise.
+        let exchange = self.exchange_of(&req.channel);
         let sign = |event: u8,
                     subject: PubKey,
                     arg: &[u8],
@@ -1251,7 +1294,7 @@ impl Chat {
          -> Result<(Action, [u8; 32])> {
             let terms = ActionTerms {
                 place: Place {
-                    exchange: self.exchange,
+                    exchange,
                     instance,
                     channel: req.channel,
                 },
@@ -1959,29 +2002,129 @@ impl Chat {
     /// changing anything, so this is also the ordinary way to reopen one.
     pub async fn open_dm(&mut self, them: &PubKey) -> Result<[u8; 32]> {
         let channel = self.dm_with(them);
-        self.create_signed(Create {
-            channel,
-            // Both are filled in by `create_signed`, which proposes the
-            // incarnation and signs one action per invitee against it.
-            instance: [0u8; 32],
-            actions: Vec::new(),
-            visibility: Visibility::Private,
-            retention_secs: RETENTION_SECS,
-            max_entries: 0,
-            // A private channel's name is carried sealed (SIP-19); at the
-            // exchange it must be empty, because a membership graph plus a
-            // name says far more than the graph.
-            name: String::new(),
-            topic: String::new(),
-            invites: vec![Invitee {
-                account: *them,
-                role: Role::Admin,
-            }],
-        })
+        // SIP-60: a direct message lives at the home of the lower key. When
+        // that is theirs and elsewhere, it is created there, from here,
+        // signed under it; this exchange carries the create and pulls the
+        // copy once their home has told it.
+        let origin = self
+            .located
+            .get(them)
+            .filter(|(home, _)| *home != self.exchange && them.as_bytes() < self.me.as_bytes())
+            .cloned();
+        if let Some((home, domain)) = &origin {
+            self.homes.insert(
+                channel,
+                Home {
+                    origin: *home,
+                    domain: domain.clone(),
+                    former: Vec::new(),
+                },
+            );
+            self.store.set_home(&channel, home);
+            self.predecessors
+                .entry(*home)
+                .or_insert_with(|| predecessors_of(home));
+        }
+        self.create_signed_at(
+            Create {
+                channel,
+                // Both are filled in by `create_signed`, which proposes the
+                // incarnation and signs one action per invitee against it.
+                instance: [0u8; 32],
+                actions: Vec::new(),
+                visibility: Visibility::Private,
+                retention_secs: RETENTION_SECS,
+                max_entries: 0,
+                // A private channel's name is carried sealed (SIP-19); at the
+                // exchange it must be empty, because a membership graph plus a
+                // name says far more than the graph.
+                name: String::new(),
+                topic: String::new(),
+                invites: vec![Invitee {
+                    account: *them,
+                    role: Role::Admin,
+                }],
+            },
+            origin.as_ref().map(|(h, _)| *h),
+        )
         .await?;
+        if origin.is_some() {
+            // The copy arrives once their home has told this exchange and
+            // it has pulled; a message opened elsewhere is not readable
+            // here until then.
+            let mut here = false;
+            for _ in 0..50 {
+                if self.info(&channel).await.is_ok() {
+                    here = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if !here {
+                return Err(ChatError::OriginAway);
+            }
+        }
 
         self.collect_keys(&channel).await?;
         Ok(channel)
+    }
+
+    // ---- SIP-60: reaching someone at another exchange -----------------------
+
+    /// Find somebody at another exchange through this one: their key, their
+    /// home and their devices. Remembered, so a direct message with them is
+    /// opened where it lives.
+    pub async fn locate(&mut self, target: &str) -> Result<sqex_proto::locate::Located> {
+        let body = self
+            .post(
+                "/account/locate",
+                sqex_proto::locate::Locate {
+                    target: target.trim().to_string(),
+                }
+                .encode(),
+            )
+            .await?;
+        let found = sqex_proto::locate::Located::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.located
+            .insert(found.account, (found.home, found.domain.clone()));
+        Ok(found)
+    }
+
+    /// Where this client last located `account`, if it did.
+    pub fn located_home(&self, account: &PubKey) -> Option<&(PubKey, String)> {
+        self.located.get(account)
+    }
+
+    /// SIP-60: say where this account lives, once. Where the exchange has
+    /// no Move on record for it, sign one naming this exchange and present
+    /// it -- which is what lets the home act when an origin tells it of a
+    /// channel. Only a client holding the account key; a linked device
+    /// leaves it to the account. Returns whether one was presented.
+    pub async fn ensure_home(&mut self) -> Result<bool> {
+        if self.me != self.device {
+            return Ok(false);
+        }
+        let me = self.me;
+        let on_record = match self.account_home(&me).await {
+            Ok(h) => h.since != 0,
+            Err(ChatError::NoChatHere(_)) => return Ok(false),
+            Err(ChatError::Refused(404, _)) => false,
+            Err(e) => return Err(e),
+        };
+        if on_record {
+            return Ok(false);
+        }
+        let exchange = self.exchange;
+        let mv = self.sign_move(&exchange)?;
+        let domain = self.domain.clone().unwrap_or_default();
+        self.present_move(&sqex_proto::home::Moving {
+            mv,
+            domain,
+            origins: Vec::new(),
+        })
+        .await?;
+        Ok(true)
     }
 
     /// Make sure the channel has an epoch and that we hold its key.
@@ -2018,7 +2161,7 @@ impl Chat {
         if info.epoch == 0 {
             let to = self.devices_of(&members_of(&info)).await?;
             self.mint_epoch(channel, 1, &to).await?;
-            return Ok(self.info(channel).await?.epoch);
+            return self.epoch_settled(channel, 1).await;
         }
         if self.store.key(channel, info.epoch)?.is_none() {
             self.collect_keys(channel).await?;
@@ -2039,7 +2182,7 @@ impl Chat {
                 }
                 let to = self.devices_of(&members_of(&info)).await?;
                 self.mint_epoch(channel, info.epoch + 1, &to).await?;
-                let after = self.info(channel).await?.epoch;
+                let after = self.epoch_settled(channel, info.epoch + 1).await?;
                 return self
                     .store
                     .key(channel, after)?
@@ -2048,6 +2191,26 @@ impl Chat {
             }
         }
         Ok(info.epoch)
+    }
+
+    /// The channel's epoch as this exchange reports it, once it is at least
+    /// `at_least`. At the origin that is at once; at a copy (SIP-43,
+    /// SIP-60) the rotation was carried to the origin and comes back with
+    /// the next pull, which the copy makes promptly after a forward -- so
+    /// this waits a little rather than posting under the epoch before.
+    async fn epoch_settled(&mut self, channel: &[u8; 32], at_least: u32) -> Result<u32> {
+        let mut epoch = self.info(channel).await?.epoch;
+        if epoch >= at_least || self.homed_elsewhere(channel).is_none() {
+            return Ok(epoch);
+        }
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            epoch = self.info(channel).await?.epoch;
+            if epoch >= at_least {
+                break;
+            }
+        }
+        Ok(epoch)
     }
 
     /// Mint an epoch key and seal it to every member.

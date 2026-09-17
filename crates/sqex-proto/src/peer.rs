@@ -84,6 +84,9 @@ pub const TYPE_MINE: u8 = 0x0d;
 pub const TYPE_CARRIED: u8 = 0x0e;
 /// SIP-59: the home carries an account's Move to an origin.
 pub const TYPE_MOVED: u8 = 0x0f;
+/// SIP-60: an origin tells an account's home that it put the account in a
+/// channel.
+pub const TYPE_INVITED: u8 = 0x10;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -1409,5 +1412,70 @@ mod home_peer_tests {
         let mut trailing = pm.encode();
         trailing.push(0);
         assert!(PeerMoved::decode(&trailing).is_err());
+    }
+}
+
+/// SIP-60: an origin tells a home that `account` is now a member of
+/// `channel` here; `domain` is the origin's own, the hint the home finds
+/// it by. `| type = 0x10 | account[32] | channel[32] | dom_len: u8 | domain |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInvited {
+    pub account: PubKey,
+    pub channel: [u8; 32],
+    pub domain: String,
+}
+
+impl PeerInvited {
+    pub fn encode(&self) -> Vec<u8> {
+        let d = self.domain.as_bytes();
+        let n = d.len().min(255);
+        let mut out = Vec::with_capacity(66 + n);
+        out.push(TYPE_INVITED);
+        out.extend_from_slice(self.account.as_bytes());
+        out.extend_from_slice(&self.channel);
+        out.push(n as u8);
+        out.extend_from_slice(&d[..n]);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PeerInvited> {
+        let short = || Error::Malformed("peer invited cut short".into());
+        if b.first() != Some(&TYPE_INVITED) {
+            return Err(Error::Malformed("not a peer invited".into()));
+        }
+        let account = PubKey::new(b.get(1..33).ok_or_else(short)?.try_into().unwrap());
+        let channel = b.get(33..65).ok_or_else(short)?.try_into().unwrap();
+        let n = *b.get(65).ok_or_else(short)? as usize;
+        let domain = b.get(66..66 + n).ok_or_else(short)?;
+        if 66 + n != b.len() {
+            return Err(Error::Malformed(
+                "trailing bytes after a peer invited".into(),
+            ));
+        }
+        Ok(PeerInvited {
+            account,
+            channel,
+            domain: String::from_utf8(domain.to_vec())
+                .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod invited_tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_invited_round_trips() {
+        let p = PeerInvited {
+            account: PubKey::new([1; 32]),
+            channel: [2; 32],
+            domain: "x.test".into(),
+        };
+        assert_eq!(PeerInvited::decode(&p.encode()).unwrap(), p);
+        assert!(PeerInvited::decode(&p.encode()[..60]).is_err());
+        let mut trailing = p.encode();
+        trailing.push(1);
+        assert!(PeerInvited::decode(&trailing).is_err());
     }
 }

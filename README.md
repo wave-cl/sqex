@@ -94,6 +94,7 @@ sqex-chat backup key         # 24 words that open a sealed copy of this store at
 sqex-chat backup now         # write the copy; `backup restore <words>` on a fresh machine
 sqex-chat move <domain>      # make another exchange your home; your conversations follow
 sqex home sign <key>         # the same statement signed offline (--yubikey works)
+sqex home locate a@b.org     # find somebody at another exchange; ^N a@b.org does it in the client
 ```
 
 Inside: `/public <name>` makes a channel anybody may find, `/find [query]`

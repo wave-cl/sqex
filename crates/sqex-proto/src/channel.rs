@@ -111,6 +111,40 @@ pub const MAX_REPORTS: usize = 256;
 pub const REPORT_TTL: u64 = 30 * 24 * 60 * 60;
 /// SIP-53: a rehome entry carried to an exchange that has not seen it.
 pub const TYPE_REHOMED: u8 = 0x1a;
+/// SIP-60: a create for a channel that is to live at another exchange --
+/// a direct message at the lower key's home -- carried there by this one.
+pub const TYPE_CREATE_AT: u8 = 0x22;
+
+/// SIP-60: `POST /channel/create_at`: `| type = 0x22 | origin[32] | Create |`.
+/// The `Create` is signed under `origin`, as every act made through a copy
+/// is (SIP-43), and goes to it as a forwarded action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateAt {
+    pub origin: PubKey,
+    pub create: Vec<u8>,
+}
+
+impl CreateAt {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33 + self.create.len());
+        out.push(TYPE_CREATE_AT);
+        out.extend_from_slice(self.origin.as_bytes());
+        out.extend_from_slice(&self.create);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<CreateAt> {
+        if b.len() < 34 || b[0] != TYPE_CREATE_AT {
+            return Err(Error::Malformed("not a create-at".into()));
+        }
+        let create = b[33..].to_vec();
+        Create::decode(&create)?;
+        Ok(CreateAt {
+            origin: PubKey::new(b[1..33].try_into().unwrap()),
+            create,
+        })
+    }
+}
 
 /// An entry the exchange wrote itself: membership and rotation events, which
 /// it can attest to because it is the authority on both.

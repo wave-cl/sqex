@@ -181,6 +181,15 @@ CREATE TABLE IF NOT EXISTS home_origin (
     domain  TEXT NOT NULL,
     PRIMARY KEY (account, origin)
 );
+-- SIP-60: where an account lives as the domain's exchange said when this
+-- exchange located it. The domain exchange's word, kept apart from a
+-- signed Move: it makes this exchange proxy and tell, never serve.
+CREATE TABLE IF NOT EXISTS learned_home (
+    account BLOB PRIMARY KEY,
+    home    BLOB NOT NULL,
+    domain  TEXT NOT NULL,
+    at      INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS device_by_account ON device (account);
 CREATE INDEX IF NOT EXISTS home_by_home ON home (home);
 "#;
@@ -845,6 +854,94 @@ impl Registry {
         self.home_of(account)
             .filter(|(home, _, _)| home != me)
             .map(|(home, domain, _)| (home, domain))
+    }
+
+    /// SIP-60: record where the domain's exchange said an account lives. A
+    /// signed Move on record for the account is not touched: it outranks
+    /// this, and `where_is` reads it first.
+    pub fn learn_home(&self, account: &PubKey, home: &PubKey, domain: &str) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "INSERT INTO learned_home (account, home, domain, at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account) DO UPDATE SET home = ?2, domain = ?3, at = ?4",
+            params![
+                account.as_bytes(),
+                home.as_bytes(),
+                domain,
+                now_unix() as i64
+            ],
+        );
+    }
+
+    /// SIP-60: where an account lives as far as this exchange knows, when
+    /// that is not here -- by its own Move first, by what a domain's
+    /// exchange said otherwise. What the proxying and the telling go by;
+    /// never what the acts-for gate goes by.
+    pub fn where_is(&self, account: &PubKey, me: &PubKey) -> Option<(PubKey, String)> {
+        if let Some((home, domain, _)) = self.home_of(account) {
+            return (home != *me).then_some((home, domain));
+        }
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT home, domain FROM learned_home WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| {
+                Ok((
+                    PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, String>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|(home, _)| home != me)
+    }
+
+    /// SIP-60: a domain this exchange has on record for an exchange key --
+    /// from a signed Move or a learned home naming it. Empty when none.
+    pub fn domain_of_exchange(&self, key: &PubKey) -> Option<String> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT domain FROM home WHERE home = ?1 AND domain != '' LIMIT 1",
+            params![key.as_bytes()],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .or_else(|| {
+            db.query_row(
+                "SELECT domain FROM learned_home WHERE home = ?1 AND domain != '' LIMIT 1",
+                params![key.as_bytes()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+    }
+
+    /// SIP-60: an origin told this home it put one of its accounts in a
+    /// channel; remember the origin so the home task pulls from it. Only
+    /// for an account whose Move names this exchange.
+    pub fn add_home_origin(
+        &self,
+        account: &PubKey,
+        origin: &PubKey,
+        domain: &str,
+        me: &PubKey,
+    ) -> bool {
+        if !self.home_of(account).is_some_and(|(h, _, _)| h == *me) {
+            return false;
+        }
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO home_origin (account, origin, domain) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account, origin) DO UPDATE SET domain = CASE WHEN ?3 = '' THEN domain ELSE ?3 END",
+            params![account.as_bytes(), origin.as_bytes(), domain],
+        )
+        .is_ok()
     }
 
     /// SIP-59: the accounts whose home on record is `peer`.

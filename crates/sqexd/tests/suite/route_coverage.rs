@@ -371,6 +371,15 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Chat("Chat::account_home"),
         Identity,
     ),
+    // SIP-60: find somebody at another exchange, and open a direct message
+    // where it lives.
+    ("POST", "/account/locate", Chat("Chat::locate"), Identity),
+    (
+        "POST",
+        "/channel/create_at",
+        Chat("Chat::open_dm"),
+        Identity,
+    ),
     // SIP-59: the home asks an origin which channels an account is in
     // there, and carries the account's Move to it.
     (
@@ -383,6 +392,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         "POST",
         "/peer/moved",
         Peer("replica::run_homed"),
+        ReplicationPeer,
+    ),
+    // SIP-60: an origin tells a home it put one of its accounts in a channel.
+    (
+        "POST",
+        "/peer/invited",
+        Peer("Server::tell_home"),
         ReplicationPeer,
     ),
     // SIP-48: the account's sealed backup. Written by its devices; read by

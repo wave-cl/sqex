@@ -927,7 +927,7 @@ async fn link_to_key(server: &Arc<Server>, key: PubKey) -> Option<SocketAddr> {
     Some(addr)
 }
 
-async fn resolve_name_at(
+pub(crate) async fn resolve_name_at(
     addr: SocketAddr,
     key: &PubKey,
     seed: &[u8; 32],
@@ -954,7 +954,7 @@ async fn resolve_name_at(
 /// SIP-59: where an exchange says an account lives -- another exchange's
 /// key and domain hint. `None` where it says "here", does not know, or is
 /// from before SIP-59.
-async fn home_at(
+pub(crate) async fn home_at(
     addr: SocketAddr,
     key: &PubKey,
     seed: &[u8; 32],
@@ -970,6 +970,46 @@ async fn home_at(
     }
     let homed = sqex_proto::home::Homed::decode(&body).ok()?;
     (homed.home != *key).then_some((homed.home, homed.domain))
+}
+
+/// SIP-60: an account's devices as its home lists them, asked as this
+/// exchange. `None` where the home refuses or does not answer.
+pub(crate) async fn devices_at(
+    addr: SocketAddr,
+    key: &PubKey,
+    seed: &[u8; 32],
+    account: &PubKey,
+) -> Option<sqex_proto::device::Devices> {
+    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
+    let (status, body) = client
+        .post(
+            "/device/list",
+            sqex_proto::device::ListDevices { account: *account }.encode(),
+        )
+        .await
+        .ok()?;
+    if status != 200 {
+        return None;
+    }
+    sqex_proto::device::Devices::decode(&body).ok()
+}
+
+/// SIP-60: one prekey for `device`, taken at its home as this exchange and
+/// handed on once. The status and body are the home's own.
+pub(crate) async fn take_prekey_at(
+    addr: SocketAddr,
+    key: &PubKey,
+    seed: &[u8; 32],
+    device: &PubKey,
+) -> Option<(u16, Vec<u8>)> {
+    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
+    client
+        .post(
+            "/prekey/take",
+            sqex_proto::prekey::Take { device: *device }.encode(),
+        )
+        .await
+        .ok()
 }
 
 fn dial_config(seed: &[u8; 32]) -> SquicConfig {
@@ -990,7 +1030,10 @@ fn dial_config(seed: &[u8; 32]) -> SquicConfig {
 /// already been found — so this runs at link setup rather than once per call.
 /// The cached answer is dropped with the link, which is what keeps it from
 /// going stale on its own.
-async fn find_peer(server: &Arc<Server>, domain: &str) -> Result<(PubKey, SocketAddr), String> {
+pub(crate) async fn find_peer(
+    server: &Arc<Server>,
+    domain: &str,
+) -> Result<(PubKey, SocketAddr), String> {
     {
         let inner = server.relay.inner.lock().unwrap();
         if let Some(key) = inner.domains.get(domain)
