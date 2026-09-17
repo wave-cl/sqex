@@ -79,6 +79,9 @@ pub const PART_ATTACHMENT: u8 = 0x02;
 pub const PART_LINK: u8 = 0x03;
 pub const PART_REPLY: u8 = 0x04;
 pub const PART_MENTION: u8 = 0x05;
+/// SIP-43: the exchange the poster sent this through, where that is not the
+/// channel's origin -- the poster's own word about the poster's own act.
+pub const PART_VIA: u8 = 0x06;
 
 pub const REACT_ADD: u8 = 0x01;
 pub const REACT_REMOVE: u8 = 0x02;
@@ -141,6 +144,13 @@ pub enum Part {
     /// An identity, carrying no display name — a name inside the message is a
     /// name the sender controls, rendered where a reader looks for identity.
     Mention(PubKey),
+    /// The exchange this was sent through, by its SIP-9 key: the exchange
+    /// *is* its key, and a domain is only a hint that resolves to one. Only
+    /// where that exchange is not the channel's origin (SIP-43). A reader
+    /// shows it -- by the domain its own pin store knows the key under, or
+    /// by the key -- and concludes nothing else from it: no exchange said
+    /// it, and nothing says who carried a message the poster did not label.
+    Via(PubKey),
 }
 
 /// A message, an edit to one, a reaction, a redaction, or channel metadata.
@@ -228,6 +238,7 @@ impl Post {
         let mut attachments = 0usize;
         let mut links = 0usize;
         let mut mentions = 0usize;
+        let mut via = 0usize;
         for p in &self.parts {
             match p {
                 Part::Text(_) => text += 1,
@@ -235,12 +246,15 @@ impl Post {
                 Part::Attachment(_) => attachments += 1,
                 Part::Link(_) => links += 1,
                 Part::Mention(_) => mentions += 1,
+                Part::Via(_) => via += 1,
             }
         }
-        // The two "at most one" kinds are the ones whose excess has no sensible
-        // reading at all: a post with two bodies, or two things it replies to.
+        // The "at most one" kinds are the ones whose excess has no sensible
+        // reading at all: a post with two bodies, two things it replies to,
+        // or two exchanges it was sent through.
         cap(text, 1, "text parts")?;
         cap(reply, 1, "reply parts")?;
+        cap(via, 1, "via parts")?;
         cap(attachments, MAX_ATTACHMENTS, "attachments")?;
         cap(links, MAX_LINKS, "link previews")?;
         cap(mentions, MAX_MENTIONS, "mentions")?;
@@ -258,6 +272,14 @@ impl Post {
     pub fn body_text(&self) -> Option<&str> {
         self.parts.iter().find_map(|p| match p {
             Part::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The exchange the poster says this was sent through, if they said.
+    pub fn via(&self) -> Option<PubKey> {
+        self.parts.iter().find_map(|p| match p {
+            Part::Via(v) => Some(*v),
             _ => None,
         })
     }
@@ -300,6 +322,7 @@ fn write_part(part: &Part, out: &mut Vec<u8>) {
         Part::Attachment(a) => (PART_ATTACHMENT, a.encode()),
         Part::Reply(t) => (PART_REPLY, t.to_be_bytes().to_vec()),
         Part::Mention(m) => (PART_MENTION, m.as_bytes().to_vec()),
+        Part::Via(v) => (PART_VIA, v.as_bytes().to_vec()),
         Part::Link(l) => {
             let mut b = Vec::new();
             b.extend_from_slice(&(l.url.len() as u16).to_be_bytes());
@@ -335,6 +358,15 @@ fn read_part(kind: u8, b: &[u8]) -> Result<Option<Part>> {
                 )));
             }
             Ok(Some(Part::Text(utf8(b, "text")?)))
+        }
+        PART_VIA => {
+            if b.len() != 32 {
+                return Err(Error::Malformed(format!(
+                    "via is {} bytes, want 32",
+                    b.len()
+                )));
+            }
+            Ok(Some(Part::Via(PubKey::new(b.try_into().unwrap()))))
         }
         PART_ATTACHMENT => {
             let mut o = 0;
@@ -870,6 +902,33 @@ mod tests {
         let Body::Post(post) = body else { panic!() };
         assert_eq!(post.body_text(), Some("but this shows"));
         assert_eq!(post.unknown, 1);
+    }
+
+    /// SIP-43's `Via`: carried and read back, one at most, and a reader
+    /// from before it steps over it as any part it does not know.
+    #[test]
+    fn a_via_part_travels_and_at_most_one_is_allowed() {
+        let ex = PubKey::new([7; 32]);
+        let mut post = Post::text("from the copy");
+        post.parts.push(Part::Via(ex));
+        let bytes = Body::Post(post.clone()).encode();
+        let Body::Post(read) = Body::decode(&bytes).unwrap().unwrap() else {
+            panic!()
+        };
+        assert_eq!(read.via(), Some(ex));
+        assert_eq!(read.body_text(), Some("from the copy"));
+        assert_eq!(Post::text("plain").via(), None);
+
+        post.parts.push(Part::Via(PubKey::new([8; 32])));
+        assert!(
+            post.validate().is_err(),
+            "two exchanges cannot both have carried it"
+        );
+        // A key is 32 bytes and nothing else is a key.
+        let mut short = vec![TYPE_POST, 1, PART_VIA];
+        short.extend_from_slice(&5u32.to_be_bytes());
+        short.extend_from_slice(b"squic");
+        assert!(Body::decode(&short).is_err());
     }
 
     #[test]

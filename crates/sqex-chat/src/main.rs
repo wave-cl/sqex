@@ -3321,6 +3321,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 has_file,
                 at: m.posted,
                 edited: m.edited.is_some(),
+                via: m.post.via().map(|k| Chat::via_name(&k)),
                 redacted: m.redacted,
                 // Only on ours: a receipt says what became of something you
                 // sent. `Read` requires everybody, because a member who has
@@ -3443,6 +3444,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 has_file: false,
                 at: c.posted,
                 edited: false,
+                via: None,
                 redacted: false,
                 receipt: None,
                 reply_to: None,

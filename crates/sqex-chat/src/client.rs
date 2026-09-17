@@ -3655,10 +3655,51 @@ impl Chat {
     /// entry. Checking here as well is a courtesy, so that a client tells
     /// somebody their edit will be ignored rather than sending one that
     /// silently is.
-    pub async fn edit(&mut self, channel: &[u8; 32], target: u64, post: SipPost) -> Result<Posted> {
+    pub async fn edit(
+        &mut self,
+        channel: &[u8; 32],
+        target: u64,
+        mut post: SipPost,
+    ) -> Result<Posted> {
+        self.stamp_via(channel, &mut post).await;
         post.validate()
             .map_err(|e| ChatError::Protocol(e.to_string()))?;
         self.send_body(channel, Body::Edit { target, post }).await
+    }
+
+    /// SIP-43: a post made through a copy says so, in the poster's own
+    /// words and under the poster's own signature -- `Via` is a part of the
+    /// body, sealed with it, and no exchange adds or learns anything. It
+    /// names this connection's exchange by key; a reader's own pin store
+    /// turns that into a domain. Left alone where the channel lives here,
+    /// or where the post already says.
+    async fn stamp_via(&mut self, channel: &[u8; 32], post: &mut SipPost) {
+        // Asked here, not assumed: a store that remembers nothing may post
+        // before it has ever looked at the channel. Cached after the first.
+        let _ = self.home(channel).await;
+        if self.homed_elsewhere(channel).is_some() && post.via().is_none() {
+            post.parts.push(Part::Via(self.exchange));
+        }
+    }
+
+    /// SIP-43: what to call the exchange a message says it came through --
+    /// the domain this machine's pin store knows the key under, or the key.
+    /// The pin store, not the message: a domain named in a message would be
+    /// the poster's to choose, and this is the reader's own knowledge.
+    pub fn via_name(exchange: &PubKey) -> String {
+        let known = sqex_discovery::Known::load(&sqex_discovery::known::path()).ok();
+        known
+            .as_ref()
+            .and_then(|k| {
+                k.entries()
+                    .iter()
+                    .find(|e| e.key == *exchange)
+                    .map(|e| e.domain.clone())
+            })
+            .unwrap_or_else(|| {
+                let key = exchange.to_string();
+                format!("{}…", &key[..key.len().min(8)])
+            })
     }
 
     /// Reply to a message: an ordinary post carrying [`Part::Reply`].
@@ -3670,7 +3711,8 @@ impl Chat {
 
     /// Send a message built by the caller — text, attachments, a reply, or a
     /// combination. `send` is this with one text part.
-    pub async fn send_post(&mut self, channel: &[u8; 32], post: SipPost) -> Result<Posted> {
+    pub async fn send_post(&mut self, channel: &[u8; 32], mut post: SipPost) -> Result<Posted> {
+        self.stamp_via(channel, &mut post).await;
         post.validate()
             .map_err(|e| ChatError::Protocol(e.to_string()))?;
         self.send_body(channel, Body::Post(post)).await

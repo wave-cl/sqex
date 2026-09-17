@@ -137,6 +137,10 @@ pub struct Said {
     pub has_file: bool,
     pub at: u64,
     pub edited: bool,
+    /// SIP-43: the exchange the sender says they posted this through, when
+    /// that was not where the conversation lives. Shortened for display
+    /// where it is a key rather than a domain.
+    pub via: Option<String>,
     /// How far this message of ours has got, if we can tell. `None` on
     /// somebody else's — a receipt is about what happened to what you sent.
     pub receipt: Option<Receipt>,
@@ -1156,6 +1160,11 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
     }
     if s.edited && !s.redacted {
         tail += "  (edited)";
+    }
+    if let Some(via) = &s.via
+        && !s.redacted
+    {
+        tail += &format!("  via {via}");
     }
     for m in &s.mentions {
         tail += &format!("  @{m}");

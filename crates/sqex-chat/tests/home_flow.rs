@@ -269,6 +269,22 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
             .messages()
             .any(|m| m.seq == posted_seq && m.post.body_text() == Some("posted at the replica"))
     );
+    // Every message made through the copy says so, in the poster's own
+    // words: `via` names the exchange it was sent through by its key, and
+    // one made at the origin says nothing.
+    let via_of = |text: &str| {
+        at_origin
+            .messages()
+            .find(|m| m.post.body_text() == Some(text))
+            .map(|m| m.post.via())
+    };
+    assert_eq!(via_of("from the origin"), Some(None));
+    assert_eq!(via_of("posted at the replica"), Some(Some(replica_key)));
+    assert_eq!(
+        via_of("from a store that remembered nothing"),
+        Some(Some(replica_key))
+    );
+
     // The origin holds the file a member sent from the copy.
     let a = at_origin
         .messages()
