@@ -2644,9 +2644,22 @@ impl Chat {
     /// It has to: SIP-31 binds it into the signature, and `Info` — the other
     /// place it appears — requires the membership this call is asking for.
     pub async fn join(&mut self, channel: &[u8; 32], instance: [u8; 32]) -> Result<()> {
-        // Our own chain state, not the exchange's: we cannot ask, and we are
-        // the only party that could be harmed by a lower answer.
-        let (chain_seq, prev) = self.store.chain(channel)?;
+        // SIP-43: where it lives, before signing -- a joiner has never asked
+        // `info` for this channel, and the place a join is signed under is
+        // the origin's, which is not this exchange's for a copy. A public
+        // channel's home is answered to anyone; an exchange from before
+        // SIP-43 is the origin of everything it serves. A refusal here is
+        // not the join's to report: the join itself will say.
+        let _ = self.home(channel).await;
+        // Our own chain state first, and the exchange's where it will say --
+        // a public channel's `info` is answered to anyone at a copy, and
+        // carries where this device stands at the origin, which a member the
+        // origin seated by welcome and a store that remembers nothing would
+        // otherwise not know. The greater of the two, never the report alone.
+        let (chain_seq, prev) = match self.info(channel).await {
+            Ok(info) => self.chain_at(channel, &info)?,
+            Err(_) => self.store.chain(channel)?,
+        };
         let terms = ActionTerms {
             place: Place {
                 exchange: self.exchange_of(channel),
