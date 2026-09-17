@@ -49,6 +49,7 @@ mod resolve_flow;
 mod room_flow;
 mod route_coverage;
 mod session_flow;
+mod shared_room_flow;
 mod signed_entry_flow;
 mod sqnr_flow;
 mod succession_flow;

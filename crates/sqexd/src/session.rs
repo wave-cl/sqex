@@ -221,6 +221,15 @@ impl Sessions {
         OpenAck::waiting(now)
     }
 
+    /// SIP-49: the ephemeral `me` is offering `peer` in an open still
+    /// waiting, if any. Read, not taken: the device keeps polling the same
+    /// open, and the bridge that matched it answers those polls.
+    pub fn pending_from(&self, me: &PubKey, peer: &PubKey) -> Option<[u8; 32]> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.expire(now_unix());
+        inner.pending.get(&(*me, *peer)).map(|p| p.ephemeral)
+    }
+
     /// Relay one sealed frame from `me` to the other end.
     pub fn send(
         &self,

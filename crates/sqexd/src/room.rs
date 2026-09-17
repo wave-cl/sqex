@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use sqex_proto::room::{MAX_MEMBERS, Member, Roster, TTL_SECS};
+use sqex_proto::room::{Homed, HomedMember, MAX_MEMBERS, Member, Roster, TTL_SECS};
 use sqnr_core::PubKey;
 
 use crate::state::now_unix;
@@ -54,11 +54,34 @@ struct Presence {
     last_seen: u64,
 }
 
+/// SIP-49: shares to one peer are at least this far apart while nothing
+/// changes; a change is shared at once.
+pub const SHARE_SECS: u64 = 10;
+
+/// SIP-49: what one relay peer last said about a room, with its home
+/// filled in -- a member the peer sent as its own is homed at the peer.
+struct Remote {
+    members: Vec<HomedMember>,
+    at: u64,
+}
+
+/// SIP-49: a room's federation state -- the peers it is shared with, what
+/// each last shared, and when this exchange last shared its own view.
+#[derive(Default)]
+struct Shared {
+    peers: HashMap<PubKey, Option<Remote>>,
+    last_shared: u64,
+    changed: bool,
+}
+
 /// Every room the exchange currently carries.
 #[derive(Default)]
 pub struct Rooms {
     /// handle -> identity -> presence
     rooms: Mutex<HashMap<[u8; 32], HashMap<PubKey, Presence>>>,
+    /// SIP-49: handle -> what is shared, and with whom. Held apart from the
+    /// members so that a peer's share cannot fill a local room.
+    shared: Mutex<HashMap<[u8; 32], Shared>>,
 }
 
 impl Rooms {
@@ -131,6 +154,158 @@ impl Rooms {
         was_there
     }
 
+    /// SIP-49: join as [`Rooms::join`] does, and ask that the room be
+    /// shared with `share`. Answers the roster with homes -- every member
+    /// here and every member a peer has shared -- and whether a share to
+    /// the peers is now due: something changed, or `SHARE_SECS` passed.
+    pub fn join_shared(
+        &self,
+        handle: [u8; 32],
+        identity: PubKey,
+        proof: [u8; 32],
+        share: &[PubKey],
+    ) -> Result<(Homed, bool), JoinError> {
+        let was_there = self
+            .rooms
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .is_some_and(|m| m.contains_key(&identity));
+        let local = self.join(handle, identity, proof)?;
+        let now = now_unix();
+        let mut shared = self.shared.lock().unwrap();
+        let s = shared.entry(handle).or_default();
+        for peer in share {
+            if !s.peers.contains_key(peer) {
+                s.peers.insert(*peer, None);
+                s.changed = true;
+            }
+        }
+        if !was_there {
+            s.changed = true;
+        }
+        let mut members: Vec<HomedMember> = local
+            .members
+            .iter()
+            .map(|m| HomedMember {
+                identity: m.identity,
+                proof: m.proof,
+                home: PubKey::new([0; 32]),
+            })
+            .collect();
+        for remote in s.peers.values().flatten() {
+            if now.saturating_sub(remote.at) >= TTL_SECS {
+                continue;
+            }
+            for m in &remote.members {
+                if m.identity != identity && !members.iter().any(|x| x.identity == m.identity) {
+                    members.push(*m);
+                }
+            }
+        }
+        members.sort_by(|a, b| a.identity.as_bytes().cmp(b.identity.as_bytes()));
+        let due =
+            !s.peers.is_empty() && (s.changed || now.saturating_sub(s.last_shared) >= SHARE_SECS);
+        Ok((Homed { now, members }, due))
+    }
+
+    /// SIP-49: what `peer` said about `handle`. A member the peer sent as
+    /// its own is homed at the peer. Returns whether this is the first the
+    /// room has been shared with that peer -- which makes the sharing
+    /// reciprocal from here.
+    pub fn take_share(&self, peer: PubKey, handle: [u8; 32], members: Vec<HomedMember>) -> bool {
+        let now = now_unix();
+        let mut shared = self.shared.lock().unwrap();
+        let s = shared.entry(handle).or_default();
+        let fresh = !s.peers.contains_key(&peer);
+        let members = members
+            .into_iter()
+            .map(|m| HomedMember {
+                home: if m.is_local() { peer } else { m.home },
+                ..m
+            })
+            .collect();
+        s.peers.insert(peer, Some(Remote { members, at: now }));
+        fresh
+    }
+
+    /// SIP-49: the peers `handle` is shared with, if any.
+    pub fn peers_of(&self, handle: &[u8; 32]) -> Vec<PubKey> {
+        self.shared
+            .lock()
+            .unwrap()
+            .get(handle)
+            .map(|s| s.peers.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// SIP-49: this exchange's view of `handle` as told to `peer` -- its
+    /// own members, and what other peers shared, less what came from
+    /// `peer` itself. At most `MAX_MEMBERS`, which is what one share may
+    /// carry. Notes the share as made.
+    pub fn view_for(&self, handle: &[u8; 32], peer: &PubKey) -> Vec<HomedMember> {
+        let now = now_unix();
+        let mut out: Vec<HomedMember> = self
+            .rooms
+            .lock()
+            .unwrap()
+            .get(handle)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|(_, p)| now.saturating_sub(p.last_seen) < TTL_SECS)
+                    .map(|(id, p)| HomedMember {
+                        identity: *id,
+                        proof: p.proof,
+                        home: PubKey::new([0; 32]),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut shared = self.shared.lock().unwrap();
+        if let Some(s) = shared.get_mut(handle) {
+            for (from, remote) in &s.peers {
+                if from == peer {
+                    continue;
+                }
+                if let Some(r) = remote
+                    && now.saturating_sub(r.at) < TTL_SECS
+                {
+                    for m in &r.members {
+                        if m.home != *peer && !out.iter().any(|x| x.identity == m.identity) {
+                            out.push(*m);
+                        }
+                    }
+                }
+            }
+            s.last_shared = now;
+            s.changed = false;
+        }
+        out.sort_by(|a, b| a.identity.as_bytes().cmp(b.identity.as_bytes()));
+        out.truncate(MAX_MEMBERS);
+        out
+    }
+
+    /// SIP-49: whether `handle` is shared at all -- a leave from it is
+    /// worth telling the peers.
+    pub fn is_shared(&self, handle: &[u8; 32]) -> bool {
+        self.shared
+            .lock()
+            .unwrap()
+            .get(handle)
+            .is_some_and(|s| !s.peers.is_empty())
+    }
+
+    /// SIP-49: a peer's link went; what it shared goes with it.
+    pub fn forget_peer(&self, peer: &PubKey) {
+        let mut shared = self.shared.lock().unwrap();
+        for s in shared.values_mut() {
+            if let Some(r) = s.peers.get_mut(peer) {
+                *r = None;
+            }
+        }
+    }
+
     /// Forget everyone whose membership has expired, and every room thereby
     /// emptied. Called from the same sweep as the other stores.
     pub fn expire(&self) {
@@ -139,6 +314,19 @@ impl Rooms {
         rooms.retain(|_, members| {
             members.retain(|_, p| now.saturating_sub(p.last_seen) < TTL_SECS);
             !members.is_empty()
+        });
+        // A share outlives its members by a TTL, so a room that emptied here
+        // is still told to the peers as empty once, and then forgotten.
+        let mut shared = self.shared.lock().unwrap();
+        shared.retain(|handle, s| {
+            for r in s.peers.values_mut() {
+                if r.as_ref()
+                    .is_some_and(|r| now.saturating_sub(r.at) >= TTL_SECS)
+                {
+                    *r = None;
+                }
+            }
+            rooms.contains_key(handle) || now.saturating_sub(s.last_shared) < TTL_SECS
         });
     }
 

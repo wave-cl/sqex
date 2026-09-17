@@ -212,6 +212,12 @@ enum Cmd {
         /// Leave after N seconds.
         #[arg(long)]
         seconds: Option<u64>,
+
+        /// SIP-49: an exchange, by base58 key, to ask yours to share the
+        /// room with -- the channel's origin, when the call is in a channel
+        /// you read through a copy. Members there see you, and you them.
+        #[arg(long = "share")]
+        share: Vec<String>,
     },
 }
 
@@ -301,6 +307,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         jitter,
         bitrate,
         seconds,
+        share,
     } = cmd
     {
         if *new {
@@ -320,14 +327,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         // A room has nobody to name, only a secret to hold, so it connects
         // rather than dials.
         let client = engine::connect(endpoint, &signer, &mut report).await?;
-        return engine::room_call(
-            client,
-            &signer,
-            id,
-            opts(&cli, source, sink, *jitter, *bitrate, *seconds, false),
-            &mut report,
-        )
-        .await;
+        let mut o = opts(&cli, source, sink, *jitter, *bitrate, *seconds, false);
+        o.share = share
+            .iter()
+            .map(|k| {
+                k.parse::<sqnr_core::PubKey>()
+                    .map_err(|e| format!("--share {k}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return engine::room_call(client, &signer, id, o, &mut report).await;
     }
 
     // A cross-exchange answerer has no peer to name either — the ring says who
@@ -477,6 +485,7 @@ fn opts(
         seconds,
         rtt,
         dtx: !cli.no_dtx,
+        share: Vec::new(),
     }
 }
 

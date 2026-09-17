@@ -70,6 +70,9 @@ struct BridgeRec {
     /// The caller device (A).
     caller: PubKey,
     caller_eph: [u8; 32],
+    /// SIP-49: the invite addressed this one device, and only its open
+    /// answers. `None` is SIP-39's account, answered by whichever device.
+    device_only: Option<PubKey>,
     /// The answering device (B's), once known.
     callee: Option<PubKey>,
     callee_eph: [u8; 32],
@@ -284,6 +287,9 @@ fn forget_link(server: &Server, peer: PubKey, id: usize) {
     }
     inner.links.remove(&peer);
     inner.domains.retain(|_, k| *k != peer);
+    drop(inner);
+    // SIP-49: what the peer shared was soft state on the link.
+    server.rooms.forget_peer(&peer);
 }
 
 fn drop_bridge(inner: &mut RelayInner, bridge: &relay::Bridge) {
@@ -375,19 +381,33 @@ pub async fn place_call(
         // No @domain: this is a local peer and belongs on the plain open path.
         return CallAck::rejected(relay::REASON_REFUSED, now);
     };
+    // Base58 is case-sensitive and a domain is not; judge which before
+    // folding.
+    let by_key = domain.parse::<PubKey>().ok();
     let domain = domain.to_ascii_lowercase();
     // Discover first, then judge the key. The allowlist is a judgement about a
     // *key*, and discovery is what produces one — so the order is fixed by what
     // each step knows, not by preference (SIP-39).
-    let (peer_key, peer_addr) = match find_peer(server, &domain).await {
-        Ok(found) => found,
-        Err(e) => {
-            // A pinned key that has changed lands here too, and that is a thing
-            // an operator must be able to find afterwards rather than a call
-            // that quietly did not connect.
-            tracing::warn!(%domain, %e, "no peer exchange for this domain");
-            return CallAck::rejected(relay::REASON_UNREACHABLE, now);
-        }
+    //
+    // SIP-49: a base58 exchange key in place of the domain names a relay
+    // peer directly -- a room member's home, known from the roster and not
+    // from any directory -- and is answered from the link already up with
+    // it, or from the domain the peer list records for it.
+    let (peer_key, peer_addr) = match by_key {
+        Some(key) => match link_to_key(server, key).await {
+            Some(addr) => (key, addr),
+            None => return CallAck::rejected(relay::REASON_UNREACHABLE, now),
+        },
+        None => match find_peer(server, &domain).await {
+            Ok(found) => found,
+            Err(e) => {
+                // A pinned key that has changed lands here too, and that is a thing
+                // an operator must be able to find afterwards rather than a call
+                // that quietly did not connect.
+                tracing::warn!(%domain, %e, "no peer exchange for this domain");
+                return CallAck::rejected(relay::REASON_UNREACHABLE, now);
+            }
+        },
     };
     if !server.peers_with(&peer_key) {
         // Found, but not somebody this operator federates with.
@@ -424,6 +444,7 @@ pub async fn place_call(
             account,
             caller,
             caller_eph: eph,
+            device_only: None,
             callee: None,
             callee_eph: [0u8; 32],
             session_id: 0,
@@ -437,17 +458,25 @@ pub async fn place_call(
         },
     );
     inner.caller_index.insert((caller, target), bridge);
-    send_control(
-        &inner,
-        &peer_key,
+    // SIP-49: a peer named by key is a room member's home, and the target
+    // is that one device; nobody is rung for it.
+    let invite = if by_key.is_some() {
+        Control::InviteDevice {
+            bridge,
+            caller,
+            caller_eph: eph,
+            device: account,
+        }
+    } else {
         Control::Invite {
             bridge,
             caller,
             caller_eph: eph,
             account,
             caller_domain: String::new(),
-        },
-    );
+        }
+    };
+    send_control(&inner, &peer_key, invite);
     CallAck::ringing(now)
 }
 
@@ -464,6 +493,15 @@ pub fn try_answer(
     let account = server.account_of(&device);
     let mut inner = server.relay.inner.lock().unwrap();
     let bridge = *inner.callee_index.get(&(caller, account))?;
+    // SIP-49: a bridge addressed to one device is nobody else's to answer.
+    if inner
+        .bridges
+        .get(&bridge)?
+        .device_only
+        .is_some_and(|d| d != device)
+    {
+        return None;
+    }
     match inner.bridges.get(&bridge)?.callee {
         Some(dev) if dev == device => {
             // Idempotent re-open by the same device.
@@ -672,6 +710,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
                         account,
                         caller,
                         caller_eph,
+                        device_only: None,
                         callee: None,
                         callee_eph: [0u8; 32],
                         session_id: 0,
@@ -686,6 +725,74 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             }
             // Ring the account's devices (SIP-30, per device).
             server.ring_crosscall(account, bridge, caller);
+        }
+        // SIP-49: an invite addressed to one device, which both sides know
+        // from a shared room. Never rung: the device opens toward the caller
+        // by itself, or already has -- in which case the bridge is answered
+        // on the spot.
+        Control::InviteDevice {
+            bridge,
+            caller,
+            caller_eph,
+            device,
+        } => {
+            if server.relay.at_capacity() {
+                let inner = server.relay.inner.lock().unwrap();
+                send_control(
+                    &inner,
+                    &peer,
+                    Control::Reject {
+                        bridge,
+                        reason: relay::REASON_REFUSED,
+                    },
+                );
+                return;
+            }
+            let owner = server.account_of(&device);
+            let waiting = server.sessions.pending_from(&device, &caller);
+            let mut inner = server.relay.inner.lock().unwrap();
+            let now = crate::state::now_unix();
+            let sid = waiting.map(|_| Relay::next_session(&mut inner));
+            inner.bridges.insert(
+                bridge,
+                BridgeRec {
+                    peer,
+                    account: owner,
+                    caller,
+                    caller_eph,
+                    device_only: Some(device),
+                    callee: waiting.map(|_| device),
+                    callee_eph: waiting.unwrap_or([0u8; 32]),
+                    session_id: sid.unwrap_or(0),
+                    local: if waiting.is_some() {
+                        device
+                    } else {
+                        PubKey::new([0u8; 32])
+                    },
+                    outcome: Outcome::Ringing,
+                    created: now,
+                    index: Index::Callee {
+                        caller,
+                        account: owner,
+                    },
+                },
+            );
+            inner.callee_index.insert((caller, owner), bridge);
+            match (waiting, sid) {
+                (Some(eph), Some(sid)) => {
+                    inner.by_session.insert(sid, bridge);
+                    send_control(
+                        &inner,
+                        &peer,
+                        Control::Accept {
+                            bridge,
+                            callee: device,
+                            callee_eph: eph,
+                        },
+                    );
+                }
+                _ => send_control(&inner, &peer, Control::Ringing { bridge }),
+            }
         }
         Control::Ringing { .. } => {} // caller side: nothing to do, still ringing
         Control::Accept {
@@ -716,7 +823,82 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             let mut inner = server.relay.inner.lock().unwrap();
             drop_bridge(&mut inner, &bridge);
         }
+        // SIP-49: a peer's view of a room. Reciprocal: the first share of a
+        // room from a peer is answered with this exchange's view of it.
+        Control::RoomShare { handle, members } => {
+            let fresh = server.rooms.take_share(peer, handle, members);
+            if fresh {
+                let view = server.rooms.view_for(&handle, &peer);
+                let inner = server.relay.inner.lock().unwrap();
+                send_control(
+                    &inner,
+                    &peer,
+                    Control::RoomShare {
+                        handle,
+                        members: view,
+                    },
+                );
+            }
+        }
     }
+}
+
+/// SIP-49: tell every peer a room is shared with what this exchange sees of
+/// it. A link is brought up where none is, by the domain the peer list
+/// records for the key; a peer with no link and no domain is not told.
+pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
+    for peer in server.rooms.peers_of(&handle) {
+        if !server.peers_with(&peer) {
+            continue;
+        }
+        if link_to_key(server, peer).await.is_none() {
+            tracing::debug!(peer = %peer, "no link to share a room over");
+            continue;
+        }
+        let view = server.rooms.view_for(&handle, &peer);
+        let inner = server.relay.inner.lock().unwrap();
+        send_control(
+            &inner,
+            &peer,
+            Control::RoomShare {
+                handle,
+                members: view,
+            },
+        );
+    }
+}
+
+/// The address of a live link to `key`, bringing one up by the domain the
+/// peer list records for it where there is none. `None` when the key is
+/// not a peer, has no domain on record, or cannot be reached.
+async fn link_to_key(server: &Arc<Server>, key: PubKey) -> Option<SocketAddr> {
+    if !server.peers_with(&key) {
+        return None;
+    }
+    if let Some(addr) = server
+        .relay
+        .inner
+        .lock()
+        .unwrap()
+        .links
+        .get(&key)
+        .map(|l| l.addr)
+    {
+        return Some(addr);
+    }
+    let domain = server
+        .peer_directory()
+        .peers
+        .into_iter()
+        .find(|p| p.key == key)
+        .map(|p| p.domain)
+        .filter(|d| !d.is_empty())?;
+    let (found, addr) = find_peer(server, &domain).await.ok()?;
+    if found != key {
+        return None;
+    }
+    ensure_link(server, key, addr).await.ok()?;
+    Some(addr)
 }
 
 async fn resolve_name_at(
@@ -955,6 +1137,7 @@ mod tests {
                     account: key(2),
                     caller: key(1),
                     caller_eph: [0u8; 32],
+                    device_only: None,
                     callee: None,
                     callee_eph: [0u8; 32],
                     session_id: 0,
@@ -1002,6 +1185,7 @@ mod tests {
                     account: key(2),
                     caller: key(1),
                     caller_eph: [0u8; 32],
+                    device_only: None,
                     callee: Some(key(2)),
                     callee_eph: [0u8; 32],
                     session_id: BRIDGE_BIT | 1,

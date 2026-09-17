@@ -23,8 +23,10 @@
 use std::collections::HashMap;
 
 use sqex_proto::refusal::{Code, Refusal};
-use sqex_proto::room::{Join, Leave, RoomId, Roster};
-use sqex_proto::session::{BySession, Open, OpenAck, OpenState, Session};
+use sqex_proto::room::{Homed, Join, JoinShared, Leave, RoomId, Roster};
+use sqex_proto::session::{
+    BySession, CallAck, CallOpen, CallState, Open, OpenAck, OpenState, Session,
+};
 use sqnr::Client;
 use sqnr_core::PubKey;
 
@@ -80,6 +82,16 @@ pub enum Event {
     /// Still in the room, but nothing has arrived from them for a long time.
     /// The session was thrown away and is being built again.
     Restarted(PubKey),
+    /// SIP-49: in the room at another exchange our exchange will not bridge
+    /// to. Present, and not heard.
+    Unreachable(PubKey),
+}
+
+/// SIP-49: how one attempt at a bridge came out.
+enum Bridged {
+    Peer(Box<Peer>),
+    Waiting,
+    Refused,
 }
 
 /// This client's membership of one room.
@@ -114,6 +126,18 @@ pub struct Membership {
     /// Names we have already complained about, so a forged member produces one
     /// line rather than one every two seconds.
     rejected: std::collections::HashSet<PubKey>,
+    /// SIP-49: the relay peers to ask our exchange to share the room with --
+    /// the channel's origin, for a member at a copy. Empty for a member at
+    /// the origin, who still asks the shared way so as to be told homes.
+    share: Vec<PubKey>,
+    /// SIP-49: where each remote member is. A member not here is local.
+    homes: HashMap<PubKey, PubKey>,
+    /// SIP-49: the exchange refused the shared join as malformed -- it is
+    /// from before SIP-49 -- so the plain join is used from then on.
+    unshared: bool,
+    /// SIP-49: members whose home is not a peer of our exchange, or whose
+    /// bridge the exchange refused: in the call and not heard.
+    pub unreachable: std::collections::HashSet<PubKey>,
 }
 
 impl Membership {
@@ -142,7 +166,22 @@ impl Membership {
             by_identity: HashMap::new(),
             pending: HashMap::new(),
             rejected: std::collections::HashSet::new(),
+            share: Vec::new(),
+            homes: HashMap::new(),
+            unshared: false,
+            unreachable: std::collections::HashSet::new(),
         }
+    }
+
+    /// SIP-49: ask the exchange to share the room with these relay peers.
+    pub fn with_share(mut self, share: Vec<PubKey>) -> Membership {
+        self.share = share;
+        self
+    }
+
+    /// SIP-49: where `id` is, if not here.
+    pub fn home_of(&self, id: &PubKey) -> Option<PubKey> {
+        self.homes.get(id).copied()
     }
 
     /// Everyone we can currently hear, sorted, for display.
@@ -164,7 +203,35 @@ impl Membership {
     /// every two seconds. Media never waits behind it — datagrams need only a
     /// shared reference to the connection.
     pub async fn poll(&mut self, client: &mut Client) -> Result<Vec<Event>, String> {
-        let roster = Self::heartbeat(self.room, self.me, client).await?;
+        let roster = if self.unshared {
+            Self::heartbeat(self.room, self.me, client).await?
+        } else {
+            match Self::heartbeat_shared(self.room, self.me, &self.share, client).await? {
+                Some(homed) => {
+                    self.homes = homed
+                        .members
+                        .iter()
+                        .filter(|m| !m.is_local())
+                        .map(|m| (m.identity, m.home))
+                        .collect();
+                    Roster {
+                        now: homed.now,
+                        members: homed
+                            .members
+                            .iter()
+                            .map(|m| sqex_proto::room::Member {
+                                identity: m.identity,
+                                proof: m.proof,
+                            })
+                            .collect(),
+                    }
+                }
+                None => {
+                    self.unshared = true;
+                    Self::heartbeat(self.room, self.me, client).await?
+                }
+            }
+        };
         let mut events = Vec::new();
 
         // 1. Keep only the members who can prove they belong here.
@@ -226,17 +293,115 @@ impl Membership {
             .iter()
             .map(|(id, eph)| (*id, eph.clone()))
             .collect();
-        let (seed, depth, rate) = (self.seed, self.depth, self.rate);
+        let (seed, depth, rate, me) = (self.seed, self.depth, self.rate, self.me);
         for (id, eph) in waiting {
-            if let Some(peer) = Self::try_establish(seed, depth, rate, eph, client, id).await? {
+            // SIP-49: toward a member elsewhere, the lower of the two places
+            // the bridge and the higher opens as for anybody local.
+            let bridge_to = self
+                .homes
+                .get(&id)
+                .filter(|_| me.as_bytes() < id.as_bytes())
+                .copied();
+            let got = match bridge_to {
+                Some(home) => {
+                    match Self::try_bridge(seed, depth, rate, eph, client, id, home).await? {
+                        Bridged::Peer(p) => Some(*p),
+                        Bridged::Waiting => None,
+                        Bridged::Refused => {
+                            if self.unreachable.insert(id) {
+                                events.push(Event::Unreachable(id));
+                            }
+                            None
+                        }
+                    }
+                }
+                None => Self::try_establish(seed, depth, rate, eph, client, id).await?,
+            };
+            let Some(peer) = got else {
+                continue;
+            };
+            {
+                self.unreachable.remove(&id);
                 events.push(Event::Joined(peer.identity));
                 self.by_identity.insert(peer.identity, peer.session_id);
                 self.peers.insert(peer.session_id, peer);
                 self.pending.remove(&id);
             }
         }
+        self.unreachable.retain(|id| still_here(id));
 
         Ok(events)
+    }
+
+    /// SIP-49: the shared join. `None` when the exchange does not know it,
+    /// which is an exchange from before SIP-49 and not an error.
+    async fn heartbeat_shared(
+        room: RoomId,
+        me: PubKey,
+        share: &[PubKey],
+        client: &mut Client,
+    ) -> Result<Option<Homed>, String> {
+        let (code, body) = client
+            .post(
+                "/room/join",
+                JoinShared::new(&room, &me, share.to_vec()).encode(),
+            )
+            .await?;
+        match code {
+            200 => Homed::decode(&body).map(Some).map_err(|e| e.to_string()),
+            400 => Ok(None),
+            _ => match Refusal::decode(&body) {
+                Ok(r) if r.code == Code::RoomFull => Err("the room is full".into()),
+                Ok(r) => Err(format!("join failed ({code}): {r}")),
+                Err(_) => Err(format!(
+                    "join failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                )),
+            },
+        }
+    }
+
+    /// SIP-49: one attempt at a bridged session with `id`, at `home`, placed
+    /// by our exchange.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_bridge(
+        seed: [u8; 32],
+        depth: u64,
+        rate: Rate,
+        eph: x25519_dalek::StaticSecret,
+        client: &mut Client,
+        id: PubKey,
+        home: PubKey,
+    ) -> Result<Bridged, String> {
+        let open = CallOpen {
+            ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
+            target: format!("{id}@{home}"),
+        };
+        let (code, body) = client.post("/session/call", open.encode()).await?;
+        if code != 200 {
+            return Ok(Bridged::Refused);
+        }
+        let ack = CallAck::decode(&body).map_err(|e| e.to_string())?;
+        match ack.state {
+            CallState::Ringing => return Ok(Bridged::Waiting),
+            // Reported once by the exchange and then cleared, so the next
+            // tick asks again; a member whose home is not a peer of ours
+            // stays unreachable and is shown so.
+            CallState::Rejected => return Ok(Bridged::Refused),
+            CallState::Established => {}
+        }
+        let session = Session::derive(&seed, &eph, &ack.peer, &ack.peer_ephemeral)
+            .map_err(|e| e.to_string())?;
+        Ok(Bridged::Peer(Box::new(Peer {
+            identity: id,
+            session,
+            session_id: ack.session_id,
+            jitter: Jitter::new(depth),
+            playback: Playback::new(rate.hz())?,
+            out_seq: 0,
+            level: 0.0,
+            last_heard: std::time::Instant::now(),
+        })))
     }
 
     /// Say we are still here, and get back who else is.

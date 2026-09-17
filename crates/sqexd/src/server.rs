@@ -238,7 +238,7 @@ pub struct Server {
     /// them apart.
     endpoints: Endpoints,
     mailbox: Mailbox,
-    rooms: Rooms,
+    pub(crate) rooms: Rooms,
     channels: Channels,
     prekeys: Prekeys,
     pub(crate) devices: Registry,
@@ -253,7 +253,7 @@ pub struct Server {
     max_names_per_account: usize,
     profiles: Profiles,
     admissions: Admissions,
-    sessions: Sessions,
+    pub(crate) sessions: Sessions,
     live_conns: Connections,
     /// SIP-39: cross-exchange call relay — the peer allowlist, the bridge
     /// ceiling, and the live links and bridges.
@@ -2933,6 +2933,41 @@ async fn route(
             }
         },
 
+        // SIP-49: a join that names relay peers is answered with homes, and
+        // the room is shared with those peers from then on. The plain join
+        // is SIP-13's, answered as it always was.
+        ("POST", "/room/join") if body.first() == Some(&sqex_proto::room::TYPE_JOIN_SHARED) => {
+            match (peer.identity, sqex_proto::room::JoinShared::decode(body)) {
+                (None, _) => no_identity("joining a room"),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some(me), Ok(join)) => {
+                    if let Some(stranger) = join.share.iter().find(|k| !server.peers_with(k)) {
+                        return refuse(
+                            403,
+                            Code::NotYours,
+                            Some(&format!(
+                                "{stranger} is not an exchange this one federates with"
+                            )),
+                        );
+                    }
+                    match server
+                        .rooms
+                        .join_shared(join.handle, me, join.proof, &join.share)
+                    {
+                        Ok((homed, due)) => {
+                            if due {
+                                let server = Arc::clone(server);
+                                tokio::spawn(async move {
+                                    crate::relay::share_room(&server, join.handle).await;
+                                });
+                            }
+                            (200, "application/octet-stream", homed.encode())
+                        }
+                        Err(e) => refuse(507, e.code(), None),
+                    }
+                }
+            }
+        }
         ("POST", "/room/join") => match (peer.identity, RoomJoin::decode(body)) {
             (None, _) => no_identity("joining a room"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -2946,6 +2981,14 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(leave)) => {
                 let was_there = server.rooms.leave(&leave.handle, &me);
+                // SIP-49: the peers are told a leave at once rather than a
+                // TTL later.
+                if was_there && server.rooms.is_shared(&leave.handle) {
+                    let server = Arc::clone(server);
+                    tokio::spawn(async move {
+                        crate::relay::share_room(&server, leave.handle).await;
+                    });
+                }
                 (200, "application/octet-stream", Left { was_there }.encode())
             }
         },

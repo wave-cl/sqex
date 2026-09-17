@@ -237,6 +237,11 @@ impl Event {
             Event::Roster(RoomEvent::Restarted(id)) => {
                 format!("~ {} went quiet — rebuilding the session", room::short(id))
             }
+            Event::Roster(RoomEvent::Unreachable(id)) => format!(
+                "! {} is in the call at an exchange ours will not bridge to — present, \
+                 and not heard",
+                room::short(id)
+            ),
             // Deliberately terse: this arrives ten times a second at worst, and
             // the once-a-second `Stats` line already says it properly. A
             // terminal should print that one and ignore this.
@@ -743,6 +748,10 @@ pub struct CallOpts {
     pub seconds: Option<u64>,
     pub rtt: bool,
     pub dtx: bool,
+    /// SIP-49: the relay peers to ask the exchange to share a room with --
+    /// the channel's origin, for a call joined through a copy. Ignored on a
+    /// two-party call.
+    pub share: Vec<PubKey>,
 }
 
 impl Default for CallOpts {
@@ -759,6 +768,7 @@ impl Default for CallOpts {
             seconds: None,
             rtt: false,
             dtx: true,
+            share: Vec::new(),
         }
     }
 }
@@ -977,7 +987,8 @@ pub async fn room_call(
     let mut mixer = Mixer::new(play_rate.frame());
     let mut pcm = vec![0f32; play_rate.frame()];
     // Every peer decodes at our playback rate, whatever rate they encoded at.
-    let mut members = Membership::new(room, me, signer.seed(), opts.depth, play_rate);
+    let mut members = Membership::new(room, me, signer.seed(), opts.depth, play_rate)
+        .with_share(opts.share.clone());
 
     let mut playout = tokio::time::interval(Duration::from_millis(FRAME_MS));
     let mut roster = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));

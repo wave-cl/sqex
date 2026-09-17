@@ -45,6 +45,10 @@ pub const TYPE_JOIN: u8 = 0x01;
 pub const TYPE_LEAVE: u8 = 0x02;
 /// The answer to a leave.
 pub const TYPE_LEFT: u8 = 0x03;
+/// SIP-49: a join that also names the relay peers to share the room with.
+pub const TYPE_JOIN_SHARED: u8 = 0x04;
+/// SIP-49: exchanges one join may name.
+pub const MAX_SHARE: usize = 4;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -239,6 +243,128 @@ impl Left {
                 "was_there is {other}, want 0 or 1"
             ))),
         }
+    }
+}
+
+/// SIP-49: a join naming the relay peers the room is to be shared with.
+///
+/// `| type: u8 = 0x04 | handle[32] | proof[32] | count: u8 | count × exchange[32] |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinShared {
+    pub handle: [u8; 32],
+    pub proof: [u8; 32],
+    pub share: Vec<PubKey>,
+}
+
+impl JoinShared {
+    pub fn new(room: &RoomId, identity: &PubKey, share: Vec<PubKey>) -> JoinShared {
+        JoinShared {
+            handle: room.handle(),
+            proof: room.proof(identity),
+            share,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(66 + self.share.len() * 32);
+        out.push(TYPE_JOIN_SHARED);
+        out.extend_from_slice(&self.handle);
+        out.extend_from_slice(&self.proof);
+        out.push(self.share.len() as u8);
+        for e in &self.share {
+            out.extend_from_slice(e.as_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<JoinShared> {
+        if b.len() < 66 || b[0] != TYPE_JOIN_SHARED {
+            return Err(Error::Malformed("not a shared join".into()));
+        }
+        let count = b[65] as usize;
+        if count > MAX_SHARE {
+            return Err(Error::Malformed(format!(
+                "a join names at most {MAX_SHARE} exchanges, not {count}"
+            )));
+        }
+        if b.len() != 66 + count * 32 {
+            return Err(Error::Malformed("shared join cut short".into()));
+        }
+        let share = (0..count)
+            .map(|i| PubKey::new(b[66 + i * 32..98 + i * 32].try_into().unwrap()))
+            .collect();
+        Ok(JoinShared {
+            handle: b[1..33].try_into().unwrap(),
+            proof: b[33..65].try_into().unwrap(),
+            share,
+        })
+    }
+}
+
+/// SIP-49: a member with the exchange it joined at -- zero for "here".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HomedMember {
+    pub identity: PubKey,
+    pub proof: [u8; 32],
+    pub home: PubKey,
+}
+
+impl HomedMember {
+    pub fn is_local(&self) -> bool {
+        self.home.as_bytes() == &[0u8; 32]
+    }
+}
+
+/// SIP-49: the roster with homes, answered to a `JoinShared`.
+///
+/// `| now: u64 | count: u16 | (identity[32] proof[32] home[32]) * count |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Homed {
+    pub now: u64,
+    pub members: Vec<HomedMember>,
+}
+
+impl Homed {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.members.len() * 96);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
+        for m in &self.members {
+            out.extend_from_slice(m.identity.as_bytes());
+            out.extend_from_slice(&m.proof);
+            out.extend_from_slice(m.home.as_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Homed> {
+        if b.len() < 10 {
+            return Err(Error::Malformed("homed roster cut short".into()));
+        }
+        let now = u64::from_be_bytes(b[0..8].try_into().unwrap());
+        let count = u16::from_be_bytes(b[8..10].try_into().unwrap()) as usize;
+        if b.len() != 10 + count * 96 {
+            return Err(Error::Malformed(format!(
+                "homed roster claims {count} members but carries {} bytes",
+                b.len() - 10
+            )));
+        }
+        // Every exchange admits at most MAX_MEMBERS; a shared room spans
+        // several, so this bounds what one exchange may relay, not the room.
+        if count > MAX_MEMBERS * MAX_SHARE {
+            return Err(Error::Malformed("homed roster too large".into()));
+        }
+        let members = (0..count)
+            .map(|i| {
+                let at = 10 + i * 96;
+                HomedMember {
+                    identity: PubKey::new(b[at..at + 32].try_into().unwrap()),
+                    proof: b[at + 32..at + 64].try_into().unwrap(),
+                    home: PubKey::new(b[at + 64..at + 96].try_into().unwrap()),
+                }
+            })
+            .collect();
+        Ok(Homed { now, members })
     }
 }
 

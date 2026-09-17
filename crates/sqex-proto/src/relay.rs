@@ -50,6 +50,10 @@ pub const TYPE_RINGING: u8 = 0x02;
 pub const TYPE_REJECT: u8 = 0x03;
 pub const TYPE_ACCEPT: u8 = 0x04;
 pub const TYPE_CLOSE: u8 = 0x05;
+/// SIP-49: one exchange's view of a shared room.
+pub const TYPE_ROOM_SHARE: u8 = 0x06;
+/// SIP-49: an invite addressed to one device, never rung.
+pub const TYPE_INVITE_DEVICE: u8 = 0x07;
 
 /// Why a bridged call did not connect (`Reject`) or ended (`Close`).
 ///
@@ -101,6 +105,23 @@ pub enum Control {
     },
     /// Either → the other: the bridged session is torn down, for `reason`.
     Close { bridge: Bridge, reason: u8 },
+    /// SIP-49, X → Y: `caller` wishes to open a session with the one
+    /// device `device`, which both already know from a shared room. Y
+    /// rings nobody: it waits for that device's own open, or answers at
+    /// once if the open is already waiting.
+    InviteDevice {
+        bridge: Bridge,
+        caller: PubKey,
+        caller_eph: [u8; 32],
+        device: PubKey,
+    },
+    /// SIP-49, either → the other: everyone the sender knows to be in the
+    /// room `handle`, each with the exchange they joined at (zero for the
+    /// sender itself). Soft state, replaced by the next share.
+    RoomShare {
+        handle: [u8; 32],
+        members: Vec<crate::room::HomedMember>,
+    },
 }
 
 impl Control {
@@ -163,6 +184,32 @@ impl Control {
                 out.push(*reason);
                 out
             }
+            Control::InviteDevice {
+                bridge,
+                caller,
+                caller_eph,
+                device,
+            } => {
+                let mut out = Vec::with_capacity(1 + BRIDGE_LEN + 96);
+                out.push(TYPE_INVITE_DEVICE);
+                out.extend_from_slice(bridge);
+                out.extend_from_slice(caller.as_bytes());
+                out.extend_from_slice(caller_eph);
+                out.extend_from_slice(device.as_bytes());
+                out
+            }
+            Control::RoomShare { handle, members } => {
+                let mut out = Vec::with_capacity(34 + members.len() * 96);
+                out.push(TYPE_ROOM_SHARE);
+                out.extend_from_slice(handle);
+                out.push(members.len() as u8);
+                for m in members {
+                    out.extend_from_slice(m.identity.as_bytes());
+                    out.extend_from_slice(&m.proof);
+                    out.extend_from_slice(m.home.as_bytes());
+                }
+                out
+            }
         }
     }
 
@@ -170,6 +217,35 @@ impl Control {
         let Some(&kind) = b.first() else {
             return Err(Error::Malformed("empty relay control frame".into()));
         };
+        if kind == TYPE_ROOM_SHARE {
+            if b.len() < 34 {
+                return Err(Error::Malformed("room share cut short".into()));
+            }
+            let count = b[33] as usize;
+            if count > crate::room::MAX_MEMBERS {
+                return Err(Error::Malformed(format!(
+                    "a share names at most {} members, not {count}",
+                    crate::room::MAX_MEMBERS
+                )));
+            }
+            if b.len() != 34 + count * 96 {
+                return Err(Error::Malformed("room share cut short".into()));
+            }
+            let members = (0..count)
+                .map(|i| {
+                    let at = 34 + i * 96;
+                    crate::room::HomedMember {
+                        identity: PubKey::new(b[at..at + 32].try_into().unwrap()),
+                        proof: b[at + 32..at + 64].try_into().unwrap(),
+                        home: PubKey::new(b[at + 64..at + 96].try_into().unwrap()),
+                    }
+                })
+                .collect();
+            return Ok(Control::RoomShare {
+                handle: b[1..33].try_into().unwrap(),
+                members,
+            });
+        }
         let bridge = Self::bridge_of(b)?;
         let rest = &b[1 + BRIDGE_LEN..];
         Ok(match kind {
@@ -222,6 +298,17 @@ impl Control {
                     bridge,
                     callee: PubKey::new(rest[0..32].try_into().unwrap()),
                     callee_eph: rest[32..64].try_into().unwrap(),
+                }
+            }
+            TYPE_INVITE_DEVICE => {
+                if rest.len() != 96 {
+                    return Err(Error::Malformed("device invite wants 96 bytes".into()));
+                }
+                Control::InviteDevice {
+                    bridge,
+                    caller: PubKey::new(rest[0..32].try_into().unwrap()),
+                    caller_eph: rest[32..64].try_into().unwrap(),
+                    device: PubKey::new(rest[64..96].try_into().unwrap()),
                 }
             }
             TYPE_CLOSE => {
