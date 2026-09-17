@@ -175,7 +175,12 @@ async fn a_timed_message_goes_at_its_time_and_stays_out_of_a_backup() {
     let channel = alice.open_dm(&bob_key).await.unwrap();
     bob.open_dm(&alice_key).await.unwrap();
     alice.send(&channel, "for keeps").await.unwrap();
-    alice.set_timer(&channel, 1);
+    // Three seconds, not one. A timer is whole seconds against a whole-second
+    // clock, so `1` is up as soon as the clock ticks — which on a slow
+    // runner it did between the send and the poll below, and "gone soon"
+    // was gone before it had been seen. Three leaves two whole seconds in
+    // which it must still be there.
+    alice.set_timer(&channel, 3);
     alice.send(&channel, "gone soon").await.unwrap();
     alice.set_timer(&channel, 0);
     let mut t = Timeline::new();
@@ -195,7 +200,7 @@ async fn a_timed_message_goes_at_its_time_and_stays_out_of_a_backup() {
     );
 
     // And it goes, from the timeline and the store, once its time has come.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     let got = alice.poll(&channel, &mut t, 0).await.unwrap();
     assert_eq!(
         said(&got.timeline),
