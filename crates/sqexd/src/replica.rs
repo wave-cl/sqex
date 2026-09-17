@@ -1524,9 +1524,20 @@ fn report(origin: &Origin, took: &HashMap<[u8; 32], Took>) {
                 "the origin equivocated: two receipts for one position, and this replica has the proof"
             );
         } else if !t.refused.is_empty() {
+            // Which ones and why, or the line cannot be acted on: an
+            // `Unattributed` run is a registry the origin cannot answer
+            // for, a `Diverged` one is the origin's head moving over
+            // something this replica was never shown.
+            let why: Vec<String> = t
+                .refused
+                .iter()
+                .take(8)
+                .map(|(seq, r)| format!("{seq}:{r:?}"))
+                .collect();
             tracing::warn!(
                 origin = %origin.key, %channel,
                 stored = t.stored, refused = t.refused.len(),
+                why = %why.join(" "),
                 "pulled, with entries refused"
             );
         } else if t.stored > 0 {

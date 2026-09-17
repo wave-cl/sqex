@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS contact (
 );
 -- SIP-62: a direct message whose other party changed key keeps its
 -- channel; this is how the conversation with the *new* key is found
--- without deriving a second one. Scoped by exchange as channels are.
+-- without deriving a second one. A fact about the correspondent, not
+-- about an exchange: the channel keeps its identifier at every copy, so
+-- the alias is read whatever exchange this store is scoped to. The
+-- exchange column records where it was learned and is not a key on read.
 CREATE TABLE IF NOT EXISTS dm_alias (
     exchange BLOB NOT NULL,
     account  BLOB NOT NULL,
@@ -666,7 +669,6 @@ const SCOPED: &[(&str, bool)] = &[
     ("channel_key", false),
     ("message", true),
     ("entry", true),
-    ("dm_alias", true),
     ("timed", true),
     ("asset", true),
     ("cursor", true),
@@ -1946,13 +1948,16 @@ impl Store {
     }
 
     /// SIP-62: the direct message with `account`, where it is a channel
-    /// whose identifier no longer derives from the pair.
+    /// whose identifier no longer derives from the pair. Read whatever
+    /// exchange the store is scoped to: a conversation keeps its channel
+    /// at every copy, and a client that learned the alias reading through
+    /// its home must find the same conversation at the origin.
     pub fn dm_alias(&self, account: &PubKey) -> Result<Option<[u8; 32]>> {
         let row: Option<Vec<u8>> = self
             .db
             .query_row(
-                "SELECT channel FROM dm_alias WHERE exchange = ?1 AND account = ?2",
-                params![self.scope()?, account.as_bytes()],
+                "SELECT channel FROM dm_alias WHERE account = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![account.as_bytes()],
                 |r| r.get(0),
             )
             .optional()
@@ -1961,10 +1966,16 @@ impl Store {
     }
 
     pub fn set_dm_alias(&self, account: &PubKey, channel: &[u8; 32]) -> Result<()> {
+        // One row per correspondent, whatever exchange it was learned at.
         self.db
             .execute(
-                "INSERT INTO dm_alias (exchange, account, channel) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (exchange, account) DO UPDATE SET channel = ?3",
+                "DELETE FROM dm_alias WHERE account = ?1",
+                params![account.as_bytes()],
+            )
+            .map_err(storage("set dm alias"))?;
+        self.db
+            .execute(
+                "INSERT INTO dm_alias (exchange, account, channel) VALUES (?1, ?2, ?3)",
                 params![self.scope()?, account.as_bytes(), &channel[..]],
             )
             .map_err(storage("set dm alias"))?;
@@ -3774,6 +3785,24 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
             "another exchange's counter is not this one's replay, and a message \
              at the same coordinates there must not be silently dropped"
         );
+    }
+
+    #[test]
+    fn a_dm_alias_is_read_whatever_exchange_the_store_is_scoped_to() {
+        // Learned reading through the home (a copy); asked at the origin.
+        let mut store = Store::open(&seed(1), None).unwrap();
+        store.scope_to(&PubKey::new([1; 32])).unwrap();
+        let them = PubKey::new([9; 32]);
+        store.set_dm_alias(&them, &[7; 32]).unwrap();
+        store.scope_to(&PubKey::new([2; 32])).unwrap();
+        assert_eq!(store.dm_alias(&them).unwrap(), Some([7; 32]));
+        // And the latest word wins wherever it was learned.
+        store.set_dm_alias(&them, &[8; 32]).unwrap();
+        store.scope_to(&PubKey::new([1; 32])).unwrap();
+        assert_eq!(store.dm_alias(&them).unwrap(), Some([8; 32]));
+        store.set_dm_alias(&them, &[9; 32]).unwrap();
+        store.scope_to(&PubKey::new([2; 32])).unwrap();
+        assert_eq!(store.dm_alias(&them).unwrap(), Some([9; 32]));
     }
 
     #[test]
