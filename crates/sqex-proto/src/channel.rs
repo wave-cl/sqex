@@ -129,6 +129,11 @@ pub const EVENT_REPLICATE: u8 = 0x0b;
 /// can unsend it. An implementation MUST NOT describe this as recalling
 /// anything; it is the end of a subscription.
 pub const EVENT_UNREPLICATE: u8 = 0x0c;
+/// SIP-44: `actor`'s account is succeeded by `subject`. The body's
+/// `chain_seq` carries the will's `issued`, `prev` is zero and `sig` is the
+/// will's signature under `actor`, so a reader checks the succession itself
+/// rather than taking the exchange's word for it.
+pub const EVENT_SUCCEEDED: u8 = 0x0d;
 
 /// The body of an entry the exchange wrote itself.
 ///
@@ -177,7 +182,7 @@ impl System {
                 b.len()
             )));
         }
-        if b[0] == 0 || b[0] > EVENT_UNREPLICATE {
+        if b[0] == 0 || b[0] > EVENT_SUCCEEDED {
             return Ok(None);
         }
         Ok(Some(System {

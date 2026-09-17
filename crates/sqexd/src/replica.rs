@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use sqex_proto::blob_store::blob_id;
+use sqex_proto::channel::{EVENT_SUCCEEDED, KIND_SYSTEM, System};
 use sqex_proto::channel::{Entry, KIND_MEMBER};
 use sqex_proto::channel_key::{Envelope, verify_envelope};
 use sqex_proto::credential::SCOPE_CHAT;
@@ -62,6 +63,7 @@ use sqex_proto::peer::{
 };
 use sqex_proto::profile::Got as ProfileGot;
 use sqex_proto::receipt::{self, Branch, Equivocation, ReceiptTerms};
+use sqex_proto::succession;
 use sqnr_core::PubKey;
 
 use crate::channel::Channels;
@@ -464,6 +466,26 @@ pub async fn pull_once(
                 took.stored += again.stored;
                 took.refused.extend(again.refused);
                 took.equivocated |= again.equivocated;
+            }
+        }
+
+        // SIP-44: a succession by guardians carries a policy's signature the
+        // entry cannot be checked against on its own. The origin's record
+        // holds the whole proof; checked here, and the seat moved only when
+        // it proves what the entry says.
+        for e in pulled.entries.iter().filter(|e| e.kind == KIND_SYSTEM) {
+            if let Ok(Some(sys)) = System::decode(&e.body)
+                && sys.event == EVENT_SUCCEEDED
+                && !succession::entry_verifies(&sys.actor, &sys.subject, sys.chain_seq, &sys.sig)
+                && let Ok((200, body)) = client
+                    .post("/account/succession", succession::ask(&sys.actor))
+                    .await
+                && let Ok(record) = succession::Succeeded::decode(&body)
+                && record.successor == sys.subject
+                && record.proof.account() == sys.actor
+                && record.proof.proves(&sys.subject)
+            {
+                let _ = store.apply_succession(channel, &sys.actor, &sys.subject);
             }
         }
 

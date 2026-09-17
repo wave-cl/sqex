@@ -135,6 +135,13 @@ enum Cmd {
     /// the domain it is reached at where the operator recorded one. A hint:
     /// reach one by discovering its domain, and refuse it if the key differs.
     Peers,
+    /// Account succession (SIP-44): name who takes your account when your
+    /// key is gone -- a successor key you sign for now, or guardians a
+    /// quorum of whom may name one later -- and, as the successor, claim it.
+    Succession {
+        #[command(subcommand)]
+        cmd: SuccessionCmd,
+    },
     /// The safety words for you and another identity (SIP-41): six words to
     /// compare with them in person or over a call. Nothing is sent unless
     /// you say the words matched.
@@ -327,6 +334,60 @@ enum AttestCmd {
 }
 
 #[derive(Subcommand)]
+enum SuccessionCmd {
+    /// Sign a will: the key that succeeds this identity, presented by that
+    /// key when this one is gone. Printed base58; keep it where the
+    /// successor's secret is not.
+    Will {
+        /// The successor's identity, base58.
+        successor: String,
+    },
+    /// Sign a policy naming guardians, a quorum of whom may name your
+    /// successor later, and lodge it at the exchange so they can find it.
+    Policy {
+        /// How many guardians it takes.
+        #[arg(long)]
+        threshold: u8,
+        /// A guardian's identity, base58; repeat for each.
+        #[arg(long = "guardian")]
+        guardians: Vec<String>,
+        /// Print the policy and lodge nothing.
+        #[arg(long)]
+        no_lodge: bool,
+    },
+    /// As a guardian: sign that `successor` succeeds `account`. Printed
+    /// base58, for the successor to collect.
+    Vouch {
+        /// The account being succeeded, base58.
+        account: String,
+        /// The key that succeeds it, base58.
+        successor: String,
+    },
+    /// As the successor: present a will, or a policy with the vouches that
+    /// meet it, and take the account.
+    Claim {
+        /// The will, base58, as `succession will` printed it.
+        #[arg(long)]
+        will: Option<String>,
+        /// The policy, base58 -- or omit it to fetch the lodged one.
+        #[arg(long)]
+        policy: Option<String>,
+        /// The account, base58, when fetching its lodged policy.
+        #[arg(long)]
+        account: Option<String>,
+        /// A guardian's vouch, base58; repeat for each.
+        #[arg(long = "vouch")]
+        vouches: Vec<String>,
+    },
+    /// What the exchange recorded of an account's succession, and the
+    /// policy it lodged.
+    Show {
+        /// The account, base58 or name@domain.
+        account: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ResolveCmd {
     /// Publish where this identity can be reached. Replaces the whole set:
     /// SIP-28 has no partial update, because reconciling one against a
@@ -479,6 +540,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Peers => peers(&cli, &cfg).await,
+        Cmd::Succession { cmd } => succession(&cli, &cfg, cmd).await,
         Cmd::Meet {
             peer,
             wait,
@@ -2099,6 +2161,206 @@ async fn admin_name(cli: &Cli, cfg: &Config, cmd: &AdminNameCmd) -> Result<(), S
         _ => println!("ok: {}", v["results"]),
     }
     Ok(())
+}
+
+// ---- succession (SIP-44) -------------------------------------------------
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn b58(bytes: &[u8]) -> String {
+    bs58::encode(bytes).into_string()
+}
+
+fn from_b58(what: &str, text: &str) -> Result<Vec<u8>, String> {
+    bs58::decode(text.trim())
+        .into_vec()
+        .map_err(|e| format!("{what} is not base58: {e}"))
+}
+
+async fn succession(cli: &Cli, cfg: &Config, cmd: &SuccessionCmd) -> Result<(), String> {
+    use sqex_proto::succession::{Claim, Policy, Proof, Succeeded, Vouch, Will, ask};
+    match cmd {
+        SuccessionCmd::Will { successor } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let successor: PubKey = successor.parse().map_err(|e| format!("bad key: {e}"))?;
+            let me = PubKey::new(signer.public());
+            if successor == me {
+                return Err("an account cannot succeed itself".into());
+            }
+            let will = Will::sign(&signer.seed(), &successor, now_secs());
+            println!("{}", b58(&will.encode()));
+            eprintln!();
+            eprintln!("A will: {successor} may take this account by presenting it.");
+            eprintln!("Keep it apart from that key's secret; together they are the account.");
+            Ok(())
+        }
+        SuccessionCmd::Policy {
+            threshold,
+            guardians,
+            no_lodge,
+        } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let guardians = guardians
+                .iter()
+                .map(|g| {
+                    g.parse::<PubKey>()
+                        .map_err(|e| format!("bad guardian {g}: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let policy = Policy::sign(&signer.seed(), *threshold, &guardians, now_secs())
+                .map_err(|e| e.to_string())?;
+            println!("{}", b58(&policy.encode()));
+            if *no_lodge {
+                return Ok(());
+            }
+            let (mut client, _server) = connect(cli, cfg).await?;
+            let (code, body) = client.post("/account/lodge", policy.encode()).await?;
+            if code != 200 {
+                return Err(format!("lodge failed ({code}): {}", said(&body)));
+            }
+            eprintln!(
+                "Lodged: any {} of {} guardians may name your successor. Tell them.",
+                threshold,
+                guardians.len()
+            );
+            Ok(())
+        }
+        SuccessionCmd::Vouch { account, successor } => {
+            let signer = load_software_identity(cli, cfg)?;
+            let account: PubKey = account.parse().map_err(|e| format!("bad account: {e}"))?;
+            let successor: PubKey = successor.parse().map_err(|e| format!("bad key: {e}"))?;
+            let vouch = Vouch::sign(&signer.seed(), &account, &successor, now_secs());
+            println!("{}", b58(&vouch.encode()));
+            eprintln!();
+            eprintln!("Your word that {successor} succeeds {account}. Give it to them.");
+            Ok(())
+        }
+        SuccessionCmd::Claim {
+            will,
+            policy,
+            account,
+            vouches,
+        } => {
+            let (mut client, _server) = connect(cli, cfg).await?;
+            let proof = if let Some(will) = will {
+                Proof::Will(Will::decode(&from_b58("the will", will)?).map_err(|e| e.to_string())?)
+            } else {
+                let policy_bytes = match (policy, account) {
+                    (Some(p), _) => from_b58("the policy", p)?,
+                    (None, Some(account)) => {
+                        let account: PubKey =
+                            account.parse().map_err(|e| format!("bad account: {e}"))?;
+                        let (code, body) = client.post("/account/lodged", ask(&account)).await?;
+                        if code != 200 {
+                            return Err(format!(
+                                "no policy lodged for {account} ({code}): {}",
+                                said(&body)
+                            ));
+                        }
+                        body
+                    }
+                    (None, None) => {
+                        return Err(
+                            "a claim needs --will, or --policy / --account with --vouch".into()
+                        );
+                    }
+                };
+                let policy = Policy::decode(&policy_bytes).map_err(|e| e.to_string())?;
+                let vouches = vouches
+                    .iter()
+                    .map(|v| Vouch::decode(&from_b58("a vouch", v)?).map_err(|e| e.to_string()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Proof::Guardians { policy, vouches }
+            };
+            let me = own_identity(cli, cfg)?;
+            if proof.successor() != Some(me) {
+                return Err("this proof names somebody else as successor".into());
+            }
+            if !proof.proves(&me) {
+                return Err(
+                    "this proof does not prove it: a signature is wrong, or the quorum is short"
+                        .into(),
+                );
+            }
+            let (code, body) = client
+                .post(
+                    "/account/succeed",
+                    Claim {
+                        proof: proof.clone(),
+                    }
+                    .encode(),
+                )
+                .await?;
+            if code != 200 {
+                return Err(format!(
+                    "the exchange refused the claim ({code}): {}",
+                    said(&body)
+                ));
+            }
+            println!(
+                "{} is yours: its names, its conversations, its place in each. Its old devices \
+                 are nobody's now; link yours.",
+                proof.account()
+            );
+            Ok(())
+        }
+        SuccessionCmd::Show { account } => {
+            let account = resolve_target(cli, cfg, account).await?;
+            let (mut client, _server) = connect(cli, cfg).await?;
+            let (code, body) = client.post("/account/succession", ask(&account)).await?;
+            match code {
+                200 => {
+                    let s = Succeeded::decode(&body).map_err(|e| e.to_string())?;
+                    println!("{account}");
+                    println!("  succeeded by {}", s.successor);
+                    println!("  at {}", s.now);
+                    match &s.proof {
+                        Proof::Will(w) => println!(
+                            "  by its will, signed {}: {}",
+                            w.issued,
+                            if w.verify() {
+                                "verifies"
+                            } else {
+                                "DOES NOT VERIFY"
+                            }
+                        ),
+                        Proof::Guardians { policy, vouches } => println!(
+                            "  by {} of {} guardians ({} vouched): {}",
+                            policy.threshold,
+                            policy.guardians.len(),
+                            vouches.len(),
+                            if s.proof.proves(&s.successor) {
+                                "verifies"
+                            } else {
+                                "DOES NOT VERIFY"
+                            }
+                        ),
+                    }
+                }
+                404 => println!("{account}: not succeeded"),
+                _ => return Err(format!("show failed ({code}): {}", said(&body))),
+            }
+            let (code, body) = client.post("/account/lodged", ask(&account)).await?;
+            if code == 200
+                && let Ok(p) = Policy::decode(&body)
+            {
+                println!(
+                    "  policy lodged: any {} of {} guardians",
+                    p.threshold,
+                    p.guardians.len()
+                );
+                for g in &p.guardians {
+                    println!("    {g}");
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// SIP-46: what this exchange federates with.

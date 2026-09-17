@@ -38,6 +38,7 @@ pub mod resolve;
 pub mod room;
 pub mod safety;
 pub mod session;
+pub mod succession;
 pub mod timeline;
 
 use sqnr_core::{Error, Operation, PubKey, Result};

@@ -40,12 +40,12 @@ use sqex_proto::blob_store::{
 use sqex_proto::channel::{
     ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
     EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REMOVED, EVENT_RENAMED,
-    EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_UNREPLICATE, Entries, Entry, Invitee,
-    KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES,
-    MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS, MAX_MINE, MAX_NAME,
-    MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark, Marks, Member,
-    Membership, Mines, Post, Posted, Public, Receipted, Retain, Role, SIGNAL_TTL, Signalled,
-    System, Tip, Visibility, constitution, direct_message_id,
+    EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_SUCCEEDED, EVENT_UNREPLICATE, Entries,
+    Entry, Invitee, KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH, MAX_BATCH_BYTES,
+    MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES, MAX_MEMBERS,
+    MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark,
+    Marks, Member, Membership, Mines, Post, Posted, Public, Receipted, Retain, Role, SIGNAL_TTL,
+    Signalled, System, Tip, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded, verify_envelope,
@@ -2820,6 +2820,84 @@ impl Channels {
         role_of(&db, channel, account).is_some()
     }
 
+    /// SIP-44: `successor` takes `account`'s place in every channel it is a
+    /// present member of, role and all, and each channel's log says so in an
+    /// entry carrying the will's signature. Returns the channels touched.
+    /// Only channels this exchange orders: a copy learns it from the log.
+    pub fn succeed_account(
+        &self,
+        account: &PubKey,
+        successor: &PubKey,
+        issued: u64,
+        sig: &[u8; 64],
+    ) -> Result<Vec<[u8; 32]>, ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin succeed"))?;
+        let channels: Vec<([u8; 32], i64)> = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT m.channel, m.role FROM member m
+                     WHERE m.account = ?1 AND m.present = 1
+                       AND m.channel NOT IN (SELECT channel FROM replicated)",
+                )
+                .map_err(storage("prepare succeed"))?;
+            let rows = stmt
+                .query_map(params![account.as_bytes()], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                        r.get::<_, i64>(1)?,
+                    ))
+                })
+                .map_err(storage("query succeed"))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(storage("read succeed"))?
+        };
+        for (channel, role) in &channels {
+            move_member(&tx, channel, account, successor, *role, now)?;
+            let place = self.place(&tx, channel)?;
+            write_succession(
+                &tx,
+                &place,
+                channel,
+                account,
+                successor,
+                issued,
+                sig,
+                now,
+                self.exchange_seed.as_ref(),
+            )?;
+        }
+        tx.commit().map_err(storage("commit succeed"))?;
+        for (channel, _) in &channels {
+            self.wake(channel);
+        }
+        Ok(channels.into_iter().map(|(c, _)| c).collect())
+    }
+
+    /// SIP-44, at a replica: seat `successor` in `account`'s place once the
+    /// proof has been checked -- for a succession the entry could not carry
+    /// whole, a guardians', which the puller settled against the origin's
+    /// record.
+    pub fn apply_succession(
+        &self,
+        channel: &[u8; 32],
+        account: &PubKey,
+        successor: &PubKey,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        let role: i64 = db
+            .query_row(
+                "SELECT role FROM member WHERE channel = ?1 AND account = ?2",
+                params![&channel[..], account.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read predecessor"))?
+            .unwrap_or(Role::Member as i64);
+        move_member(&db, channel, account, successor, role, now_unix())
+    }
+
     /// SIP-43: whether the origin has told this replica the channel's shape.
     pub fn shape_known(&self, channel: &[u8; 32]) -> bool {
         let db = self.db.lock().unwrap();
@@ -4329,6 +4407,114 @@ fn advance_chain(
     Ok(())
 }
 
+/// SIP-44: `successor` takes `account`'s seat, keeping the higher role where
+/// the successor was already seated (a fresh key may have been welcomed).
+fn move_member(
+    db: &Connection,
+    channel: &[u8; 32],
+    account: &PubKey,
+    successor: &PubKey,
+    role: i64,
+    now: u64,
+) -> Result<(), ChannelError> {
+    db.execute(
+        "INSERT INTO member (channel, account, role, joined, present)
+         VALUES (?1, ?2, ?3, ?4, 1)
+         ON CONFLICT (channel, account) DO UPDATE SET role = MAX(role, ?3), present = 1",
+        params![&channel[..], successor.as_bytes(), role, now as i64],
+    )
+    .map_err(storage("seat successor"))?;
+    db.execute(
+        "DELETE FROM member WHERE channel = ?1 AND account = ?2",
+        params![&channel[..], account.as_bytes()],
+    )
+    .map_err(storage("unseat predecessor"))?;
+    Ok(())
+}
+
+/// SIP-44: the exchange's entry saying `account` is succeeded by `successor`.
+/// Like `write_system`, but the authority inside is the will's signature under
+/// the old key rather than a device's chain step: `chain_seq` carries the
+/// will's `issued`, `prev` is zero, `sig` is the will's. The entry hash is the
+/// link of the will's input, so the receipt commits to the same statement a
+/// reader verifies.
+#[allow(clippy::too_many_arguments)]
+fn write_succession(
+    db: &Connection,
+    place: &Place,
+    channel: &[u8; 32],
+    account: &PubKey,
+    successor: &PubKey,
+    issued: u64,
+    sig: &[u8; 64],
+    now: u64,
+    seed: Option<&[u8; 32]>,
+) -> Result<(), ChannelError> {
+    let seq: u64 = db
+        .query_row(
+            "SELECT next_seq FROM channel WHERE id = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(storage("read next_seq"))?
+        .ok_or(ChannelError::NoSuchChannel)? as u64;
+    let body = System {
+        event: EVENT_SUCCEEDED,
+        subject: *successor,
+        actor: *account,
+        actor_device: *account,
+        chain_seq: issued,
+        prev: [0; 32],
+        sig: *sig,
+    }
+    .encode();
+    let entry_hash = link(&sqex_proto::succession::Will::input(
+        account, successor, issued,
+    ));
+    let head = advance_head(db, channel, &entry_hash)?;
+    let receipt_bytes = match seed {
+        Some(seed) => receipt::sign(
+            seed,
+            &ReceiptTerms {
+                place: *place,
+                seq,
+                posted: now,
+                entry_hash,
+                head,
+            },
+        ),
+        None => [0u8; 64],
+    };
+    db.execute(
+        "INSERT INTO entry (channel, seq, kind, account, device, posted,
+                            expires_after, epoch, msg_seq,
+                            chain_seq, prev, body_hash, sig, body,
+                            entry_hash, head, receipt)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, 0, 0, 0, 0, ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            &channel[..],
+            seq as i64,
+            KIND_SYSTEM as i64,
+            &[0u8; 32][..],
+            now as i64,
+            &GENESIS[..],
+            &[0u8; 64][..],
+            &body,
+            &entry_hash[..],
+            &head[..],
+            &receipt_bytes[..],
+        ],
+    )
+    .map_err(storage("insert succession entry"))?;
+    db.execute(
+        "UPDATE channel SET next_seq = ?2, empty_since = NULL WHERE id = ?1",
+        params![&channel[..], (seq + 1) as i64],
+    )
+    .map_err(storage("bump next_seq"))?;
+    Ok(())
+}
+
 /// Apply one signed membership action to a replica's local roster.
 ///
 /// The rules mirror the origin's own, because they are the same rules read from
@@ -4389,6 +4575,29 @@ fn derive_membership(
                 params![&channel[..], sys.subject.as_bytes()],
             )
             .map_err(storage("derive departure"))?;
+        }
+        // SIP-44: only under the old key's own signature. An origin cannot
+        // tell a copy that Bob is now Mallory without Bob having said so; an
+        // entry that does not verify as a will is left for the puller to
+        // settle against the proof the origin serves.
+        EVENT_SUCCEEDED
+            if sqex_proto::succession::entry_verifies(
+                &sys.actor,
+                &sys.subject,
+                sys.chain_seq,
+                &sys.sig,
+            ) =>
+        {
+            let role: i64 = db
+                .query_row(
+                    "SELECT role FROM member WHERE channel = ?1 AND account = ?2",
+                    params![&channel[..], sys.actor.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("read predecessor"))?
+                .unwrap_or(Role::Member as i64);
+            move_member(db, channel, &sys.actor, &sys.subject, role, posted)?;
         }
         _ => {}
     }

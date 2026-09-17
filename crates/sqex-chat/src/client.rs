@@ -238,6 +238,10 @@ pub enum ChatError {
     /// SIP-43: the conversation lives at another exchange, and this one could
     /// not reach it to order the post. Nothing was sent; the draft stands.
     OriginAway,
+    /// SIP-44: this account has been succeeded by the key named. Everything it
+    /// held is that key's now, and this device is nobody's until it is
+    /// linked to it.
+    Succeeded(Option<PubKey>),
 }
 
 /// Turn a refused response into the error a caller can act on.
@@ -260,6 +264,9 @@ fn classify(path: &str, code: u16, body: &[u8]) -> ChatError {
             // own devices, and only the exchange holds the facts to judge it.
             RefusalCode::NotAnAdmin => ChatError::NotAnAdmin,
             RefusalCode::OriginAway => ChatError::OriginAway,
+            RefusalCode::Succeeded => {
+                ChatError::Succeeded(r.detail.as_deref().and_then(|d| d.parse().ok()))
+            }
             _ => ChatError::Refused(code, r),
         },
         // An exchange older than this client, where refusals were JSON and a
@@ -318,6 +325,16 @@ impl std::fmt::Display for ChatError {
                  {} bytes and anybody holding the exchange's key can check it",
                 p.seq,
                 sqex_proto::receipt::EQUIVOCATION_LEN
+            ),
+            ChatError::Succeeded(Some(by)) => write!(
+                f,
+                "this account has been succeeded by {by}: its names and conversations are that \
+                 key's now, and this device is nobody's until it is linked to it"
+            ),
+            ChatError::Succeeded(None) => write!(
+                f,
+                "this account has been succeeded: its names and conversations belong to another \
+                 key now"
             ),
             ChatError::OriginAway => write!(
                 f,

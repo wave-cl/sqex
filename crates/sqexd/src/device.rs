@@ -138,6 +138,22 @@ CREATE TABLE IF NOT EXISTS revoked (
     -- member rekey a channel after revoking one of its own devices.
     account   BLOB
 );
+-- SIP-44: accounts that have been succeeded, by the key that holds them now,
+-- with the proof as it was presented so anybody may check it. Once per
+-- account, ever.
+CREATE TABLE IF NOT EXISTS succession (
+    account   BLOB PRIMARY KEY,
+    successor BLOB NOT NULL,
+    at        INTEGER NOT NULL,
+    proof     BLOB NOT NULL
+);
+-- SIP-44: a policy an account lodged ahead of need, so its guardians hold
+-- nothing. Replaced by a later one from the same account.
+CREATE TABLE IF NOT EXISTS lodged (
+    account BLOB PRIMARY KEY,
+    policy  BLOB NOT NULL,
+    at      INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS device_by_account ON device (account);
 "#;
 
@@ -422,6 +438,133 @@ impl Registry {
     /// registry has never been told about resolves to itself, which is the
     /// ordinary single-client case and must not require anybody to have
     /// understood any of this.
+    /// SIP-44: who holds `account` now, if it has been succeeded.
+    pub fn successor_of(&self, account: &PubKey) -> Option<PubKey> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT successor FROM succession WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|b| b.try_into().ok().map(PubKey::new))
+    }
+
+    /// SIP-44: the recorded succession of `account`, as `/account/succession`
+    /// serves it.
+    pub fn succession_of(&self, account: &PubKey) -> Option<(PubKey, u64, Vec<u8>)> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT successor, at, proof FROM succession WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|(s, at, proof)| s.try_into().ok().map(|k| (PubKey::new(k), at, proof)))
+    }
+
+    /// SIP-44: whether `account` has any device registered -- a successor
+    /// must be a fresh key.
+    pub fn has_devices(&self, account: &PubKey) -> bool {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM device WHERE account = ?1 AND not_after >= ?2 LIMIT 1",
+            params![account.as_bytes(), now as i64],
+            |_| Ok(true),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }
+
+    /// SIP-44: record that `successor` holds `account` from now, and remove
+    /// `account`'s devices as though revoked. Refused where `account` was
+    /// succeeded already: once, ever.
+    pub fn succeed(
+        &self,
+        account: &PubKey,
+        successor: &PubKey,
+        proof: &[u8],
+    ) -> Result<(), DeviceError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin succeed"))?;
+        let done: bool = tx
+            .query_row(
+                "SELECT 1 FROM succession WHERE account = ?1",
+                params![account.as_bytes()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(storage("read succession"))?
+            .unwrap_or(false);
+        if done {
+            return Err(DeviceError::NotAuthorised);
+        }
+        tx.execute(
+            "INSERT INTO succession (account, successor, at, proof) VALUES (?1, ?2, ?3, ?4)",
+            params![account.as_bytes(), successor.as_bytes(), now as i64, proof],
+        )
+        .map_err(storage("record succession"))?;
+        // Its devices go as revoked ones do, kept in `revoked` until their
+        // credentials would have expired, so none is registered again on
+        // the strength of a credential the old key signed.
+        tx.execute(
+            "INSERT OR REPLACE INTO revoked (device, at, not_after, account)
+             SELECT device, ?2, not_after, account FROM device WHERE account = ?1",
+            params![account.as_bytes(), now as i64],
+        )
+        .map_err(storage("retire devices"))?;
+        tx.execute(
+            "DELETE FROM device WHERE account = ?1",
+            params![account.as_bytes()],
+        )
+        .map_err(storage("remove devices"))?;
+        tx.execute(
+            "DELETE FROM lodged WHERE account = ?1",
+            params![account.as_bytes()],
+        )
+        .map_err(storage("clear lodged"))?;
+        tx.commit().map_err(storage("commit succeed"))?;
+        Ok(())
+    }
+
+    /// SIP-44: keep a policy for `account` ahead of need.
+    pub fn lodge(&self, account: &PubKey, policy: &[u8]) -> Result<(), DeviceError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO lodged (account, policy, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account) DO UPDATE SET policy = ?2, at = ?3",
+            params![account.as_bytes(), policy, now_unix() as i64],
+        )
+        .map_err(storage("lodge policy"))?;
+        Ok(())
+    }
+
+    pub fn lodged(&self, account: &PubKey) -> Option<Vec<u8>> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT policy FROM lodged WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     pub fn account_for(&self, device: &PubKey) -> PubKey {
         let now = now_unix();
         let db = self.db.lock().unwrap();

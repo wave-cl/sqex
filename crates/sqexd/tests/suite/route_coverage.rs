@@ -302,6 +302,31 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::Forwarder::forward"),
         ReplicationPeer,
     ),
+    // SIP-44: a successor presents the account's will or its guardians' word.
+    (
+        "POST",
+        "/account/succeed",
+        Cli("sqex succession claim"),
+        Identity,
+    ),
+    (
+        "POST",
+        "/account/succession",
+        Cli("sqex succession show"),
+        Identity,
+    ),
+    (
+        "POST",
+        "/account/lodge",
+        Cli("sqex succession lodge"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/account/lodged",
+        Cli("sqex succession show"),
+        Identity,
+    ),
     // SIP-43: where a channel lives, asked once per channel before signing.
     ("POST", "/channel/home", Chat("Chat::home"), Member),
     // Reached when a fetch is refused with `equivocated`: the client asks for

@@ -118,6 +118,19 @@ pub struct Profiles {
 }
 
 impl Profiles {
+    /// SIP-44: `account`'s block list is `successor`'s.
+    pub fn succeed(&self, account: &PubKey, successor: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE OR IGNORE block SET account = ?2 WHERE account = ?1",
+            params![account.as_bytes(), successor.as_bytes()],
+        );
+        let _ = db.execute(
+            "DELETE FROM block WHERE account = ?1",
+            params![account.as_bytes()],
+        );
+    }
+
     pub fn open(path: Option<&Path>) -> rusqlite::Result<Profiles> {
         let db = match path {
             Some(p) => Connection::open(p)?,

@@ -77,6 +77,7 @@ use sqex_proto::session::{
     BySession, CallAck, CallDecline, CallOpen, DatagramFrame, Open, SendFrame, TYPE_CLOSE,
     TYPE_RECV,
 };
+use sqex_proto::succession::{self, Claim, Policy, Proof};
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -1283,6 +1284,19 @@ async fn route(
         return refuse(403, Code::NotWhitelisted, None);
     }
 
+    // SIP-44: a succeeded account is nobody's client, and so are its
+    // devices. Told where the account went, on every route a client uses,
+    // so a client still holding the old key learns rather than wonders. The
+    // succession routes themselves stay open: reading one is how anybody
+    // checks it, and a claim comes from the successor, who is not this.
+    if let Some(me) = account
+        && !open_regardless(path)
+        && !path.starts_with("/account/")
+        && let Some(successor) = server.devices.successor_of(&me)
+    {
+        return refuse(403, Code::Succeeded, Some(&successor.to_string()));
+    }
+
     // The front door, held open once per account.
     //
     // Here rather than on one particular route because there is no single
@@ -1488,6 +1502,62 @@ async fn route(
         // the connection, so whoever holds the key can set it — after a theft,
         // that is the attacker. An exchange cannot express "this key was
         // stolen, use this one instead".
+        // SIP-44: a successor presents the account's will, or its guardians'
+        // word, and the exchange carries the account across.
+        ("POST", "/account/succeed") => match (peer.identity, Claim::decode(body)) {
+            (None, _) => no_identity("succeeding an account"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(claim)) => succeed(server, &me, claim).await,
+        },
+        // SIP-44: what was recorded, for anybody to check.
+        ("POST", "/account/succession") => match (peer.identity, succession::asked(body)) {
+            (None, _) => no_identity("reading a succession"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(_), Ok(account)) => match server.devices.succession_of(&account) {
+                Some((successor, now, proof)) => match Proof::decode(&proof) {
+                    Ok(proof) => (
+                        200,
+                        "application/octet-stream",
+                        succession::Succeeded {
+                            successor,
+                            now,
+                            proof,
+                        }
+                        .encode(),
+                    ),
+                    Err(_) => refuse(500, Code::Storage, None),
+                },
+                None => refuse(404, Code::NotFound, None),
+            },
+        },
+        // SIP-44: the policy an account lodged, for its guardians and its
+        // successor to find when the account is gone.
+        ("POST", "/account/lodged") => match (peer.identity, succession::asked(body)) {
+            (None, _) => no_identity("reading a policy"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(_), Ok(account)) => match server.devices.lodged(&account) {
+                Some(policy) => (200, "application/octet-stream", policy),
+                None => refuse(404, Code::NotFound, None),
+            },
+        },
+        // SIP-44: an account keeps its policy here ahead of need.
+        ("POST", "/account/lodge") => match (peer.identity, Policy::decode(body)) {
+            (None, _) => no_identity("lodging a policy"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(policy)) => {
+                if policy.account != me || !policy.verify() {
+                    return refuse(403, Code::NotYours, None);
+                }
+                match server.devices.lodge(&me, &policy.encode()) {
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(_) => refuse(500, Code::Storage, None),
+                }
+            }
+        },
         ("POST", "/resolve/successor") => match (peer.identity, ResolveSuccessor::decode(body)) {
             (None, _) => no_identity("naming a successor"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -3213,6 +3283,78 @@ fn open_regardless(path: &str) -> bool {
 
 fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
     refuse(e.status(), e.code(), None)
+}
+
+/// SIP-44: verify a claim and carry the account across -- devices, names,
+/// channels, blocks, resolution -- or refuse it whole. One refusal for every
+/// way a claim can be wrong that is not a malformed body: a will is a
+/// statement about who may act, and which check somebody else's failed is
+/// not theirs to learn.
+async fn succeed(server: &Server, me: &PubKey, claim: Claim) -> (u16, &'static str, Vec<u8>) {
+    let refused = || refuse(403, Code::NotYours, None);
+    let proof = claim.proof;
+    let account = proof.account();
+    let Some(successor) = proof.successor() else {
+        return refused();
+    };
+    if successor != *me
+        || account == successor
+        || !proof.proves(&successor)
+        || server.devices.successor_of(&account).is_some()
+        || server.devices.successor_of(&successor).is_some()
+        || server.devices.has_devices(&successor)
+        || !server.names.names_for(&successor).is_empty()
+    {
+        return refused();
+    }
+    if server
+        .devices
+        .succeed(&account, &successor, &proof.encode())
+        .is_err()
+    {
+        return refused();
+    }
+    let (issued, sig) = proof.stamp();
+    let moved = server.names.succeed(&account, &successor);
+    server.profiles.succeed(&account, &successor);
+    server.endpoints.set_successor(
+        account,
+        ResolveSuccessor {
+            successor,
+            reason: "succeeded".into(),
+        },
+    );
+    let channels = match server
+        .channels
+        .succeed_account(&account, &successor, issued, &sig)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(account = %account, "succession recorded but channels did not follow: {e:?}");
+            Vec::new()
+        }
+    };
+    for channel in &channels {
+        server.tell(
+            channel,
+            EventKind::Channel {
+                channel: *channel,
+                last_seq: server.channels.highest(channel),
+            },
+        );
+    }
+    tracing::info!(
+        account = %account,
+        successor = %successor,
+        names = moved,
+        channels = channels.len(),
+        "account succeeded"
+    );
+    (
+        200,
+        "application/octet-stream",
+        ChannelAck { now: now_unix() }.encode(),
+    )
 }
 
 /// SIP-43: carry a member's signed join or leave for a channel that lives

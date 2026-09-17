@@ -321,6 +321,17 @@ impl Names {
     /// Renew every open name an account holds. Called where the account shows
     /// activity — a SIP-4 beat or a SIP-28 publish — so a name that is in use
     /// does not lapse on its lease. Administrator assignments are left alone.
+    /// SIP-44: every name `account` held is `successor`'s, leases and
+    /// assignments alike.
+    pub fn succeed(&self, account: &PubKey, successor: &PubKey) -> usize {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE name SET account = ?2 WHERE account = ?1",
+            params![account.as_bytes(), successor.as_bytes()],
+        )
+        .unwrap_or(0)
+    }
+
     pub fn renew(&self, account: &PubKey) {
         let now = now_unix();
         let db = self.db.lock().unwrap();

@@ -107,6 +107,9 @@ pub enum Code {
     /// SIP-43: the channel lives at another exchange, and that exchange cannot
     /// be reached to order the post. Nothing was stored; try later.
     OriginAway,
+    /// SIP-44: this account has been succeeded; the detail names the key
+    /// that holds it now. The old key and its devices are nobody's client.
+    Succeeded,
     /// SIP-35: this exchange holds two receipts for one position from the
     /// channel's origin, and will present neither branch as the conversation.
     Equivocated,
@@ -200,6 +203,7 @@ impl Code {
             Code::TooManyEndpoints => 60,
             Code::WouldPublish => 61,
             Code::OriginAway => 62,
+            Code::Succeeded => 63,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -281,6 +285,7 @@ impl Code {
             60 => Code::TooManyEndpoints,
             61 => Code::WouldPublish,
             62 => Code::OriginAway,
+            63 => Code::Succeeded,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -387,6 +392,7 @@ impl Code {
             Code::Storage => "storage",
             Code::WouldPublish => "would_publish",
             Code::OriginAway => "origin_away",
+            Code::Succeeded => "succeeded",
 
             Code::Unknown(_) => "unknown",
         }
@@ -457,6 +463,7 @@ impl Code {
         Code::Storage,
         Code::WouldPublish,
         Code::OriginAway,
+        Code::Succeeded,
     ];
 }
 
