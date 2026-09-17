@@ -11,12 +11,12 @@ use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
     EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
     EVENT_REHOMED, EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
-    EVENT_UNREPLICATE, Entries, Entry, Fetch, Home, Invite, Invitee, KIND_MEMBER, KIND_SYSTEM,
-    List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark, Marks,
-    Membership, Mine, Mines, Post, Posted, Rehome, Rehomed, Retain, Role, Stranded, System,
-    TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE,
-    TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_STRANDED, TYPE_UNREPLICATE, Visibility,
-    constitution, direct_message_id,
+    EVENT_UNREPLICATE, Entries, Entry, Fetch, Found, Home, Invite, Invitee, KIND_MEMBER,
+    KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
+    Marks, Membership, Mine, Mines, Post, Posted, Rehome, Rehomed, Retain, Role, Row, Search,
+    Stranded, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN,
+    TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_STRANDED, TYPE_UNREPLICATE,
+    Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
@@ -2745,6 +2745,49 @@ impl Chat {
     }
 
     /// Search the public directory. An empty query returns everything.
+    /// SIP-55: the directory across this exchange and its peers, each row
+    /// naming where the channel lives and whether it is joinable here.
+    /// An exchange from before SIP-55 answers with its own directory only,
+    /// every row at home.
+    pub async fn search(&mut self, query: &str, offset: u32) -> Result<Found> {
+        match self
+            .post(
+                "/channel/search",
+                Search {
+                    offset,
+                    query: query.to_string(),
+                }
+                .encode(),
+            )
+            .await
+        {
+            Ok(body) => Found::decode(&body).map_err(|e| ChatError::Protocol(e.to_string())),
+            Err(ChatError::NoChatHere(_)) => {
+                let listing = self.find(query, offset).await?;
+                Ok(Found {
+                    now: listing.now,
+                    total: listing.total,
+                    rows: listing
+                        .channels
+                        .into_iter()
+                        .map(|p| Row {
+                            channel: p.channel,
+                            instance: p.instance,
+                            home: self.exchange,
+                            domain: String::new(),
+                            here: true,
+                            members: p.members,
+                            last: p.last,
+                            name: p.name,
+                            topic: p.topic,
+                        })
+                        .collect(),
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn find(&mut self, query: &str, offset: u32) -> Result<Listing> {
         let body = self
             .post(

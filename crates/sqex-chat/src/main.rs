@@ -2064,11 +2064,13 @@ async fn handle_key(
                     return;
                 }
                 Command::Find(query) => {
-                    match chat.find(query, 0).await {
-                        Ok(listing) => {
-                            app.found_total = listing.total;
-                            app.found = listing
-                                .channels
+                    // SIP-55: across this exchange and its peers; an older
+                    // exchange answers with its own directory.
+                    match chat.search(query, 0).await {
+                        Ok(found) => {
+                            app.found_total = found.total;
+                            app.found = found
+                                .rows
                                 .into_iter()
                                 .map(|c| Found {
                                     channel: c.channel,
@@ -2076,6 +2078,8 @@ async fn handle_key(
                                     name: c.name,
                                     topic: c.topic,
                                     members: c.members,
+                                    at: c.domain,
+                                    here: c.here,
                                 })
                                 .collect();
                             if app.found.is_empty() {
@@ -2091,6 +2095,13 @@ async fn handle_key(
                         app.trouble.message = Some("no such number — /find first".into());
                         return;
                     };
+                    if !found.here {
+                        app.trouble.message = Some(format!(
+                            "#{} lives at {} and no copy is held here: connect to {} to join it",
+                            found.name, found.at, found.at
+                        ));
+                        return;
+                    }
                     // The incarnation comes from the directory row we found it
                     // in — a joiner has to sign against it and cannot ask
                     // `Info`, which wants the membership this is acquiring.

@@ -223,6 +223,10 @@ pub struct FileConfig {
     /// as a replica, takes a channel's rehome to itself. Default 300.
     #[serde(default)]
     pub rehome_away_secs: Option<u64>,
+    /// SIP-55: seconds between reads of each peer's public directory.
+    /// Default 60.
+    #[serde(default)]
+    pub directory_secs: Option<u64>,
 }
 
 /// A peer in `replication_peers`: a bare key, or a key with the accounts it
@@ -318,6 +322,8 @@ pub struct Config {
     pub backup_quota: u64,
     /// SIP-53: seconds before an unreachable origin counts as gone.
     pub rehome_away_secs: u64,
+    /// SIP-55: seconds between reads of each peer's directory.
+    pub directory_secs: u64,
 }
 
 /// One resolved origin to replicate from.
@@ -520,6 +526,7 @@ impl FileConfig {
                 .backup_quota
                 .unwrap_or(sqex_proto::backup::DEFAULT_QUOTA),
             rehome_away_secs: self.rehome_away_secs.unwrap_or(300),
+            directory_secs: self.directory_secs.unwrap_or(60).max(1),
         })
     }
 }

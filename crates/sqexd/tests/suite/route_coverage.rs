@@ -234,6 +234,8 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/channel/close", Chat("/close yes"), ChannelAdmin),
     ("POST", "/channel/mine", Chat("Chat::mine"), SelfOnly),
     ("POST", "/channel/list", Chat("/find"), Anyone),
+    // SIP-55: the same directory, this exchange's and its peers'.
+    ("POST", "/channel/search", Chat("Chat::search"), Anyone),
     ("POST", "/channel/invite", Chat("/invite"), ChannelAdmin),
     ("POST", "/channel/remove", Chat("/kick"), ChannelAdmin),
     // SIP-35. The peering routes are called by another exchange rather than by
@@ -600,7 +602,7 @@ fn the_authorization_surface_holds_its_shape() {
         .iter()
         .filter(|(_, p, _, _)| p.starts_with("/channel/"))
     {
-        if *path == "/channel/list" {
+        if *path == "/channel/list" || *path == "/channel/search" {
             assert_eq!(w, &Anyone, "the directory is public by construction");
         } else {
             assert_ne!(w, &Anyone, "{path} names a channel id and must not be open");

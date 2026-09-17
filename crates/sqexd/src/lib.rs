@@ -8,6 +8,7 @@ pub mod challenge;
 pub mod channel;
 pub mod config;
 pub mod device;
+pub mod directory;
 pub mod events;
 pub mod mailbox;
 pub mod name;

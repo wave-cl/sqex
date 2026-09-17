@@ -91,6 +91,8 @@ pub const TYPE_HOME: u8 = 0x18;
 pub const TYPE_REHOME: u8 = 0x19;
 /// SIP-53: what of one's own an exchange stranded past a rehome.
 pub const TYPE_STRANDED: u8 = 0x1b;
+/// SIP-55: a directory search across this exchange and its peers.
+pub const TYPE_SEARCH: u8 = 0x1c;
 /// SIP-53: a rehome entry carried to an exchange that has not seen it.
 pub const TYPE_REHOMED: u8 = 0x1a;
 
@@ -1117,6 +1119,156 @@ impl Rehomed {
             domain,
             entry,
         })
+    }
+}
+
+/// SIP-55: `POST /channel/search`. The same query as `List`, answered
+/// with `Found`: this exchange's directory and its peers', each row with
+/// its home.
+///
+/// `| type: u8 = 0x1c | offset: u32 | q_len: u16 | query |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Search {
+    pub offset: u32,
+    pub query: String,
+}
+
+impl Search {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(7 + self.query.len());
+        out.push(TYPE_SEARCH);
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out.extend_from_slice(&(self.query.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.query.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Search> {
+        want(b, 7, "search")?;
+        if b[0] != TYPE_SEARCH {
+            return Err(Error::Malformed(format!("not a search (type {:#x})", b[0])));
+        }
+        let len = u16::from_be_bytes([b[5], b[6]]) as usize;
+        if len > MAX_QUERY || b.len() != 7 + len {
+            return Err(Error::Malformed("search cut short".into()));
+        }
+        Ok(Search {
+            offset: u32at(b, 1),
+            query: utf8(&b[7..], "query")?,
+        })
+    }
+}
+
+/// SIP-55: one channel found, and where it lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub channel: [u8; 32],
+    pub instance: [u8; 32],
+    /// The exchange that orders it.
+    pub home: PubKey,
+    /// Where `home` is reached; empty for the answering exchange itself.
+    pub domain: String,
+    /// Whether the answering exchange holds it -- ordered here, or a copy.
+    pub here: bool,
+    pub members: u16,
+    pub last: u64,
+    pub name: String,
+    pub topic: String,
+}
+
+/// SIP-55: the answer to a search.
+///
+/// `| now: u64 | total: u32 | count: u16 | count × Row |`
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Found {
+    pub now: u64,
+    pub total: u32,
+    pub rows: Vec<Row>,
+}
+
+impl Found {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(14 + self.rows.len() * 128);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&self.total.to_be_bytes());
+        out.extend_from_slice(&(self.rows.len() as u16).to_be_bytes());
+        for r in &self.rows {
+            out.extend_from_slice(&r.channel);
+            out.extend_from_slice(&r.instance);
+            out.extend_from_slice(r.home.as_bytes());
+            let d = &r.domain.as_bytes()[..r.domain.len().min(255)];
+            out.push(d.len() as u8);
+            out.extend_from_slice(d);
+            out.push(u8::from(r.here));
+            out.extend_from_slice(&r.members.to_be_bytes());
+            out.extend_from_slice(&r.last.to_be_bytes());
+            let n = &r.name.as_bytes()[..r.name.len().min(255)];
+            out.push(n.len() as u8);
+            out.extend_from_slice(n);
+            let t = &r.topic.as_bytes()[..r.topic.len().min(u16::MAX as usize)];
+            out.extend_from_slice(&(t.len() as u16).to_be_bytes());
+            out.extend_from_slice(t);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Found> {
+        want(b, 14, "found")?;
+        let now = u64at(b, 0);
+        let total = u32at(b, 8);
+        let count = u16::from_be_bytes([b[12], b[13]]) as usize;
+        if count > MAX_DIRECTORY {
+            return Err(Error::Malformed("too many rows".into()));
+        }
+        let mut at = 14;
+        let mut rows = Vec::with_capacity(count);
+        for _ in 0..count {
+            if at + 97 > b.len() {
+                return Err(Error::Malformed("found cut short".into()));
+            }
+            let channel: [u8; 32] = b[at..at + 32].try_into().unwrap();
+            let instance: [u8; 32] = b[at + 32..at + 64].try_into().unwrap();
+            let home = PubKey::new(b[at + 64..at + 96].try_into().unwrap());
+            let dl = b[at + 96] as usize;
+            at += 97;
+            if at + dl + 12 > b.len() {
+                return Err(Error::Malformed("found cut short".into()));
+            }
+            let domain = utf8(&b[at..at + dl], "domain")?;
+            at += dl;
+            let here = b[at] != 0;
+            let members = u16::from_be_bytes([b[at + 1], b[at + 2]]);
+            let last = u64at(b, at + 3);
+            let nl = b[at + 11] as usize;
+            at += 12;
+            if at + nl + 2 > b.len() {
+                return Err(Error::Malformed("found cut short".into()));
+            }
+            let name = utf8(&b[at..at + nl], "name")?;
+            at += nl;
+            let tl = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+            at += 2;
+            if at + tl > b.len() {
+                return Err(Error::Malformed("found cut short".into()));
+            }
+            let topic = utf8(&b[at..at + tl], "topic")?;
+            at += tl;
+            rows.push(Row {
+                channel,
+                instance,
+                home,
+                domain,
+                here,
+                members,
+                last,
+                name,
+                topic,
+            });
+        }
+        if at != b.len() {
+            return Err(Error::Malformed("trailing bytes after found".into()));
+        }
+        Ok(Found { now, total, rows })
     }
 }
 

@@ -312,6 +312,10 @@ pub struct Server {
     /// SIP-53: how long an origin must be out of reach before a replica
     /// takes a rehome to itself.
     pub(crate) rehome_away_secs: u64,
+    /// SIP-55: the peers' public directories as last read.
+    pub(crate) directories: crate::directory::Directories,
+    /// SIP-55: how often they are read.
+    pub(crate) directory_secs: u64,
     /// SIP-45: whether `http://` to loopback is an acceptable endpoint --
     /// for the tests, which stand a listener up there.
     wake_loopback: bool,
@@ -886,6 +890,8 @@ pub async fn bind_with(
         ),
         contacts: Mutex::new(HashMap::new()),
         rehome_away_secs: config.rehome_away_secs,
+        directories: crate::directory::Directories::default(),
+        directory_secs: config.directory_secs,
         transport: Arc::clone(&listener),
         accepted_envelope_versions,
         challenges: Challenges::new(config.challenge_ttl),
@@ -1069,6 +1075,12 @@ pub async fn serve(bound: Bound) -> Result<()> {
             forwarder,
         ));
     }
+
+    // SIP-55: the peers' directories, read on an interval for searches.
+    tokio::spawn(crate::directory::run(
+        Arc::clone(&server),
+        server.exchange_seed,
+    ));
 
     // SIP-53: channels whose origin moved somewhere this exchange was not
     // configured for are pulled from wherever the rehome said.
@@ -2532,6 +2544,15 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.mine(&me, req.offset) {
                 Ok(mine) => (200, "application/octet-stream", mine.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        // SIP-55: this exchange's directory and its peers', each row with
+        // its home. Answerable to anybody, as the directory is.
+        ("POST", "/channel/search") => match sqex_proto::channel::Search::decode(body) {
+            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            Ok(req) => match crate::directory::search(server, &req.query, req.offset) {
+                Ok(found) => (200, "application/octet-stream", found.encode()),
                 Err(e) => refused(e),
             },
         },

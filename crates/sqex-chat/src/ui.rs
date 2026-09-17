@@ -325,6 +325,10 @@ pub struct Found {
     pub name: String,
     pub topic: String,
     pub members: u16,
+    /// SIP-55: where the channel lives, as a domain -- empty at home.
+    pub at: String,
+    /// SIP-55: whether it can be joined through this exchange.
+    pub here: bool,
 }
 
 /// Everything on screen.
@@ -1992,6 +1996,18 @@ fn directory(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(palette::MUTED),
             ),
         ];
+        // SIP-55: a room elsewhere says so, and whether /join works from here
+        // or the person has to go there.
+        if !c.at.is_empty() {
+            spans.push(Span::styled(
+                if c.here {
+                    format!("  at {}, copied here", c.at)
+                } else {
+                    format!("  at {} — connect there to join", c.at)
+                },
+                Style::default().fg(palette::MUTED),
+            ));
+        }
         if !c.topic.is_empty() {
             spans.push(Span::styled(
                 format!("  {}", truncate(&c.topic, 40)),
