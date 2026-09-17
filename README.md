@@ -229,10 +229,12 @@ from the start.
 The managed whitelist is applied **to the transport**: with it enabled, sQUIC
 drops the handshake of any key not allowed before the Diffie-Hellman -- the
 silent server -- so a peer that is not listed never gets a connection, let
-alone an answer. Three sets are allowed through: the list itself, the
+alone an answer. Five sets are allowed through: the list itself, the
 configured administrators (or enabling the list would lock out the only keys
-that can disable it), and the SIP-35 peering exchanges, which have an
-allowlist of their own. All are Ed25519 keys forward-derived to the X25519 the
+that can disable it), the SIP-35 peering exchanges, which have an allowlist
+of their own, and -- because of a listed account rather than beside it --
+its registered devices (SIP-47) and the exchange its own Move names as its
+home (SIP-63). All are Ed25519 keys forward-derived to the X25519 the
 transport verifies (SIP-2), and the set is kept in step with every signed
 change, so `sqex admin whitelist add` takes effect at the door immediately and
 `remove` closes what it let in. The same set gates every client route as well

@@ -44,6 +44,7 @@ mod mailbox_flow;
 mod migration_flow;
 mod moving_flow;
 mod name_flow;
+mod open_peering_flow;
 mod private_channel_flow;
 mod profile_flow;
 mod reaching_flow;

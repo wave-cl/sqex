@@ -72,6 +72,18 @@ challenge_ttl_secs = 30
 # to it. See SIP-35 for the account-signed form, which is the stronger one.
 # replication_peers = []
 
+# SIP-63: serve the peering routes to *any* identified caller, listed or not.
+# This grants nothing: an unlisted caller may pull, wait on, carry into or be
+# told of a channel exactly where a member's signed statement entitles it --
+# an admin's authorisation naming its key, or an account's Move naming it as
+# home (SIP-59) -- and is refused uniformly everywhere else, as an unlisted
+# key is refused today. What it removes is the operator: a home nobody here
+# listed can pull for the accounts that chose it, and an origin nobody here
+# listed can say it put one of this exchange's accounts in a channel. The
+# list above still applies for what only it can grant (`for`). Calls stay
+# with SIP-39's peer list. A transport whitelist still closes the door.
+# open_peering = false
+
 # ---------------------------------------------------------------------------
 # SIP-39: cross-exchange calls.
 # ---------------------------------------------------------------------------
@@ -136,7 +148,7 @@ seed_relay_peers = [
 # pulled from wherever each lives, and its posts carried back; this is the
 # interval between those pulls, in seconds. A move and a post from here
 # pull at once regardless. The origins must list this exchange as a
-# replication peer for the pulls to be served.
+# replication peer, or peer openly (SIP-63), for the pulls to be served.
 # home_secs = 30
 
 # SIP-60: the domain this exchange is published under (SIP-33). Told to
@@ -156,3 +168,4 @@ seed_relay_peers = [
 # creates = [10, 3600]
 # uploads = [60, 3600]
 # reports = [20, 3600]
+# peering = [60, 3600]    # SIP-63: per caller key, the writes a peer causes

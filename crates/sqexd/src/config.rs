@@ -238,6 +238,13 @@ pub struct FileConfig {
     /// hint.
     #[serde(default)]
     pub domain: Option<String>,
+    /// SIP-63: serve the peering routes to any identified caller, granting
+    /// nothing by it -- what a caller may pull is what a member's signed
+    /// statement (an admin's `0x0b`, an account's Move) entitles it to,
+    /// listed or not. Off, the default, is SIP-35 as written: only
+    /// `replication_peers` may ask.
+    #[serde(default)]
+    pub open_peering: bool,
     /// SIP-56: rate limits, per account. Each is `[n, seconds]`: n in any
     /// window of that many seconds, refilling steadily; `[0, 0]` is
     /// unlimited. Omitted ones take SIP-56's defaults.
@@ -260,6 +267,9 @@ pub struct FileLimits {
     pub uploads: Option<[u32; 2]>,
     #[serde(default)]
     pub reports: Option<[u32; 2]>,
+    /// SIP-63: the writes a peer causes, per caller key.
+    #[serde(default)]
+    pub peering: Option<[u32; 2]>,
 }
 
 impl FileLimits {
@@ -278,6 +288,7 @@ impl FileLimits {
             creates: pick(self.creates, d.creates),
             uploads: pick(self.uploads, d.uploads),
             reports: pick(self.reports, d.reports),
+            peering: pick(self.peering, d.peering),
         }
     }
 }
@@ -381,6 +392,8 @@ pub struct Config {
     pub home_secs: u64,
     /// SIP-60: this exchange's own domain, lowercased; `None` when unknown.
     pub domain: Option<String>,
+    /// SIP-63: the peering routes are served to any identified caller.
+    pub open_peering: bool,
     /// SIP-56: the rate limits.
     pub limits: crate::limits::Limits,
 }
@@ -592,6 +605,7 @@ impl FileConfig {
                 .as_deref()
                 .map(|d| d.trim().to_ascii_lowercase())
                 .filter(|d| !d.is_empty()),
+            open_peering: self.open_peering,
             limits: self.limits.resolve(),
         })
     }

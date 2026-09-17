@@ -123,6 +123,29 @@ const MAX_BODY: usize = 64 * 1024;
 /// Said when the SIP-38 name route is disabled (`name_registration = "off"`).
 const NAME_ROUTE_OFF: &str = "this exchange does not offer names";
 
+/// SIP-63: how many `/peer/wait` requests one caller may hold open at
+/// once. A replica holds one per origin and never meets it; a stranger
+/// past it is refused uniformly, which SIP-61 reads as "does not wait".
+const MAX_WAITS_PER_PEER: usize = 8;
+
+/// SIP-63: one held wait, counted against its caller until dropped.
+struct WaitHeld {
+    server: Arc<Server>,
+    who: PubKey,
+}
+
+impl Drop for WaitHeld {
+    fn drop(&mut self) {
+        let mut waits = self.server.waits.lock().unwrap();
+        if let Some(n) = waits.get_mut(&self.who) {
+            *n -= 1;
+            if *n == 0 {
+                waits.remove(&self.who);
+            }
+        }
+    }
+}
+
 /// What the transport established about the caller on one connection.
 ///
 /// Both facts come from the same MAC1-verified Initial: the X25519 key SIP-2
@@ -299,6 +322,12 @@ pub struct Server {
     /// peering routes; it gives it no channel, which takes a signed
     /// authorisation from one of that channel's admins.
     replication_peers: Vec<crate::config::ReplicationPeer>,
+    /// SIP-63: the peering routes are served to any identified caller. A
+    /// caller not on the list above is then a peer with no standing grant;
+    /// what it may pull is what a member's signed statement entitles it to.
+    open_peering: bool,
+    /// SIP-63: how many `/peer/wait` requests each caller holds open now.
+    waits: Mutex<HashMap<PubKey, usize>>,
     /// SIP-35: the origins this one replicates *from*, and the seed it dials
     /// them with — its own SIP-9 identity, because a peering connection is an
     /// ordinary SIP-3 one and an exchange's identity is that key.
@@ -417,6 +446,15 @@ impl Server {
         // it, and removing the account removes its devices with it.
         let (devices, expiry) = self.devices.registered_to(&state.keys());
         allowed.extend(devices.iter().filter_map(derive));
+        // SIP-63: so is the recorded home of an admitted account, for as
+        // long as its Move names one -- the same shape, the person's own
+        // signature naming a key that acts for them.
+        allowed.extend(
+            self.devices
+                .homes_of(&state.keys(), &self.public_key)
+                .iter()
+                .filter_map(derive),
+        );
         *self.admission_expiry.lock().unwrap() = expiry;
         self.transport.enable_whitelist(&allowed);
         // Whoever is connected and no longer allowed goes -- a moment from
@@ -465,6 +503,14 @@ impl Server {
         self.limiter
             .take(kind, who, scope)
             .map_err(ChannelError::RateLimited)
+    }
+
+    /// SIP-63: one write a peer caused -- a hint, a Move, a rehome notice,
+    /// a carried registration -- against the caller's own bucket. The one
+    /// reply on a peering route that is not the uniform refusal: it is
+    /// about the caller and says nothing of any channel or account.
+    pub(crate) fn peer_write(&self, who: &PubKey) -> std::result::Result<(), ChannelError> {
+        self.limit(crate::limits::Kind::Peering, who, [0; 32])
     }
 
     /// SIP-54: a signal pulled from the origin's log, handed to this
@@ -654,9 +700,43 @@ impl Server {
     /// Whether `who` may speak the SIP-35 peering routes at all.
     ///
     /// The operational half of the gate, and only that half — what a peer may
-    /// then *pull* is [`Self::may_pull`].
-    fn peering(&self, who: &PubKey) -> Option<&crate::config::ReplicationPeer> {
-        self.replication_peers.iter().find(|p| p.key == *who)
+    /// then *pull* is [`Self::may_pull`]. SIP-63: an exchange that peers
+    /// openly answers anyone, as a peer that holds no grant of its own --
+    /// the entitlement functions see an empty `for` list and decide from
+    /// the log and the home records alone.
+    fn peering(&self, who: &PubKey) -> Option<crate::config::ReplicationPeer> {
+        self.replication_peers
+            .iter()
+            .find(|p| p.key == *who)
+            .cloned()
+            .or_else(|| {
+                self.open_peering.then(|| crate::config::ReplicationPeer {
+                    key: *who,
+                    acts_for: Vec::new(),
+                })
+            })
+    }
+
+    /// SIP-63: whether `key`, found for a domain, may be asked on a
+    /// client's behalf -- a listed peer, or anyone when peering openly.
+    /// Calls are not asked here; they keep SIP-39's list.
+    pub(crate) fn may_ask(&self, key: &PubKey) -> bool {
+        self.open_peering || self.peers_with(key)
+    }
+
+    /// SIP-63: hold one more wait for `who`, or say the caller is over
+    /// `MAX_WAITS_PER_PEER`. The guard lets go when dropped.
+    fn hold_wait(self: &Arc<Self>, who: PubKey) -> Option<WaitHeld> {
+        let mut waits = self.waits.lock().unwrap();
+        let n = waits.entry(who).or_insert(0);
+        if *n >= MAX_WAITS_PER_PEER {
+            return None;
+        }
+        *n += 1;
+        Some(WaitHeld {
+            server: Arc::clone(self),
+            who,
+        })
     }
 
     /// Whether an admitted peer may pull this channel.
@@ -1009,6 +1089,8 @@ pub async fn bind_with(
         admins: RwLock::new(config.admins),
         welcome: None,
         replication_peers: config.replication_peers.clone(),
+        open_peering: config.open_peering,
+        waits: Mutex::new(HashMap::new()),
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
         waker: std::sync::OnceLock::new(),
@@ -1190,6 +1272,8 @@ pub async fn serve(bound: Bound) -> Result<()> {
         key = %public_key,
         admins = server.admins.read().unwrap().len(),
         relay_peers = server.state.lock().unwrap().peer_count(),
+        replication_peers = server.replication_peers.len(),
+        peering = if server.open_peering { "open" } else { "listed" },
         "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");
@@ -3409,7 +3493,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                    .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
             {
                 match server.channels.pull(&req.channel, req.since, req.max) {
                     Ok(pulled) => (200, "application/octet-stream", pulled.encode()),
@@ -3429,7 +3513,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                    .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
             {
                 match server.channels.shape_of(&req.channel) {
                     Ok(shape) => (200, "application/octet-stream", shape.encode()),
@@ -3445,7 +3529,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                    .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
             {
                 match server.channels.device_standing(&req.channel, &req.device) {
                     Ok(standing) => (200, "application/octet-stream", standing.encode()),
@@ -3461,7 +3545,7 @@ async fn route(
                 (Some(who), Ok(req))
                     if server
                         .peering(&who)
-                        .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                        .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
                 {
                     match server.channels.all_cursors(&req.channel) {
                         Ok(marks) => (200, "application/octet-stream", marks.encode()),
@@ -3476,7 +3560,7 @@ async fn route(
                 (Some(who), Ok(req))
                     if server
                         .peering(&who)
-                        .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                        .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
                 {
                     (
                         200,
@@ -3498,7 +3582,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                    .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
             {
                 (
                     200,
@@ -3517,6 +3601,9 @@ async fn route(
         ("POST", "/peer/rehomed") => {
             match (peer.identity, sqex_proto::channel::Rehomed::decode(body)) {
                 (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                    if let Err(e) = server.peer_write(&who) {
+                        return refused(e);
+                    }
                     match server
                         .channels
                         .adopt_rehome(&req.channel, &req.entry, &req.domain)
@@ -3543,7 +3630,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.acts_for(p, &req.account)) =>
+                    .is_some_and(|p| server.acts_for(&p, &req.account)) =>
             {
                 (
                     200,
@@ -3562,6 +3649,9 @@ async fn route(
         // beyond the peer list, since the signature is the authority.
         ("POST", "/peer/moved") => match (peer.identity, PeerMoved::decode(body)) {
             (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                if let Err(e) = server.peer_write(&who) {
+                    return refused(e);
+                }
                 record_move(server, &req.mv, &req.domain, &[])
             }
             _ => peering_refused(),
@@ -3572,10 +3662,17 @@ async fn route(
         ("POST", "/peer/wait") => match (peer.identity, PeerWait::decode(body)) {
             (Some(who), Ok(req)) if server.peering(&who).is_some() => {
                 let p = server.peering(&who).unwrap();
+                // SIP-63: past the caller's share of held waits, the
+                // uniform refusal -- which a replica reads as "does not
+                // wait" and polls instead, rather than looping on an
+                // empty answer.
+                let Some(_held) = server.hold_wait(who) else {
+                    return peering_refused();
+                };
                 let watched: Vec<([u8; 32], u64)> = req
                     .channels
                     .iter()
-                    .filter(|(c, _)| server.may_pull(p, c))
+                    .filter(|(c, _)| server.may_pull(&p, c))
                     .cloned()
                     .collect();
                 let secs = req.wait_secs.min(sqex_proto::channel::MAX_WAIT);
@@ -3598,6 +3695,9 @@ async fn route(
         // the Move first.
         ("POST", "/peer/invited") => match (peer.identity, PeerInvited::decode(body)) {
             (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                if let Err(e) = server.peer_write(&who) {
+                    return refused(e);
+                }
                 let domain = req.domain.trim().to_ascii_lowercase();
                 if server
                     .devices
@@ -3632,11 +3732,20 @@ async fn route(
                     let Ok(device) = device else {
                         return peering_refused();
                     };
-                    if carried.credential.delegate != device
-                        || server
-                            .devices
-                            .register(&carried.credential.delegate, &carried.credential)
-                            .is_err()
+                    if carried.credential.delegate != device {
+                        return peering_refused();
+                    }
+                    // SIP-63: a registration this exchange had not seen is
+                    // a write the caller caused, counted against it.
+                    if server.devices.account_for(&device) == device
+                        && let Err(e) = server.peer_write(&who)
+                    {
+                        return refused(e);
+                    }
+                    if server
+                        .devices
+                        .register(&carried.credential.delegate, &carried.credential)
+                        .is_err()
                     {
                         return peering_refused();
                     }
@@ -3651,7 +3760,7 @@ async fn route(
                 let account = server.devices.account_for(&req.device);
                 let allowed = server
                     .peering(&who)
-                    .is_some_and(|p| server.may_forward(p, &req.post.channel, &account));
+                    .is_some_and(|p| server.may_forward(&p, &req.post.channel, &account));
                 if !allowed {
                     return peering_refused();
                 }
@@ -3675,7 +3784,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             match server
                                 .limit(crate::limits::Kind::Joins, &account, [0; 32])
@@ -3710,7 +3819,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             match server.channels.leave(
                                 &account,
@@ -3747,7 +3856,7 @@ async fn route(
                         ) {
                             Ok(r)
                                 if server.peering(&who).is_some_and(|p| {
-                                    server.may_forward(p, &r.channel, &account)
+                                    server.may_forward(&p, &r.channel, &account)
                                 }) =>
                             {
                                 match server.channels.mute(
@@ -3781,7 +3890,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             report_here(server, &account, &r)
                         }
@@ -3793,7 +3902,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             match server.channels.redact(&account, &r.channel, r.target) {
                                 Ok(()) => {
@@ -3819,7 +3928,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             match server
                                 .channels
@@ -3847,7 +3956,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             match server
                                 .limit(crate::limits::Kind::Signals, &req.device, r.channel)
@@ -3906,7 +4015,7 @@ async fn route(
                             _ => None,
                         };
                         let allowed = server.peering(&who).is_some_and(|p| match named {
-                            Some(channel) => server.may_forward(p, &channel, &account),
+                            Some(channel) => server.may_forward(&p, &channel, &account),
                             None => true,
                         });
                         if !allowed {
@@ -3920,7 +4029,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                                .is_some_and(|p| server.may_forward(&p, &r.channel, &account)) =>
                         {
                             let account_of = |d: &PubKey| server.devices.account_for(d);
                             let revoked_since =
@@ -3948,7 +4057,7 @@ async fn route(
                         Ok(r)
                             if server
                                 .peering(&who)
-                                .is_some_and(|p| server.acts_for(p, &account)) =>
+                                .is_some_and(|p| server.acts_for(&p, &account)) =>
                         {
                             let blocked =
                                 |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
@@ -4001,7 +4110,7 @@ async fn route(
                             if r.revocation.is_some()
                                 && server
                                     .peering(&who)
-                                    .is_some_and(|p| server.acts_for(p, &account)) =>
+                                    .is_some_and(|p| server.acts_for(&p, &account)) =>
                         {
                             match server.devices.revoke(
                                 &req.device,
@@ -4062,7 +4171,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                    .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
             {
                 match server
                     .channels
@@ -4078,7 +4187,7 @@ async fn route(
             (Some(who), Ok(req))
                 if server
                     .peering(&who)
-                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                    .is_some_and(|p| server.may_pull(&p, &req.channel)) =>
             {
                 match server
                     .channels
@@ -5367,7 +5476,7 @@ async fn locate(server: &Arc<Server>, req: &Locate) -> (u16, &'static str, Vec<u
     let Ok((key, addr)) = crate::relay::find_peer(server, &domain).await else {
         return refuse(404, Code::NotFound, Some("no exchange for that domain"));
     };
-    if !server.peers_with(&key) {
+    if !server.may_ask(&key) {
         return refuse(403, Code::NotAuthorised, Some("not a federated domain"));
     }
     let seed = server.exchange_seed;
@@ -5386,7 +5495,7 @@ async fn locate(server: &Arc<Server>, req: &Locate) -> (u16, &'static str, Vec<u
         && !d.is_empty()
         && let Ok((found, a)) = crate::relay::find_peer(server, &d).await
         && found == h
-        && server.peers_with(&h)
+        && server.may_ask(&h)
     {
         (home, home_domain, home_addr) = (h, d, a);
     }
@@ -5461,11 +5570,16 @@ fn record_move(
             } else {
                 tracing::info!(account = %mv.account, home = %mv.home, domain, "an account moved away");
             }
+            // SIP-63: a whitelist admits the home an admitted account
+            // named, and stops when the account names another.
+            server.resync_transport();
             (
                 200,
                 "application/octet-stream",
                 sqex_proto::home::Moved {
                     now: now_unix(),
+                    // SIP-63: open peering answers any home, and `peering`
+                    // says so; a listed exchange answers from its list.
                     peered: mv.home == me || server.peering(&mv.home).is_some(),
                 }
                 .encode(),

@@ -965,6 +965,22 @@ impl Registry {
             .map(|(home, domain, _)| (home, domain))
     }
 
+    /// SIP-63: the recorded homes of `accounts`, other than `me` -- what a
+    /// transport whitelist admits because of the accounts that chose them,
+    /// as SIP-47 admits their devices. A record a handover re-keyed still
+    /// names the home and still counts; a later Move naming `me` ends it.
+    pub fn homes_of(&self, accounts: &[PubKey], me: &PubKey) -> Vec<PubKey> {
+        let mut out = Vec::new();
+        for account in accounts {
+            if let Some((home, _)) = self.away(account, me)
+                && !out.contains(&home)
+            {
+                out.push(home);
+            }
+        }
+        out
+    }
+
     /// SIP-60: record where the domain's exchange said an account lives. A
     /// signed Move on record for the account is not touched: it outranks
     /// this, and `where_is` reads it first.
