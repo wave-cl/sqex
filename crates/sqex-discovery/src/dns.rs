@@ -55,11 +55,33 @@ async fn resolver() -> Result<&'static TokioResolver> {
             // the chain is checked here rather than taken on trust from whoever
             // answered.
             builder.options_mut().validate = true;
+            room_for_a_key_rollover(builder.options_mut());
             builder
                 .build()
                 .map_err(|e| Error::Resolve(format!("cannot build a validating resolver: {e}")))
         })
         .await
+}
+
+/// A UDP answer that is larger than the size we advertised must not be cut
+/// off at the size we advertised.
+///
+/// hickory advertises 1232 bytes of EDNS payload and — this is the part
+/// that matters — reads the datagram into a buffer of exactly that size.
+/// Every resolver tried (the ISP's, the router's, Cloudflare, Google)
+/// ignores the advertised size for a large DNSKEY RRset and sends the whole
+/// thing, and hickory then decodes a packet with its last record cut in
+/// half: "incorrect rdata length", the server marked as failed, and the
+/// zone reported as *unsigned*. On 2026-09-17 Identity Digital rolled the
+/// KSK of every TLD it runs, `.org` and `.exchange` among them, which put a
+/// fifth key in each DNSKEY RRset and the signed answer over 1232 bytes —
+/// and discovery of both exchanges stopped at once, from every network,
+/// while `dig` reported the chain Secure. Four kilobytes is the size these
+/// resolvers actually send up to; TCP is tried after that, not instead of
+/// it, so the common case stays one datagram each way.
+fn room_for_a_key_rollover(opts: &mut hickory_resolver::config::ResolverOpts) {
+    opts.edns_payload_len = 4096;
+    opts.try_tcp_on_error = true;
 }
 
 /// Resolvers that carry DNSSEC records intact, as transport for a lookup the
@@ -78,6 +100,7 @@ async fn public_resolver() -> Result<&'static TokioResolver> {
             let mut builder =
                 Resolver::builder_with_config(config, TokioRuntimeProvider::default());
             builder.options_mut().validate = true;
+            room_for_a_key_rollover(builder.options_mut());
             builder
                 .build()
                 .map_err(|e| Error::Resolve(format!("cannot build a validating resolver: {e}")))
@@ -296,4 +319,107 @@ async fn lookup_txt_via(resolver: &TokioResolver, name: &str) -> Result<Vec<Stri
         );
     }
     Ok(secure)
+}
+
+#[cfg(test)]
+mod oversize_tests {
+    //! A resolver that answers with more than it was told it may send.
+    //!
+    //! What every resolver tried did on 2026-09-17 for a DNSKEY RRset with a
+    //! fifth key in it — see `room_for_a_key_rollover`. Stood in for here by
+    //! a socket that answers any question with an unsigned TXT RRset of
+    //! 1,500 bytes, so the outcome that proves the datagram was read whole
+    //! is *Unsigned* (every record seen, none proven), and the outcome of a
+    //! datagram cut at 1232 is a decode failure reported as *Resolve*.
+
+    use super::*;
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    use hickory_resolver::proto::op::{Message, MessageType, OpCode};
+    use hickory_resolver::proto::rr::rdata::TXT;
+    use hickory_resolver::proto::rr::{Name, Record};
+
+    /// Answers every query with `records` TXT records of a hundred bytes.
+    async fn oversize_server(records: usize) -> std::net::SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_vec(&buf[..n]) else {
+                    continue;
+                };
+                let mut reply =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                reply.metadata.recursion_available = true;
+                for q in &query.queries {
+                    reply.add_query(q.clone());
+                }
+                let name: Name = "_sqex.big.test.".parse().unwrap();
+                for i in 0..records {
+                    let text = format!("v=sqex1; k={:0>90}", i);
+                    reply.add_answer(Record::from_rdata(
+                        name.clone(),
+                        300,
+                        RData::TXT(TXT::new(vec![text])),
+                    ));
+                }
+                let bytes = reply.to_vec().unwrap();
+                assert!(
+                    bytes.len() > 1232,
+                    "the answer must be oversize to test anything"
+                );
+                let _ = socket.send_to(&bytes, from).await;
+            }
+        });
+        addr
+    }
+
+    fn resolver_at(addr: std::net::SocketAddr, with_room: bool) -> TokioResolver {
+        let mut server = NameServerConfig::udp(addr.ip());
+        for c in &mut server.connections {
+            c.port = addr.port();
+        }
+        let config = ResolverConfig::from_parts(None, Vec::new(), vec![server]);
+        let mut builder = Resolver::builder_with_config(config, TokioRuntimeProvider::default());
+        builder.options_mut().validate = false;
+        builder.options_mut().attempts = 0;
+        if with_room {
+            room_for_a_key_rollover(builder.options_mut());
+            // Not for this test: the fake speaks no TCP, and a fallback to
+            // it would hang rather than say what UDP made of the answer.
+            builder.options_mut().try_tcp_on_error = false;
+        }
+        builder.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_answer_larger_than_advertised_is_read_whole() {
+        let addr = oversize_server(14).await;
+        let resolver = resolver_at(addr, true);
+        let err = lookup_txt_via(&resolver, "_sqex.big.test.")
+            .await
+            .expect_err("unsigned records are refused");
+        assert!(
+            matches!(err, Error::Unsigned { unproven: 14, .. }),
+            "every record should have been read and found unproven: {err:?}"
+        );
+    }
+
+    /// The negative control, and the record of why the room is needed: at
+    /// hickory's default the same answer is cut at 1232 bytes and the cut
+    /// record fails to decode. Should this start passing, hickory has
+    /// changed how it reads a datagram and `room_for_a_key_rollover` can go.
+    #[tokio::test]
+    async fn at_the_default_size_the_same_answer_is_cut_and_fails_to_decode() {
+        let addr = oversize_server(14).await;
+        let resolver = resolver_at(addr, false);
+        let err = lookup_txt_via(&resolver, "_sqex.big.test.")
+            .await
+            .expect_err("a cut datagram cannot decode");
+        assert!(
+            matches!(err, Error::Resolve(_)),
+            "wanted the decode failure, got {err:?}"
+        );
+    }
 }
