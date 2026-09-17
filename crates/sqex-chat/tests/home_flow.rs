@@ -187,8 +187,14 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
 
     // A store that remembers nothing, at the replica: the replica's `info`
     // says where this device stands at the origin, so the client resumes
-    // from there rather than signing from zero.
+    // from there rather than signing from zero. And a file sent from here
+    // is carried to the origin chunk by chunk -- the replica keeps nothing
+    // on the way -- and comes back to the copy by the ordinary pull, so a
+    // reader at either end opens it.
+    let secret: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+    let blob;
     {
+        use sqex_proto::message::{Part, Post as SipPost};
         let mut fresh = chat_at(
             replica_addr,
             replica_pub,
@@ -201,6 +207,56 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
             .await
             .unwrap();
         assert_eq!(posted.seq, posted_seq + 1);
+
+        let path = replica_dir.path().join("notes.md");
+        std::fs::write(&path, &secret).unwrap();
+        let limits = fresh.blob_limits().await.unwrap();
+        let prepared = fresh.prepare_file(&path, limits.chunk as usize).unwrap();
+        let attachment = fresh.upload(&channel, &prepared).await.unwrap();
+        blob = attachment.blob;
+        let mut post = SipPost::text("the notes, from the copy");
+        post.parts.push(Part::Attachment(attachment));
+        fresh.send_post(&channel, post).await.unwrap();
+    }
+    // Somebody else at the replica, with no local copy, fetches it there.
+    {
+        let mut other = chat_at(
+            replica_addr,
+            replica_pub,
+            1,
+            &replica_dir.path().join("other.db"),
+        )
+        .await;
+        let mut t = Timeline::new();
+        let mut attachment = None;
+        for _ in 0..50 {
+            let got = other.poll(&channel, &mut t, 0).await.unwrap();
+            if let Some(a) = got
+                .timeline
+                .messages()
+                .find(|m| m.post.body_text() == Some("the notes, from the copy"))
+                .and_then(|m| m.post.attachments().next().cloned())
+            {
+                attachment = Some(a);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let attachment = attachment.expect("the file's message never reached the copy");
+        assert_eq!(attachment.blob, blob);
+        let mut opened = None;
+        for _ in 0..50 {
+            if let Ok(bytes) = other.download(&attachment).await {
+                opened = Some(bytes);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            opened.as_deref(),
+            Some(&secret[..]),
+            "the blob never came back to the copy"
+        );
     }
 
     // Back at the origin: it holds the posts, and the chain is one chain --
@@ -213,6 +269,13 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
             .messages()
             .any(|m| m.seq == posted_seq && m.post.body_text() == Some("posted at the replica"))
     );
+    // The origin holds the file a member sent from the copy.
+    let a = at_origin
+        .messages()
+        .find(|m| m.post.body_text() == Some("the notes, from the copy"))
+        .and_then(|m| m.post.attachments().next().cloned())
+        .expect("the file's message is not at the origin");
+    assert_eq!(alice.download(&a).await.unwrap(), secret);
     alice
         .send(&channel, "and back at the origin")
         .await
@@ -224,6 +287,7 @@ async fn a_client_posts_where_it_is_and_the_origin_orders_it() {
             "from the origin",
             "posted at the replica",
             "from a store that remembered nothing",
+            "the notes, from the copy",
             "and back at the origin"
         ]
     );

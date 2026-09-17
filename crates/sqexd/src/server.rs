@@ -37,8 +37,8 @@ use sqex_proto::attest::{Attestation, Query as AttestQuery};
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::blob_store::{
     Begin as BlobBegin, Begun, ByBlob, ByChannelBlob, ByUpload, Commit as BlobCommit, Committed,
-    GetChunk, Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT, TYPE_DETACH as BL_DETACH,
-    TYPE_HEAD as BL_HEAD,
+    GetChunk, Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT, TYPE_ATTACH as BL_ATTACH,
+    TYPE_DETACH as BL_DETACH, TYPE_HEAD as BL_HEAD,
 };
 use sqex_proto::channel::{
     Ack as ChannelAck, ByAccount as ChannelByAccount, ByChannel, ByChannelSigned, ByTarget,
@@ -299,6 +299,10 @@ pub struct Server {
     exchange_seed: [u8; 32],
     /// SIP-43: the way to each origin for a member's post, by origin key.
     origins: HashMap<PubKey, Arc<crate::replica::Forwarder>>,
+    /// SIP-43: uploads this replica is carrying to an origin, by the number
+    /// it gave the client: the origin, the origin's number, and whose it is.
+    carried_uploads: Mutex<HashMap<u64, (PubKey, u64, PubKey)>>,
+    next_carried: AtomicU64,
 }
 
 impl Server {
@@ -716,6 +720,8 @@ pub async fn bind_with(
         replication_peers: config.replication_peers.clone(),
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
+        carried_uploads: Mutex::new(HashMap::new()),
+        next_carried: AtomicU64::new(0),
         origins: config
             .replicate
             .iter()
@@ -1108,7 +1114,8 @@ async fn handle_stream(
     let path = req.uri().path().to_string();
 
     // Read the request body (bounded), if any.
-    let cap = if path == "/blob/put" {
+    // SIP-43: a chunk carried from a replica arrives on the peering route.
+    let cap = if path == "/blob/put" || path == "/peer/forward" {
         MAX_CHUNK_BODY
     } else {
         MAX_BODY
@@ -1766,65 +1773,14 @@ async fn route(
             }
             .encode(),
         ),
-        ("POST", "/blob/begin") => match (account, BlobBegin::decode(body)) {
-            (None, _) => no_identity("beginning an upload"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server.channels.begin_upload(&me, &req) {
-                Ok(upload) => (
-                    200,
-                    "application/octet-stream",
-                    Begun {
-                        upload,
-                        now: now_unix(),
-                    }
-                    .encode(),
-                ),
-                Err(e) => refused(e),
-            },
-        },
-        ("POST", "/blob/put") => match (account, BlobPut::decode(body)) {
-            (None, _) => no_identity("uploading a chunk"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server.channels.put_chunk(&me, &req) {
-                Ok(()) => (
-                    200,
-                    "application/octet-stream",
-                    ChannelAck { now: now_unix() }.encode(),
-                ),
-                Err(e) => refused(e),
-            },
-        },
-        ("POST", "/blob/commit") => match (account, BlobCommit::decode(body)) {
-            (None, _) => no_identity("committing an upload"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => {
-                match server.channels.commit_upload(&me, req.upload, &req.blob) {
-                    Ok(stored) => (
-                        200,
-                        "application/octet-stream",
-                        Committed {
-                            stored,
-                            blob: req.blob,
-                            now: now_unix(),
-                        }
-                        .encode(),
-                    ),
-                    Err(e) => refused(e),
-                }
-            }
-        },
-        ("POST", "/blob/abort") => match (account, ByUpload::decode(body, BL_ABORT)) {
-            (None, _) => no_identity("aborting an upload"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server.channels.abort_upload(&me, req.upload) {
-                Ok(()) => (
-                    200,
-                    "application/octet-stream",
-                    ChannelAck { now: now_unix() }.encode(),
-                ),
-                Err(e) => refused(e),
-            },
-        },
+        // The blob store's writes, one arm each so the dispatch table reads
+        // as a table; all six answer the same way.
+        ("POST", "/blob/begin") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/put") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/commit") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/abort") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/attach") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/detach") => blob_write(server, account, device, path, body).await,
         ("POST", "/blob/head") => match (account, ByBlob::decode(body, BL_HEAD)) {
             (None, _) => no_identity("reading a blob"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -1840,37 +1796,6 @@ async fn route(
                 Ok(c) => (200, "application/octet-stream", c.encode()),
                 Err(e) => refused(e),
             },
-        },
-        ("POST", "/blob/attach") => {
-            match (
-                account,
-                ByChannelBlob::decode(body, sqex_proto::blob_store::TYPE_ATTACH),
-            ) {
-                (None, _) => no_identity("attaching a blob"),
-                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-                (Some(me), Ok(req)) => match server.channels.attach_blob(&me, &req) {
-                    Ok(()) => (
-                        200,
-                        "application/octet-stream",
-                        ChannelAck { now: now_unix() }.encode(),
-                    ),
-                    Err(e) => refused(e),
-                },
-            }
-        }
-        ("POST", "/blob/detach") => match (account, ByChannelBlob::decode(body, BL_DETACH)) {
-            (None, _) => no_identity("detaching a blob"),
-            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => {
-                match server.channels.detach_blob(&me, &req.channel, &req.blob) {
-                    Ok(()) => (
-                        200,
-                        "application/octet-stream",
-                        ChannelAck { now: now_unix() }.encode(),
-                    ),
-                    Err(e) => refused(e),
-                }
-            }
         },
 
         // SIP-23 prekeys. The exchange hands each one-time key out at most
@@ -2653,6 +2578,31 @@ async fn route(
                         }
                         _ => return peering_refused(),
                     },
+                    // An upload, a chunk, its commit or abort, an attach or a
+                    // detach: the blob store's own checks apply -- an upload
+                    // is its uploader's, an attach a member's -- and the
+                    // peer gate is the channel's where the request names one.
+                    "/blob/begin" | "/blob/put" | "/blob/commit" | "/blob/abort"
+                    | "/blob/attach" | "/blob/detach" => {
+                        let named = match req.path.as_str() {
+                            "/blob/begin" => BlobBegin::decode(&req.body).ok().map(|b| b.channel),
+                            "/blob/attach" => ByChannelBlob::decode(&req.body, BL_ATTACH)
+                                .ok()
+                                .map(|b| b.channel),
+                            "/blob/detach" => ByChannelBlob::decode(&req.body, BL_DETACH)
+                                .ok()
+                                .map(|b| b.channel),
+                            _ => None,
+                        };
+                        let allowed = server.peering(&who).is_some_and(|p| match named {
+                            Some(channel) => server.may_forward(p, &channel, &account),
+                            None => true,
+                        });
+                        if !allowed {
+                            return peering_refused();
+                        }
+                        blob_here(server, &account, &req.path, &req.body)
+                    }
                     _ => return peering_refused(),
                 };
                 (
@@ -3291,6 +3241,237 @@ async fn forward_action(
             }
         },
     )
+}
+
+/// A blob-store write from a client: carried to the origin where the channel
+/// lives elsewhere (SIP-43), answered here otherwise.
+async fn blob_write(
+    server: &Server,
+    account: Option<PubKey>,
+    device: Option<PubKey>,
+    path: &str,
+    body: &[u8],
+) -> (u16, &'static str, Vec<u8>) {
+    let Some(me) = account else {
+        return no_identity("using the blob store");
+    };
+    // SIP-43: an upload for a channel that lives elsewhere is carried to the
+    // origin, chunk by chunk, and the replica keeps nothing but the number
+    // it gave the client for the origin's upload.
+    if let Some(answer) = carry_blob(server, &me, &device.unwrap_or(me), path, body).await {
+        return answer;
+    }
+    let (status, body) = blob_here(server, &me, path, body);
+    (status, "application/octet-stream", body)
+}
+
+/// The blob store's write routes, answered here: the status and body a
+/// client gets. One function, because SIP-43 has the same requests arrive
+/// carried from a replica, and a carried one must get exactly what a
+/// direct one would.
+fn blob_here(server: &Server, me: &PubKey, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let ack = || ChannelAck { now: now_unix() }.encode();
+    let refused = |e: ChannelError| {
+        let (status, _, body) = refused(e);
+        (status, body)
+    };
+    let malformed = |e: Error| {
+        let (status, _, body) = refuse(400, Code::Malformed, Some(&e.to_string()));
+        (status, body)
+    };
+    match path {
+        "/blob/begin" => match BlobBegin::decode(body) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.begin_upload(me, &req) {
+                Ok(upload) => (
+                    200,
+                    Begun {
+                        upload,
+                        now: now_unix(),
+                    }
+                    .encode(),
+                ),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/put" => match BlobPut::decode(body) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.put_chunk(me, &req) {
+                Ok(()) => (200, ack()),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/commit" => match BlobCommit::decode(body) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.commit_upload(me, req.upload, &req.blob) {
+                Ok(stored) => (
+                    200,
+                    Committed {
+                        stored,
+                        blob: req.blob,
+                        now: now_unix(),
+                    }
+                    .encode(),
+                ),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/abort" => match ByUpload::decode(body, BL_ABORT) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.abort_upload(me, req.upload) {
+                Ok(()) => (200, ack()),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/attach" => match ByChannelBlob::decode(body, BL_ATTACH) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.attach_blob(me, &req) {
+                Ok(()) => (200, ack()),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/detach" => match ByChannelBlob::decode(body, BL_DETACH) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.detach_blob(me, &req.channel, &req.blob) {
+                Ok(()) => (200, ack()),
+                Err(e) => refused(e),
+            },
+        },
+        _ => {
+            let (status, _, body) = refuse(404, Code::NotFound, None);
+            (status, body)
+        }
+    }
+}
+
+/// The bit that marks an upload number this replica gave a client for an
+/// upload it is carrying to an origin. Its own uploads count from one.
+const CARRIED_BIT: u64 = 1 << 63;
+
+/// SIP-43: carry a blob-store write to the origin of the channel it is for.
+///
+/// `begin`, `attach` and `detach` name a channel; where it lives elsewhere
+/// the request goes there as sent, and for a `begin` the origin's upload
+/// number comes back translated to one of this exchange's, so `put`,
+/// `commit` and `abort` naming it are carried too, with the origin's number
+/// put back. Nothing is stored here on the way: the blob arrives back by
+/// the ordinary pull once the origin holds it. `None` when the request is
+/// this exchange's own to answer.
+async fn carry_blob(
+    server: &Server,
+    me: &PubKey,
+    device: &PubKey,
+    path: &str,
+    body: &[u8],
+) -> Option<(u16, &'static str, Vec<u8>)> {
+    let away = |origin: &PubKey, e: String| {
+        tracing::warn!(origin = %origin, "carry failed: {e}");
+        refuse(503, Code::OriginAway, None)
+    };
+    match path {
+        "/blob/begin" => {
+            let req = BlobBegin::decode(body).ok()?;
+            let origin = server.channels.origin_of(&req.channel)?;
+            let Some(forwarder) = server.origins.get(&origin) else {
+                return Some(refuse(421, Code::Replicated, None));
+            };
+            let answer = match forwarder
+                .action(&server.exchange_seed, device, path, body)
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => return Some(away(&origin, e)),
+            };
+            if answer.status != 200 {
+                return Some((answer.status, "application/octet-stream", answer.body));
+            }
+            let Ok(begun) = Begun::decode(&answer.body) else {
+                return Some(away(&origin, "the origin's answer did not decode".into()));
+            };
+            let local = {
+                let mut carried = server.carried_uploads.lock().unwrap();
+                let n = server.next_carried.fetch_add(1, Ordering::Relaxed) + 1;
+                let local = CARRIED_BIT | n;
+                carried.insert(local, (origin, begun.upload, *me));
+                local
+            };
+            Some((
+                200,
+                "application/octet-stream",
+                Begun {
+                    upload: local,
+                    now: begun.now,
+                }
+                .encode(),
+            ))
+        }
+        "/blob/put" | "/blob/commit" | "/blob/abort" => {
+            // The upload number is the first field of each, after the type.
+            let local = match path {
+                "/blob/put" => BlobPut::decode(body).ok()?.upload,
+                "/blob/commit" => BlobCommit::decode(body).ok()?.upload,
+                _ => ByUpload::decode(body, BL_ABORT).ok()?.upload,
+            };
+            if local & CARRIED_BIT == 0 {
+                return None;
+            }
+            let (origin, theirs, owner) = *server.carried_uploads.lock().unwrap().get(&local)?;
+            if owner != *me {
+                let (s, t, b) = refuse(403, Code::NotYours, None);
+                return Some((s, t, b));
+            }
+            let Some(forwarder) = server.origins.get(&origin) else {
+                return Some(refuse(421, Code::Replicated, None));
+            };
+            // The same bytes with the origin's number in place of ours.
+            let rewritten = match path {
+                "/blob/put" => {
+                    let mut r = BlobPut::decode(body).ok()?;
+                    r.upload = theirs;
+                    r.encode()
+                }
+                "/blob/commit" => {
+                    let mut r = BlobCommit::decode(body).ok()?;
+                    r.upload = theirs;
+                    r.encode()
+                }
+                _ => ByUpload { upload: theirs }.encode(BL_ABORT),
+            };
+            let answer = match forwarder
+                .action(&server.exchange_seed, device, path, &rewritten)
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => return Some(away(&origin, e)),
+            };
+            if path != "/blob/put" && answer.status == 200 {
+                server.carried_uploads.lock().unwrap().remove(&local);
+            }
+            Some((answer.status, "application/octet-stream", answer.body))
+        }
+        "/blob/attach" | "/blob/detach" => {
+            let type_byte = if path == "/blob/attach" {
+                BL_ATTACH
+            } else {
+                BL_DETACH
+            };
+            let req = ByChannelBlob::decode(body, type_byte).ok()?;
+            let origin = server.channels.origin_of(&req.channel)?;
+            let Some(forwarder) = server.origins.get(&origin) else {
+                return Some(refuse(421, Code::Replicated, None));
+            };
+            Some(
+                match forwarder
+                    .action(&server.exchange_seed, device, path, body)
+                    .await
+                {
+                    Ok(a) => (a.status, "application/octet-stream", a.body),
+                    Err(e) => away(&origin, e),
+                },
+            )
+        }
+        _ => None,
+    }
 }
 
 /// Order a post at this exchange and say what became of it: the status and
