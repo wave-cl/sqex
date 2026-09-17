@@ -883,10 +883,19 @@ impl Channels {
             .clone()
     }
 
-    fn wake(&self, channel: &[u8; 32]) {
+    /// Wake whoever waits on `channel` -- a client's long poll, or a
+    /// peer's SIP-61 wait. Callable from the route layer for the changes
+    /// the store does not write as entries (a signal, a read mark).
+    pub(crate) fn wake(&self, channel: &[u8; 32]) {
         if let Some(n) = self.waiters.lock().unwrap().get(channel) {
             n.notify_waiters();
         }
+    }
+
+    /// SIP-61: the newest `seq` held for a channel, 0 for none.
+    pub fn last_seq(&self, channel: &[u8; 32]) -> u64 {
+        let db = self.db.lock().unwrap();
+        window(&db, channel).1
     }
 }
 

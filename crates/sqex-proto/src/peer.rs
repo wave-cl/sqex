@@ -87,6 +87,10 @@ pub const TYPE_MOVED: u8 = 0x0f;
 /// SIP-60: an origin tells an account's home that it put the account in a
 /// channel.
 pub const TYPE_INVITED: u8 = 0x10;
+/// SIP-61: a replica waits on the origin for any of its channels to change.
+pub const TYPE_WAIT: u8 = 0x11;
+/// SIP-61: channels one wait may name.
+pub const MAX_WAIT_CHANNELS: usize = 256;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -1477,5 +1481,118 @@ mod invited_tests {
         let mut trailing = p.encode();
         trailing.push(1);
         assert!(PeerInvited::decode(&trailing).is_err());
+    }
+}
+
+/// SIP-61: one held request per origin, naming the channels the replica
+/// holds from it and where each stands. Answered at once where any has an
+/// entry past `since`, otherwise when any changes, otherwise empty when
+/// the wait runs out.
+/// `| type = 0x11 | wait_secs: u16 | count: u16 | count × (channel[32] | since: u64) |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerWait {
+    pub wait_secs: u16,
+    pub channels: Vec<([u8; 32], u64)>,
+}
+
+impl PeerWait {
+    pub fn encode(&self) -> Vec<u8> {
+        let n = self.channels.len().min(MAX_WAIT_CHANNELS);
+        let mut out = Vec::with_capacity(5 + n * 40);
+        out.push(TYPE_WAIT);
+        out.extend_from_slice(&self.wait_secs.to_be_bytes());
+        out.extend_from_slice(&(n as u16).to_be_bytes());
+        for (c, since) in self.channels.iter().take(n) {
+            out.extend_from_slice(c);
+            out.extend_from_slice(&since.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PeerWait> {
+        let short = || Error::Malformed("peer wait cut short".into());
+        if b.first() != Some(&TYPE_WAIT) {
+            return Err(Error::Malformed("not a peer wait".into()));
+        }
+        let wait_secs = u16::from_be_bytes(b.get(1..3).ok_or_else(short)?.try_into().unwrap());
+        let n = u16::from_be_bytes(b.get(3..5).ok_or_else(short)?.try_into().unwrap()) as usize;
+        if n > MAX_WAIT_CHANNELS {
+            return Err(Error::Malformed(format!(
+                "a wait names at most {MAX_WAIT_CHANNELS} channels, not {n}"
+            )));
+        }
+        if b.len() != 5 + n * 40 {
+            return Err(short());
+        }
+        let channels = (0..n)
+            .map(|i| {
+                let at = 5 + i * 40;
+                (
+                    b[at..at + 32].try_into().unwrap(),
+                    u64::from_be_bytes(b[at + 32..at + 40].try_into().unwrap()),
+                )
+            })
+            .collect();
+        Ok(PeerWait {
+            wait_secs,
+            channels,
+        })
+    }
+}
+
+/// SIP-61: the channels, among those waited on, that changed.
+/// `| now: u64 | count: u16 | count × channel[32] |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Changed {
+    pub now: u64,
+    pub channels: Vec<[u8; 32]>,
+}
+
+impl Changed {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.channels.len() * 32);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.channels.len().min(u16::MAX as usize) as u16).to_be_bytes());
+        for c in self.channels.iter().take(u16::MAX as usize) {
+            out.extend_from_slice(c);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Changed> {
+        let short = || Error::Malformed("changed cut short".into());
+        let now = u64::from_be_bytes(b.get(0..8).ok_or_else(short)?.try_into().unwrap());
+        let n = u16::from_be_bytes(b.get(8..10).ok_or_else(short)?.try_into().unwrap()) as usize;
+        if b.len() != 10 + n * 32 {
+            return Err(short());
+        }
+        let channels = (0..n)
+            .map(|i| b[10 + i * 32..42 + i * 32].try_into().unwrap())
+            .collect();
+        Ok(Changed { now, channels })
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_wait_and_its_answer_round_trip() {
+        let w = PeerWait {
+            wait_secs: 25,
+            channels: vec![([1; 32], 7), ([2; 32], 0)],
+        };
+        assert_eq!(PeerWait::decode(&w.encode()).unwrap(), w);
+        assert!(PeerWait::decode(&w.encode()[..30]).is_err());
+        let mut too_many = w.encode();
+        too_many[3..5].copy_from_slice(&300u16.to_be_bytes());
+        assert!(PeerWait::decode(&too_many).is_err());
+        let c = Changed {
+            now: 9,
+            channels: vec![[3; 32]],
+        };
+        assert_eq!(Changed::decode(&c.encode()).unwrap(), c);
+        assert!(Changed::decode(&c.encode()[..20]).is_err());
     }
 }

@@ -394,6 +394,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::run_homed"),
         ReplicationPeer,
     ),
+    // SIP-61: a replica waits on the origin for its channels to change.
+    (
+        "POST",
+        "/peer/wait",
+        Peer("replica::wait_on"),
+        ReplicationPeer,
+    ),
     // SIP-60: an origin tells a home it put one of its accounts in a channel.
     (
         "POST",

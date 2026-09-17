@@ -946,10 +946,133 @@ fn carried(carry: Option<&sqex_proto::credential::Credential>, inner: Vec<u8>) -
     }
 }
 
+/// SIP-61: how a wait on the origin ended.
+enum Waited {
+    /// Something changed in at least one channel.
+    Changed,
+    /// The wait ran out with nothing.
+    Quiet,
+    /// The origin does not speak SIP-61 (or refuses this peer the route).
+    Unsupported,
+    /// The connection went; the caller redials.
+    Lost,
+}
+
+/// How long after an origin refused a wait before trying it again.
+const WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// SIP-61: hold one request at the origin naming `channels` and where each
+/// stands here, for up to `secs`. At most `MAX_WAIT_CHANNELS` are named.
+async fn wait_on(
+    client: &mut H3Client,
+    store: &Channels,
+    channels: &[[u8; 32]],
+    secs: u16,
+) -> Waited {
+    let named: Vec<([u8; 32], u64)> = channels
+        .iter()
+        .take(sqex_proto::peer::MAX_WAIT_CHANNELS)
+        .map(|c| (*c, store.last_seq(c)))
+        .collect();
+    let req = sqex_proto::peer::PeerWait {
+        wait_secs: secs.min(sqex_proto::channel::MAX_WAIT),
+        channels: named,
+    };
+    match client.post("/peer/wait", req.encode()).await {
+        Ok((200, body)) => match sqex_proto::peer::Changed::decode(&body) {
+            Ok(c) if c.channels.is_empty() => Waited::Quiet,
+            Ok(_) => Waited::Changed,
+            Err(_) => Waited::Unsupported,
+        },
+        Ok(_) => Waited::Unsupported,
+        Err(_) => Waited::Lost,
+    }
+}
+
+/// Between pulls: wait on the origin (SIP-61) where it lets us, sleep the
+/// interval where it does not, and come back early for a poke either way.
+/// `waits_from` is when the origin may next be asked to wait, after a
+/// refusal. Returns whether the connection is still good.
+async fn pause_or_wait(
+    client: &mut H3Client,
+    store: &Channels,
+    channels: &[[u8; 32]],
+    interval: std::time::Duration,
+    poke: &tokio::sync::Notify,
+    waits_from: &mut tokio::time::Instant,
+) -> bool {
+    if tokio::time::Instant::now() < *waits_from || channels.is_empty() {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = poke.notified() => {}
+        }
+        return true;
+    }
+    let secs = interval
+        .as_secs()
+        .clamp(1, sqex_proto::channel::MAX_WAIT as u64) as u16;
+    tokio::select! {
+        waited = wait_on(client, store, channels, secs) => match waited {
+            Waited::Changed | Waited::Quiet => true,
+            Waited::Unsupported => {
+                *waits_from = tokio::time::Instant::now() + WAIT_RETRY;
+                true
+            }
+            Waited::Lost => false,
+        },
+        _ = poke.notified() => true,
+    }
+}
+
+/// SIP-61 for the loops that pull from several origins a cycle: wait on
+/// all of them at once, and come back when any changes, when `notify`
+/// fires, or when the interval runs out. Each origin's connection is
+/// spent on its wait; the next cycle dials afresh.
+async fn wait_any(
+    server: &Arc<crate::server::Server>,
+    waits: Vec<(H3Client, Vec<[u8; 32]>)>,
+    interval: std::time::Duration,
+    notify: &tokio::sync::Notify,
+) {
+    let secs = interval
+        .as_secs()
+        .clamp(1, sqex_proto::channel::MAX_WAIT as u64) as u16;
+    let mut set = tokio::task::JoinSet::new();
+    for (mut client, channels) in waits {
+        if channels.is_empty() {
+            continue;
+        }
+        let server = Arc::clone(server);
+        set.spawn(async move { wait_on(&mut client, server.channels(), &channels, secs).await });
+    }
+    let sleep = tokio::time::sleep(interval);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return,
+            _ = notify.notified() => return,
+            next = set.join_next() => match next {
+                Some(Ok(Waited::Changed)) => return,
+                Some(_) => continue,
+                None => {
+                    // Nothing left to wait on: sleep out the interval.
+                    tokio::select! {
+                        _ = &mut sleep => {}
+                        _ = notify.notified() => {}
+                    }
+                    return;
+                }
+            },
+        }
+    }
+}
+
 /// Waits its interval between pulls, floored by SIP-35 at `PEER_MIN_INTERVAL`
 /// — a replica that hammered an origin would be a worse citizen than one that
 /// lagged -- or less, when a post this replica forwarded was taken and the
-/// member who wrote it is waiting to read it back.
+/// member who wrote it is waiting to read it back. SIP-61: where the origin
+/// lets a replica wait on it, the wait replaces the sleep and a change at
+/// the origin is pulled at once.
 pub async fn run(
     server: Arc<crate::server::Server>,
     seed: [u8; 32],
@@ -965,6 +1088,7 @@ pub async fn run(
             }
         }
     };
+    let mut waits_from = tokio::time::Instant::now();
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
@@ -981,7 +1105,18 @@ pub async fn run(
                         }
                         Ok(took) => report(&origin, &took),
                     }
-                    pause(origin.interval).await;
+                    if !pause_or_wait(
+                        &mut client,
+                        server.channels(),
+                        &origin.channels,
+                        origin.interval,
+                        &forwarder.poke,
+                        &mut waits_from,
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -999,8 +1134,10 @@ pub async fn run_moved(
     configured: Vec<PubKey>,
     interval: std::time::Duration,
 ) {
+    let never = tokio::sync::Notify::new();
+    let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
     loop {
-        tokio::time::sleep(interval).await;
+        wait_any(&server, std::mem::take(&mut waits), interval, &never).await;
         for (origin, domain, channels) in server.channels().moved_channels(&configured) {
             if domain.is_empty() {
                 continue;
@@ -1029,7 +1166,10 @@ pub async fn run_moved(
                     Err(e) => {
                         tracing::warn!(origin = %origin, error = %e, "pull from a moved origin failed")
                     }
-                    Ok(took) => report(&task, &took),
+                    Ok(took) => {
+                        report(&task, &took);
+                        waits.push((client, task.channels.clone()));
+                    }
                 },
             }
         }
@@ -1050,11 +1190,11 @@ pub async fn run_homed(
     configured: Vec<(PubKey, Vec<[u8; 32]>)>,
     interval: std::time::Duration,
 ) {
+    let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = server.homed.notified() => {}
-        }
+        // SIP-61: wait on every origin pulled last cycle; a move here or a
+        // forward through here comes back early either way.
+        wait_any(&server, std::mem::take(&mut waits), interval, &server.homed).await;
         let me = server.public_key;
         for (origin, domain, accounts) in server.devices.homed_here(&me) {
             if origin == me {
@@ -1133,7 +1273,10 @@ pub async fn run_homed(
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "pull for a homed account failed")
                 }
-                Ok(took) => report(&task, &took),
+                Ok(took) => {
+                    report(&task, &took);
+                    waits.push((client, task.channels.clone()));
+                }
             }
         }
     }

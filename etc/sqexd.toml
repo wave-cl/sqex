@@ -127,6 +127,11 @@ seed_relay_peers = [
 # Omit for the reference default of 512 MiB.
 # backup_quota = 536870912
 
+# SIP-61: a replica waits on each origin for its channels to change rather
+# than pulling on the interval alone, so a copy is as live as the origin;
+# the intervals below (`interval_secs`, `home_secs`) are then the safety
+# net -- a full pull that costs what it always cost -- and not the delivery.
+
 # SIP-59: an account that signs this exchange as its home has its channels
 # pulled from wherever each lives, and its posts carried back; this is the
 # interval between those pulls, in seconds. A move and a post from here

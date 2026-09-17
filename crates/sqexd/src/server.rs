@@ -65,9 +65,9 @@ use sqex_proto::mailbox::{
 use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
-    Carried, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi, Mine,
-    PEER_VERSION, PeerInvited, PeerMoved, Pull as PeerPull, PullBlob, PullEnvelopes, PullMine,
-    PullRecord, PullShape, PullStanding,
+    Carried, Changed, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi,
+    Mine, PEER_VERSION, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBlob,
+    PullEnvelopes, PullMine, PullRecord, PullShape, PullStanding,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -816,6 +816,10 @@ impl Server {
         let to = self.channels.members_of(channel);
         self.events.publish(&to, event);
         self.wake(&to, &event);
+        // SIP-61: and the peers waiting on this channel, for everything a
+        // pull would carry -- an entry woke them already; a signal, a
+        // read mark or a redaction only gets here.
+        self.channels.wake(channel);
     }
 
     /// SIP-45: the same people, to their devices that are not listening.
@@ -836,6 +840,7 @@ impl Server {
             .collect();
         self.events.publish(&to, event);
         self.wake(&to, &event);
+        self.channels.wake(channel);
     }
 
     /// The same, plus one account who may no longer be present — somebody
@@ -847,6 +852,7 @@ impl Server {
         }
         self.events.publish(&to, event);
         self.wake(&to, &event);
+        self.channels.wake(channel);
     }
 
     // --- SIP-39: effects the relay module drives, kept here so it needs no
@@ -3553,6 +3559,32 @@ async fn route(
             }
             _ => peering_refused(),
         },
+        // SIP-61: a replica waits here for any of its channels to change.
+        // Channels the peer may not pull are left out of every answer and
+        // never waited on, so the answer says nothing about them.
+        ("POST", "/peer/wait") => match (peer.identity, PeerWait::decode(body)) {
+            (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                let p = server.peering(&who).unwrap();
+                let watched: Vec<([u8; 32], u64)> = req
+                    .channels
+                    .iter()
+                    .filter(|(c, _)| server.may_pull(p, c))
+                    .cloned()
+                    .collect();
+                let secs = req.wait_secs.min(sqex_proto::channel::MAX_WAIT);
+                let changed = wait_for_changes(server, &watched, secs).await;
+                (
+                    200,
+                    "application/octet-stream",
+                    Changed {
+                        now: now_unix(),
+                        channels: changed,
+                    }
+                    .encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
         // SIP-60: an origin says it put one of the accounts homed here in a
         // channel. Acted on only for an account whose own Move names this
         // exchange: the origin hint is kept and the home task pulls, carrying
@@ -5176,6 +5208,60 @@ fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
 ///
 /// It carries no detail for the same reason. A detail string is a reply that
 /// varies.
+/// SIP-61: the channels among `watched` that have an entry past the seq
+/// the peer holds, at once; else the first to change -- an entry, a
+/// signal, a read mark, a redaction -- within `secs`; else none. The
+/// notifiers are taken before the first look, as `fetch_waiting` takes
+/// its one, so a change in the gap still wakes the wait.
+async fn wait_for_changes(
+    server: &Arc<Server>,
+    watched: &[([u8; 32], u64)],
+    secs: u16,
+) -> Vec<[u8; 32]> {
+    let notifiers: Vec<_> = watched
+        .iter()
+        .map(|(c, _)| server.channels.notifier(c))
+        .collect();
+    let past = |server: &Server| -> Vec<[u8; 32]> {
+        watched
+            .iter()
+            .filter(|(c, since)| server.channels.last_seq(c) > *since)
+            .map(|(c, _)| *c)
+            .collect()
+    };
+    let already = past(server);
+    if !already.is_empty() || secs == 0 || watched.is_empty() {
+        return already;
+    }
+    // One task per notifier, each reporting its index once; the first to
+    // report ends the wait, and the rest are dropped with the receiver.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<usize>(watched.len().max(1));
+    let tasks: Vec<_> = notifiers
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                n.notified().await;
+                let _ = tx.send(i).await;
+            })
+        })
+        .collect();
+    drop(tx);
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(secs as u64), rx.recv()).await;
+    for t in &tasks {
+        t.abort();
+    }
+    let mut changed = past(server);
+    if let Ok(Some(i)) = woken
+        && let Some((c, _)) = watched.get(i)
+        && !changed.contains(c)
+    {
+        changed.push(*c);
+    }
+    changed
+}
+
 /// SIP-60: locate `label@domain` -- the domain's exchange, the label
 /// resolved there, the account's home (followed once), its devices as the
 /// home lists them -- and remember where the account lives.
