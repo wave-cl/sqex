@@ -219,6 +219,9 @@ pub enum ChatError {
     AlreadyKeyed(u32),
     /// The operation is an admin's and this account is not one.
     NotAnAdmin,
+    /// SIP-47: this device is not in the named account's device list, so
+    /// the account has not registered it -- or registered a different key.
+    NotListed(PubKey),
     /// SIP-35: this exchange holds two receipts for one position from the
     /// channel's origin, and will present neither branch as the conversation.
     ///
@@ -313,6 +316,11 @@ impl std::fmt::Display for ChatError {
                  replace it — if they cannot open it, rotate to hand out a new key"
             ),
             ChatError::NotAnAdmin => write!(f, "that is an admin's to do, and you are not one"),
+            ChatError::NotListed(account) => write!(
+                f,
+                "{account} has not registered this device: the key it registered is not \
+                 this one, or the registration has not reached this exchange"
+            ),
             // Said plainly, and without deciding anything. Neither branch is
             // shown, because a client that picked one would be resolving on the
             // reader's behalf a contradiction only the exchange could have
@@ -429,6 +437,7 @@ fn is_admin(info: &ChannelInfo, who: &PubKey) -> bool {
 /// read it — the cursor it was asked from, and whether receipts were asked for.
 /// Nothing can be learned from one without [`Chat::absorb`], which holds the
 /// keys.
+#[derive(Debug)]
 pub struct Fetched {
     channel: [u8; 32],
     since: u64,
@@ -441,7 +450,45 @@ impl Fetched {
     pub fn channel(&self) -> [u8; 32] {
         self.channel
     }
+
+    /// An `Entries` reply that arrived inside a SIP-52 catch-up rather than
+    /// as the answer to a fetch: the same bytes, absorbed the same way.
+    fn carried(channel: [u8; 32], since: u64, body: Vec<u8>) -> Fetched {
+        Fetched {
+            channel,
+            since,
+            receipts: false,
+            body,
+        }
+    }
 }
+
+/// One channel of a SIP-52 catch-up, as this client got it: the keys already
+/// opened and kept, the entries still to be absorbed.
+#[derive(Debug)]
+pub struct Caught {
+    pub channel: [u8; 32],
+    /// `sqex_proto::catchup::STATUS_*`.
+    pub status: u8,
+    /// The exchange holds entries this answer did not carry.
+    pub more: bool,
+    /// The entries, to absorb into the caller's timeline. `None` when the
+    /// channel was absent or deferred.
+    pub fetched: Option<Fetched>,
+    pub keys_opened: usize,
+}
+
+/// A SIP-52 answer, after the keys in it were kept.
+#[derive(Debug)]
+pub struct CaughtUp {
+    pub now: u64,
+    /// This device's remaining one-time prekeys, as the exchange counts them.
+    pub prekeys: u16,
+    pub caught: Vec<Caught>,
+    pub unnamed: Vec<Unnamed>,
+}
+
+pub use sqex_proto::catchup::{Named, Unnamed};
 
 /// A fetch that has not been sent yet, and need not be sent from here.
 ///
@@ -2070,6 +2117,19 @@ impl Chat {
             )
             .await?;
         let got = Got::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.absorb_keys(channel, &instance, got).await
+    }
+
+    /// Open the envelopes a `Got` carries and keep what they hold. The
+    /// second half of [`collect_keys`](Self::collect_keys), on its own so a
+    /// SIP-52 catch-up -- which carries a `Got` per channel -- opens them
+    /// through exactly this and no second implementation of the prekey rules.
+    async fn absorb_keys(
+        &mut self,
+        channel: &[u8; 32],
+        instance: &[u8; 32],
+        got: Got,
+    ) -> Result<usize> {
         if got.envelopes.is_empty() {
             return Ok(0);
         }
@@ -2103,7 +2163,7 @@ impl Chat {
             };
             if !verify_envelope(
                 &self.exchange_of(channel),
-                &instance,
+                instance,
                 channel,
                 env.from_epoch,
                 &addressed,
@@ -2212,6 +2272,45 @@ impl Chat {
         Ok(Devices::decode(&body)
             .map_err(|e| ChatError::Protocol(e.to_string()))?
             .devices)
+    }
+
+    /// SIP-47 §Pairing, step 3: a device that was registered by a sibling
+    /// and holds no credential finds itself in `account`'s device list, with
+    /// the credential the sibling presented (SIP-32), and only then treats
+    /// the account as its own. It keeps the credential -- SIP-42's `Hello`
+    /// needs it -- publishes prekeys under its own key so it can be sealed
+    /// to, and collects whatever its siblings already sealed.
+    ///
+    /// The list is public and the credential names both keys in the clear;
+    /// nothing here is taken on the exchange's word. The credential is
+    /// verified under `account` for this device before anything is written.
+    pub async fn claim_listed(&mut self, account: &PubKey) -> Result<Credential> {
+        let body = self
+            .post("/device/list", ListDevices { account: *account }.encode())
+            .await?;
+        let listed = Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let mine = listed
+            .devices
+            .iter()
+            .find(|d| d.device == self.device)
+            .ok_or(ChatError::NotListed(*account))?;
+        let credential = mine.credential.clone().ok_or_else(|| {
+            ChatError::Protocol("the registration carries no credential (SIP-32)".into())
+        })?;
+        if credential.delegate != self.device
+            || credential.account != *account
+            || credential.verify(account, SCOPE_CHAT, listed.now).is_err()
+        {
+            return Err(ChatError::NotListed(*account));
+        }
+        self.store.set_credential(&credential.encode())?;
+        self.store.set_account(account)?;
+        self.me = *account;
+        self.top_up_prekeys().await?;
+        for m in self.mine().await? {
+            let _ = self.collect_keys(&m.channel).await;
+        }
+        Ok(credential)
     }
 
     /// Sign a credential naming `device`, so that device may act for us.
@@ -4489,6 +4588,84 @@ impl Chat {
     }
 
     /// Mark everything up to `seq` read, so the other side's client can say so.
+    /// SIP-52: everything that moved in the named channels, in one round
+    /// trip -- the entries since each cursor and the envelopes waiting for
+    /// this device there, plus the channels the account is in that were not
+    /// named and this device's prekey count.
+    ///
+    /// Envelopes are opened here, on the path `collect_keys` uses, before
+    /// anything is returned; entries come back as [`Fetched`] for the caller
+    /// to absorb into its timelines exactly as a poll's answer is. The store
+    /// therefore sees the same rows whichever route fed it.
+    ///
+    /// `Err(ChatError::NoChatHere(_))` is an exchange from before SIP-52; a
+    /// caller falls back to polling, which is what it did.
+    pub async fn catchup(&mut self, named: &[Named], budget: u32) -> Result<CaughtUp> {
+        use sqex_proto::catchup::{Catchup, STATUS_OK};
+        let body = self
+            .post(
+                "/channel/catchup",
+                Catchup {
+                    budget,
+                    named: named.to_vec(),
+                }
+                .encode(),
+            )
+            .await?;
+        let answer = sqex_proto::catchup::CaughtUp::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let mut caught = Vec::with_capacity(answer.caught.len());
+        for (c, asked) in answer.caught.into_iter().zip(named) {
+            let mut keys_opened = 0;
+            let mut fetched = None;
+            if c.status == STATUS_OK {
+                if !c.got.is_empty() {
+                    let got =
+                        Got::decode(&c.got).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                    if !got.envelopes.is_empty() {
+                        // The incarnation, for verifying who published each
+                        // envelope: one round trip, only for a channel that
+                        // actually handed keys over.
+                        let instance = self.info(&c.channel).await?.instance;
+                        keys_opened = self.absorb_keys(&c.channel, &instance, got).await?;
+                    }
+                }
+                if !c.fetched.is_empty() {
+                    fetched = Some(Fetched::carried(c.channel, asked.since, c.fetched));
+                }
+            }
+            caught.push(Caught {
+                channel: c.channel,
+                status: c.status,
+                more: c.more,
+                fetched,
+                keys_opened,
+            });
+        }
+        Ok(CaughtUp {
+            now: answer.now,
+            prekeys: answer.prekeys,
+            caught,
+            unnamed: answer.unnamed,
+        })
+    }
+
+    /// What this client would name in a SIP-52 catch-up: every channel the
+    /// store holds, with where it got to in each.
+    pub fn named_for_catchup(&self) -> Result<Vec<Named>> {
+        let mut named = Vec::new();
+        for c in self.store.channels()? {
+            let (since, _, _) = self.store.cursor(&c.channel)?;
+            let since_epoch = self.store.highest_epoch(&c.channel)?;
+            named.push(Named {
+                channel: c.channel,
+                since,
+                since_epoch,
+            });
+        }
+        Ok(named)
+    }
+
     pub async fn mark_read(&mut self, channel: &[u8; 32], seq: u64) -> Result<()> {
         use sqex_proto::channel::Cursor;
         let body = self

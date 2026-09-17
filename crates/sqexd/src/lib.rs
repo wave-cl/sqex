@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod attest;
 pub mod beacon;
+pub mod catchup;
 pub mod challenge;
 pub mod channel;
 pub mod config;

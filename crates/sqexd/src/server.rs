@@ -1177,6 +1177,9 @@ async fn handle_stream(
 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // Which route, at debug: the counter says how many, and a client
+    // measuring what a session costs needs to know what they were.
+    tracing::debug!(%method, %path, "request");
 
     // Read the request body (bounded), if any.
     // SIP-43: a chunk carried from a replica arrives on the peering route.
@@ -2922,6 +2925,27 @@ async fn route(
             _ => peering_refused(),
         },
 
+        // SIP-52: what a device that has been away needs, in one answer
+        // composed from the routes around it. See `crate::catchup`.
+        ("POST", "/channel/catchup") => {
+            match (account, device, sqex_proto::catchup::Catchup::decode(body)) {
+                (None, _, _) | (_, None, _) => no_identity("catching up"),
+                (_, _, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some(me), Some(mine), Ok(req)) => (
+                    200,
+                    "application/octet-stream",
+                    crate::catchup::answer(
+                        &server.channels,
+                        &server.prekeys,
+                        &me,
+                        &mine,
+                        &req,
+                        now_unix(),
+                    )
+                    .encode(),
+                ),
+            }
+        }
         ("POST", "/channel/fetch") => match (account, ChannelFetch::decode(body)) {
             (None, _) => no_identity("fetching entries"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),

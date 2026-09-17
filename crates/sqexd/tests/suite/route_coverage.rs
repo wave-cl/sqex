@@ -378,6 +378,11 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/channel/redact", Chat("/redact"), ChannelAdmin),
     ("POST", "/channel/signal", Chat("Chat::typing"), Member),
     ("POST", "/channel/fetch", Chat("Chat::poll"), Member),
+    // SIP-52: one round trip for a device that has been away, composed from
+    // fetch, key/get, mine and prekey/count under their own rules. Any
+    // identity may ask; each named channel is answered under `fetch`'s own
+    // membership check, and one not the caller's reads as absent.
+    ("POST", "/channel/catchup", Chat("Chat::catchup"), Identity),
     // Not in the dispatch match: an event stream has no body to return, so
     // it is answered in `handle_stream` before `route` is reached. `served()`
     // scans for that shape too, or this route would be invisible here — which

@@ -172,7 +172,20 @@ pub async fn lookup(domain: &str) -> Result<Published> {
 /// lookup ends at "not published" without the filter ever running, and the test
 /// passes whether the filter exists or not.
 pub async fn lookup_txt(name: &str) -> Result<Vec<String>> {
-    lookup_txt_falling_back(resolver().await?, public_resolver, name).await
+    // A system with no resolver configuration at all -- Android has no
+    // `/etc/resolv.conf`, and nothing else hickory knows to read -- cannot
+    // build the first resolver, let alone get an answer out of it. That is
+    // the same situation as a system resolver that cannot do the lookup,
+    // and takes the same road: the public resolvers, as transport only, with
+    // every answer still validated here.
+    let system = match resolver().await {
+        Ok(system) => system,
+        Err(why) => {
+            tracing::info!(name, %why, "no system resolver; asking public resolvers");
+            return lookup_txt_via(public_resolver().await?, name).await;
+        }
+    };
+    lookup_txt_falling_back(system, public_resolver, name).await
 }
 
 /// [`lookup_txt`] with the two resolvers as arguments: the system's, and a
