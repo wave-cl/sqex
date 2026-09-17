@@ -1001,6 +1001,28 @@ impl Store {
         follow_handover(&self.db, from, to)
     }
 
+    /// SIP-62: the position just before the first `seq` missing from what
+    /// this store holds of a channel -- an entry the exchange did not serve
+    /// when the cursor passed it (a copy that had refused it, since
+    /// filled), which a fetch from the cursor would never see again.
+    pub fn lowest_gap(&self, channel: &[u8; 32]) -> Result<Option<u64>> {
+        let scope = self.scope()?;
+        self.db
+            .query_row(
+                "SELECT m.seq FROM message m
+                 WHERE m.exchange = ?1 AND m.channel = ?2
+                   AND m.seq < (SELECT MAX(seq) FROM message WHERE exchange = ?1 AND channel = ?2)
+                   AND NOT EXISTS (SELECT 1 FROM message f
+                                   WHERE f.exchange = ?1 AND f.channel = ?2 AND f.seq = m.seq + 1)
+                 ORDER BY m.seq LIMIT 1",
+                params![scope, &channel[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|o| o.map(|s| s as u64))
+            .map_err(storage("find a gap"))
+    }
+
     /// SIP-59: re-file what this store holds under `from` -- the home it
     /// is leaving -- under `to`, and claim `to` as its exchange. Chains
     /// stay filed by origin. See [`move_home`].

@@ -733,6 +733,8 @@ pub struct Chat {
     /// SIP-60: where people this client located live -- their home's key
     /// and domain -- for opening a direct message where it belongs.
     located: HashMap<PubKey, (PubKey, String)>,
+    /// SIP-62: channels whose store gap was asked for this run.
+    gap_asked: std::collections::HashSet<[u8; 32]>,
     /// SIP-57: the timer this client puts on what it sends, per channel;
     /// seconds, none where unset.
     timers: HashMap<[u8; 32], u32>,
@@ -828,6 +830,7 @@ impl Chat {
             told_about: HashMap::new(),
             homes: HashMap::new(),
             located: HashMap::new(),
+            gap_asked: std::collections::HashSet::new(),
             former: HashMap::new(),
             timers: HashMap::new(),
             bound_in: HashMap::new(),
@@ -4899,7 +4902,16 @@ impl Chat {
 
     /// The asking half of [`poll`](Self::poll), on this client's own borrow.
     async fn ask(&mut self, channel: &[u8; 32], wait_secs: u16) -> Result<Fetched> {
-        let (since, _, _) = self.store.cursor(channel)?;
+        let (mut since, _, _) = self.store.cursor(channel)?;
+        // SIP-62: a hole in what this store holds is asked for again, once
+        // per channel per run -- an entry a copy refused and later took
+        // sits below the cursor, where a fetch from the cursor never looks.
+        if !self.gap_asked.contains(channel)
+            && let Ok(Some(gap)) = self.store.lowest_gap(channel)
+        {
+            self.gap_asked.insert(*channel);
+            since = since.min(gap);
+        }
         // A long poll is *meant* to sit there: `wait_secs` is how long the
         // exchange may hold the request open with nothing to say. Judging it
         // by the ordinary deadline would call a working long poll a dead

@@ -153,7 +153,30 @@ async fn a_client_hands_its_account_over_and_the_conversation_keeps_its_channel(
     // A restart: the store says which account this device is, the new
     // key it kept signs a fresh Move (the exchange's record was re-keyed
     // with its signature cleared), and the conversation is where it was.
+    // And a hole: one message row taken out of the store, as a copy that
+    // refused an entry and later took it leaves one below the cursor. The
+    // restarted client asks for the gap, once, and the conversation is
+    // whole again.
+    let hole_seq = ta
+        .messages()
+        .find(|m| m.post.body_text() == Some("hi alice"))
+        .map(|m| m.seq)
+        .unwrap();
     drop(alice_at);
+    {
+        let db = rusqlite::Connection::open(&alice_store).unwrap();
+        let n = db
+            .execute("DELETE FROM message WHERE seq = ?1", [hole_seq as i64])
+            .unwrap();
+        assert_eq!(n, 1, "the hole was not made");
+        // A real hole was never seen at all; the replay guard (SIP-17) must
+        // not know it, or the refetch is a replay by definition.
+        db.execute(
+            "DELETE FROM seen WHERE channel = ?1 AND device = ?2",
+            rusqlite::params![&dm[..], bob.as_bytes()],
+        )
+        .unwrap();
+    }
     let (seed, _) = identity(1);
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(&alice_store)).unwrap();
@@ -167,6 +190,7 @@ async fn a_client_hands_its_account_over_and_the_conversation_keeps_its_channel(
     assert_ne!(again.account_home(&new).await.unwrap().since, 0);
     assert_eq!(again.dm_with(&bob), dm);
     let mut t = again.history(&dm, &[new, bob]).unwrap();
+    assert_eq!(said(&t).len(), 3, "the hole is there before the fetch");
     assert!(
         until(
             &mut again,
