@@ -61,6 +61,9 @@ pub const TYPE_FORWARD: u8 = 0x06;
 /// SIP-43: what the constitution's digest covers and a replica cannot
 /// recover from it -- the channel's visibility, name and topic.
 pub const TYPE_SHAPE: u8 = 0x07;
+/// SIP-43: a member's signed membership request -- a join or a leave --
+/// carried from a replica to the origin as the member sent it.
+pub const TYPE_FORWARD_ACTION: u8 = 0x09;
 /// SIP-43: where a device stands at the origin -- its SIP-31 chain and its
 /// SIP-17 counter -- which a replica does not track and a device with a
 /// fresh store cannot otherwise learn.
@@ -917,5 +920,66 @@ mod standing_tests {
         };
         assert_eq!(Standing::decode(&s.encode()).unwrap(), s);
         assert!(Standing::decode(&[0; 47]).is_err());
+    }
+}
+
+/// SIP-43: a signed request a member made at a replica, carried to the
+/// origin: which route it was for and the bytes as sent. Only routes the
+/// origin lists are honoured -- a join or a leave, each carrying the
+/// member's own SIP-31 action -- and the origin resolves `device` to an
+/// account from its own registry, as for a forwarded post.
+///
+/// `| type = 0x09 | device[32] | path_len: u8 | path | body |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardAction {
+    pub device: PubKey,
+    pub path: String,
+    pub body: Vec<u8>,
+}
+
+impl ForwardAction {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(34 + self.path.len() + self.body.len());
+        out.push(TYPE_FORWARD_ACTION);
+        out.extend_from_slice(self.device.as_bytes());
+        out.push(self.path.len().min(255) as u8);
+        out.extend_from_slice(&self.path.as_bytes()[..self.path.len().min(255)]);
+        out.extend_from_slice(&self.body);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ForwardAction> {
+        let short = || Error::Malformed("forwarded action cut short".into());
+        if b.first() != Some(&TYPE_FORWARD_ACTION) {
+            return Err(Error::Malformed("not a forwarded action".into()));
+        }
+        let device = PubKey::new(b.get(1..33).ok_or_else(short)?.try_into().unwrap());
+        let len = *b.get(33).ok_or_else(short)? as usize;
+        let path = b.get(34..34 + len).ok_or_else(short)?;
+        let path = std::str::from_utf8(path)
+            .map_err(|_| Error::Malformed("path is not UTF-8".into()))?
+            .to_string();
+        Ok(ForwardAction {
+            device,
+            path,
+            body: b[34 + len..].to_vec(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod forward_action_tests {
+    use super::*;
+
+    #[test]
+    fn a_forwarded_action_round_trips() {
+        let f = ForwardAction {
+            device: PubKey::new([1; 32]),
+            path: "/channel/join".into(),
+            body: vec![9, 8, 7],
+        };
+        assert_eq!(ForwardAction::decode(&f.encode()).unwrap(), f);
+        assert!(ForwardAction::decode(&[TYPE_FORWARD_ACTION; 20]).is_err());
+        assert!(ForwardAction::decode(&[0]).is_err());
     }
 }

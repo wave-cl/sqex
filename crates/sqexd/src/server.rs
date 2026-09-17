@@ -61,8 +61,8 @@ use sqex_proto::mailbox::{
 use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
-    Forward as PeerForward, Forwarded, Hello as PeerHello, Hi, PEER_VERSION, Pull as PeerPull,
-    PullBlob, PullEnvelopes, PullRecord, PullShape, PullStanding,
+    Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi, PEER_VERSION,
+    Pull as PeerPull, PullBlob, PullEnvelopes, PullRecord, PullShape, PullStanding,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -1972,6 +1972,11 @@ async fn route(
             (None, _) => no_identity("joining a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
+                // SIP-43: a join at a replica is the member's own signed act,
+                // carried to the origin as a post is.
+                if let Some(answer) = forward_action(server, &dev, &req.channel, path, body).await {
+                    return answer;
+                }
                 match server.channels.join(&me, &dev, &req.channel, &req.action) {
                     Ok(()) => {
                         server.tell(
@@ -1996,6 +2001,9 @@ async fn route(
             (None, _) => no_identity("leaving a channel"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
+                if let Some(answer) = forward_action(server, &dev, &req.channel, path, body).await {
+                    return answer;
+                }
                 match server.channels.leave(&me, &dev, &req.channel, &req.action) {
                     Ok(()) => {
                         server.tell_including(
@@ -2569,6 +2577,84 @@ async fn route(
                     return peering_refused();
                 }
                 let (status, body) = post_here(server, &account, &req.device, &req.post);
+                (
+                    200,
+                    "application/octet-stream",
+                    Forwarded { status, body }.encode(),
+                )
+            }
+            // A join or a leave, the member's own signed act. Routed here by
+            // hand to the two handlers a member may reach this way, and to
+            // nothing else: this is not a proxy.
+            (Some(who), Err(_)) if body.first() == Some(&sqex_proto::peer::TYPE_FORWARD_ACTION) => {
+                let Ok(req) = ForwardAction::decode(body) else {
+                    return peering_refused();
+                };
+                let account = server.devices.account_for(&req.device);
+                let (status, body) = match req.path.as_str() {
+                    "/channel/join" => match ByChannelSigned::decode(&req.body, CH_JOIN) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            match server
+                                .channels
+                                .join(&account, &req.device, &r.channel, &r.action)
+                            {
+                                Ok(()) => {
+                                    server.tell(
+                                        &r.channel,
+                                        EventKind::Membership {
+                                            channel: r.channel,
+                                            account,
+                                            what: MEMBER_JOINED,
+                                        },
+                                    );
+                                    (200, ChannelAck { now: now_unix() }.encode())
+                                }
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
+                        }
+                        _ => return peering_refused(),
+                    },
+                    "/channel/leave" => match ByChannelSigned::decode(&req.body, CH_LEAVE) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            match server.channels.leave(
+                                &account,
+                                &req.device,
+                                &r.channel,
+                                &r.action,
+                            ) {
+                                Ok(()) => {
+                                    server.tell_including(
+                                        &r.channel,
+                                        &account,
+                                        EventKind::Membership {
+                                            channel: r.channel,
+                                            account,
+                                            what: MEMBER_LEFT,
+                                        },
+                                    );
+                                    (200, ChannelAck { now: now_unix() }.encode())
+                                }
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
+                        }
+                        _ => return peering_refused(),
+                    },
+                    _ => return peering_refused(),
+                };
                 (
                     200,
                     "application/octet-stream",
@@ -3177,6 +3263,34 @@ fn open_regardless(path: &str) -> bool {
 
 fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
     refuse(e.status(), e.code(), None)
+}
+
+/// SIP-43: carry a member's signed join or leave for a channel that lives
+/// elsewhere, and answer with the origin's answer. `None` when the channel
+/// lives here, and the route goes on as it would.
+async fn forward_action(
+    server: &Server,
+    device: &PubKey,
+    channel: &[u8; 32],
+    path: &str,
+    body: &[u8],
+) -> Option<(u16, &'static str, Vec<u8>)> {
+    let origin = server.channels.origin_of(channel)?;
+    let Some(forwarder) = server.origins.get(&origin) else {
+        return Some(refuse(421, Code::Replicated, None));
+    };
+    Some(
+        match forwarder
+            .action(&server.exchange_seed, device, path, body)
+            .await
+        {
+            Ok(answer) => (answer.status, "application/octet-stream", answer.body),
+            Err(e) => {
+                tracing::warn!(origin = %origin, "forward failed: {e}");
+                refuse(503, Code::OriginAway, None)
+            }
+        },
+    )
 }
 
 /// Order a post at this exchange and say what became of it: the status and

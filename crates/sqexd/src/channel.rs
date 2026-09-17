@@ -1242,22 +1242,25 @@ impl Channels {
             params![&channel[..], caller.as_bytes(), now as i64],
         )
         .map_err(storage("insert member"))?;
-        if !already {
-            let place = self.place(&tx, channel)?;
-            write_system(
-                &tx,
-                &place,
-                channel,
-                EVENT_JOINED,
-                caller,
-                caller,
-                device,
-                &[],
-                action,
-                now,
-                self.exchange_seed.as_ref(),
-            )?;
-        }
+        // Written whether or not the caller was present already. A member
+        // the exchange seated by welcome has no signed entry saying so, and
+        // this is the one they can make; and the action carries a chain
+        // step the caller has spent, which an answer of "already here"
+        // would drop and leave their next signature a fork.
+        let place = self.place(&tx, channel)?;
+        write_system(
+            &tx,
+            &place,
+            channel,
+            EVENT_JOINED,
+            caller,
+            caller,
+            device,
+            &[],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
+        )?;
         tx.execute(
             "UPDATE channel SET empty_since = NULL WHERE id = ?1",
             params![&channel[..]],

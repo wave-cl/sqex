@@ -738,6 +738,46 @@ impl Forwarder {
         }
     }
 
+    /// Carry a member's signed join or leave to the origin, as
+    /// [`forward`](Self::forward) carries a post.
+    pub async fn action(
+        &self,
+        seed: &[u8; 32],
+        device: &PubKey,
+        path: &str,
+        body: &[u8],
+    ) -> std::result::Result<Forwarded, String> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            *slot = Some(
+                H3Client::connect(self.addr, self.key.as_bytes(), seed)
+                    .await
+                    .map_err(|e| format!("dial the origin: {e}"))?,
+            );
+        }
+        let client = slot.as_mut().expect("just filled");
+        let req = sqex_proto::peer::ForwardAction {
+            device: *device,
+            path: path.to_string(),
+            body: body.to_vec(),
+        };
+        let (code, body) = match client.post("/peer/forward", req.encode()).await {
+            Ok(a) => a,
+            Err(e) => {
+                *slot = None;
+                return Err(format!("the origin did not answer: {e}"));
+            }
+        };
+        if code != 200 {
+            return Err(format!("the origin refused the forward ({code})"));
+        }
+        let forwarded = Forwarded::decode(&body).map_err(|e| e.to_string())?;
+        if forwarded.status == 200 {
+            self.poke.notify_one();
+        }
+        Ok(forwarded)
+    }
+
     /// Ask the origin where `device` stands in `channel`, for an `info`
     /// answered here: a replica tracks no chains, and a device with a fresh
     /// store would otherwise sign from zero and be refused.

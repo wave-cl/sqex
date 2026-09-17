@@ -1797,8 +1797,77 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
-    let posted = Posted::decode(&body, req.receipts).unwrap();
     chain = resumed;
+
+    // A join at the replica is carried too: the stranger signs a `joined`
+    // under the origin, the origin writes it, the replica pulls it and
+    // derives them a member -- and from then on they post here like Alice.
+    let (stranger_seed, stranger_key) = identity(152);
+    let t = Signer::new(stranger_seed, stranger_key, origin_pub);
+    let joining = t.action_outside(
+        channel,
+        info.instance,
+        sqex_proto::channel::EVENT_JOINED,
+        &stranger_key,
+        &[],
+        0,
+        sqex_proto::entry_sig::GENESIS,
+    );
+    let (code, body) = stranger
+        .post(
+            "/channel/join",
+            sqex_proto::channel::ByChannelSigned {
+                channel,
+                action: joining,
+            }
+            .encode(sqex_proto::channel::TYPE_JOIN),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        200,
+        "a join at the replica was refused: {}",
+        common::said(&body)
+    );
+    let mut member_here = false;
+    for _ in 0..30 {
+        let (code, body) = stranger
+            .post(
+                "/channel/mine",
+                sqex_proto::channel::Mine { offset: 0 }.encode(),
+            )
+            .await
+            .unwrap();
+        if code == 200
+            && sqex_proto::channel::Mines::decode(&body)
+                .unwrap()
+                .channels
+                .iter()
+                .any(|m| m.channel == channel)
+        {
+            member_here = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(member_here, "the replica never derived the joiner a member");
+    let joined_info = t.info(&mut stranger, channel).await;
+    let mut t_chain = Chain {
+        seq: joined_info.my_chain_seq,
+        head: joined_info.my_chain_head,
+    };
+    let req = t.post_chained(
+        &mut t_chain,
+        channel,
+        info.instance,
+        0,
+        joined_info.my_msg_seq + 1,
+        b"joined and posted from the copy".to_vec(),
+    );
+    let (code, body) = stranger.post("/channel/post", req.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let posted = Posted::decode(&body, req.receipts).unwrap();
 
     // Control: signed under the replica's own key, the origin refuses it as
     // forged -- the replica did not quietly re-sign or store it.
@@ -1825,13 +1894,16 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
     let after = s.info(&mut a, channel).await.last;
     assert_eq!(after, posted.seq, "something was stored anyway");
 
-    // Control: a stranger's post is refused by the origin as a stranger's,
-    // through the replica, exactly as it would be at the origin.
-    let (stranger_seed, stranger_key) = identity(152);
-    let t = Signer::new(stranger_seed, stranger_key, origin_pub);
-    let mut t_chain = Chain::default();
-    let req = t.post_chained(&mut t_chain, channel, info.instance, 0, 0, b"hi".to_vec());
-    let (code, _) = stranger.post("/channel/post", req.encode()).await.unwrap();
+    // Control: somebody who never joined is refused by the origin as a
+    // stranger, through the replica, exactly as at the origin.
+    let (nobody_seed, nobody_key) = identity(153);
+    let mut nobody = Client::connect_as(replica_addr, &replica_pub, &nobody_seed)
+        .await
+        .unwrap();
+    let u = Signer::new(nobody_seed, nobody_key, origin_pub);
+    let mut u_chain = Chain::default();
+    let req = u.post_chained(&mut u_chain, channel, info.instance, 0, 0, b"hi".to_vec());
+    let (code, _) = nobody.post("/channel/post", req.encode()).await.unwrap();
     assert_ne!(code, 200, "a stranger posted through the replica");
 
     // Control: with the origin gone, the member is told so and nothing is
