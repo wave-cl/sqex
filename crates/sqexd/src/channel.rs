@@ -39,13 +39,14 @@ use sqex_proto::blob_store::{
 };
 use sqex_proto::channel::{
     ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
-    EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED, EVENT_REHOMED, EVENT_REMOVED,
-    EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_SUCCEEDED,
-    EVENT_UNREPLICATE, Entries, Entry, Invitee, KIND_MEMBER, KIND_SYSTEM, Listing, MAX_BATCH,
-    MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY, MAX_ENTRIES,
-    MAX_MEMBERS, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN,
-    MIN_RETENTION, Mark, Marks, Member, Membership, Mines, Post, Posted, Public, Receipted, Retain,
-    Role, SIGNAL_TTL, Signalled, System, Tip, Visibility, constitution, direct_message_id,
+    EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_MUTED, EVENT_PROMOTED, EVENT_REHOMED,
+    EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_SUCCEEDED,
+    EVENT_UNMUTED, EVENT_UNREPLICATE, Entries, Entry, Invitee, KIND_MEMBER, KIND_SYSTEM, Listing,
+    MAX_BATCH, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY,
+    MAX_ENTRIES, MAX_MEMBERS, MAX_MINE, MAX_NAME, MAX_REPORTS, MAX_RETENTION, MAX_SIGNALS,
+    MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark, Marks, Member, Membership, Mines, Post, Posted,
+    Public, REPORT_TTL, Receipted, Reported, Reports, Retain, Role, SIGNAL_TTL, Signalled, System,
+    Tip, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded, verify_envelope,
@@ -152,6 +153,10 @@ pub enum ChannelError {
     /// SIP-53: the named exchange holds no `0x0b` for the channel, or a
     /// replica was asked to make some other exchange the origin.
     NotAReplica,
+    /// SIP-56: muted in this channel -- reads, may not write.
+    Muted,
+    /// SIP-56: over a rate limit; how many seconds to wait.
+    RateLimited(u64),
     Storage,
 }
 
@@ -192,6 +197,8 @@ impl ChannelError {
             ChannelError::NotHeld => "not_held",
             ChannelError::OriginReachable(_) => "origin_reachable",
             ChannelError::NotAReplica => "not_a_replica",
+            ChannelError::Muted => "muted",
+            ChannelError::RateLimited(_) => "rate_limited",
             ChannelError::Storage => "storage",
         }
     }
@@ -235,7 +242,21 @@ impl ChannelError {
             ChannelError::NotHeld => Code::NotHeld,
             ChannelError::OriginReachable(_) => Code::OriginReachable,
             ChannelError::NotAReplica => Code::NotAReplica,
+            ChannelError::Muted => Code::Muted,
+            ChannelError::RateLimited(_) => Code::RateLimited,
             ChannelError::Storage => Code::Storage,
+        }
+    }
+
+    /// What the refusal's detail says, where a number is the point of it:
+    /// how long to wait, which generation is held, how long ago the origin
+    /// answered.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            ChannelError::RateLimited(secs) => Some(secs.to_string()),
+            ChannelError::StaleGeneration(g) => Some(g.to_string()),
+            ChannelError::OriginReachable(a) => Some(a.to_string()),
+            _ => None,
         }
     }
 
@@ -247,7 +268,11 @@ impl ChannelError {
             | ChannelError::NoSuchUpload
             | ChannelError::NoSuchBlob
             | ChannelError::NoSuchEntry => 404,
-            ChannelError::NotAMember | ChannelError::NotAnAdmin | ChannelError::NotPublic => 403,
+            ChannelError::NotAMember
+            | ChannelError::NotAnAdmin
+            | ChannelError::NotPublic
+            | ChannelError::Muted => 403,
+            ChannelError::RateLimited(_) => 429,
             ChannelError::Full
             | ChannelError::TooManyChannels
             | ChannelError::TooManyUploads
@@ -591,6 +616,17 @@ CREATE TABLE IF NOT EXISTS stranded (
     posted   INTEGER NOT NULL,
     PRIMARY KEY (channel, seq)
 );
+-- SIP-56: reports to a channel's admins. Not entries: not in the log, not
+-- replicated, forgotten after REPORT_TTL.
+CREATE TABLE IF NOT EXISTS report (
+    id       INTEGER PRIMARY KEY,
+    channel  BLOB    NOT NULL,
+    reporter BLOB    NOT NULL,
+    target   INTEGER NOT NULL,
+    reason   INTEGER NOT NULL,
+    at       INTEGER NOT NULL,
+    note     TEXT    NOT NULL
+);
 CREATE TABLE IF NOT EXISTS high_water (
     channel BLOB    NOT NULL,
     device  BLOB    NOT NULL,
@@ -727,6 +763,8 @@ impl Channels {
             "origin_domain",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        // SIP-56: a member who reads and may not write.
+        add_column(&db, "member", "muted", "INTEGER NOT NULL DEFAULT 0")?;
         // SIP-35's `replicated` shipped in 0.31.0 without `derivable`, which
         // was added to the `CREATE TABLE` body in 0.32.0 — where it did nothing
         // for the exchanges that already had the table, because `CREATE TABLE
@@ -843,6 +881,19 @@ impl Channels {
 /// SIP-54: a channel's numbered signal log -- the next number, and the
 /// signals kept.
 type SignalLog = (u64, std::collections::VecDeque<Logged>);
+
+/// SIP-56: whether a member is muted in a channel.
+fn is_muted(db: &Connection, channel: &[u8; 32], who: &PubKey) -> bool {
+    db.query_row(
+        "SELECT muted FROM member WHERE channel = ?1 AND account = ?2",
+        params![&channel[..], who.as_bytes()],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .is_some_and(|m| m != 0)
+}
 
 /// The role of somebody who is *present*: a member who may read and post.
 fn role_of(db: &Connection, channel: &[u8; 32], who: &PubKey) -> Option<Role> {
@@ -1458,6 +1509,10 @@ impl Channels {
             let (visibility, epoch, retention, next) = channel_row(&tx, &req.channel)?;
             if role_of(&tx, &req.channel, account).is_none() {
                 return Err(Self::unreadable(&tx, &req.channel));
+            }
+            // SIP-56: muted reads and may not write.
+            if is_muted(&tx, &req.channel, account) {
+                return Err(ChannelError::Muted);
             }
             // Epoch 0 means unsealed. That is every entry in a public channel
             // and no member entry in a private one, which is why a private
@@ -2478,6 +2533,180 @@ impl Channels {
         tx.commit().map_err(storage("commit invite"))?;
         self.wake(channel);
         Ok(())
+    }
+
+    /// SIP-56: mute or unmute a member. An admin's signed act, an entry
+    /// like a removal; the member reads and may not write from here.
+    pub fn mute(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        channel: &[u8; 32],
+        account: &PubKey,
+        action: &Action,
+        on: bool,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin mute"))?;
+        Channels::read_only(&tx, channel)?;
+        visibility_of(&tx, channel)?;
+        if !is_admin(&tx, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        match role_of(&tx, channel, account) {
+            None => return Err(ChannelError::NotAMember),
+            // An admin is demoted first, as for a removal.
+            Some(Role::Admin) if on => return Err(ChannelError::LastAdmin),
+            Some(_) => {}
+        }
+        let place = self.place(&tx, channel)?;
+        write_system(
+            &tx,
+            &place,
+            channel,
+            if on { EVENT_MUTED } else { EVENT_UNMUTED },
+            account,
+            caller,
+            device,
+            &[],
+            action,
+            now,
+            self.exchange_seed.as_ref(),
+        )?;
+        tx.execute(
+            "UPDATE member SET muted = ?3 WHERE channel = ?1 AND account = ?2",
+            params![&channel[..], account.as_bytes(), i64::from(on)],
+        )
+        .map_err(storage("set muted"))?;
+        tx.commit().map_err(storage("commit mute"))?;
+        self.wake(channel);
+        Ok(())
+    }
+
+    /// SIP-56: whether `who` is muted in `channel`, for a copy refusing
+    /// before it forwards.
+    pub fn muted(&self, channel: &[u8; 32], who: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        is_muted(&db, channel, who)
+    }
+
+    /// SIP-56: a present member reports an entry to the admins. Kept, not
+    /// logged; the oldest goes past `MAX_REPORTS`.
+    pub fn report(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        target: u64,
+        reason: u8,
+        note: &str,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin report"))?;
+        visibility_of(&tx, channel)?;
+        if role_of(&tx, channel, caller).is_none() {
+            return Err(Self::unreadable(&tx, channel));
+        }
+        tx.execute(
+            "DELETE FROM report WHERE channel = ?1 AND at < ?2",
+            params![&channel[..], now.saturating_sub(REPORT_TTL) as i64],
+        )
+        .map_err(storage("expire reports"))?;
+        tx.execute(
+            "INSERT INTO report (channel, reporter, target, reason, at, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &channel[..],
+                caller.as_bytes(),
+                target as i64,
+                reason as i64,
+                now as i64,
+                note
+            ],
+        )
+        .map_err(storage("insert report"))?;
+        tx.execute(
+            "DELETE FROM report WHERE channel = ?1 AND id NOT IN
+             (SELECT id FROM report WHERE channel = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![&channel[..], MAX_REPORTS as i64],
+        )
+        .map_err(storage("cap reports"))?;
+        tx.commit().map_err(storage("commit report"))?;
+        Ok(())
+    }
+
+    /// SIP-56: the channel's reports, to an admin.
+    pub fn reports(&self, caller: &PubKey, channel: &[u8; 32]) -> Result<Reports, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if !is_admin(&db, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        let now = now_unix();
+        let mut stmt = db
+            .prepare(
+                "SELECT id, reporter, target, reason, at, note FROM report
+                 WHERE channel = ?1 AND at >= ?2 ORDER BY id",
+            )
+            .map_err(storage("prepare reports"))?;
+        let reports = stmt
+            .query_map(
+                params![&channel[..], now.saturating_sub(REPORT_TTL) as i64],
+                |r| {
+                    Ok(Reported {
+                        id: r.get::<_, i64>(0)? as u64,
+                        reporter: PubKey::new(
+                            r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32]),
+                        ),
+                        target: r.get::<_, i64>(2)? as u64,
+                        reason: r.get::<_, i64>(3)? as u8,
+                        at: r.get::<_, i64>(4)? as u64,
+                        note: r.get(5)?,
+                    })
+                },
+            )
+            .map_err(storage("query reports"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage("read reports"))?;
+        Ok(Reports { now, reports })
+    }
+
+    /// SIP-56: an admin dismisses a report.
+    pub fn dismiss(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        id: u64,
+    ) -> Result<(), ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if !is_admin(&db, channel, caller) {
+            return Err(ChannelError::NotAnAdmin);
+        }
+        db.execute(
+            "DELETE FROM report WHERE channel = ?1 AND id = ?2",
+            params![&channel[..], id as i64],
+        )
+        .map_err(storage("dismiss report"))?;
+        Ok(())
+    }
+
+    /// The channel's admins, present or not, for telling them something.
+    pub fn admins_of(&self, channel: &[u8; 32]) -> Vec<PubKey> {
+        let db = self.db.lock().unwrap();
+        db.prepare("SELECT account FROM member WHERE channel = ?1 AND role = 1")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![&channel[..]], |r| r.get::<_, Vec<u8>>(0))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(|r| r.ok())
+                            .filter_map(|b| b.try_into().ok().map(PubKey::new))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
     }
 
     /// SIP-35: serve a peer the entries of a channel it is authorised to hold.
@@ -4562,6 +4791,10 @@ impl Channels {
             if role_of(&tx, &req.channel, uploader).is_none() {
                 return Err(Self::unreadable(&tx, &req.channel));
             }
+            // SIP-56: muted reads and may not write.
+            if is_muted(&tx, &req.channel, uploader) {
+                return Err(ChannelError::Muted);
+            }
         }
         expire_uploads(&tx, now)?;
 
@@ -5312,14 +5545,35 @@ fn derive_membership(
             )
             .map_err(storage("derive creator"))?;
         }
-        EVENT_ADDED | EVENT_JOINED => present(Role::Member)?,
+        EVENT_ADDED | EVENT_JOINED => {
+            present(Role::Member)?;
+            // SIP-56: a mute ends with leaving; a member back is not muted.
+            db.execute(
+                "UPDATE member SET muted = 0 WHERE channel = ?1 AND account = ?2",
+                params![&channel[..], sys.subject.as_bytes()],
+            )
+            .map_err(storage("derive unmute"))?;
+        }
+        // SIP-56: derived as membership is, so a copy refuses a muted
+        // member's writes itself.
+        EVENT_MUTED | EVENT_UNMUTED => {
+            db.execute(
+                "UPDATE member SET muted = ?3 WHERE channel = ?1 AND account = ?2",
+                params![
+                    &channel[..],
+                    sys.subject.as_bytes(),
+                    i64::from(sys.event == EVENT_MUTED)
+                ],
+            )
+            .map_err(storage("derive mute"))?;
+        }
         EVENT_PROMOTED => present(Role::Admin)?,
         EVENT_DEMOTED => present(Role::Member)?,
         // Presence and authority are different things here exactly as they are
         // at an origin: leaving a public channel does not surrender a role.
         EVENT_LEFT | EVENT_REMOVED => {
             db.execute(
-                "UPDATE member SET present = 0 WHERE channel = ?1 AND account = ?2",
+                "UPDATE member SET present = 0, muted = 0 WHERE channel = ?1 AND account = ?2",
                 params![&channel[..], sys.subject.as_bytes()],
             )
             .map_err(storage("derive departure"))?;
@@ -6066,6 +6320,10 @@ impl Channels {
             visibility_of(&db, channel)?;
             if role_of(&db, channel, caller).is_none() {
                 return Err(Self::unreadable(&db, channel));
+            }
+            // SIP-56: muted reads and may not write.
+            if is_muted(&db, channel, caller) {
+                return Err(ChannelError::Muted);
             }
             let mut stmt = db
                 .prepare("SELECT account FROM member WHERE channel = ?1 AND present = 1")

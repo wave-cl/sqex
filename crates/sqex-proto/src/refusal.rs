@@ -148,6 +148,11 @@ pub enum Code {
     /// at a replica, not this exchange.
     NotAReplica,
 
+    // SIP-56 abuse controls. `RateLimited` (18) is reused, with the detail
+    // now saying how many seconds to wait.
+    /// Muted in this channel: reads, may not write.
+    Muted,
+
     // SIP-5 mailbox.
     RecipientFull,
     RecipientQuota,
@@ -222,6 +227,7 @@ impl Code {
             Code::NotHeld => 65,
             Code::OriginReachable => 66,
             Code::NotAReplica => 67,
+            Code::Muted => 68,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -308,6 +314,7 @@ impl Code {
             65 => Code::NotHeld,
             66 => Code::OriginReachable,
             67 => Code::NotAReplica,
+            68 => Code::Muted,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -419,6 +426,7 @@ impl Code {
             Code::NotHeld => "not_held",
             Code::OriginReachable => "origin_reachable",
             Code::NotAReplica => "not_a_replica",
+            Code::Muted => "muted",
 
             Code::Unknown(_) => "unknown",
         }
@@ -494,6 +502,7 @@ impl Code {
         Code::NotHeld,
         Code::OriginReachable,
         Code::NotAReplica,
+        Code::Muted,
     ];
 }
 

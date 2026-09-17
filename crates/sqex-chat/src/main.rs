@@ -1355,6 +1355,11 @@ impl Dirty {
             // silent exchange, and that is read where the stream is drained.
             // An admission request needs an admin tool this client is not.
             ChatEvent::Admission | ChatEvent::Heartbeat => {}
+            // SIP-56: a report awaits this admin. Marked like a channel
+            // change, so the reader looks; `/reports` shows it.
+            ChatEvent::Reported { channel } => {
+                self.channels.insert(channel);
+            }
             // SIP-39: a cross-exchange call is ringing a device of this account,
             // but this is a terminal chat client with no media and no way to
             // answer one — and the event names a bridge, not a channel, so there
@@ -2263,6 +2268,61 @@ async fn handle_key(
                     },
                     Err(e) => Err(e),
                 },
+                Command::Mute(key, on) => match resolve_peer(chat, &key).await {
+                    Ok(who) => chat.mute(&channel, &who, on).await.map(|()| {
+                        Some(if on {
+                            format!("muted {} — they read, and may not write", short(&who))
+                        } else {
+                            format!("unmuted {}", short(&who))
+                        })
+                    }),
+                    Err(e) => Err(e),
+                },
+                Command::Report(seq, reason, note) => {
+                    chat.report(&channel, seq, reason, &note).await.map(|()| {
+                        Some(format!(
+                            "reported {seq} to the admins. They see who reported it; nobody \
+                             else does"
+                        ))
+                    })
+                }
+                Command::Reports => chat.reports(&channel).await.map(|rs| {
+                    if rs.is_empty() {
+                        return Some("no reports".into());
+                    }
+                    let lines: Vec<String> = rs
+                        .iter()
+                        .map(|r| {
+                            let why = match r.reason {
+                                1 => "spam",
+                                2 => "harassment",
+                                3 => "illegal",
+                                _ => "other",
+                            };
+                            format!(
+                                "#{} {} reported {} as {}{}",
+                                r.id,
+                                short(&r.reporter),
+                                if r.target == 0 {
+                                    "the channel".to_string()
+                                } else {
+                                    format!("entry {}", r.target)
+                                },
+                                why,
+                                if r.note.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(": {}", r.note)
+                                }
+                            )
+                        })
+                        .collect();
+                    Some(lines.join("\n"))
+                }),
+                Command::Dismiss(id) => chat
+                    .dismiss(&channel, id)
+                    .await
+                    .map(|()| Some(format!("dismissed report #{id}"))),
                 Command::Kick(key) => match resolve_peer(chat, &key).await {
                     Ok(who) => chat.remove(&channel, &who).await.map(|()| {
                         Some(format!(
@@ -2675,6 +2735,14 @@ enum Command {
     Invite(String),
     /// `/kick <key>` — remove somebody, and rotate so what follows is not theirs.
     Kick(String),
+    /// SIP-56: `/mute <key>` and `/unmute <key>` -- they read, may not write.
+    Mute(String, bool),
+    /// SIP-56: `/report <seq> <reason> [note]` -- to the channel's admins.
+    Report(u64, u8, String),
+    /// SIP-56: `/reports` -- what members reported, for an admin.
+    Reports,
+    /// SIP-56: `/dismiss <id>`.
+    Dismiss(u64),
     /// `/replicate <exchange key>` — let another exchange hold a copy of this
     /// channel. `bool` is false for `/unreplicate`, which ends the
     /// subscription and recalls nothing.
@@ -2820,6 +2888,35 @@ impl Command {
             "/invite" if !first.is_empty() => Command::Invite(first.to_string()),
             "/invite" => Command::Unknown("/invite needs a public key".into()),
             "/kick" if !first.is_empty() => Command::Kick(first.to_string()),
+            "/mute" if !first.is_empty() => Command::Mute(first.to_string(), true),
+            "/mute" => Command::Unknown("/mute needs a public key".into()),
+            "/unmute" if !first.is_empty() => Command::Mute(first.to_string(), false),
+            "/unmute" => Command::Unknown("/unmute needs a public key".into()),
+            "/report" => {
+                let mut words = rest.split_whitespace();
+                let seq = words.next().and_then(|w| w.parse::<u64>().ok());
+                let reason = match words.next() {
+                    Some("spam") | Some("1") => Some(1),
+                    Some("harassment") | Some("2") => Some(2),
+                    Some("illegal") | Some("3") => Some(3),
+                    Some("other") | Some("4") => Some(4),
+                    _ => None,
+                };
+                let note: String = words.collect::<Vec<_>>().join(" ");
+                match (seq, reason) {
+                    (Some(seq), Some(reason)) => Command::Report(seq, reason, note),
+                    _ => Command::Unknown(
+                        "/report <seq> <spam|harassment|illegal|other> [note] -- the note is \
+                         stored in the clear at the exchange"
+                            .into(),
+                    ),
+                }
+            }
+            "/reports" => Command::Reports,
+            "/dismiss" => match first.parse::<u64>() {
+                Ok(id) => Command::Dismiss(id),
+                Err(_) => Command::Unknown("/dismiss needs a report's id".into()),
+            },
             "/kick" => Command::Unknown("/kick needs a public key".into()),
             "/replicate" if !first.is_empty() => Command::Replicate(first.to_string(), true),
             "/replicate" => Command::Unknown(

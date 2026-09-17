@@ -234,6 +234,12 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/channel/close", Chat("/close yes"), ChannelAdmin),
     ("POST", "/channel/mine", Chat("Chat::mine"), SelfOnly),
     ("POST", "/channel/list", Chat("/find"), Anyone),
+    // SIP-56: an admin's mute, a member's report, an admin's reading of it.
+    ("POST", "/channel/mute", Chat("/mute"), ChannelAdmin),
+    ("POST", "/channel/unmute", Chat("/unmute"), ChannelAdmin),
+    ("POST", "/channel/report", Chat("/report"), Member),
+    ("POST", "/channel/reports", Chat("/reports"), ChannelAdmin),
+    ("POST", "/channel/dismiss", Chat("/dismiss"), ChannelAdmin),
     // SIP-55: the same directory, this exchange's and its peers'.
     ("POST", "/channel/search", Chat("Chat::search"), Anyone),
     ("POST", "/channel/invite", Chat("/invite"), ChannelAdmin),

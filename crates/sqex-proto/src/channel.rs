@@ -93,6 +93,22 @@ pub const TYPE_REHOME: u8 = 0x19;
 pub const TYPE_STRANDED: u8 = 0x1b;
 /// SIP-55: a directory search across this exchange and its peers.
 pub const TYPE_SEARCH: u8 = 0x1c;
+/// SIP-56: a member reports an entry to the channel's admins.
+pub const TYPE_REPORT: u8 = 0x1d;
+/// SIP-56: an admin reads the channel's reports.
+pub const TYPE_REPORTS: u8 = 0x1e;
+/// SIP-56: an admin dismisses one.
+pub const TYPE_DISMISS: u8 = 0x1f;
+/// SIP-56: an admin mutes a member.
+pub const TYPE_MUTE: u8 = 0x20;
+/// SIP-56: an admin unmutes a member.
+pub const TYPE_UNMUTE: u8 = 0x21;
+/// SIP-56: a report's note, at most.
+pub const MAX_NOTE: usize = 1024;
+/// SIP-56: reports kept per channel.
+pub const MAX_REPORTS: usize = 256;
+/// SIP-56: how long a report is kept.
+pub const REPORT_TTL: u64 = 30 * 24 * 60 * 60;
 /// SIP-53: a rehome entry carried to an exchange that has not seen it.
 pub const TYPE_REHOMED: u8 = 0x1a;
 
@@ -147,6 +163,10 @@ pub const EVENT_SUCCEEDED: u8 = 0x0d;
 /// receipted by the incoming one, and every entry after it is both under
 /// the new. `arg` is empty; the receipt's `posted` is when.
 pub const EVENT_REHOMED: u8 = 0x0e;
+/// SIP-56: `actor` muted `subject` -- reads, may not write. `arg` empty.
+pub const EVENT_MUTED: u8 = 0x0f;
+/// SIP-56: `actor` unmuted `subject`.
+pub const EVENT_UNMUTED: u8 = 0x10;
 
 /// The body of an entry the exchange wrote itself.
 ///
@@ -195,7 +215,7 @@ impl System {
                 b.len()
             )));
         }
-        if b[0] == 0 || b[0] > EVENT_REHOMED {
+        if b[0] == 0 || b[0] > EVENT_UNMUTED {
             return Ok(None);
         }
         Ok(Some(System {
@@ -1269,6 +1289,129 @@ impl Found {
             return Err(Error::Malformed("trailing bytes after found".into()));
         }
         Ok(Found { now, total, rows })
+    }
+}
+
+/// SIP-56: `POST /channel/report`.
+///
+/// `| type: u8 = 0x1d | channel[32] | target: u64 | reason: u8 | note_len: u16 | note |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub channel: [u8; 32],
+    /// The entry reported; 0 for the channel itself.
+    pub target: u64,
+    /// 1 spam, 2 harassment, 3 illegal, 4 other.
+    pub reason: u8,
+    pub note: String,
+}
+
+impl Report {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(44 + self.note.len());
+        out.push(TYPE_REPORT);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.target.to_be_bytes());
+        out.push(self.reason);
+        let n = &self.note.as_bytes()[..self.note.len().min(MAX_NOTE)];
+        out.extend_from_slice(&(n.len() as u16).to_be_bytes());
+        out.extend_from_slice(n);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Report> {
+        want(b, 44, "report")?;
+        if b[0] != TYPE_REPORT {
+            return Err(Error::Malformed("not a report".into()));
+        }
+        let len = u16::from_be_bytes([b[42], b[43]]) as usize;
+        if len > MAX_NOTE || b.len() != 44 + len {
+            return Err(Error::Malformed("report cut short".into()));
+        }
+        Ok(Report {
+            channel: b[1..33].try_into().unwrap(),
+            target: u64at(b, 33),
+            reason: b[41],
+            note: utf8(&b[44..], "note")?,
+        })
+    }
+}
+
+/// SIP-56: one report, as the admins see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub id: u64,
+    pub reporter: PubKey,
+    pub target: u64,
+    pub reason: u8,
+    pub at: u64,
+    pub note: String,
+}
+
+/// SIP-56: the answer to `POST /channel/reports`.
+///
+/// `| now: u64 | count: u16 | count × (id: u64 | reporter[32] | target: u64 | reason: u8 | at: u64 | note_len: u16 | note) |`
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reports {
+    pub now: u64,
+    pub reports: Vec<Reported>,
+}
+
+impl Reports {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.reports.len() * 80);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.reports.len() as u16).to_be_bytes());
+        for r in &self.reports {
+            out.extend_from_slice(&r.id.to_be_bytes());
+            out.extend_from_slice(r.reporter.as_bytes());
+            out.extend_from_slice(&r.target.to_be_bytes());
+            out.push(r.reason);
+            out.extend_from_slice(&r.at.to_be_bytes());
+            let n = &r.note.as_bytes()[..r.note.len().min(MAX_NOTE)];
+            out.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            out.extend_from_slice(n);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Reports> {
+        want(b, 10, "reports")?;
+        let now = u64at(b, 0);
+        let count = u16::from_be_bytes([b[8], b[9]]) as usize;
+        if count > MAX_REPORTS {
+            return Err(Error::Malformed("too many reports".into()));
+        }
+        let mut at = 10;
+        let mut reports = Vec::with_capacity(count);
+        for _ in 0..count {
+            if at + 59 > b.len() {
+                return Err(Error::Malformed("reports cut short".into()));
+            }
+            let id = u64at(b, at);
+            let reporter = PubKey::new(b[at + 8..at + 40].try_into().unwrap());
+            let target = u64at(b, at + 40);
+            let reason = b[at + 48];
+            let when = u64at(b, at + 49);
+            let len = u16::from_be_bytes([b[at + 57], b[at + 58]]) as usize;
+            at += 59;
+            if at + len > b.len() {
+                return Err(Error::Malformed("reports cut short".into()));
+            }
+            let note = utf8(&b[at..at + len], "note")?;
+            at += len;
+            reports.push(Reported {
+                id,
+                reporter,
+                target,
+                reason,
+                at: when,
+                note,
+            });
+        }
+        if at != b.len() {
+            return Err(Error::Malformed("trailing bytes after reports".into()));
+        }
+        Ok(Reports { now, reports })
     }
 }
 

@@ -126,3 +126,15 @@ seed_relay_peers = [
 # (history and keys the exchange cannot read, kept past its own retention).
 # Omit for the reference default of 512 MiB.
 # backup_quota = 536870912
+
+# SIP-56: rate limits, per account, on what costs the exchange and its
+# members something. Each is [n, seconds]: n in any window of that many
+# seconds, refilling steadily; [0, 0] is unlimited. Omitted ones take the
+# SIP's defaults, shown here. Reads are never limited.
+# [limits]
+# posts = [30, 60]        # per channel
+# signals = [60, 60]      # per device, per channel
+# joins = [20, 3600]
+# creates = [10, 3600]
+# uploads = [60, 3600]
+# reports = [20, 3600]

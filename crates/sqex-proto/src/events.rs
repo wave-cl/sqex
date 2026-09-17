@@ -81,6 +81,8 @@ pub const KIND_RINGING: u8 = 0x09;
 /// opening a session toward the caller. The caller's domain travels on the
 /// exchange-to-exchange invite, not here, so this stays a fixed-size event.
 pub const KIND_CROSSCALL: u8 = 0x0A;
+/// SIP-56: a report awaits the admins of this channel. Admins only.
+pub const KIND_REPORTED: u8 = 0x0B;
 
 /// What happened to a membership.
 pub const MEMBER_JOINED: u8 = 0x01;
@@ -163,6 +165,8 @@ pub enum Event {
     /// `caller`. The client opens a session toward `caller` to answer; the
     /// caller's domain is display-only and does not ride the event.
     CrossCall { bridge: [u8; 16], caller: PubKey },
+    /// SIP-56: a member reported an entry in this channel. To its admins.
+    Reported { channel: [u8; 32] },
     /// A kind this build does not know. Carried rather than rejected so that
     /// ignoring it is deliberate; see the module docs.
     Unknown(u8),
@@ -207,6 +211,7 @@ impl Event {
                 out
             }
             Event::Profile { account } => one(KIND_PROFILE, account.as_bytes()),
+            Event::Reported { channel } => one(KIND_REPORTED, channel),
             Event::Admission => vec![KIND_ADMISSION],
             Event::Heartbeat => vec![KIND_HEARTBEAT],
             Event::Resync => vec![KIND_RESYNC],
@@ -281,6 +286,12 @@ impl Event {
                 want(32)?;
                 Event::Profile {
                     account: PubKey::new(body[0..32].try_into().unwrap()),
+                }
+            }
+            KIND_REPORTED => {
+                want(32)?;
+                Event::Reported {
+                    channel: body[0..32].try_into().unwrap(),
                 }
             }
             KIND_ADMISSION => {

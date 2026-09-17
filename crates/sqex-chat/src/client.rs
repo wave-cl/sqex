@@ -9,14 +9,15 @@ use sha2::{Digest, Sha256};
 use sqex_proto::blob::Attachment;
 use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
-    EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_PROMOTED,
-    EVENT_REHOMED, EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED,
-    EVENT_UNREPLICATE, Entries, Entry, Fetch, Found, Home, Invite, Invitee, KIND_MEMBER,
-    KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC, MIN_RETENTION, Mark,
-    Marks, Membership, Mine, Mines, Post, Posted, Rehome, Rehomed, Retain, Role, Row, Search,
-    Stranded, System, TYPE_CLOSE, TYPE_CURSORS, TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN,
-    TYPE_LEAVE, TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_STRANDED, TYPE_UNREPLICATE,
-    Visibility, constitution, direct_message_id,
+    EVENT_ADDED, EVENT_CREATED, EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_MUTED,
+    EVENT_PROMOTED, EVENT_REHOMED, EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION,
+    EVENT_ROTATED, EVENT_UNMUTED, EVENT_UNREPLICATE, Entries, Entry, Fetch, Found, Home, Invite,
+    Invitee, KIND_MEMBER, KIND_SYSTEM, List, Listing, MAX_MINE, MAX_NAME, MAX_RETENTION, MAX_TOPIC,
+    MIN_RETENTION, Mark, Marks, Membership, Mine, Mines, Post, Posted, Rehome, Rehomed, Report,
+    Reported, Reports, Retain, Role, Row, Search, Stranded, System, TYPE_CLOSE, TYPE_CURSORS,
+    TYPE_DISMISS, TYPE_EQUIVOCATION, TYPE_HOME, TYPE_INFO, TYPE_JOIN, TYPE_LEAVE, TYPE_MUTE,
+    TYPE_REDACT, TYPE_REMOVE, TYPE_REPLICATE, TYPE_REPORTS, TYPE_STRANDED, TYPE_UNMUTE,
+    TYPE_UNREPLICATE, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
@@ -2903,6 +2904,81 @@ impl Chat {
         )
         .await?;
         self.store.set_chain(channel, action.chain_seq, &head)?;
+        Ok(())
+    }
+
+    /// SIP-56: mute a member -- they read and may not write -- or unmute
+    /// them. An admin's signed entry, like a removal.
+    pub async fn mute(&mut self, channel: &[u8; 32], who: &PubKey, on: bool) -> Result<()> {
+        let info = self.info(channel).await?;
+        let (event, path, type_byte) = if on {
+            (EVENT_MUTED, "/channel/mute", TYPE_MUTE)
+        } else {
+            (EVENT_UNMUTED, "/channel/unmute", TYPE_UNMUTE)
+        };
+        let (action, head) = self.sign_action_at(channel, &info, event, who, &[])?;
+        self.post(
+            path,
+            ByAccount {
+                channel: *channel,
+                account: *who,
+                action,
+            }
+            .encode(type_byte),
+        )
+        .await?;
+        self.store.set_chain(channel, action.chain_seq, &head)?;
+        Ok(())
+    }
+
+    /// SIP-56: report an entry to the channel's admins. Not an entry: the
+    /// exchange holds it for the admins and nobody else sees it -- but the
+    /// note is stored in the clear.
+    pub async fn report(
+        &mut self,
+        channel: &[u8; 32],
+        target: u64,
+        reason: u8,
+        note: &str,
+    ) -> Result<()> {
+        self.post(
+            "/channel/report",
+            Report {
+                channel: *channel,
+                target,
+                reason,
+                note: note.to_string(),
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// SIP-56: the channel's reports, for an admin.
+    pub async fn reports(&mut self, channel: &[u8; 32]) -> Result<Vec<Reported>> {
+        let body = self
+            .post(
+                "/channel/reports",
+                ByChannel { channel: *channel }.encode(TYPE_REPORTS),
+            )
+            .await?;
+        Ok(Reports::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .reports)
+    }
+
+    /// SIP-56: dismiss a report.
+    pub async fn dismiss(&mut self, channel: &[u8; 32], id: u64) -> Result<()> {
+        self.post(
+            "/channel/dismiss",
+            ByTarget {
+                channel: *channel,
+                target: id,
+            }
+            .encode(TYPE_DISMISS),
+        )
+        .await?;
         Ok(())
     }
 

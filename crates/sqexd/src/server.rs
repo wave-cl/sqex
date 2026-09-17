@@ -46,10 +46,11 @@ use sqex_proto::channel::{
     Create as ChannelCreate, Created, Cursor as ChannelCursor, Directory as ChannelDirectory,
     Fetch as ChannelFetch, Home, Invite as ChannelInvite, Invitee, List as ChannelList,
     Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain, SignalOut,
-    TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_EQUIVOCATION as CH_EQUIVOCATION,
-    TYPE_HOME as CH_HOME, TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE,
-    TYPE_REDACT as CH_REDACT, TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE,
-    TYPE_STRANDED as CH_STRANDED, TYPE_UNREPLICATE as CH_UNREPLICATE,
+    TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_DISMISS as CH_DISMISS,
+    TYPE_EQUIVOCATION as CH_EQUIVOCATION, TYPE_HOME as CH_HOME, TYPE_INFO as CH_INFO,
+    TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE, TYPE_MUTE as CH_MUTE, TYPE_REDACT as CH_REDACT,
+    TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE, TYPE_REPORTS as CH_REPORTS,
+    TYPE_STRANDED as CH_STRANDED, TYPE_UNMUTE as CH_UNMUTE, TYPE_UNREPLICATE as CH_UNREPLICATE,
 };
 use sqex_proto::channel_key::{Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING};
 use sqex_proto::device::{
@@ -312,6 +313,8 @@ pub struct Server {
     /// SIP-53: how long an origin must be out of reach before a replica
     /// takes a rehome to itself.
     pub(crate) rehome_away_secs: u64,
+    /// SIP-56: the rate limits, per account.
+    pub(crate) limiter: crate::limits::Limiter,
     /// SIP-55: the peers' public directories as last read.
     pub(crate) directories: crate::directory::Directories,
     /// SIP-55: how often they are read.
@@ -440,6 +443,18 @@ impl Server {
             .unwrap()
             .entry(origin)
             .or_insert_with(|| Arc::new(crate::replica::Forwarder::new(origin, addr, domain)));
+    }
+
+    /// SIP-56: take a token or say how long to wait, as a refusal.
+    pub(crate) fn limit(
+        &self,
+        kind: crate::limits::Kind,
+        who: &PubKey,
+        scope: [u8; 32],
+    ) -> std::result::Result<(), ChannelError> {
+        self.limiter
+            .take(kind, who, scope)
+            .map_err(ChannelError::RateLimited)
     }
 
     /// SIP-54: a signal pulled from the origin's log, handed to this
@@ -890,6 +905,7 @@ pub async fn bind_with(
         ),
         contacts: Mutex::new(HashMap::new()),
         rehome_away_secs: config.rehome_away_secs,
+        limiter: crate::limits::Limiter::new(config.limits),
         directories: crate::directory::Directories::default(),
         directory_secs: config.directory_secs,
         transport: Arc::clone(&listener),
@@ -1199,6 +1215,8 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 // nobody is calling still has to tidy up the ones abandoned
                 // mid-ring.
                 server.relay.sweep(now_unix());
+                // SIP-56: buckets that have refilled are no buckets.
+                server.limiter.sweep();
                 // SIP-47: a device is admitted for as long as its credential
                 // stands, and a credential runs out with nobody at the door
                 // to say so. The one time-driven change to the whitelist.
@@ -2230,7 +2248,10 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
                 let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
-                match server.channels.create(&me, &dev, &req, &blocked) {
+                match server
+                    .limit(crate::limits::Kind::Creates, &me, [0; 32])
+                    .and_then(|()| server.channels.create(&me, &dev, &req, &blocked))
+                {
                     Ok((created, epoch, instance)) => {
                         // Everybody invited learns of a channel that did not
                         // exist when they last looked, which is the whole of
@@ -2268,7 +2289,10 @@ async fn route(
                 if let Some(answer) = forward_action(server, &dev, &req.channel, path, body).await {
                     return answer;
                 }
-                match server.channels.join(&me, &dev, &req.channel, &req.action) {
+                match server
+                    .limit(crate::limits::Kind::Joins, &me, [0; 32])
+                    .and_then(|()| server.channels.join(&me, &dev, &req.channel, &req.action))
+                {
                     Ok(()) => {
                         server.tell(
                             &req.channel,
@@ -2325,8 +2349,13 @@ async fn route(
                 let device = device.unwrap_or(me);
                 // SIP-43: a channel that lives elsewhere is posted to here
                 // and ordered there. Nothing is stored on the way; the
-                // origin's answer is the member's answer.
+                // origin's answer is the member's answer. SIP-56: unless the
+                // copy already knows the member is muted, in which case it
+                // refuses as the origin would and carries nothing.
                 if let Some(origin) = server.channels.origin_of(&req.channel) {
+                    if server.channels.muted(&req.channel, &me) {
+                        return refused(ChannelError::Muted);
+                    }
                     let Some(forwarder) = server.forwarder(&origin) else {
                         return refuse(421, Code::Replicated, None);
                     };
@@ -2544,6 +2573,82 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => match server.channels.mine(&me, req.offset) {
                 Ok(mine) => (200, "application/octet-stream", mine.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        // SIP-56: an admin mutes or unmutes a member -- an entry, carried
+        // to the origin from a copy as a join is.
+        ("POST", "/channel/mute") | ("POST", "/channel/unmute") => {
+            let on = path == "/channel/mute";
+            let type_byte = if on { CH_MUTE } else { CH_UNMUTE };
+            match (who, ChannelByAccount::decode(body, type_byte)) {
+                (None, _) => no_identity("muting a member"),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some((me, dev)), Ok(req)) => {
+                    if let Some(answer) =
+                        forward_action(server, &dev, &req.channel, path, body).await
+                    {
+                        return answer;
+                    }
+                    match server.channels.mute(
+                        &me,
+                        &dev,
+                        &req.channel,
+                        &req.account,
+                        &req.action,
+                        on,
+                    ) {
+                        Ok(()) => {
+                            server.tell(
+                                &req.channel,
+                                EventKind::Channel {
+                                    channel: req.channel,
+                                    last_seq: 0,
+                                },
+                            );
+                            (
+                                200,
+                                "application/octet-stream",
+                                ChannelAck { now: now_unix() }.encode(),
+                            )
+                        }
+                        Err(e) => refused(e),
+                    }
+                }
+            }
+        }
+        // SIP-56: a member reports an entry to the admins; carried to the
+        // origin from a copy, held there, and the admins told.
+        ("POST", "/channel/report") => match (account, sqex_proto::channel::Report::decode(body)) {
+            (None, _) => no_identity("reporting"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if let Some(answer) =
+                    forward_action(server, &device.unwrap_or(me), &req.channel, path, body).await
+                {
+                    return answer;
+                }
+                let (status, body) = report_here(server, &me, &req);
+                (status, "application/octet-stream", body)
+            }
+        },
+        ("POST", "/channel/reports") => match (account, ByChannel::decode(body, CH_REPORTS)) {
+            (None, _) => no_identity("reading reports"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => match server.channels.reports(&me, &req.channel) {
+                Ok(r) => (200, "application/octet-stream", r.encode()),
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/channel/dismiss") => match (account, ByTarget::decode(body, CH_DISMISS)) {
+            (None, _) => no_identity("dismissing a report"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => match server.channels.dismiss(&me, &req.channel, req.target) {
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
                 Err(e) => refused(e),
             },
         },
@@ -2838,9 +2943,12 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some((me, dev)), Ok(req)) => {
                 match server
-                    .channels
-                    .signal(&me, &dev, &req.channel, req.kind, &req.body)
-                {
+                    .limit(crate::limits::Kind::Signals, &dev, req.channel)
+                    .and_then(|()| {
+                        server
+                            .channels
+                            .signal(&me, &dev, &req.channel, req.kind, &req.body)
+                    }) {
                     Ok(()) => {
                         // SIP-54: delivered here at once, and carried to
                         // the origin, whose log every copy pulls.
@@ -3053,9 +3161,15 @@ async fn route(
                                 .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
                         {
                             match server
-                                .channels
-                                .join(&account, &req.device, &r.channel, &r.action)
-                            {
+                                .limit(crate::limits::Kind::Joins, &account, [0; 32])
+                                .and_then(|()| {
+                                    server.channels.join(
+                                        &account,
+                                        &req.device,
+                                        &r.channel,
+                                        &r.action,
+                                    )
+                                }) {
                                 Ok(()) => {
                                     server.tell(
                                         &r.channel,
@@ -3107,6 +3221,55 @@ async fn route(
                         }
                         _ => return peering_refused(),
                     },
+                    // SIP-56: an admin's mute, or a member's report, from a copy.
+                    "/channel/mute" | "/channel/unmute" => {
+                        let on = req.path == "/channel/mute";
+                        match ChannelByAccount::decode(
+                            &req.body,
+                            if on { CH_MUTE } else { CH_UNMUTE },
+                        ) {
+                            Ok(r)
+                                if server.peering(&who).is_some_and(|p| {
+                                    server.may_forward(p, &r.channel, &account)
+                                }) =>
+                            {
+                                match server.channels.mute(
+                                    &account,
+                                    &req.device,
+                                    &r.channel,
+                                    &r.account,
+                                    &r.action,
+                                    on,
+                                ) {
+                                    Ok(()) => {
+                                        server.tell(
+                                            &r.channel,
+                                            EventKind::Channel {
+                                                channel: r.channel,
+                                                last_seq: 0,
+                                            },
+                                        );
+                                        (200, ChannelAck { now: now_unix() }.encode())
+                                    }
+                                    Err(e) => {
+                                        let (s, _, b) = refused(e);
+                                        (s, b)
+                                    }
+                                }
+                            }
+                            _ => return peering_refused(),
+                        }
+                    }
+                    "/channel/report" => match sqex_proto::channel::Report::decode(&req.body) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            report_here(server, &account, &r)
+                        }
+                        _ => return peering_refused(),
+                    },
                     // SIP-54: a member's read mark, set at a copy.
                     "/channel/cursor" => match ChannelCursor::decode(&req.body) {
                         Ok(r)
@@ -3142,13 +3305,17 @@ async fn route(
                                 .peering(&who)
                                 .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
                         {
-                            match server.channels.signal(
-                                &account,
-                                &req.device,
-                                &r.channel,
-                                r.kind,
-                                &r.body,
-                            ) {
+                            match server
+                                .limit(crate::limits::Kind::Signals, &req.device, r.channel)
+                                .and_then(|()| {
+                                    server.channels.signal(
+                                        &account,
+                                        &req.device,
+                                        &r.channel,
+                                        r.kind,
+                                        &r.body,
+                                    )
+                                }) {
                                 Ok(()) => {
                                     server.tell_others(
                                         &r.channel,
@@ -3876,7 +4043,8 @@ fn open_regardless(path: &str) -> bool {
 }
 
 fn refused(e: ChannelError) -> (u16, &'static str, Vec<u8>) {
-    refuse(e.status(), e.code(), None)
+    let detail = e.detail();
+    refuse(e.status(), e.code(), detail.as_deref())
 }
 
 /// SIP-44: verify a claim and carry the account across -- devices, names,
@@ -4018,7 +4186,10 @@ fn blob_here(server: &Server, me: &PubKey, path: &str, body: &[u8]) -> (u16, Vec
     match path {
         "/blob/begin" => match BlobBegin::decode(body) {
             Err(e) => malformed(e),
-            Ok(req) => match server.channels.begin_upload(me, &req) {
+            Ok(req) => match server
+                .limit(crate::limits::Kind::Uploads, me, [0; 32])
+                .and_then(|()| server.channels.begin_upload(me, &req))
+            {
                 Ok(upload) => (
                     200,
                     Begun {
@@ -4214,13 +4385,47 @@ async fn carry_blob(
 /// body `/channel/post` answers a member with. One function, because SIP-43
 /// has the same answer travel back through a replica, and a forwarded post
 /// must get exactly what a direct one would.
+/// SIP-56: record a report and tell the channel's admins.
+fn report_here(
+    server: &Server,
+    account: &PubKey,
+    req: &sqex_proto::channel::Report,
+) -> (u16, Vec<u8>) {
+    match server
+        .limit(crate::limits::Kind::Reports, account, [0; 32])
+        .and_then(|()| {
+            server
+                .channels
+                .report(account, &req.channel, req.target, req.reason, &req.note)
+        }) {
+        Ok(()) => {
+            let admins = server.channels.admins_of(&req.channel);
+            server.events.publish(
+                &admins,
+                EventKind::Reported {
+                    channel: req.channel,
+                },
+            );
+            (200, ChannelAck { now: now_unix() }.encode())
+        }
+        Err(e) => {
+            let (status, _, body) = refused(e);
+            (status, body)
+        }
+    }
+}
+
 fn post_here(
     server: &Server,
     account: &PubKey,
     device: &PubKey,
     req: &ChannelPost,
 ) -> (u16, Vec<u8>) {
-    match server.channels.post(account, device, req) {
+    // SIP-56: counted against the member, here or carried from a copy.
+    let outcome = server
+        .limit(crate::limits::Kind::Posts, account, req.channel)
+        .and_then(|()| server.channels.post(account, device, req));
+    match outcome {
         Ok(posted) => {
             server.tell(
                 &req.channel,

@@ -1738,6 +1738,8 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "add somebody; remove them and rotate the key",
             ),
             ("/op <key>  /deop <key>", "grant or withdraw admin here"),
+            ("/mute <key>  /unmute", "they read, and may not write"),
+            ("/report <seq> <why>", "tell the admins; /reports, /dismiss"),
             (
                 "/leave  /close",
                 "leave it; or end it for everyone, permanently",

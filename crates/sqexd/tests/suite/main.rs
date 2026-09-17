@@ -28,6 +28,7 @@
 
 mod common;
 
+mod abuse_flow;
 mod admin_flow;
 mod attest_flow;
 mod backup_flow;

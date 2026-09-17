@@ -53,7 +53,7 @@ async fn server_named(
     }
     let config_toml = format!(
         "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{admins}]\n\
-         welcome_channel = {welcome:?}\n",
+         welcome_channel = {welcome:?}\n[limits]\ncreates = [0, 0]\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );
@@ -87,7 +87,7 @@ async fn server_in_unused(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::Joi
         // sight moves both baselines. The front door has its own tests, in
         // sqex-chat's `public_join_flow`.
         "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
-         welcome_channel = \"\"\n",
+         welcome_channel = \"\"\n[limits]\ncreates = [0, 0]\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
     );

@@ -227,6 +227,48 @@ pub struct FileConfig {
     /// Default 60.
     #[serde(default)]
     pub directory_secs: Option<u64>,
+    /// SIP-56: rate limits, per account. Each is `[n, seconds]`: n in any
+    /// window of that many seconds, refilling steadily; `[0, 0]` is
+    /// unlimited. Omitted ones take SIP-56's defaults.
+    #[serde(default)]
+    pub limits: FileLimits,
+}
+
+/// SIP-56's limits as written in the file.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct FileLimits {
+    #[serde(default)]
+    pub posts: Option<[u32; 2]>,
+    #[serde(default)]
+    pub signals: Option<[u32; 2]>,
+    #[serde(default)]
+    pub joins: Option<[u32; 2]>,
+    #[serde(default)]
+    pub creates: Option<[u32; 2]>,
+    #[serde(default)]
+    pub uploads: Option<[u32; 2]>,
+    #[serde(default)]
+    pub reports: Option<[u32; 2]>,
+}
+
+impl FileLimits {
+    fn resolve(&self) -> crate::limits::Limits {
+        use crate::limits::{Limit, Limits};
+        let d = Limits::default();
+        let pick = |v: Option<[u32; 2]>, default: Limit| match v {
+            Some([0, _]) | Some([_, 0]) => Limit::unlimited(),
+            Some([n, secs]) => Limit::per(n, secs),
+            None => default,
+        };
+        Limits {
+            posts: pick(self.posts, d.posts),
+            signals: pick(self.signals, d.signals),
+            joins: pick(self.joins, d.joins),
+            creates: pick(self.creates, d.creates),
+            uploads: pick(self.uploads, d.uploads),
+            reports: pick(self.reports, d.reports),
+        }
+    }
 }
 
 /// A peer in `replication_peers`: a bare key, or a key with the accounts it
@@ -324,6 +366,8 @@ pub struct Config {
     pub rehome_away_secs: u64,
     /// SIP-55: seconds between reads of each peer's directory.
     pub directory_secs: u64,
+    /// SIP-56: the rate limits.
+    pub limits: crate::limits::Limits,
 }
 
 /// One resolved origin to replicate from.
@@ -527,6 +571,7 @@ impl FileConfig {
                 .unwrap_or(sqex_proto::backup::DEFAULT_QUOTA),
             rehome_away_secs: self.rehome_away_secs.unwrap_or(300),
             directory_secs: self.directory_secs.unwrap_or(60).max(1),
+            limits: self.limits.resolve(),
         })
     }
 }
