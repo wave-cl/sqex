@@ -25,6 +25,7 @@
 //! cannot be seen, because nothing tells the client to look for it.
 
 pub mod attach;
+pub mod backup;
 pub mod client;
 pub mod events;
 pub mod store;

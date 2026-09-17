@@ -141,6 +141,10 @@ pub enum ChannelError {
     /// verify — which is the same recovery as from an exchange that has never
     /// heard of SIP-34.
     NoReceipts,
+    /// SIP-48: a manifest at or below the generation held, which is named.
+    StaleGeneration(u64),
+    /// SIP-48: a manifest naming a blob the account neither holds nor may fetch.
+    NotHeld,
     Storage,
 }
 
@@ -177,6 +181,8 @@ impl ChannelError {
             ChannelError::InviteQuota => "invite_quota",
             ChannelError::BadRetention => "bad_retention",
             ChannelError::LastAdmin => "last_admin",
+            ChannelError::StaleGeneration(_) => "stale_generation",
+            ChannelError::NotHeld => "not_held",
             ChannelError::Storage => "storage",
         }
     }
@@ -216,6 +222,8 @@ impl ChannelError {
             ChannelError::Replicated(_) => Code::Replicated,
             ChannelError::Underived(_) => Code::Underived,
             ChannelError::Equivocated => Code::Equivocated,
+            ChannelError::StaleGeneration(_) => Code::StaleGeneration,
+            ChannelError::NotHeld => Code::NotHeld,
             ChannelError::Storage => Code::Storage,
         }
     }
@@ -242,6 +250,8 @@ impl ChannelError {
             // Not the caller's fault and not a conflict with state: the state
             // itself is contradictory, and saying so is the whole point.
             ChannelError::Equivocated => 409,
+            // SIP-48: another device wrote first; the detail says where it got to.
+            ChannelError::StaleGeneration(_) | ChannelError::NotHeld => 409,
             ChannelError::WrongEpoch
             | ChannelError::BadRetention
             | ChannelError::LastAdmin
@@ -322,6 +332,8 @@ pub struct Channels {
     /// much disk a busy channel can take. It is also the only way to exercise
     /// the byte prune without writing 128 MiB.
     max_channel_bytes: u64,
+    /// SIP-48: stored blob bytes one account may hold as its backup.
+    backup_quota: u64,
     /// One notifier per channel, so a parked `Fetch` wakes the moment an entry
     /// lands. Kept outside the database lock on purpose: a long poll must never
     /// hold the thing every other request needs.
@@ -587,6 +599,24 @@ CREATE TABLE IF NOT EXISTS attachment (
     uploader      BLOB    NOT NULL,
     PRIMARY KEY (channel, blob)
 );
+-- SIP-48: one manifest per account, naming the blobs the account holds.
+-- Those blobs sit in `attachment` with the account's key as the channel:
+-- never swept by time, released only by a manifest that omits them.
+CREATE TABLE IF NOT EXISTS backup (
+    account    BLOB PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    device     BLOB    NOT NULL,
+    written    INTEGER NOT NULL,
+    blobs      BLOB    NOT NULL,
+    sealed     BLOB    NOT NULL,
+    sig        BLOB    NOT NULL
+);
+-- SIP-44 as this store needs it: who took an account over, so that what
+-- the account held (SIP-48) is served to its successor.
+CREATE TABLE IF NOT EXISTS succeeded (
+    account   BLOB PRIMARY KEY,
+    successor BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS upload (
     id            INTEGER PRIMARY KEY,
     channel       BLOB    NOT NULL,
@@ -670,6 +700,7 @@ impl Channels {
             exchange,
             exchange_seed,
             max_channel_bytes: MAX_CHANNEL_BYTES,
+            backup_quota: sqex_proto::backup::DEFAULT_QUOTA,
             waiters: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
         })
@@ -731,6 +762,11 @@ impl Channels {
     /// Lower the stored-bytes cap. An operator may want a smaller number than
     /// SIP-16 recommends; a test needs one, or it must write 128 MiB to find
     /// out whether the prune runs at all.
+    pub fn with_backup_quota(mut self, bytes: u64) -> Channels {
+        self.backup_quota = bytes;
+        self
+    }
+
     pub fn with_max_channel_bytes(mut self, bytes: u64) -> Channels {
         self.max_channel_bytes = bytes;
         self
@@ -2853,6 +2889,11 @@ impl Channels {
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(storage("read succeed"))?
         };
+        tx.execute(
+            "INSERT OR REPLACE INTO succeeded (account, successor) VALUES (?1, ?2)",
+            params![account.as_bytes(), successor.as_bytes()],
+        )
+        .map_err(storage("record succession"))?;
         for (channel, role) in &channels {
             move_member(&tx, channel, account, successor, *role, now)?;
             let place = self.place(&tx, channel)?;
@@ -3970,9 +4011,20 @@ impl Channels {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin upload"))?;
-        visibility_of(&tx, &req.channel)?;
-        if role_of(&tx, &req.channel, uploader).is_none() {
-            return Err(Self::unreadable(&tx, &req.channel));
+        // SIP-48: `channel` equal to the uploader's own account is a backup
+        // segment, held by the account against its own quota rather than a
+        // channel's. Anybody else's account is refused as a channel that is
+        // not here, which it is not.
+        let held_by_account = req.channel == *uploader.as_bytes();
+        if held_by_account {
+            if channel_blob_bytes(&tx, &req.channel)? + req.size > self.backup_quota {
+                return Err(ChannelError::BlobQuota);
+            }
+        } else {
+            visibility_of(&tx, &req.channel)?;
+            if role_of(&tx, &req.channel, uploader).is_none() {
+                return Err(Self::unreadable(&tx, &req.channel));
+            }
         }
         expire_uploads(&tx, now)?;
 
@@ -3986,7 +4038,9 @@ impl Channels {
         if open as usize >= MAX_UPLOADS {
             return Err(ChannelError::TooManyUploads);
         }
-        if channel_blob_bytes(&tx, &req.channel)? + req.size > MAX_CHANNEL_BLOB_BYTES {
+        if !held_by_account
+            && channel_blob_bytes(&tx, &req.channel)? + req.size > MAX_CHANNEL_BLOB_BYTES
+        {
             return Err(ChannelError::BlobQuota);
         }
 
@@ -4112,6 +4166,157 @@ impl Channels {
         drop_upload(&db, upload)
     }
 
+    /// SIP-48: write `account`'s manifest as `device`. The generation must
+    /// advance; the blob list is what the account holds from here -- each
+    /// named blob is held (attached to the account) if it can be fetched,
+    /// and what was held and is no longer named is released.
+    pub fn write_backup(
+        &self,
+        account: &PubKey,
+        device: &PubKey,
+        m: &sqex_proto::backup::Manifest,
+    ) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin backup write"))?;
+        let current: Option<u64> = tx
+            .query_row(
+                "SELECT generation FROM backup WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| r.get::<_, i64>(0).map(|g| g as u64),
+            )
+            .optional()
+            .map_err(storage("read backup generation"))?;
+        if let Some(g) = current
+            && m.generation <= g
+        {
+            return Err(ChannelError::StaleGeneration(g));
+        }
+        let held: Vec<[u8; 32]> = {
+            let mut stmt = tx
+                .prepare("SELECT blob FROM attachment WHERE channel = ?1")
+                .map_err(storage("prepare held"))?;
+            let rows = stmt
+                .query_map(params![account.as_bytes()], |r| {
+                    Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+                })
+                .map_err(storage("query held"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for blob in &m.blobs {
+            if held.contains(blob) {
+                continue;
+            }
+            if !Self::may_fetch(&tx, account, blob)? {
+                return Err(ChannelError::NotHeld);
+            }
+            attach(&tx, account.as_bytes(), blob, device, 0, now)?;
+        }
+        for blob in &held {
+            if !m.blobs.contains(blob) {
+                tx.execute(
+                    "DELETE FROM attachment WHERE channel = ?1 AND blob = ?2",
+                    params![account.as_bytes(), &blob[..]],
+                )
+                .map_err(storage("release held blob"))?;
+                collect_blob(&tx, blob)?;
+            }
+        }
+        let mut blobs = Vec::with_capacity(m.blobs.len() * 32);
+        for b in &m.blobs {
+            blobs.extend_from_slice(b);
+        }
+        tx.execute(
+            "INSERT INTO backup (account, generation, device, written, blobs, sealed, sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (account) DO UPDATE SET generation = ?2, device = ?3, written = ?4,
+                 blobs = ?5, sealed = ?6, sig = ?7",
+            params![
+                account.as_bytes(),
+                m.generation as i64,
+                device.as_bytes(),
+                now as i64,
+                blobs,
+                &m.sealed,
+                &m.sig[..],
+            ],
+        )
+        .map_err(storage("write backup"))?;
+        tx.commit().map_err(storage("commit backup write"))?;
+        Ok(())
+    }
+
+    /// SIP-48: the manifest `account` holds, if any, and what it counts
+    /// against.
+    pub fn read_backup(&self, account: &PubKey) -> Result<sqex_proto::backup::Held, ChannelError> {
+        let db = self.db.lock().unwrap();
+        type Row = (u64, Vec<u8>, u64, Vec<u8>, Vec<u8>, Vec<u8>);
+        let row: Option<Row> = db
+            .query_row(
+                "SELECT generation, device, written, blobs, sealed, sig FROM backup WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? as u64,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(storage("read backup"))?;
+        let used = channel_blob_bytes(&db, account.as_bytes())?;
+        // Generation 0 is nothing held: the quota is still worth reporting.
+        let Some((generation, device, written, blobs, sealed, sig)) = row else {
+            return Ok(sqex_proto::backup::Held::none(self.backup_quota, used));
+        };
+        Ok(sqex_proto::backup::Held {
+            generation,
+            device: PubKey::new(device.try_into().unwrap_or([0; 32])),
+            written,
+            quota: self.backup_quota,
+            used,
+            blobs: blobs.as_chunks::<32>().0.to_vec(),
+            sealed,
+            sig: sig.try_into().unwrap_or([0; 64]),
+        })
+    }
+
+    /// SIP-48: release everything `account` holds.
+    pub fn drop_backup(&self, account: &PubKey) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin backup drop"))?;
+        let held: Vec<[u8; 32]> = {
+            let mut stmt = tx
+                .prepare("SELECT blob FROM attachment WHERE channel = ?1")
+                .map_err(storage("prepare held"))?;
+            let rows = stmt
+                .query_map(params![account.as_bytes()], |r| {
+                    Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+                })
+                .map_err(storage("query held"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        tx.execute(
+            "DELETE FROM attachment WHERE channel = ?1",
+            params![account.as_bytes()],
+        )
+        .map_err(storage("release held blobs"))?;
+        for blob in &held {
+            collect_blob(&tx, blob)?;
+        }
+        tx.execute(
+            "DELETE FROM backup WHERE account = ?1",
+            params![account.as_bytes()],
+        )
+        .map_err(storage("drop backup"))?;
+        tx.commit().map_err(storage("commit backup drop"))?;
+        Ok(())
+    }
+
     /// Whether the caller may fetch a blob: a member of any channel it is
     /// attached to, or anybody at all if one of those channels is public.
     fn may_fetch(db: &Connection, who: &PubKey, blob: &[u8; 32]) -> Result<bool, ChannelError> {
@@ -4141,6 +4346,12 @@ impl Channels {
         let mut public = false;
         let mut private = false;
         for c in channels {
+            // SIP-48: held by the caller's own account, or by one the
+            // caller succeeded (SIP-44).
+            if c == *who.as_bytes() || succeeded_by(db, &c) == Some(*who) {
+                member = true;
+                continue;
+            }
             match visibility_of(db, &c) {
                 Ok(Visibility::Public) => public = true,
                 Ok(Visibility::Private) => private = true,
@@ -4206,8 +4417,8 @@ impl Channels {
     fn attached_privately(db: &Connection, blob: &[u8; 32]) -> Result<bool, ChannelError> {
         let mut stmt = db
             .prepare(
-                "SELECT 1 FROM attachment a JOIN channel c ON c.id = a.channel \
-                 WHERE a.blob = ?1 AND c.visibility = 0 LIMIT 1",
+                "SELECT 1 FROM attachment a LEFT JOIN channel c ON c.id = a.channel \
+                 WHERE a.blob = ?1 AND (c.visibility = 0 OR c.id IS NULL) LIMIT 1",
             )
             .map_err(storage("prepare private attachment check"))?;
         let found = stmt
@@ -4800,6 +5011,19 @@ fn attach(
     )
     .map_err(storage("insert attachment"))?;
     Ok(())
+}
+
+/// SIP-44: who took `account` over here, if anybody.
+fn succeeded_by(db: &Connection, account: &[u8; 32]) -> Option<PubKey> {
+    db.query_row(
+        "SELECT successor FROM succeeded WHERE account = ?1",
+        params![&account[..]],
+        |r| r.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|b| b.try_into().ok().map(PubKey::new))
 }
 
 /// Delete a blob that has no attachments left. A blob attached elsewhere

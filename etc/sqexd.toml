@@ -121,3 +121,8 @@ seed_relay_peers = [
 # Set this to also accept http:// to loopback, which the test suite needs and
 # a public exchange does not.
 # wake_loopback = false
+
+# SIP-48: bytes one account may hold at this exchange as its sealed backup
+# (history and keys the exchange cannot read, kept past its own retention).
+# Omit for the reference default of 512 MiB.
+# backup_quota = 536870912

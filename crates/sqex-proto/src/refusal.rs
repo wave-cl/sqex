@@ -134,6 +134,12 @@ pub enum Code {
     NotYours,
     StaleSerial,
 
+    // SIP-48 backups.
+    /// A manifest at or below the generation held; the detail is the held one.
+    StaleGeneration,
+    /// A manifest naming a blob the account does not hold and may not fetch.
+    NotHeld,
+
     // SIP-5 mailbox.
     RecipientFull,
     RecipientQuota,
@@ -204,6 +210,8 @@ impl Code {
             Code::WouldPublish => 61,
             Code::OriginAway => 62,
             Code::Succeeded => 63,
+            Code::StaleGeneration => 64,
+            Code::NotHeld => 65,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -286,6 +294,8 @@ impl Code {
             61 => Code::WouldPublish,
             62 => Code::OriginAway,
             63 => Code::Succeeded,
+            64 => Code::StaleGeneration,
+            65 => Code::NotHeld,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -393,6 +403,8 @@ impl Code {
             Code::WouldPublish => "would_publish",
             Code::OriginAway => "origin_away",
             Code::Succeeded => "succeeded",
+            Code::StaleGeneration => "stale_generation",
+            Code::NotHeld => "not_held",
 
             Code::Unknown(_) => "unknown",
         }
@@ -464,6 +476,8 @@ impl Code {
         Code::WouldPublish,
         Code::OriginAway,
         Code::Succeeded,
+        Code::StaleGeneration,
+        Code::NotHeld,
     ];
 }
 

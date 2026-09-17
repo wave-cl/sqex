@@ -327,6 +327,16 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Cli("sqex succession show"),
         Identity,
     ),
+    // SIP-48: the account's sealed backup. Written by its devices; read by
+    // them, or by the account that succeeded it.
+    ("POST", "/backup/write", Chat("Chat::backup"), SelfOnly),
+    ("POST", "/backup/read", Chat("Chat::restore"), SelfOnly),
+    (
+        "POST",
+        "/backup/drop",
+        Cli("sqex-chat backup drop"),
+        SelfOnly,
+    ),
     // SIP-45: a device that cannot hold a stream leaves an endpoint.
     (
         "POST",

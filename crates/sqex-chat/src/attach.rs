@@ -96,15 +96,26 @@ impl Chat {
     pub fn prepare_file(&self, path: &std::path::Path, chunk: usize) -> Result<Prepared> {
         let plaintext = std::fs::read(path)
             .map_err(|e| ChatError::Protocol(format!("{}: {e}", path.display())))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Prepared::from_bytes(&name, &plaintext, chunk)
+    }
+}
+
+impl Prepared {
+    /// Seal bytes in hand as a file called `name`: one key, one nonce per
+    /// chunk, the name over the ciphertext.
+    pub fn from_bytes(name: &str, plaintext: &[u8], chunk: usize) -> Result<Prepared> {
         if plaintext.len() as u64 > MAX_BLOB {
             return Err(ChatError::Protocol(format!(
-                "{} is {} bytes; the limit is {MAX_BLOB}",
-                path.display(),
+                "{name} is {} bytes; the limit is {MAX_BLOB}",
                 plaintext.len()
             )));
         }
         if plaintext.is_empty() {
-            return Err(ChatError::Protocol(format!("{} is empty", path.display())));
+            return Err(ChatError::Protocol(format!("{name} is empty")));
         }
 
         let mut key = [0u8; 32];
@@ -124,11 +135,7 @@ impl Chat {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let (kind, mut mime) = kind_of(&name);
+        let (kind, mut mime) = kind_of(name);
         mime.truncate(MAX_MIME);
         // Only a file carries its name. An image or a video is displayed, not
         // opened by name, and SIP-18 gives those kinds their meta for shape.
@@ -159,7 +166,9 @@ impl Chat {
             sealed,
         })
     }
+}
 
+impl Chat {
     /// Upload a prepared file to a channel and return its reference.
     ///
     /// An upload that fails partway is aborted rather than left to expire, so

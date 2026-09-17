@@ -594,7 +594,7 @@ pub struct Redacted {
 
 pub struct Chat {
     client: Client,
-    seed: [u8; 32],
+    pub(crate) seed: [u8; 32],
     /// Where to dial to get back. `None` when nobody said — a `Chat` that
     /// cannot reconnect must not pretend to be reconnecting, and must not
     /// short-circuit its own requests either, so it keeps the behaviour it had

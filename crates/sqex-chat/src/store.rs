@@ -1097,6 +1097,28 @@ impl Store {
 
     // ---- verified (SIP-41) ---------------------------------------------
 
+    /// A value kept by name: the backup key, and whatever else has no table
+    /// of its own.
+    pub fn meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.db
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .optional()
+            .map_err(storage("read meta"))
+    }
+
+    pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(storage("write meta"))?;
+        Ok(())
+    }
+
     /// Mark a key verified: this person compared its safety words with its
     /// owner. Marking again keeps the first time.
     pub fn verify(&self, account: &PubKey, now: u64) -> Result<()> {

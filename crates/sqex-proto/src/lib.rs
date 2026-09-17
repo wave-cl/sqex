@@ -11,6 +11,7 @@
 //! provably corresponds to what executes.
 
 pub mod attest;
+pub mod backup;
 pub mod beacon;
 pub mod blob;
 pub mod blob_store;

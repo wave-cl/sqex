@@ -215,6 +215,10 @@ pub struct FileConfig {
     /// a deployment posts wakes to `https://` and nothing else.
     #[serde(default)]
     pub wake_loopback: bool,
+    /// SIP-48: stored bytes one account may hold as its sealed backup.
+    /// Omit for the reference default (512 MiB).
+    #[serde(default)]
+    pub backup_quota: Option<u64>,
 }
 
 /// A peer in `replication_peers`: a bare key, or a key with the accounts it
@@ -306,6 +310,8 @@ pub struct Config {
     pub max_bridges: Option<u64>,
     /// SIP-45: accept `http://` wake endpoints on loopback (tests).
     pub wake_loopback: bool,
+    /// SIP-48: per-account backup quota, bytes.
+    pub backup_quota: u64,
 }
 
 /// One resolved origin to replicate from.
@@ -504,6 +510,9 @@ impl FileConfig {
             seed_relay_peers: relay_peers,
             max_bridges: self.max_bridges,
             wake_loopback: self.wake_loopback,
+            backup_quota: self
+                .backup_quota
+                .unwrap_or(sqex_proto::backup::DEFAULT_QUOTA),
         })
     }
 }

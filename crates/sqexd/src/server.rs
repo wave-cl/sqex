@@ -34,6 +34,7 @@ use crate::room::Rooms;
 use crate::session::Sessions;
 use crate::state::{AuditEntry, State, WhitelistEntry, now_unix};
 use sqex_proto::attest::{Attestation, Query as AttestQuery};
+use sqex_proto::backup::Manifest as BackupManifest;
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::blob_store::{
     Begin as BlobBegin, Begun, ByBlob, ByChannelBlob, ByUpload, Commit as BlobCommit, Committed,
@@ -814,7 +815,8 @@ pub async fn bind_with(
             // shorter root.
             Some(signing_key.to_bytes()),
         )
-        .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?,
+        .map_err(|e| Error::Malformed(format!("cannot open the channel log: {e}")))?
+        .with_backup_quota(config.backup_quota),
         // Durable, and it was not always. The argument for keeping prekeys in
         // memory was that a key surviving a restart the device did not is a key
         // whose secret is gone, so serving it produces an envelope nobody can
@@ -1624,6 +1626,54 @@ async fn route(
                     Err(_) => refuse(500, Code::Storage, None),
                 }
             }
+        },
+        // SIP-48: the account's sealed backup. Written by a device of the
+        // account; read by one, or by the account that succeeded it.
+        ("POST", "/backup/write") => match (who, BackupManifest::decode(body)) {
+            (None, _) => no_identity("writing a backup"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some((me, dev)), Ok(m)) => match server.channels.write_backup(&me, &dev, &m) {
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
+                Err(ChannelError::StaleGeneration(g)) => {
+                    let e = ChannelError::StaleGeneration(g);
+                    refuse(e.status(), e.code(), Some(&g.to_string()))
+                }
+                Err(e) => refused(e),
+            },
+        },
+        ("POST", "/backup/read") => match (account, sqex_proto::backup::asked(body)) {
+            (None, _) => no_identity("reading a backup"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(of)) => {
+                // Yours, or one you succeeded (SIP-44).
+                if of != me && server.devices.successor_of(&of) != Some(me) {
+                    return refuse(403, Code::NotYours, None);
+                }
+                // Nothing held is generation 0, not a refusal: a 404 here
+                // would read as an exchange without the route.
+                match server.channels.read_backup(&of) {
+                    Ok(h) => (200, "application/octet-stream", h.encode()),
+                    Err(e) => refused(e),
+                }
+            }
+        },
+        ("POST", "/backup/drop") => match account {
+            None => no_identity("dropping a backup"),
+            Some(_) if !sqex_proto::backup::is_drop(body) => {
+                refuse(400, Code::Malformed, Some("not a drop"))
+            }
+            Some(me) => match server.channels.drop_backup(&me) {
+                Ok(()) => (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                ),
+                Err(e) => refused(e),
+            },
         },
         // SIP-45: where to wake this device, and until when.
         ("POST", "/wake/register") => match (peer.identity, WakeRegister::decode(body)) {

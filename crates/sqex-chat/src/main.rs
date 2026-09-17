@@ -112,6 +112,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
+    /// A sealed copy of this store at the exchange (SIP-48): your channels'
+    /// history and keys, and your contacts, under a key only you hold.
+    Backup {
+        #[command(subcommand)]
+        cmd: BackupCmd,
+    },
     /// Ask an exchange that does not know you to let you in (SIP-24).
     ///
     /// It answers every request identically — the same body, the same delay —
@@ -125,6 +131,29 @@ enum Cmd {
         #[arg(long, default_value = "")]
         label: String,
     },
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Show this store's backup key as 24 words, making one if there is
+    /// none yet. Write them down where this machine is not: they are the
+    /// whole of what opens the backup, and nothing can get them back.
+    Key,
+    /// Write the store to the exchange now.
+    Now,
+    /// What the exchange holds: generation, size, quota.
+    Show,
+    /// Take a backup into this store. Yours, or -- as a successor (SIP-44)
+    /// -- the account you succeeded, with `--from`. The 24 words follow.
+    Restore {
+        /// The account whose backup to take, base58. Yours if omitted.
+        #[arg(long)]
+        from: Option<String>,
+        /// The 24 words, as `backup key` printed them.
+        words: Vec<String>,
+    },
+    /// Release everything the exchange holds for this account.
+    Drop,
 }
 
 #[derive(Subcommand)]
@@ -248,6 +277,9 @@ async fn run(cli: Cli) -> Result<(), String> {
     if let Some(Cmd::Device { cmd }) = &cli.cmd {
         return device_command(&mut chat, cmd).await;
     }
+    if let Some(Cmd::Backup { cmd }) = &cli.cmd {
+        return backup_command(&mut chat, cmd).await;
+    }
 
     if let Some(Cmd::Admit { label }) = &cli.cmd {
         chat.request_admission(label)
@@ -284,6 +316,89 @@ async fn run(cli: Cli) -> Result<(), String> {
     // ending however it ends, hands it on.
     let _lock = store::lock(&path, &server).map_err(|e| e.to_string())?;
     interface(chat, pinned_notice).await
+}
+
+async fn backup_command(chat: &mut Chat, cmd: &BackupCmd) -> Result<(), String> {
+    use sqex_proto::backup::from_words;
+    match cmd {
+        BackupCmd::Key => {
+            let (key, fresh) = match chat.backup_key().map_err(|e| e.to_string())? {
+                Some(k) => (k, false),
+                None => (chat.new_backup_key().map_err(|e| e.to_string())?, true),
+            };
+            if fresh {
+                println!("made a backup key. Write these words down, in order, where this");
+                println!("machine is not; they are the whole of what opens the backup.");
+            }
+            let words = Chat::backup_words(&key);
+            for line in words.chunks(6) {
+                println!("  {}", line.join(" "));
+            }
+            Ok(())
+        }
+        BackupCmd::Now => {
+            let key = chat
+                .backup_key()
+                .map_err(|e| e.to_string())?
+                .ok_or("no backup key yet: run `backup key` first and write the words down")?;
+            let r = chat.backup(&key).await.map_err(|e| e.to_string())?;
+            println!(
+                "backed up: generation {}, {} channel(s) uploaded, {} kept, {} contact(s), {} bytes",
+                r.generation, r.uploaded, r.kept, r.contacts, r.bytes
+            );
+            println!("the exchange holds {} of {} bytes for you", r.used, r.quota);
+            Ok(())
+        }
+        BackupCmd::Show => {
+            let me = chat.me;
+            let h = chat.backup_held(&me).await.map_err(|e| e.to_string())?;
+            if h.is_some() {
+                println!(
+                    "generation {}, written by {} at {}, {} blob(s)",
+                    h.generation,
+                    h.device,
+                    h.written,
+                    h.blobs.len()
+                );
+            } else {
+                println!("nothing backed up here");
+            }
+            println!("{} of {} bytes used", h.used, h.quota);
+            Ok(())
+        }
+        BackupCmd::Restore { from, words } => {
+            let key = if words.is_empty() {
+                chat.backup_key()
+                    .map_err(|e| e.to_string())?
+                    .ok_or("give the 24 words, or run `backup key` on the machine that has them")?
+            } else {
+                let w: Vec<&str> = words.iter().map(String::as_str).collect();
+                from_words(&w).map_err(|e| e.to_string())?
+            };
+            let from = match from {
+                Some(s) => Some(s.parse::<PubKey>().map_err(|e| e.to_string())?),
+                None => None,
+            };
+            let r = chat.restore(&key, from).await.map_err(|e| e.to_string())?;
+            println!(
+                "restored generation {}: {} channel(s), {} entries, {} keys, {} contact(s)",
+                r.generation, r.channels, r.entries, r.keys, r.contacts
+            );
+            for s in &r.skipped {
+                println!("  skipped {s}");
+            }
+            // Ours to keep, from now on.
+            if from.is_none() {
+                chat.set_backup_key(&key).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        BackupCmd::Drop => {
+            chat.drop_backup().await.map_err(|e| e.to_string())?;
+            println!("dropped");
+            Ok(())
+        }
+    }
 }
 
 /// Whether a credential was written for this client.
