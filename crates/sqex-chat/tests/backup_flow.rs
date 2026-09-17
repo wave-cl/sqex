@@ -161,3 +161,52 @@ async fn a_store_comes_back_from_the_exchange_after_the_exchange_forgot_it() {
     let mut third = chat_at(addr, server_pub, 1, &dir.path().join("alice-3.db")).await;
     assert!(third.restore(&key, None).await.is_err());
 }
+
+/// SIP-57: a timed message goes from the store at its time, and never goes
+/// into a backup.
+#[tokio::test]
+async fn a_timed_message_goes_at_its_time_and_stays_out_of_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    alice.send(&channel, "for keeps").await.unwrap();
+    alice.set_timer(&channel, 1);
+    alice.send(&channel, "gone soon").await.unwrap();
+    alice.set_timer(&channel, 0);
+    let mut t = Timeline::new();
+    let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["for keeps", "gone soon"]);
+
+    // The backup, taken while it is still live, leaves it out.
+    let key = alice.new_backup_key().unwrap();
+    alice.backup(&key).await.unwrap();
+    let mut fresh = chat_at(addr, server_pub, 1, &dir.path().join("alice-2.db")).await;
+    fresh.restore(&key, None).await.unwrap();
+    let history = fresh.history(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(
+        said(&history),
+        vec!["for keeps"],
+        "a timed message went into a backup"
+    );
+
+    // And it goes, from the timeline and the store, once its time has come.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let got = alice.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(
+        said(&got.timeline),
+        vec!["for keeps"],
+        "a timed message outlived its timer"
+    );
+    let history = alice.history(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(said(&history), vec!["for keeps"]);
+    // Bob, reading it for the first time now, never sees it: the exchange
+    // may not have pruned yet, and a client does not fold what is past.
+    let mut tb = Timeline::new();
+    let got = bob.poll(&channel, &mut tb, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["for keeps"]);
+}

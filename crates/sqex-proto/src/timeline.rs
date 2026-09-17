@@ -315,6 +315,12 @@ impl Timeline {
         self.messages.values()
     }
 
+    /// SIP-57: drop a message whose timer has run out. What a store does
+    /// on disk, done to the copy in memory.
+    pub fn forget(&mut self, seq: u64) -> bool {
+        self.messages.remove(&seq).is_some()
+    }
+
     pub fn get(&self, seq: u64) -> Option<&Message> {
         self.messages.get(&seq)
     }

@@ -2319,6 +2319,17 @@ async fn handle_key(
                         .collect();
                     Some(lines.join("\n"))
                 }),
+                Command::Expire(secs) => {
+                    chat.set_timer(&channel, secs);
+                    Ok(Some(if secs == 0 {
+                        "no timer: what you send here stays".into()
+                    } else {
+                        format!(
+                            "what you send here goes after {secs}s -- from the exchange, every \
+                             copy, and every reader's store alike"
+                        )
+                    }))
+                }
                 Command::Dismiss(id) => chat
                     .dismiss(&channel, id)
                     .await
@@ -2743,6 +2754,8 @@ enum Command {
     Reports,
     /// SIP-56: `/dismiss <id>`.
     Dismiss(u64),
+    /// SIP-57: `/expire <secs>` -- a timer on what you send here; 0 for none.
+    Expire(u32),
     /// `/replicate <exchange key>` — let another exchange hold a copy of this
     /// channel. `bool` is false for `/unreplicate`, which ends the
     /// subscription and recalls nothing.
@@ -2913,6 +2926,13 @@ impl Command {
                 }
             }
             "/reports" => Command::Reports,
+            "/expire" => match first.parse::<u32>() {
+                Ok(secs) => Command::Expire(secs),
+                Err(_) => Command::Unknown(
+                    "/expire <seconds> puts a timer on what you send here; /expire 0 takes it off"
+                        .into(),
+                ),
+            },
             "/dismiss" => match first.parse::<u64>() {
                 Ok(id) => Command::Dismiss(id),
                 Err(_) => Command::Unknown("/dismiss needs a report's id".into()),

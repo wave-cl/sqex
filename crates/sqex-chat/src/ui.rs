@@ -1754,6 +1754,7 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "what it is called, what it is for, its picture",
             ),
             ("/retain <secs> [max]", "how long it keeps what is said"),
+            ("/expire <secs>", "a timer on what you send; 0 for none"),
             (
                 "/who  /read",
                 "who is here and their keys in full; how far each has read",

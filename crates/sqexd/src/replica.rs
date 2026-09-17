@@ -1011,6 +1011,36 @@ async fn pull_soft_state(
     {
         server.merge_pulled_cursors(channel, &marks);
     }
+    // SIP-57: redactions since the last look, a little before it in case
+    // of clocks: applying one twice is nothing.
+    let looked = store.tombstone_mark(channel);
+    if let Ok((200, body)) = client
+        .post(
+            "/peer/tombstones",
+            sqex_proto::peer::PullTombstones {
+                channel: *channel,
+                since: looked.saturating_sub(5),
+            }
+            .encode(),
+        )
+        .await
+        && let Ok(t) = sqex_proto::peer::Tombstones::decode(&body)
+    {
+        let mut changed = false;
+        for (seq, _) in &t.redacted {
+            changed |= store.apply_tombstone(channel, *seq);
+        }
+        if changed {
+            server.tell(
+                channel,
+                sqex_proto::events::Event::Channel {
+                    channel: *channel,
+                    last_seq: 0,
+                },
+            );
+        }
+        store.set_tombstone_mark(channel, t.now);
+    }
     let since = store.signal_mark(channel);
     if let Ok((200, body)) = client
         .post(

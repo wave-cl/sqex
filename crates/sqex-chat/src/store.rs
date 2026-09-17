@@ -187,6 +187,15 @@ CREATE TABLE IF NOT EXISTS incarnation (
     announce INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (exchange, channel)
 );
+-- SIP-57: messages with a timer, and when each goes. A new table rather
+-- than a column, per the note above.
+CREATE TABLE IF NOT EXISTS timed (
+    exchange BLOB    NOT NULL,
+    channel  BLOB    NOT NULL,
+    seq      INTEGER NOT NULL,
+    until    INTEGER NOT NULL,
+    PRIMARY KEY (exchange, channel, seq)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -1096,6 +1105,50 @@ impl Store {
     }
 
     // ---- verified (SIP-41) ---------------------------------------------
+
+    /// SIP-57: note that a message goes at `until`.
+    pub fn note_timer(&self, channel: &[u8; 32], seq: u64, until: u64) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT OR REPLACE INTO timed (exchange, channel, seq, until) VALUES (?1, ?2, ?3, ?4)",
+                params![self.scope()?, &channel[..], seq as i64, until as i64],
+            )
+            .map_err(storage("note timer"))?;
+        Ok(())
+    }
+
+    /// SIP-57: delete every message whose timer has run out, and say which.
+    pub fn expire_timed(&self, now: u64) -> Result<Vec<([u8; 32], u64)>> {
+        let scope = self.scope()?;
+        let gone: Vec<([u8; 32], u64)> = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT channel, seq FROM timed WHERE exchange = ?1 AND until <= ?2")
+                .map_err(storage("prepare expiry"))?;
+            let rows = stmt
+                .query_map(params![&scope, now as i64], |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                        r.get::<_, i64>(1)? as u64,
+                    ))
+                })
+                .map_err(storage("query expiry"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        for (channel, seq) in &gone {
+            for table in ["message", "entry", "timed"] {
+                self.db
+                    .execute(
+                        &format!(
+                            "DELETE FROM {table} WHERE exchange = ?1 AND channel = ?2 AND seq = ?3"
+                        ),
+                        params![&scope, &channel[..], *seq as i64],
+                    )
+                    .map_err(storage("expire"))?;
+            }
+        }
+        Ok(gone)
+    }
 
     /// A value kept by name: the backup key, and whatever else has no table
     /// of its own.

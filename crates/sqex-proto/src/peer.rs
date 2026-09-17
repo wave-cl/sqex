@@ -74,6 +74,8 @@ pub const TYPE_CURSORS: u8 = 0x0a;
 pub const TYPE_SIGNALS: u8 = 0x0b;
 /// SIP-54: signals the origin keeps per channel for replicas to pull.
 pub const SIGNAL_LOG: usize = 256;
+/// SIP-57: a replica asks the origin what was redacted since a time.
+pub const TYPE_TOMBSTONES: u8 = 0x0c;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -965,6 +967,74 @@ impl Signals {
             return Err(Error::Malformed("trailing bytes after signals".into()));
         }
         Ok(Signals { next, signals })
+    }
+}
+
+/// SIP-57: `POST /peer/tombstones`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullTombstones {
+    pub channel: [u8; 32],
+    pub since: u64,
+}
+
+impl PullTombstones {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(TYPE_TOMBSTONES);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.since.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullTombstones> {
+        if b.len() != 41 || b[0] != TYPE_TOMBSTONES {
+            return Err(Error::Malformed("not a tombstones pull".into()));
+        }
+        Ok(PullTombstones {
+            channel: b[1..33].try_into().unwrap(),
+            since: u64::from_be_bytes(b[33..41].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-57: the answer: `| now: u64 | count: u16 | count × (seq: u64 | at: u64) |`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Tombstones {
+    pub now: u64,
+    pub redacted: Vec<(u64, u64)>,
+}
+
+impl Tombstones {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.redacted.len() * 16);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.redacted.len() as u16).to_be_bytes());
+        for (seq, at) in &self.redacted {
+            out.extend_from_slice(&seq.to_be_bytes());
+            out.extend_from_slice(&at.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Tombstones> {
+        if b.len() < 10 {
+            return Err(Error::Malformed("tombstones cut short".into()));
+        }
+        let now = u64::from_be_bytes(b[..8].try_into().unwrap());
+        let count = u16::from_be_bytes([b[8], b[9]]) as usize;
+        if b.len() != 10 + count * 16 {
+            return Err(Error::Malformed("tombstones cut short".into()));
+        }
+        let redacted = (0..count)
+            .map(|i| {
+                let at = 10 + i * 16;
+                (
+                    u64::from_be_bytes(b[at..at + 8].try_into().unwrap()),
+                    u64::from_be_bytes(b[at + 8..at + 16].try_into().unwrap()),
+                )
+            })
+            .collect();
+        Ok(Tombstones { now, redacted })
     }
 }
 

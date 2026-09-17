@@ -37,6 +37,7 @@ mod blob_flow;
 mod call_flow;
 mod channel_flow;
 mod device_flow;
+mod forgetting_flow;
 mod mailbox_flow;
 mod migration_flow;
 mod name_flow;

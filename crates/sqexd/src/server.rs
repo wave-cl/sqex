@@ -689,7 +689,7 @@ impl Server {
     /// and reading a member list takes that same non-reentrant lock. Publishing
     /// from inside `wake` would deadlock the daemon. Nothing here holds the
     /// database, and `Channels` stays unaware that subscriptions exist.
-    fn tell(&self, channel: &[u8; 32], event: EventKind) {
+    pub(crate) fn tell(&self, channel: &[u8; 32], event: EventKind) {
         let to = self.channels.members_of(channel);
         self.events.publish(&to, event);
         self.wake(&to, &event);
@@ -2915,26 +2915,35 @@ async fn route(
         ("POST", "/channel/redact") => match (account, ByTarget::decode(body, CH_REDACT)) {
             (None, _) => no_identity("redacting an entry"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            (Some(me), Ok(req)) => match server.channels.redact(&me, &req.channel, req.target) {
-                Ok(()) => {
-                    // No sequence number to name: a redaction changes an entry
-                    // that is already numbered. Zero is the wire's word for
-                    // "fetch and see".
-                    server.tell(
-                        &req.channel,
-                        EventKind::Channel {
-                            channel: req.channel,
-                            last_seq: 0,
-                        },
-                    );
-                    (
-                        200,
-                        "application/octet-stream",
-                        ChannelAck { now: now_unix() }.encode(),
-                    )
+            (Some(me), Ok(req)) => {
+                // SIP-57: at a copy, carried to the origin; the tombstone
+                // comes back on the next pull.
+                if let Some(answer) =
+                    forward_action(server, &device.unwrap_or(me), &req.channel, path, body).await
+                {
+                    return answer;
                 }
-                Err(e) => refused(e),
-            },
+                match server.channels.redact(&me, &req.channel, req.target) {
+                    Ok(()) => {
+                        // No sequence number to name: a redaction changes an entry
+                        // that is already numbered. Zero is the wire's word for
+                        // "fetch and see".
+                        server.tell(
+                            &req.channel,
+                            EventKind::Channel {
+                                channel: req.channel,
+                                last_seq: 0,
+                            },
+                        );
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(e) => refused(e),
+                }
+            }
         },
         // Relayed to the other members and stored nowhere. An exchange that
         // dropped every one of these would still conform.
@@ -3104,6 +3113,28 @@ async fn route(
                 _ => peering_refused(),
             }
         }
+        // SIP-57: what the origin redacted since a time, for a copy.
+        ("POST", "/peer/tombstones") => match (
+            peer.identity,
+            sqex_proto::peer::PullTombstones::decode(body),
+        ) {
+            (Some(who), Ok(req))
+                if server
+                    .peering(&who)
+                    .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+            {
+                (
+                    200,
+                    "application/octet-stream",
+                    sqex_proto::peer::Tombstones {
+                        now: now_unix(),
+                        redacted: server.channels.tombstones_since(&req.channel, req.since),
+                    }
+                    .encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
         // SIP-53: the new origin, or another replica, telling this exchange
         // a channel moved. Gated as a pull is.
         ("POST", "/peer/rehomed") => {
@@ -3267,6 +3298,33 @@ async fn route(
                                 .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
                         {
                             report_here(server, &account, &r)
+                        }
+                        _ => return peering_refused(),
+                    },
+                    // SIP-57: a redaction made at a copy, by the author or an
+                    // admin as the origin judges them.
+                    "/channel/redact" => match ByTarget::decode(&req.body, CH_REDACT) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            match server.channels.redact(&account, &r.channel, r.target) {
+                                Ok(()) => {
+                                    server.tell(
+                                        &r.channel,
+                                        EventKind::Channel {
+                                            channel: r.channel,
+                                            last_seq: 0,
+                                        },
+                                    );
+                                    (200, ChannelAck { now: now_unix() }.encode())
+                                }
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
                         }
                         _ => return peering_refused(),
                     },

@@ -697,6 +697,12 @@ impl Sync {
             }
             let mut at = 0;
             if let Ok(e) = Entry::read_receipted(b, &mut at) {
+                // SIP-57: a timed message past its time is not handed over;
+                // one still within it is, timer intact.
+                if e.expires_after > 0 && now_secs() >= e.posted + u64::from(e.expires_after) {
+                    last = *seq;
+                    continue;
+                }
                 bytes += b.len();
                 last = *seq;
                 entries.push(e);
@@ -857,6 +863,14 @@ impl Link for Relayed {
         }
         Ok(frames.frames)
     }
+}
+
+/// The clock, in whole seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

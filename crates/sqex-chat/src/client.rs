@@ -695,6 +695,9 @@ pub struct Chat {
     /// verifies under, and it is this connection's exchange only for a
     /// channel that lives here.
     homes: HashMap<[u8; 32], Home>,
+    /// SIP-57: the timer this client puts on what it sends, per channel;
+    /// seconds, none where unset.
+    timers: HashMap<[u8; 32], u32>,
     /// SIP-53: the exchanges a channel was ordered by before its current
     /// origin, newest first. What they signed and receipted verifies under
     /// them, as a key's predecessors do (SIP-40).
@@ -787,6 +790,7 @@ impl Chat {
             told_about: HashMap::new(),
             homes: HashMap::new(),
             former: HashMap::new(),
+            timers: HashMap::new(),
             bound_in: HashMap::new(),
             domain: None,
             followed,
@@ -3416,6 +3420,40 @@ impl Chat {
         keys
     }
 
+    /// SIP-57: put a timer on what this client sends in `channel`, in
+    /// seconds; 0 for none. Signed into each entry, so the exchange, every
+    /// copy and every reader delete at the same time.
+    pub fn set_timer(&mut self, channel: &[u8; 32], secs: u32) {
+        if secs == 0 {
+            self.timers.remove(channel);
+        } else {
+            self.timers.insert(*channel, secs);
+        }
+    }
+
+    pub fn timer(&self, channel: &[u8; 32]) -> u32 {
+        self.timers.get(channel).copied().unwrap_or(0)
+    }
+
+    /// SIP-57: delete every timed message whose time has come, from the
+    /// store and from `timeline` where it is that channel's. Returns what
+    /// went.
+    pub fn expire(&mut self, timeline: Option<(&[u8; 32], &mut Timeline)>) -> Result<usize> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let gone = self.store.expire_timed(now)?;
+        if let Some((channel, t)) = timeline {
+            for (c, seq) in &gone {
+                if c == channel {
+                    t.forget(*seq);
+                }
+            }
+        }
+        Ok(gone.len())
+    }
+
     /// SIP-53: the channel's origin is `subject` from here. The one it had
     /// is kept as a former origin, and signing moves to the new one.
     fn moved_origin(&mut self, channel: &[u8; 32], subject: &PubKey) {
@@ -4144,13 +4182,16 @@ impl Chat {
         // holding a key. The chain position is the greater of what we remember
         // and what the exchange reports, never its report alone.
         let (chain_seq, prev) = self.chain_at(channel, &info)?;
+        // SIP-57: the timer is signed into the entry, so every holder sees
+        // the same one.
+        let expires_after = self.timers.get(channel).copied().unwrap_or(0);
         let terms = EntryTerms {
             place: self.place(channel, &info),
             account: self.me,
             device: self.device,
             epoch,
             msg_seq,
-            expires_after: 0,
+            expires_after,
             chain_seq,
             prev,
             body: &sealed,
@@ -4166,7 +4207,7 @@ impl Chat {
             channel: *channel,
             epoch,
             msg_seq,
-            expires_after: 0,
+            expires_after,
             chain_seq,
             prev,
             sig,
@@ -4209,6 +4250,14 @@ impl Chat {
                 plain: Some(&plain),
             },
         )?;
+        // SIP-57: our own timed message goes from our store at its time too.
+        if expires_after > 0 {
+            self.store.note_timer(
+                channel,
+                posted.seq,
+                posted.posted + u64::from(expires_after),
+            )?;
+        }
         Ok(posted)
     }
 
@@ -4352,6 +4401,10 @@ impl Chat {
         wait_secs: u16,
     ) -> Result<Conversation> {
         let got = self.ask(channel, wait_secs).await?;
+        // SIP-57: what has run out goes, from the store and the timeline,
+        // before the conversation is read out; what arrives already past
+        // its time is not folded at all.
+        let _ = self.expire(Some((channel, timeline)));
         self.absorb(timeline, got).await
     }
 
@@ -4540,6 +4593,11 @@ impl Chat {
                 );
                 continue;
             }
+            // SIP-57: a timed message already past its time is not folded,
+            // stored or shown; the exchange's backstop merely had not run.
+            if e.expires_after > 0 && now_secs() >= e.posted + u64::from(e.expires_after) {
+                continue;
+            }
             // SIP-42: the entry as served, signature and receipt included,
             // so a sibling device can be handed history it can verify. Only
             // a receipted one: without the receipt a copy could not be
@@ -4565,6 +4623,13 @@ impl Chat {
                     },
                 },
             )?;
+            // SIP-57: a timed message goes at its time, here as everywhere.
+            // SIP-16 lets a client count from its own read time; this one
+            // takes the exchange's backstop, which every holder agrees on.
+            if e.expires_after > 0 {
+                self.store
+                    .note_timer(channel, e.seq, e.posted + u64::from(e.expires_after))?;
+            }
             // A tombstone fetched fresh must overwrite a body we already hold.
             // `put_message` keeps what it has, which is right for a re-fetch
             // and wrong for this.
@@ -4962,6 +5027,14 @@ impl Chat {
         Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         Ok(())
     }
+}
+
+/// The clock, in whole seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -303,6 +303,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::Forwarder::standing"),
         ReplicationPeer,
     ),
+    // SIP-57: a replica pulls what the origin redacted.
+    (
+        "POST",
+        "/peer/tombstones",
+        Peer("replica::pull_soft_state"),
+        ReplicationPeer,
+    ),
     // SIP-54: a replica pulls the members' marks and the signal log.
     (
         "POST",

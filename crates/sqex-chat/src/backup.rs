@@ -224,7 +224,11 @@ impl Chat {
                 for (seq, b) in &raw {
                     let mut at = 0;
                     if let Ok(e) = sqex_proto::channel::Entry::read_receipted(b, &mut at) {
-                        entries.push(e);
+                        // SIP-57: a message with a timer has no business in
+                        // a backup, which is opened at a time nobody chose.
+                        if e.expires_after == 0 {
+                            entries.push(e);
+                        }
                     }
                     since = *seq;
                 }

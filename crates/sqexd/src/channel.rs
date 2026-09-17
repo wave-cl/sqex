@@ -391,6 +391,9 @@ pub struct Channels {
     /// SIP-54: at a replica, how far into each origin's signal log this
     /// exchange has pulled.
     signal_since: Mutex<HashMap<[u8; 32], u64>>,
+    /// SIP-57: at a replica, the origin's clock when tombstones were last
+    /// pulled for each channel.
+    tombstone_since: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 /// What an exchange holds about one numbered position: `posted`, the entry
@@ -616,6 +619,14 @@ CREATE TABLE IF NOT EXISTS stranded (
     posted   INTEGER NOT NULL,
     PRIMARY KEY (channel, seq)
 );
+-- SIP-57: what was redacted here, for copies to pull. Kept for the
+-- channel's retention, after which the entry would have gone anyway.
+CREATE TABLE IF NOT EXISTS tombstone (
+    channel BLOB    NOT NULL,
+    seq     INTEGER NOT NULL,
+    at      INTEGER NOT NULL,
+    PRIMARY KEY (channel, seq)
+);
 -- SIP-56: reports to a channel's admins. Not entries: not in the log, not
 -- replicated, forgotten after REPORT_TTL.
 CREATE TABLE IF NOT EXISTS report (
@@ -792,6 +803,7 @@ impl Channels {
             signals: Mutex::new(HashMap::new()),
             signal_log: Mutex::new(HashMap::new()),
             signal_since: Mutex::new(HashMap::new()),
+            tombstone_since: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1899,13 +1911,19 @@ fn prune(
     now: u64,
     max_bytes: u64,
 ) -> Result<usize, ChannelError> {
+    // SIP-57: a copy keeps no longer than the channel's policy, which the
+    // origin reports as its window; its own retention is its capacity and
+    // may be shorter, never longer.
     let mut gone = db
         .execute(
             "DELETE FROM entry WHERE channel = ?1 AND ?2 - posted >= CASE
                  WHEN expires_after > 0 AND expires_after < (
-                     SELECT retention_secs FROM channel WHERE id = ?1)
+                     SELECT MIN(c.retention_secs, COALESCE(r.window_secs, c.retention_secs))
+                     FROM channel c LEFT JOIN replicated r ON r.channel = c.id WHERE c.id = ?1)
                  THEN expires_after
-                 ELSE (SELECT retention_secs FROM channel WHERE id = ?1) END",
+                 ELSE (SELECT MIN(c.retention_secs, COALESCE(r.window_secs, c.retention_secs))
+                       FROM channel c LEFT JOIN replicated r ON r.channel = c.id WHERE c.id = ?1)
+                 END",
             params![&channel[..], now as i64],
         )
         .map_err(storage("prune by age"))?;
@@ -5809,6 +5827,9 @@ fn write_system_between(
     Ok(seq)
 }
 
+/// SIP-57: tombstones per answer.
+pub const MAX_TOMBSTONES: usize = 256;
+
 /// SIP-53: at least this long between rehomes of one channel.
 pub const REHOME_MIN_SECS: u64 = 3600;
 /// SIP-53: stranded entries are kept this long for their authors.
@@ -6260,6 +6281,9 @@ impl Channels {
         target: u64,
     ) -> Result<(), ChannelError> {
         let db = self.db.lock().unwrap();
+        // SIP-57: a redaction is the origin's to make; a copy carries it
+        // there and takes the tombstone back on its next pull.
+        Channels::read_only(&db, channel)?;
         visibility_of(&db, channel)?;
         let row: Option<(Vec<u8>, i64)> = db
             .query_row(
@@ -6293,7 +6317,44 @@ impl Channels {
             params![&channel[..], target as i64],
         )
         .map_err(storage("redact entry"))?;
+        db.execute(
+            "INSERT OR REPLACE INTO tombstone (channel, seq, at) VALUES (?1, ?2, ?3)",
+            params![&channel[..], target as i64, now_unix() as i64],
+        )
+        .map_err(storage("record tombstone"))?;
         Ok(())
+    }
+
+    /// SIP-57: positions redacted here at or after `since`, for a copy.
+    pub fn tombstones_since(&self, channel: &[u8; 32], since: u64) -> Vec<(u64, u64)> {
+        let db = self.db.lock().unwrap();
+        db.prepare(
+            "SELECT seq, at FROM tombstone WHERE channel = ?1 AND at >= ?2
+             ORDER BY at DESC, seq DESC LIMIT ?3",
+        )
+        .ok()
+        .and_then(|mut st| {
+            st.query_map(
+                params![&channel[..], since as i64, MAX_TOMBSTONES as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+    }
+
+    /// SIP-57: a redaction pulled from the origin, applied to a copy: the
+    /// body goes, the hash, head and receipt stay. Returns whether the
+    /// entry was held with a body.
+    pub fn apply_tombstone(&self, channel: &[u8; 32], seq: u64) -> bool {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE entry SET body = x'' WHERE channel = ?1 AND seq = ?2 AND length(body) > 0",
+            params![&channel[..], seq as i64],
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
     }
 
     /// Relay a signal to the channel's other members.
@@ -6399,6 +6460,20 @@ impl Channels {
             next: *next,
             signals: q.iter().filter(|l| l.seq > since).cloned().collect(),
         }
+    }
+
+    /// SIP-57: the origin's clock at the last tombstone pull.
+    pub fn tombstone_mark(&self, channel: &[u8; 32]) -> u64 {
+        *self
+            .tombstone_since
+            .lock()
+            .unwrap()
+            .get(channel)
+            .unwrap_or(&0)
+    }
+
+    pub fn set_tombstone_mark(&self, channel: &[u8; 32], at: u64) {
+        self.tombstone_since.lock().unwrap().insert(*channel, at);
     }
 
     /// SIP-54: where this replica's pull of a channel's signals got to.
@@ -6827,6 +6902,68 @@ mod tests {
         // tail, and the sequence numbers are not reissued.
         assert_eq!(member[0].body[0], 6);
         assert_eq!(member[3].body[0], 9);
+    }
+
+    /// SIP-57: a copy prunes by the lesser of its own window and the
+    /// origin's -- the policy binds, the capacity may be shorter and never
+    /// longer.
+    #[test]
+    fn a_copy_keeps_no_longer_than_the_origins_window() {
+        let c = open();
+        let alice = key(1);
+        c.create(&alice, &alice, &public_channel(MAX_RETENTION), &|_, _| {
+            false
+        })
+        .unwrap();
+        for i in 0..3u8 {
+            c.post(
+                &alice,
+                &alice,
+                &post_as(&c, ALICE, &[7; 32], 0, i as u64, vec![i; 8]),
+            )
+            .unwrap();
+        }
+        // Age the entries by a day, well within this exchange's own window.
+        {
+            let db = c.db.lock().unwrap();
+            db.execute(
+                "UPDATE entry SET posted = posted - 86400 WHERE channel = ?1",
+                params![&[7u8; 32][..]],
+            )
+            .unwrap();
+        }
+        c.sweep();
+        assert_eq!(
+            c.fetch(&alice, &alice, &[7; 32], 0, false)
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|e| e.kind == KIND_MEMBER)
+                .count(),
+            3,
+            "the exchange's own window kept them"
+        );
+        // Now the channel is a copy of an origin whose window is an hour.
+        {
+            let db = c.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO replicated (channel, origin, window_secs, derivable, shaped)
+                 VALUES (?1, ?2, 3600, 1, 1)",
+                params![&[7u8; 32][..], key(9).as_bytes()],
+            )
+            .unwrap();
+        }
+        c.sweep();
+        assert_eq!(
+            c.fetch(&alice, &alice, &[7; 32], 0, false)
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|e| e.kind == KIND_MEMBER)
+                .count(),
+            0,
+            "a copy held past the origin's window"
+        );
     }
 
     #[test]
