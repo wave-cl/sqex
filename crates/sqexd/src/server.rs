@@ -78,6 +78,7 @@ use sqex_proto::session::{
     TYPE_RECV,
 };
 use sqex_proto::succession::{self, Claim, Policy, Proof};
+use sqex_proto::wake::Register as WakeRegister;
 
 /// The server's own version, reported in status. The protocol lives in
 /// sqnr-core, but this string identifies the daemon.
@@ -239,7 +240,7 @@ pub struct Server {
     rooms: Rooms,
     channels: Channels,
     prekeys: Prekeys,
-    devices: Registry,
+    pub(crate) devices: Registry,
     /// SIP-38: the per-domain name directory. Durable, unlike the SIP-28
     /// endpoint store beside it — a name is the identity a person keeps, not an
     /// address that is only interesting while fresh.
@@ -298,6 +299,12 @@ pub struct Server {
     /// ordinary SIP-3 one and an exchange's identity is that key.
     replicate: Vec<OriginConfig>,
     exchange_seed: [u8; 32],
+    /// SIP-45: wakes for devices that cannot hold a stream, posted off the
+    /// request path. Set once the `Arc` exists, since the task holds it.
+    waker: std::sync::OnceLock<crate::wake::Waker>,
+    /// SIP-45: whether `http://` to loopback is an acceptable endpoint --
+    /// for the tests, which stand a listener up there.
+    wake_loopback: bool,
     /// SIP-43: the way to each origin for a member's post, by origin key.
     origins: HashMap<PubKey, Arc<crate::replica::Forwarder>>,
     /// SIP-43: uploads this replica is carrying to an origin, by the number
@@ -541,6 +548,14 @@ impl Server {
     fn tell(&self, channel: &[u8; 32], event: EventKind) {
         let to = self.channels.members_of(channel);
         self.events.publish(&to, event);
+        self.wake(&to, &event);
+    }
+
+    /// SIP-45: the same people, to their devices that are not listening.
+    fn wake(&self, to: &[PubKey], event: &EventKind) {
+        if let Some(w) = self.waker.get() {
+            w.tell(to, event);
+        }
     }
 
     /// The same, less one account — for a change that account made itself and
@@ -553,6 +568,7 @@ impl Server {
             .filter(|m| m != not)
             .collect();
         self.events.publish(&to, event);
+        self.wake(&to, &event);
     }
 
     /// The same, plus one account who may no longer be present — somebody
@@ -563,6 +579,7 @@ impl Server {
             to.push(*also);
         }
         self.events.publish(&to, event);
+        self.wake(&to, &event);
     }
 
     // --- SIP-39: effects the relay module drives, kept here so it needs no
@@ -721,6 +738,8 @@ pub async fn bind_with(
         replication_peers: config.replication_peers.clone(),
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
+        waker: std::sync::OnceLock::new(),
+        wake_loopback: config.wake_loopback,
         carried_uploads: Mutex::new(HashMap::new()),
         next_carried: AtomicU64::new(0),
         origins: config
@@ -811,7 +830,6 @@ pub async fn bind_with(
         connections: AtomicU64::new(0),
         requests: AtomicU64::new(0),
     });
-
     // The front door, made once and found by name thereafter. An exchange
     // with nothing in it is a room with no doors: a new account can reach
     // nobody, and be reached by nobody, until somebody hands it a sixty-four
@@ -848,6 +866,14 @@ pub async fn bind_with(
             Err(e) => tracing::warn!("no welcome channel: {e:?}"),
         }
     }
+
+    // SIP-45: started here rather than in the struct, because the task needs
+    // the `Arc` and the `Arc` needs the struct -- and after the welcome
+    // channel, whose `get_mut` needs the `Arc` unshared, weakly or not. Weak,
+    // so the server can go.
+    let _ = server
+        .waker
+        .set(crate::wake::start(Arc::downgrade(&server)));
 
     Ok(Bound {
         listener,
@@ -1198,7 +1224,8 @@ async fn serve_events(
         }
     }
 
-    let Some(mut feed) = server.events.subscribe(me) else {
+    let device = peer.identity.unwrap_or(me);
+    let Some(mut feed) = server.events.subscribe(me, device) else {
         let (status, ct, out) = refuse(
             429,
             Code::TooManyStreams,
@@ -1556,6 +1583,45 @@ async fn route(
                     ),
                     Err(_) => refuse(500, Code::Storage, None),
                 }
+            }
+        },
+        // SIP-45: where to wake this device, and until when.
+        ("POST", "/wake/register") => match (peer.identity, WakeRegister::decode(body)) {
+            (None, _) => no_identity("registering a wake"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(device), Ok(req)) => {
+                if !sqex_proto::wake::acceptable(&req.endpoint, server.wake_loopback) {
+                    return refuse(
+                        400,
+                        Code::Malformed,
+                        Some("an endpoint is an https:// address"),
+                    );
+                }
+                match server
+                    .devices
+                    .register_wake(&device, &req.endpoint, req.ttl)
+                {
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(_) => refuse(500, Code::Storage, None),
+                }
+            }
+        },
+        ("POST", "/wake/forget") => match peer.identity {
+            None => no_identity("forgetting a wake"),
+            Some(_) if !sqex_proto::wake::is_forget(body) => {
+                refuse(400, Code::Malformed, Some("not a forget"))
+            }
+            Some(device) => {
+                server.devices.forget_wake(&device);
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
             }
         },
         ("POST", "/resolve/successor") => match (peer.identity, ResolveSuccessor::decode(body)) {

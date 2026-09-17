@@ -211,6 +211,10 @@ pub struct FileConfig {
     /// its own quantity. A public federating exchange should set one.
     #[serde(default)]
     pub max_bridges: Option<u64>,
+    /// SIP-45: accept `http://` wake endpoints on loopback. For tests only;
+    /// a deployment posts wakes to `https://` and nothing else.
+    #[serde(default)]
+    pub wake_loopback: bool,
 }
 
 /// A peer in `replication_peers`: a bare key, or a key with the accounts it
@@ -300,6 +304,8 @@ pub struct Config {
     /// and is what the relay actually consults.
     pub seed_relay_peers: Vec<PubKey>,
     pub max_bridges: Option<u64>,
+    /// SIP-45: accept `http://` wake endpoints on loopback (tests).
+    pub wake_loopback: bool,
 }
 
 /// One resolved origin to replicate from.
@@ -497,6 +503,7 @@ impl FileConfig {
             replicate,
             seed_relay_peers: relay_peers,
             max_bridges: self.max_bridges,
+            wake_loopback: self.wake_loopback,
         })
     }
 }

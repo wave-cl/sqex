@@ -113,3 +113,11 @@ seed_relay_peers = [
 #
 # Unlike the peer list this is read at startup, so changing it needs a restart.
 # max_bridges = 64
+
+# SIP-45: wake-up for devices that cannot hold a stream. A device leaves an
+# https:// push endpoint of its own choosing; the exchange posts the word
+# `wake` to it, and nothing else, when an event would have gone on a stream
+# the device is not holding. Only public https:// endpoints are accepted.
+# Set this to also accept http:// to loopback, which the test suite needs and
+# a public exchange does not.
+# wake_loopback = false

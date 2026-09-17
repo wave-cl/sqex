@@ -327,6 +327,14 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Cli("sqex succession show"),
         Identity,
     ),
+    // SIP-45: a device that cannot hold a stream leaves an endpoint.
+    (
+        "POST",
+        "/wake/register",
+        Cli("sqex wake register"),
+        SelfOnly,
+    ),
+    ("POST", "/wake/forget", Cli("sqex wake forget"), SelfOnly),
     // SIP-43: where a channel lives, asked once per channel before signing.
     ("POST", "/channel/home", Chat("Chat::home"), Member),
     // Reached when a fetch is refused with `equivocated`: the client asks for

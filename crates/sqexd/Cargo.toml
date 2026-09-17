@@ -20,6 +20,9 @@ h3-quinn = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
+# SIP-45: the one plain-HTTPS request this exchange ever makes -- a wake to
+# an endpoint a member supplied. rustls, no redirects, bounded in time.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"] }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = "0.10"

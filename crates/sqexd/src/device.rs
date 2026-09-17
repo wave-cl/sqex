@@ -154,6 +154,14 @@ CREATE TABLE IF NOT EXISTS lodged (
     policy  BLOB NOT NULL,
     at      INTEGER NOT NULL
 );
+-- SIP-45: where each device asked to be woken, until when, and when it last
+-- was. Never served back; a place to post to and nothing else.
+CREATE TABLE IF NOT EXISTS wake (
+    device   BLOB PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    expires  INTEGER NOT NULL,
+    woken    INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS device_by_account ON device (account);
 "#;
 
@@ -563,6 +571,86 @@ impl Registry {
         .optional()
         .ok()
         .flatten()
+    }
+
+    /// SIP-45: keep where `device` asked to be woken.
+    pub fn register_wake(
+        &self,
+        device: &PubKey,
+        endpoint: &str,
+        ttl: u32,
+    ) -> Result<(), DeviceError> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO wake (device, endpoint, expires, woken) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT (device) DO UPDATE SET endpoint = ?2, expires = ?3",
+            params![
+                device.as_bytes(),
+                endpoint,
+                (now_unix() + u64::from(ttl)) as i64
+            ],
+        )
+        .map_err(storage("register wake"))?;
+        Ok(())
+    }
+
+    pub fn forget_wake(&self, device: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "DELETE FROM wake WHERE device = ?1",
+            params![device.as_bytes()],
+        );
+    }
+
+    /// SIP-45: the devices of `account` -- the registered ones, and the
+    /// account itself where it has none -- with a live endpoint, and when
+    /// each was last woken.
+    pub fn wakeable(&self, account: &PubKey) -> Vec<(PubKey, String, u64)> {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        let mut devices: Vec<PubKey> = db
+            .prepare("SELECT device FROM device WHERE account = ?1 AND not_after >= ?2")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![account.as_bytes(), now as i64], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .filter_map(|b| b.try_into().ok().map(PubKey::new))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        if devices.is_empty() {
+            devices.push(*account);
+        }
+        let mut out = Vec::new();
+        for d in devices {
+            let row: Option<(String, i64)> = db
+                .query_row(
+                    "SELECT endpoint, woken FROM wake WHERE device = ?1 AND expires >= ?2",
+                    params![d.as_bytes(), now as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if let Some((endpoint, woken)) = row {
+                out.push((d, endpoint, woken as u64));
+            }
+        }
+        out
+    }
+
+    /// SIP-45: note that `device` was just woken.
+    pub fn woke(&self, device: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE wake SET woken = ?2 WHERE device = ?1",
+            params![device.as_bytes(), now_unix() as i64],
+        );
     }
 
     pub fn account_for(&self, device: &PubKey) -> PubKey {

@@ -87,6 +87,7 @@ sqex-chat                    # the conversations
 sqex-chat device link <key>  # authorise another of your own clients
 sqex-chat device sync        # trade history with them, past what the exchange keeps
 sqex succession will <key>   # name the key that takes your account if this one is lost
+sqex wake register <url>     # a push endpoint the exchange knocks on while you are away
 ```
 
 Inside: `/public <name>` makes a channel anybody may find, `/find [query]`

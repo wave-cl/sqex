@@ -20,6 +20,7 @@ pub mod room;
 pub mod server;
 pub mod session;
 pub mod state;
+pub mod wake;
 
 pub use config::Config;
 pub use server::{Bound, Server, bind, bind_with, serve};

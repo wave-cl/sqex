@@ -40,6 +40,7 @@ pub mod safety;
 pub mod session;
 pub mod succession;
 pub mod timeline;
+pub mod wake;
 
 use sqnr_core::{Error, Operation, PubKey, Result};
 

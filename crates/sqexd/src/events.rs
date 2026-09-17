@@ -49,6 +49,8 @@ pub struct Feed {
     /// not end the others.
     pub id: u64,
     pub who: PubKey,
+    /// The device this stream was opened from (SIP-45).
+    pub device: PubKey,
 }
 
 struct Sub {
@@ -61,18 +63,22 @@ struct Sub {
 #[derive(Default)]
 pub struct Subscribers {
     by_identity: Mutex<HashMap<PubKey, Vec<Sub>>>,
+    /// SIP-45: how many streams each *device* holds, since a wake is a
+    /// device's and only the device that is listening needs none.
+    by_device: Mutex<HashMap<PubKey, usize>>,
     next: AtomicU64,
 }
 
 impl Subscribers {
     /// Open a stream for `who`, or `None` if they already hold the most this
     /// exchange will keep for one identity.
-    pub fn subscribe(&self, who: PubKey) -> Option<Feed> {
+    pub fn subscribe(&self, who: PubKey, device: PubKey) -> Option<Feed> {
         let mut map = self.by_identity.lock().unwrap();
         let subs = map.entry(who).or_default();
         if subs.len() >= MAX_PER_IDENTITY {
             return None;
         }
+        *self.by_device.lock().unwrap().entry(device).or_insert(0) += 1;
         let (tx, rx) = mpsc::channel(QUEUE);
         let behind = Arc::new(AtomicBool::new(false));
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -86,14 +92,34 @@ impl Subscribers {
             behind,
             id,
             who,
+            device,
         })
+    }
+
+    /// SIP-45: whether `device` holds a stream of its own right now.
+    pub fn listening(&self, device: &PubKey) -> bool {
+        self.by_device
+            .lock()
+            .unwrap()
+            .get(device)
+            .is_some_and(|n| *n > 0)
     }
 
     /// Forget one stream, and the identity entirely once its last one goes.
     pub fn unsubscribe(&self, feed: &Feed) {
         let mut map = self.by_identity.lock().unwrap();
         if let Some(subs) = map.get_mut(&feed.who) {
+            let before = subs.len();
             subs.retain(|s| s.id != feed.id);
+            if subs.len() < before {
+                let mut devices = self.by_device.lock().unwrap();
+                if let Some(n) = devices.get_mut(&feed.device) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        devices.remove(&feed.device);
+                    }
+                }
+            }
             if subs.is_empty() {
                 map.remove(&feed.who);
             }
@@ -222,8 +248,8 @@ mod tests {
     #[tokio::test]
     async fn an_event_reaches_a_subscriber_and_nobody_else() {
         let subs = Subscribers::default();
-        let mut a = subs.subscribe(key(1)).unwrap();
-        let mut b = subs.subscribe(key(2)).unwrap();
+        let mut a = subs.subscribe(key(1), key(1)).unwrap();
+        let mut b = subs.subscribe(key(2), key(2)).unwrap();
 
         subs.publish(&[key(1)], Event::Heartbeat);
 
@@ -237,8 +263,8 @@ mod tests {
     #[tokio::test]
     async fn every_stream_an_identity_holds_is_told() {
         let subs = Subscribers::default();
-        let mut one = subs.subscribe(key(1)).unwrap();
-        let mut two = subs.subscribe(key(1)).unwrap();
+        let mut one = subs.subscribe(key(1), key(1)).unwrap();
+        let mut two = subs.subscribe(key(1), key(1)).unwrap();
 
         subs.publish(&[key(1)], Event::Admission);
 
@@ -249,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn a_reader_that_stops_reading_is_marked_behind_rather_than_buffered() {
         let subs = Subscribers::default();
-        let feed = subs.subscribe(key(1)).unwrap();
+        let feed = subs.subscribe(key(1), key(1)).unwrap();
 
         for _ in 0..QUEUE + 50 {
             subs.publish(&[key(1)], Event::Heartbeat);
@@ -267,22 +293,22 @@ mod tests {
     async fn an_identity_cannot_hold_more_streams_than_the_cap() {
         let subs = Subscribers::default();
         let held: Vec<_> = (0..MAX_PER_IDENTITY)
-            .map(|_| subs.subscribe(key(1)).unwrap())
+            .map(|_| subs.subscribe(key(1), key(1)).unwrap())
             .collect();
-        assert!(subs.subscribe(key(1)).is_none());
+        assert!(subs.subscribe(key(1), key(1)).is_none());
         assert_eq!(subs.count(&key(1)), MAX_PER_IDENTITY);
 
         // And one going away makes room for one more, rather than the cap
         // being a lifetime total.
         subs.unsubscribe(&held[0]);
         assert_eq!(subs.count(&key(1)), MAX_PER_IDENTITY - 1);
-        assert!(subs.subscribe(key(1)).is_some());
+        assert!(subs.subscribe(key(1), key(1)).is_some());
     }
 
     #[tokio::test]
     async fn the_last_stream_leaving_forgets_the_identity() {
         let subs = Subscribers::default();
-        let feed = subs.subscribe(key(1)).unwrap();
+        let feed = subs.subscribe(key(1), key(1)).unwrap();
         assert_eq!(subs.total(), 1);
         subs.unsubscribe(&feed);
         assert_eq!(subs.total(), 0);
@@ -330,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn what_is_published_is_what_is_written() {
         let subs = Subscribers::default();
-        let mut feed = subs.subscribe(key(1)).unwrap();
+        let mut feed = subs.subscribe(key(1), key(1)).unwrap();
         let want = Event::Channel {
             channel: [3; 32],
             last_seq: 7,
@@ -354,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn a_backlog_is_replaced_by_one_resync_and_not_followed_by_it() {
         let subs = Subscribers::default();
-        let mut feed = subs.subscribe(key(1)).unwrap();
+        let mut feed = subs.subscribe(key(1), key(1)).unwrap();
 
         // Enough to overflow: the queue fills and the rest mark it behind.
         for i in 0..QUEUE + 10 {
@@ -393,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_stream_still_beats() {
         let subs = Subscribers::default();
-        let mut feed = subs.subscribe(key(1)).unwrap();
+        let mut feed = subs.subscribe(key(1), key(1)).unwrap();
         // Nothing is ever published to this one.
 
         let (mut rec, got) = recorder(3);
@@ -411,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn a_broken_sink_ends_the_pump() {
         let subs = Subscribers::default();
-        let mut feed = subs.subscribe(key(1)).unwrap();
+        let mut feed = subs.subscribe(key(1), key(1)).unwrap();
         subs.publish(&[key(1)], Event::Admission);
 
         let (mut rec, got) = recorder(0);

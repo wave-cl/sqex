@@ -142,6 +142,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SuccessionCmd,
     },
+    /// Wake-up for a device that cannot hold a stream (SIP-45): leave a
+    /// push endpoint with the exchange, which posts the word `wake` to it
+    /// when something happens while this device is away. Nothing else goes
+    /// to the endpoint.
+    Wake {
+        #[command(subcommand)]
+        cmd: WakeCmd,
+    },
     /// The safety words for you and another identity (SIP-41): six words to
     /// compare with them in person or over a call. Nothing is sent unless
     /// you say the words matched.
@@ -331,6 +339,22 @@ enum AttestCmd {
         #[arg(short = 'i', long)]
         issuer: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WakeCmd {
+    /// Leave an endpoint: an https:// address your push distributor gave
+    /// this device. Replaces any it held. Registered for `--days` (at most
+    /// 30); re-run when you connect.
+    Register {
+        /// The endpoint, an absolute https:// URL.
+        url: String,
+        /// How long to keep it, in days.
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+    },
+    /// Drop this device's endpoint. Nothing further is posted to it.
+    Forget,
 }
 
 #[derive(Subcommand)]
@@ -541,6 +565,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Peers => peers(&cli, &cfg).await,
         Cmd::Succession { cmd } => succession(&cli, &cfg, cmd).await,
+        Cmd::Wake { cmd } => wake(&cli, &cfg, cmd).await,
         Cmd::Meet {
             peer,
             wait,
@@ -2359,6 +2384,50 @@ async fn succession(cli: &Cli, cfg: &Config, cmd: &SuccessionCmd) -> Result<(), 
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// SIP-45: an endpoint the exchange posts `wake` to while this device is
+/// away. The exchange never serves it back, so there is nothing to show.
+async fn wake(cli: &Cli, cfg: &Config, cmd: &WakeCmd) -> Result<(), String> {
+    use sqex_proto::wake::{MAX_TTL, Register, acceptable, forget};
+    let (mut client, _server) = connect(cli, cfg).await?;
+    match cmd {
+        WakeCmd::Register { url, days } => {
+            if !acceptable(url, false) {
+                return Err(
+                    "the endpoint must be an absolute https:// URL of at most 512 bytes".into(),
+                );
+            }
+            let ttl = u32::try_from(u64::from(*days) * 86_400)
+                .ok()
+                .filter(|t| *t <= MAX_TTL)
+                .ok_or("at most 30 days")?;
+            let req = Register {
+                ttl,
+                endpoint: url.clone(),
+            };
+            let (code, body) = client.post("/wake/register", req.encode()).await?;
+            match code {
+                200 => {
+                    println!("registered for {days} day(s)");
+                    Ok(())
+                }
+                404 => Err("this exchange does not wake devices (SIP-45)".into()),
+                _ => Err(format!("register failed ({code}): {}", said(&body))),
+            }
+        }
+        WakeCmd::Forget => {
+            let (code, body) = client.post("/wake/forget", forget()).await?;
+            match code {
+                200 => {
+                    println!("forgotten");
+                    Ok(())
+                }
+                404 => Err("this exchange does not wake devices (SIP-45)".into()),
+                _ => Err(format!("forget failed ({code}): {}", said(&body))),
+            }
         }
     }
 }
