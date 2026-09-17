@@ -82,7 +82,7 @@ use sqex_proto::session::{
     BySession, CallAck, CallDecline, CallOpen, DatagramFrame, Open, SendFrame, TYPE_CLOSE,
     TYPE_RECV,
 };
-use sqex_proto::succession::{self, Claim, Policy, Proof};
+use sqex_proto::succession::{self, Claim, Handover, Policy, Proof};
 use sqex_proto::wake::Register as WakeRegister;
 
 /// The server's own version, reported in status. The protocol lives in
@@ -2007,6 +2007,13 @@ async fn route(
                 }
                 None => refuse(404, Code::NotFound, None),
             },
+        },
+        // SIP-62: the account, still holding its key, names its successor
+        // and keeps its devices under the new key's credentials.
+        ("POST", "/account/handover") => match (account, Handover::decode(body)) {
+            (None, _) => no_identity("handing an account over"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(h)) => handover(server, &me, h).await,
         },
         // SIP-44: what was recorded, for anybody to check.
         ("POST", "/account/succession") => match (peer.identity, succession::asked(body)) {
@@ -4744,6 +4751,8 @@ async fn succeed(server: &Server, me: &PubKey, claim: Claim) -> (u16, &'static s
         || server.devices.successor_of(&successor).is_some()
         || server.devices.has_devices(&successor)
         || !server.names.names_for(&successor).is_empty()
+        // SIP-62: a key that is a member somewhere is an account too.
+        || server.channels.has_memberships(&successor)
     {
         return refused();
     }
@@ -4789,6 +4798,91 @@ async fn succeed(server: &Server, me: &PubKey, claim: Claim) -> (u16, &'static s
         names = moved,
         channels = channels.len(),
         "account succeeded"
+    );
+    (
+        200,
+        "application/octet-stream",
+        ChannelAck { now: now_unix() }.encode(),
+    )
+}
+
+/// SIP-62: verify a handover and carry it out through SIP-44's path, with
+/// the devices kept. One refusal for every way it can be wrong, as for a
+/// claim.
+async fn handover(server: &Server, me: &PubKey, h: Handover) -> (u16, &'static str, Vec<u8>) {
+    let refused = || refuse(403, Code::NotYours, None);
+    let (account, successor) = (h.will.account, h.will.successor);
+    if account != *me
+        || account == successor
+        || !h.will.verify()
+        || server.devices.successor_of(&account).is_some()
+        || server.devices.successor_of(&successor).is_some()
+        || server.devices.has_devices(&successor)
+        || !server.names.names_for(&successor).is_empty()
+        || server.channels.has_memberships(&successor)
+    {
+        return refused();
+    }
+    let now = now_unix();
+    let mine: Vec<PubKey> = match server.devices.list(&account) {
+        Ok(d) if d.devices.is_empty() => vec![account],
+        Ok(d) => d.devices.iter().map(|x| x.device).collect(),
+        Err(_) => return refused(),
+    };
+    for c in &h.credentials {
+        if c.account != successor
+            || !mine.contains(&c.delegate)
+            || c.verify(&successor, sqex_proto::credential::SCOPE_CHAT, now)
+                .is_err()
+        {
+            return refused();
+        }
+    }
+    let proof = Proof::Will(h.will).encode();
+    if server
+        .devices
+        .handover(&account, &successor, &proof, &h.credentials)
+        .is_err()
+    {
+        return refused();
+    }
+    server.resync_transport();
+    let (issued, sig) = (h.will.issued, h.will.sig);
+    let moved = server.names.succeed(&account, &successor);
+    server.profiles.succeed(&account, &successor);
+    server.endpoints.set_successor(
+        account,
+        ResolveSuccessor {
+            successor,
+            reason: "succeeded".into(),
+        },
+    );
+    let channels = match server
+        .channels
+        .succeed_account(&account, &successor, issued, &sig)
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(account = %account, "handover recorded but channels did not follow: {e:?}");
+            Vec::new()
+        }
+    };
+    for channel in &channels {
+        server.tell(
+            channel,
+            EventKind::Channel {
+                channel: *channel,
+                last_seq: server.channels.highest(channel),
+            },
+        );
+    }
+    tracing::info!(
+        account = %account,
+        successor = %successor,
+        devices = h.credentials.len(),
+        names = moved,
+        channels = channels.len(),
+        "account handed over"
     );
     (
         200,

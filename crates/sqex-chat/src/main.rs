@@ -151,6 +151,20 @@ enum Cmd {
         #[arg(long)]
         signed: Option<String>,
     },
+    /// Hand this account over to a new key (SIP-62), keeping this client
+    /// and your other devices. The new key is made here and kept sealed in
+    /// this store, unless you signed the will and the credentials
+    /// elsewhere (`sqex succession will`, `sqex device link`) and pass
+    /// them in.
+    Handover {
+        /// A will naming the new key, base58, signed by the account.
+        #[arg(long)]
+        signed: Option<String>,
+        /// A credential from the new key for one of your devices, base58;
+        /// repeat for each device you keep. This client must be one.
+        #[arg(long = "credential")]
+        credentials: Vec<String>,
+    },
     /// Where an account lives, as this exchange has it (SIP-59).
     Home {
         /// The account, base58, or a name here. Yours if omitted.
@@ -318,6 +332,42 @@ async fn run(cli: Cli) -> Result<(), String> {
     }) = &cli.cmd
     {
         return move_command(&mut chat, home, home_key.as_deref(), signed.as_deref()).await;
+    }
+    if let Some(Cmd::Handover {
+        signed,
+        credentials,
+    }) = &cli.cmd
+    {
+        let was = chat.me;
+        match signed {
+            None => {
+                if !credentials.is_empty() {
+                    return Err("--credential goes with --signed".into());
+                }
+                let new = chat.handover(None).await.map_err(|e| e.to_string())?;
+                println!("handed over: {was} is now {new}");
+                println!("the new key is kept sealed in this store; this client and your other");
+                println!("devices act for it. Run `backup now` so the key is not only here.");
+            }
+            Some(w) => {
+                let raw = bs58::decode(w.trim())
+                    .into_vec()
+                    .map_err(|e| format!("bad will: {e}"))?;
+                let will = sqex_proto::succession::Will::decode(&raw).map_err(|e| e.to_string())?;
+                let mut creds = Vec::new();
+                for c in credentials {
+                    let raw = bs58::decode(c.trim())
+                        .into_vec()
+                        .map_err(|e| format!("bad credential: {e}"))?;
+                    creds.push(Credential::decode(&raw).map_err(|e| e.to_string())?);
+                }
+                chat.handover_signed(will, creds)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                println!("handed over: {was} is now {}", chat.me);
+            }
+        }
+        return Ok(());
     }
     if let Some(Cmd::Home { who }) = &cli.cmd {
         let account = match who {

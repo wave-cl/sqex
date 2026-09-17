@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS contact (
     label   TEXT NOT NULL,
     added   INTEGER NOT NULL
 );
+-- SIP-62: a direct message whose other party changed key keeps its
+-- channel; this is how the conversation with the *new* key is found
+-- without deriving a second one. Scoped by exchange as channels are.
+CREATE TABLE IF NOT EXISTS dm_alias (
+    exchange BLOB NOT NULL,
+    account  BLOB NOT NULL,
+    channel  BLOB NOT NULL,
+    PRIMARY KEY (exchange, account)
+);
 -- SIP-41: the keys whose safety words this person compared with their
 -- owner, and when. A fact this person established; nothing the exchange
 -- says puts a row here or takes one out.
@@ -657,6 +666,7 @@ const SCOPED: &[(&str, bool)] = &[
     ("channel_key", false),
     ("message", true),
     ("entry", true),
+    ("dm_alias", true),
     ("timed", true),
     ("asset", true),
     ("cursor", true),
@@ -1883,6 +1893,60 @@ impl Store {
             })
             .optional()
             .map_err(storage("read credential"))
+    }
+
+    /// SIP-62: the account's own seed, where this client made the key it
+    /// handed over to -- sealed, and what signs for the account from then
+    /// on (a Move, a credential, the next handover). `None` where the
+    /// account is this device's key or is held elsewhere.
+    pub fn account_seed(&self) -> Result<Option<[u8; 32]>> {
+        match self.meta("account_seed")? {
+            Some(sealed) => self.unseal(&sealed).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_account_seed(&self, seed: &[u8; 32]) -> Result<()> {
+        let sealed = self.seal_bytes(seed)?;
+        self.set_meta("account_seed", &sealed)
+    }
+
+    /// SIP-62: a correspondent changed key; the contact row follows, label
+    /// and all. Verification (SIP-41) does not: a new key is unverified.
+    pub fn rekey_contact(&self, old: &PubKey, new: &PubKey) -> Result<()> {
+        self.db
+            .execute(
+                "UPDATE OR IGNORE contact SET account = ?2 WHERE account = ?1",
+                params![old.as_bytes(), new.as_bytes()],
+            )
+            .map_err(storage("rekey contact"))?;
+        Ok(())
+    }
+
+    /// SIP-62: the direct message with `account`, where it is a channel
+    /// whose identifier no longer derives from the pair.
+    pub fn dm_alias(&self, account: &PubKey) -> Result<Option<[u8; 32]>> {
+        let row: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT channel FROM dm_alias WHERE exchange = ?1 AND account = ?2",
+                params![self.scope()?, account.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read dm alias"))?;
+        Ok(row.and_then(|c| c.try_into().ok()))
+    }
+
+    pub fn set_dm_alias(&self, account: &PubKey, channel: &[u8; 32]) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO dm_alias (exchange, account, channel) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (exchange, account) DO UPDATE SET channel = ?3",
+                params![self.scope()?, account.as_bytes(), &channel[..]],
+            )
+            .map_err(storage("set dm alias"))?;
+        Ok(())
     }
 
     pub fn set_credential(&self, bytes: &[u8]) -> Result<()> {

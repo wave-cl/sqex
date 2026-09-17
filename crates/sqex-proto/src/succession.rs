@@ -18,6 +18,9 @@ pub const TYPE_WILL: u8 = 0x01;
 pub const TYPE_POLICY: u8 = 0x02;
 pub const TYPE_VOUCH: u8 = 0x03;
 pub const TYPE_CLAIM: u8 = 0x04;
+/// SIP-62: a will presented by its own signer, now, with the credentials
+/// the new key signed for the devices the account keeps.
+pub const TYPE_HANDOVER: u8 = 0x05;
 
 /// Guardians a policy may name.
 pub const MAX_GUARDIANS: usize = 8;
@@ -502,6 +505,64 @@ impl Claim {
     }
 }
 
+/// SIP-62: `POST /account/handover`. The account, still holding its key,
+/// names its successor by the same will SIP-44 uses, and carries a
+/// credential from the successor for each device it keeps.
+/// `| type = 0x05 | Will | count: u8 | count × Credential(len-prefixed u16) |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handover {
+    pub will: Will,
+    pub credentials: Vec<crate::credential::Credential>,
+}
+
+impl Handover {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![TYPE_HANDOVER];
+        out.extend_from_slice(&self.will.encode());
+        let n = self.credentials.len().min(crate::device::MAX_DEVICES);
+        out.push(n as u8);
+        for c in self.credentials.iter().take(n) {
+            let bytes = c.encode();
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Handover> {
+        if b.first() != Some(&TYPE_HANDOVER) {
+            return Err(Error::Malformed("not a handover".into()));
+        }
+        let will = Will::decode(b.get(1..1 + WILL_LEN).ok_or_else(|| short("handover"))?)?;
+        let mut at = 1 + WILL_LEN;
+        let n = *b.get(at).ok_or_else(|| short("handover"))? as usize;
+        at += 1;
+        if n > crate::device::MAX_DEVICES {
+            return Err(Error::Malformed(format!(
+                "a handover keeps at most {} devices, not {n}",
+                crate::device::MAX_DEVICES
+            )));
+        }
+        let mut credentials = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = u16::from_be_bytes(
+                b.get(at..at + 2)
+                    .ok_or_else(|| short("handover"))?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            at += 2;
+            let bytes = b.get(at..at + len).ok_or_else(|| short("handover"))?;
+            at += len;
+            credentials.push(crate::credential::Credential::decode(bytes)?);
+        }
+        if at != b.len() {
+            return Err(Error::Malformed("trailing bytes after a handover".into()));
+        }
+        Ok(Handover { will, credentials })
+    }
+}
+
 /// What the exchange recorded: served by `/account/succession`.
 /// `| successor[32] | now: u64 | proof |`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,5 +693,37 @@ mod tests {
         assert!(Policy::sign(&seed(1), 1, &[key(1)], 7).is_err());
         assert!(Policy::sign(&seed(1), 1, &[key(3), key(3)], 7).is_err());
         assert!(Policy::sign(&seed(1), 0, &[key(3)], 7).is_err());
+    }
+}
+
+#[cfg(test)]
+mod handover_tests {
+    use super::*;
+
+    #[test]
+    fn a_handover_round_trips() {
+        let old = [5u8; 32];
+        let new_seed = [6u8; 32];
+        let new = PubKey::new(SigningKey::from_bytes(&new_seed).verifying_key().to_bytes());
+        let will = Will::sign(&old, &new, 9);
+        let device = PubKey::new(SigningKey::from_bytes(&old).verifying_key().to_bytes());
+        let credential = crate::credential::Credential::issue(
+            &new_seed,
+            &device,
+            crate::credential::SCOPE_CHAT,
+            1,
+            99,
+        )
+        .unwrap();
+        let h = Handover {
+            will,
+            credentials: vec![credential],
+        };
+        assert_eq!(Handover::decode(&h.encode()).unwrap(), h);
+        let mut trailing = h.encode();
+        trailing.push(0);
+        assert!(Handover::decode(&trailing).is_err());
+        assert!(Handover::decode(&h.encode()[..50]).is_err());
+        assert!(Claim::decode(&h.encode()).is_err());
     }
 }

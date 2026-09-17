@@ -499,9 +499,15 @@ pub async fn pull_once(
         // holds the whole proof; checked here, and the seat moved only when
         // it proves what the entry says.
         for e in pulled.entries.iter().filter(|e| e.kind == KIND_SYSTEM) {
-            if let Ok(Some(sys)) = System::decode(&e.body)
-                && sys.event == EVENT_SUCCEEDED
-                && !succession::entry_verifies(&sys.actor, &sys.subject, sys.chain_seq, &sys.sig)
+            let Ok(Some(sys)) = System::decode(&e.body) else {
+                continue;
+            };
+            if sys.event != EVENT_SUCCEEDED {
+                continue;
+            }
+            let mut verified =
+                succession::entry_verifies(&sys.actor, &sys.subject, sys.chain_seq, &sys.sig);
+            if !verified
                 && let Ok((200, body)) = client
                     .post("/account/succession", succession::ask(&sys.actor))
                     .await
@@ -511,6 +517,12 @@ pub async fn pull_once(
                 && record.proof.proves(&sys.subject)
             {
                 let _ = store.apply_succession(channel, &sys.actor, &sys.subject);
+                verified = true;
+            }
+            // SIP-62: what this exchange holds of the account under SIP-59
+            // and SIP-60 follows the key, once the succession is checked.
+            if verified {
+                server.devices.follow_succession(&sys.actor, &sys.subject);
             }
         }
 

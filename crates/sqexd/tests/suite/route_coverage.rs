@@ -350,6 +350,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Cli("sqex succession show"),
         Identity,
     ),
+    // SIP-62: the account hands itself over to a new key, devices kept.
+    (
+        "POST",
+        "/account/handover",
+        Chat("sqex-chat handover"),
+        SelfOnly,
+    ),
     (
         "POST",
         "/account/lodge",

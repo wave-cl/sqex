@@ -574,8 +574,97 @@ impl Registry {
             params![account.as_bytes()],
         )
         .map_err(storage("clear lodged"))?;
+        // SIP-62: the account's home records follow the key here too.
+        follow_succession(&tx, account, successor)?;
         tx.commit().map_err(storage("commit succeed"))?;
         Ok(())
+    }
+
+    /// SIP-62: a succession by the account's own hand, with the devices it
+    /// keeps registered to the successor under the credentials the new key
+    /// signed -- in the one transaction, so no request in between finds
+    /// a device that belongs to nobody. The credentials are verified by
+    /// the caller; this records.
+    pub fn handover(
+        &self,
+        account: &PubKey,
+        successor: &PubKey,
+        proof: &[u8],
+        kept: &[Credential],
+    ) -> Result<(), DeviceError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin handover"))?;
+        let done: bool = tx
+            .query_row(
+                "SELECT 1 FROM succession WHERE account = ?1",
+                params![account.as_bytes()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(storage("read succession"))?
+            .unwrap_or(false);
+        if done {
+            return Err(DeviceError::NotAuthorised);
+        }
+        tx.execute(
+            "INSERT INTO succession (account, successor, at, proof) VALUES (?1, ?2, ?3, ?4)",
+            params![account.as_bytes(), successor.as_bytes(), now as i64, proof],
+        )
+        .map_err(storage("record succession"))?;
+        // The old key's registrations go as SIP-44 has them go; the kept
+        // devices come straight back under the new key's credentials, and
+        // are not left in `revoked`, since the account kept them.
+        tx.execute(
+            "INSERT OR REPLACE INTO revoked (device, at, not_after, account)
+             SELECT device, ?2, not_after, account FROM device WHERE account = ?1",
+            params![account.as_bytes(), now as i64],
+        )
+        .map_err(storage("retire devices"))?;
+        tx.execute(
+            "DELETE FROM device WHERE account = ?1",
+            params![account.as_bytes()],
+        )
+        .map_err(storage("remove devices"))?;
+        for c in kept {
+            tx.execute(
+                "INSERT INTO device (device, account, added, issued, not_after, credential)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (device) DO UPDATE SET account = ?2, issued = ?4, not_after = ?5,
+                                                    credential = ?6",
+                params![
+                    c.delegate.as_bytes(),
+                    successor.as_bytes(),
+                    now as i64,
+                    c.issued as i64,
+                    c.not_after as i64,
+                    c.encode(),
+                ],
+            )
+            .map_err(storage("keep device"))?;
+            tx.execute(
+                "DELETE FROM revoked WHERE device = ?1",
+                params![c.delegate.as_bytes()],
+            )
+            .map_err(storage("unretire device"))?;
+        }
+        tx.execute(
+            "DELETE FROM lodged WHERE account = ?1",
+            params![account.as_bytes()],
+        )
+        .map_err(storage("clear lodged"))?;
+        follow_succession(&tx, account, successor)?;
+        tx.commit().map_err(storage("commit handover"))?;
+        Ok(())
+    }
+
+    /// SIP-62: re-key what this exchange holds of an account under SIP-59
+    /// and SIP-60 -- its Move, its origin hints, a learned home -- to its
+    /// successor, the Move's signature cleared. At an origin or a copy,
+    /// on a succession learned from the log.
+    pub fn follow_succession(&self, account: &PubKey, successor: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = follow_succession(&db, account, successor);
     }
 
     /// SIP-44: keep a policy for `account` ahead of need.
@@ -772,7 +861,20 @@ impl Registry {
         if let Some(issued) = held
             && mv.issued <= issued as u64
         {
-            return Ok(false);
+            // SIP-62: a record re-keyed by a handover carries no signature
+            // and is replaced by any Move the new key signs.
+            let cleared: bool = tx
+                .query_row(
+                    "SELECT length(sig) < 64 FROM home WHERE account = ?1",
+                    params![mv.account.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(storage("read home sig"))?
+                .unwrap_or(false);
+            if !cleared {
+                return Ok(false);
+            }
         }
         tx.execute(
             "INSERT INTO home (account, home, domain, issued, sig) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -806,10 +908,15 @@ impl Registry {
 
     /// SIP-59: the home on record for an account -- key, domain hint,
     /// `issued` -- if a Move was ever presented here.
+    ///
+    /// SIP-62: a record re-keyed by a handover has its signature cleared
+    /// and answers `since = 0`, so the successor's client signs a fresh
+    /// Move; the record still says where the account lives.
     pub fn home_of(&self, account: &PubKey) -> Option<(PubKey, String, u64)> {
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT home, domain, issued FROM home WHERE account = ?1",
+            "SELECT home, domain, CASE WHEN length(sig) = 64 THEN issued ELSE 0 END
+             FROM home WHERE account = ?1",
             params![account.as_bytes()],
             |r| {
                 Ok((
@@ -824,11 +931,13 @@ impl Registry {
         .flatten()
     }
 
-    /// SIP-59: the Move on record, as presented, for carrying on.
+    /// SIP-59: the Move on record, as presented, for carrying on. `None`
+    /// for a record a handover re-keyed (SIP-62): the exchange acts on it
+    /// and does not carry it, until the new key has signed one.
     pub fn move_of(&self, account: &PubKey) -> Option<(sqex_proto::home::Move, String)> {
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT home, domain, issued, sig FROM home WHERE account = ?1",
+            "SELECT home, domain, issued, sig FROM home WHERE account = ?1 AND length(sig) = 64",
             params![account.as_bytes()],
             |r| {
                 let sig: Vec<u8> = r.get(3)?;
@@ -990,6 +1099,39 @@ impl Registry {
             })
             .collect()
     }
+}
+
+/// SIP-62: the home records of `account` become `successor`'s, the Move's
+/// signature cleared (it was the old key's). The successor's own rows, if
+/// it has any, stand -- a fresh key has none.
+fn follow_succession(
+    db: &Connection,
+    account: &PubKey,
+    successor: &PubKey,
+) -> Result<(), DeviceError> {
+    db.execute(
+        "UPDATE OR IGNORE home SET account = ?2, sig = x'' WHERE account = ?1",
+        params![account.as_bytes(), successor.as_bytes()],
+    )
+    .map_err(storage("re-key home"))?;
+    db.execute(
+        "UPDATE OR IGNORE home_origin SET account = ?2 WHERE account = ?1",
+        params![account.as_bytes(), successor.as_bytes()],
+    )
+    .map_err(storage("re-key origins"))?;
+    db.execute(
+        "UPDATE OR IGNORE learned_home SET account = ?2 WHERE account = ?1",
+        params![account.as_bytes(), successor.as_bytes()],
+    )
+    .map_err(storage("re-key learned home"))?;
+    for table in ["home", "home_origin", "learned_home"] {
+        db.execute(
+            &format!("DELETE FROM {table} WHERE account = ?1"),
+            params![account.as_bytes()],
+        )
+        .map_err(storage("drop old key's home rows"))?;
+    }
+    Ok(())
 }
 
 fn account_of(db: &Connection, device: &PubKey, now: u64) -> Result<Option<PubKey>, DeviceError> {

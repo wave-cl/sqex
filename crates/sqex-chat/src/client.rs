@@ -1992,7 +1992,13 @@ impl Chat {
     // ---- opening a conversation -----------------------------------------
 
     /// The channel two accounts share. Derived, not asked for.
+    ///
+    /// SIP-62: a conversation whose other party changed key keeps its
+    /// channel, and is found here before anything is derived.
     pub fn dm_with(&self, them: &PubKey) -> [u8; 32] {
+        if let Ok(Some(c)) = self.store.dm_alias(them) {
+            return c;
+        }
         direct_message_id(&self.me, them)
     }
 
@@ -2069,6 +2075,117 @@ impl Chat {
         Ok(channel)
     }
 
+    // ---- SIP-62: account key handover ------------------------------------
+
+    /// Hand this account over to a new key while the old one is still
+    /// held: the will under the account's key, a credential from the new
+    /// key for each device the account has (this one included), presented
+    /// together. On success this client acts for the successor, the new
+    /// seed is kept sealed in the store, and the conversations this
+    /// account had by derived identifier are remembered under the new key.
+    /// `new_seed` is made here when not given.
+    pub async fn handover(&mut self, new_seed: Option<[u8; 32]>) -> Result<PubKey> {
+        let old_seed = self.account_seed().ok_or_else(|| {
+            ChatError::Protocol(format!(
+                "this client acts for {} and cannot sign for it; sign the will and the \
+                 credentials with the account's key and pass them with --signed",
+                self.me
+            ))
+        })?;
+        let new_seed = new_seed.unwrap_or_else(|| {
+            use rand_core::RngCore;
+            let mut b = [0u8; 32];
+            rand_core::OsRng.fill_bytes(&mut b);
+            b
+        });
+        let new = PubKey::new(
+            ed25519_dalek::SigningKey::from_bytes(&new_seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let will = sqex_proto::succession::Will::sign(&old_seed, &new, now_secs());
+        let mut devices: Vec<PubKey> = self.my_devices().await?.iter().map(|d| d.device).collect();
+        if devices.is_empty() {
+            devices.push(self.device);
+        }
+        let now = now_secs();
+        let credentials = devices
+            .iter()
+            .map(|d| {
+                Credential::issue(
+                    &new_seed,
+                    d,
+                    SCOPE_CHAT,
+                    now.saturating_sub(60),
+                    now + 90 * 86_400,
+                )
+                .map_err(|e| ChatError::Protocol(e.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.handover_signed(will, credentials).await?;
+        self.store.set_account_seed(&new_seed)?;
+        Ok(new)
+    }
+
+    /// Present a handover signed elsewhere -- the will by the account, the
+    /// credentials by the successor (SIP-58) -- and become the successor's
+    /// device. The conversations this account had by derived identifier
+    /// are remembered under the new key.
+    pub async fn handover_signed(
+        &mut self,
+        will: sqex_proto::succession::Will,
+        credentials: Vec<Credential>,
+    ) -> Result<()> {
+        let old = self.me;
+        let new = will.successor;
+        let mine = credentials
+            .iter()
+            .find(|c| c.delegate == self.device)
+            .cloned()
+            .ok_or_else(|| {
+                ChatError::Protocol("no credential in the handover names this device".into())
+            })?;
+        // The direct messages this account is in, by the old derivation,
+        // before the seats move.
+        let mut dms: Vec<(PubKey, [u8; 32])> = Vec::new();
+        for m in self.mine().await? {
+            if let Ok(info) = self.info(&m.channel).await
+                && info.members.len() == 2
+                && let Some(other) = info.members.iter().map(|x| x.account).find(|a| *a != old)
+                && direct_message_id(&old, &other) == m.channel
+            {
+                dms.push((other, m.channel));
+            }
+        }
+        self.post(
+            "/account/handover",
+            sqex_proto::succession::Handover { will, credentials }.encode(),
+        )
+        .await?;
+        self.store.set_credential(&mine.encode())?;
+        self.store.set_account(&new)?;
+        self.me = new;
+        for (other, channel) in dms {
+            self.store.set_dm_alias(&other, &channel)?;
+        }
+        Ok(())
+    }
+
+    /// SIP-62: a correspondent's key changed, seen in a channel's log. The
+    /// contact follows; where the channel was the direct message with the
+    /// old key, it is the direct message with the new.
+    fn follow_correspondent(&mut self, channel: &[u8; 32], old: &PubKey, new: &PubKey) {
+        if *old == self.me || *new == self.me {
+            return;
+        }
+        let _ = self.store.rekey_contact(old, new);
+        if direct_message_id(&self.me, old) == *channel
+            || self.store.dm_alias(old).ok().flatten() == Some(*channel)
+        {
+            let _ = self.store.set_dm_alias(new, channel);
+        }
+    }
+
     // ---- SIP-60: reaching someone at another exchange -----------------------
 
     /// Find somebody at another exchange through this one: their key, their
@@ -2102,7 +2219,7 @@ impl Chat {
     /// channel. Only a client holding the account key; a linked device
     /// leaves it to the account. Returns whether one was presented.
     pub async fn ensure_home(&mut self) -> Result<bool> {
-        if self.me != self.device {
+        if self.account_seed().is_none() {
             return Ok(false);
         }
         let me = self.me;
@@ -2534,7 +2651,14 @@ impl Chat {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        Credential::issue(&self.seed, device, SCOPE_CHAT, now, now + lifetime)
+        let seed = self.account_seed().ok_or_else(|| {
+            ChatError::Protocol(format!(
+                "this client acts for {} and cannot sign for it; `sqex device link` with the \
+                 account's key instead",
+                self.me
+            ))
+        })?;
+        Credential::issue(&seed, device, SCOPE_CHAT, now, now + lifetime)
             .map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
@@ -3783,14 +3907,25 @@ impl Chat {
     /// not the account, and is told to have the account sign (`sqex home
     /// sign`, which can drive a hardware key).
     pub fn sign_move(&self, home: &PubKey) -> Result<sqex_proto::home::Move> {
-        if self.me != self.device {
+        let Some(seed) = self.account_seed() else {
             return Err(ChatError::Protocol(format!(
                 "this client acts for {} and cannot sign for it; run `sqex home sign {home}` \
                  with the account's key and pass the result with --signed",
                 self.me
             )));
+        };
+        Ok(sqex_proto::home::Move::sign(&seed, home, now_secs()))
+    }
+
+    /// What signs for the account here: this device's own key where the
+    /// device is the account, or the account seed the store keeps from a
+    /// handover this client made (SIP-62). `None` for a linked device of an
+    /// account held elsewhere.
+    fn account_seed(&self) -> Option<[u8; 32]> {
+        if self.me == self.device {
+            return Some(self.seed);
         }
-        Ok(sqex_proto::home::Move::sign(&self.seed, home, now_secs()))
+        self.store.account_seed().ok().flatten()
     }
 
     /// Where this account's channels live, as this client knows: this
@@ -5081,6 +5216,20 @@ impl Chat {
             let body = self.post("/channel/fetch", again.encode()).await?;
             entries = Entries::decode(&body, again.receipts)
                 .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        }
+
+        // SIP-62: a correspondent who changed key is followed as a contact
+        // and as a conversation, before anything is folded.
+        let successions: Vec<(PubKey, PubKey)> = entries
+            .entries
+            .iter()
+            .filter(|e| e.kind == KIND_SYSTEM)
+            .filter_map(|e| System::decode(&e.body).ok().flatten())
+            .filter(|s| s.event == sqex_proto::channel::EVENT_SUCCEEDED)
+            .map(|s| (s.actor, s.subject))
+            .collect();
+        for (old, new) in successions {
+            self.follow_correspondent(channel, &old, &new);
         }
 
         // Being below the oldest retained entry means we have been away longer
