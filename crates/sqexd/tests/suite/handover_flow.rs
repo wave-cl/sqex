@@ -418,7 +418,7 @@ async fn a_copy_follows_a_handover_from_the_log() {
     let (bob_seed, bob) = identity(97);
     let (new_seed, new) = identity(98);
     let channel = [96u8; 32];
-    let (mut a, _chain) = a_life(
+    let (mut a, mut chain) = a_life(
         x_addr,
         x_pub,
         alice_seed,
@@ -485,4 +485,37 @@ async fn a_copy_follows_a_handover_from_the_log() {
             .any(|s| s.event == EVENT_SUCCEEDED && s.subject == new),
         "the copy holds no succeeded entry"
     );
+
+    // The old key is a device of the new one now; what it posts as the
+    // successor reaches the copy, bound to the account through the
+    // origin's registry.
+    let s = Signer::new(alice_seed, alice, x_pub).for_account(new);
+    let info = s.info(&mut a, channel).await;
+    let post = s.post_chained(
+        &mut chain,
+        channel,
+        info.instance,
+        0,
+        1,
+        b"as the new key".to_vec(),
+    );
+    let (code, body) = a.post("/channel/post", post.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let mut seen = false;
+    for _ in 0..50 {
+        let texts: Vec<String> = fetch_all(&mut at_y, channel)
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.kind == sqex_proto::channel::KIND_MEMBER)
+            .map(|e| String::from_utf8_lossy(&e.body).into_owned())
+            .collect();
+        if texts == ["before", "as the new key"] {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(seen, "the copy refused the successor's post");
 }

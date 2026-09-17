@@ -423,7 +423,7 @@ pub async fn pull_once(
         let mut creds: HashMap<PubKey, Option<PubKey>> = HashMap::new();
         for e in &pulled.entries {
             if e.kind == KIND_MEMBER && e.device != e.account && !creds.contains_key(&e.device) {
-                creds.insert(e.device, account_for(client, &e.device).await);
+                creds.insert(e.device, account_for(client, &e.account, &e.device).await);
             }
         }
         let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
@@ -476,7 +476,7 @@ pub async fn pull_once(
                         && e.device != e.account
                         && !creds.contains_key(&e.device)
                     {
-                        creds.insert(e.device, account_for(client, &e.device).await);
+                        creds.insert(e.device, account_for(client, &e.account, &e.device).await);
                     }
                 }
                 let lookup = move |d: &PubKey| creds.get(d).copied().flatten();
@@ -737,12 +737,19 @@ async fn pull_profiles(
 /// SIP-20 artifact it checks for itself. SIP-20 puts the reason plainly: a
 /// credential naming an account the verifier did not ask about is not evidence
 /// of anything.
-pub async fn account_for(client: &mut H3Client, device: &PubKey) -> Option<PubKey> {
-    // SIP-22 makes an account with no registered devices its own device, so the
-    // registry answers about a device key as readily as an account key, and the
-    // row that names this device is the one being looked for.
+///
+/// Asked by the **account the entry names**, since SIP-22's list is by
+/// account: asking by the device key found nothing for any linked device,
+/// and a copy refused every entry a linked device ever signed (SIP-62
+/// turned that up, since a handover makes every account's own key a
+/// linked device of the new one).
+pub async fn account_for(
+    client: &mut H3Client,
+    account: &PubKey,
+    device: &PubKey,
+) -> Option<PubKey> {
     let (code, body) = client
-        .post("/device/list", ListDevices { account: *device }.encode())
+        .post("/device/list", ListDevices { account: *account }.encode())
         .await
         .ok()?;
     if code != 200 {
@@ -975,16 +982,21 @@ const WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// SIP-61: hold one request at the origin naming `channels` and where each
 /// stands here, for up to `secs`. At most `MAX_WAIT_CHANNELS` are named.
+///
+/// `seen` is the highest seq this replica was *shown* per channel, refused
+/// entries included: a wait keyed on what is stored would answer at once
+/// for ever while an entry the replica refuses sits at the origin.
 async fn wait_on(
     client: &mut H3Client,
     store: &Channels,
     channels: &[[u8; 32]],
+    seen: &HashMap<[u8; 32], u64>,
     secs: u16,
 ) -> Waited {
     let named: Vec<([u8; 32], u64)> = channels
         .iter()
         .take(sqex_proto::peer::MAX_WAIT_CHANNELS)
-        .map(|c| (*c, store.last_seq(c)))
+        .map(|c| (*c, store.last_seq(c).max(seen.get(c).copied().unwrap_or(0))))
         .collect();
     let req = sqex_proto::peer::PeerWait {
         wait_secs: secs.min(sqex_proto::channel::MAX_WAIT),
@@ -1005,10 +1017,12 @@ async fn wait_on(
 /// interval where it does not, and come back early for a poke either way.
 /// `waits_from` is when the origin may next be asked to wait, after a
 /// refusal. Returns whether the connection is still good.
+#[allow(clippy::too_many_arguments)]
 async fn pause_or_wait(
     client: &mut H3Client,
     store: &Channels,
     channels: &[[u8; 32]],
+    seen: &HashMap<[u8; 32], u64>,
     interval: std::time::Duration,
     poke: &tokio::sync::Notify,
     waits_from: &mut tokio::time::Instant,
@@ -1024,7 +1038,7 @@ async fn pause_or_wait(
         .as_secs()
         .clamp(1, sqex_proto::channel::MAX_WAIT as u64) as u16;
     tokio::select! {
-        waited = wait_on(client, store, channels, secs) => match waited {
+        waited = wait_on(client, store, channels, seen, secs) => match waited {
             Waited::Changed | Waited::Quiet => true,
             Waited::Unsupported => {
                 *waits_from = tokio::time::Instant::now() + WAIT_RETRY;
@@ -1036,6 +1050,17 @@ async fn pause_or_wait(
     }
 }
 
+/// SIP-61: what a pull showed this replica, refused entries included, so a
+/// wait does not fire on an entry it will refuse again.
+fn note_seen(seen: &mut HashMap<[u8; 32], u64>, took: &HashMap<[u8; 32], Took>) {
+    for (channel, t) in took {
+        if let Some(top) = t.refused.iter().map(|(seq, _)| *seq).max() {
+            let e = seen.entry(*channel).or_insert(0);
+            *e = (*e).max(top);
+        }
+    }
+}
+
 /// SIP-61 for the loops that pull from several origins a cycle: wait on
 /// all of them at once, and come back when any changes, when `notify`
 /// fires, or when the interval runs out. Each origin's connection is
@@ -1043,6 +1068,7 @@ async fn pause_or_wait(
 async fn wait_any(
     server: &Arc<crate::server::Server>,
     waits: Vec<(H3Client, Vec<[u8; 32]>)>,
+    seen: &HashMap<[u8; 32], u64>,
     interval: std::time::Duration,
     notify: &tokio::sync::Notify,
 ) {
@@ -1055,7 +1081,10 @@ async fn wait_any(
             continue;
         }
         let server = Arc::clone(server);
-        set.spawn(async move { wait_on(&mut client, server.channels(), &channels, secs).await });
+        let seen = seen.clone();
+        set.spawn(
+            async move { wait_on(&mut client, server.channels(), &channels, &seen, secs).await },
+        );
     }
     let sleep = tokio::time::sleep(interval);
     tokio::pin!(sleep);
@@ -1101,6 +1130,7 @@ pub async fn run(
         }
     };
     let mut waits_from = tokio::time::Instant::now();
+    let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
@@ -1115,12 +1145,16 @@ pub async fn run(
                             tracing::warn!(origin = %origin.key, error = %e, "pull failed");
                             break;
                         }
-                        Ok(took) => report(&origin, &took),
+                        Ok(took) => {
+                            report(&origin, &took);
+                            note_seen(&mut seen, &took);
+                        }
                     }
                     if !pause_or_wait(
                         &mut client,
                         server.channels(),
                         &origin.channels,
+                        &seen,
                         origin.interval,
                         &forwarder.poke,
                         &mut waits_from,
@@ -1148,8 +1182,9 @@ pub async fn run_moved(
 ) {
     let never = tokio::sync::Notify::new();
     let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
+    let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     loop {
-        wait_any(&server, std::mem::take(&mut waits), interval, &never).await;
+        wait_any(&server, std::mem::take(&mut waits), &seen, interval, &never).await;
         for (origin, domain, channels) in server.channels().moved_channels(&configured) {
             if domain.is_empty() {
                 continue;
@@ -1180,6 +1215,7 @@ pub async fn run_moved(
                     }
                     Ok(took) => {
                         report(&task, &took);
+                        note_seen(&mut seen, &took);
                         waits.push((client, task.channels.clone()));
                     }
                 },
@@ -1203,10 +1239,18 @@ pub async fn run_homed(
     interval: std::time::Duration,
 ) {
     let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
+    let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     loop {
         // SIP-61: wait on every origin pulled last cycle; a move here or a
         // forward through here comes back early either way.
-        wait_any(&server, std::mem::take(&mut waits), interval, &server.homed).await;
+        wait_any(
+            &server,
+            std::mem::take(&mut waits),
+            &seen,
+            interval,
+            &server.homed,
+        )
+        .await;
         let me = server.public_key;
         for (origin, domain, accounts) in server.devices.homed_here(&me) {
             if origin == me {
@@ -1287,6 +1331,7 @@ pub async fn run_homed(
                 }
                 Ok(took) => {
                     report(&task, &took);
+                    note_seen(&mut seen, &took);
                     waits.push((client, task.channels.clone()));
                 }
             }

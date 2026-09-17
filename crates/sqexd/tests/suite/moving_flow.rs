@@ -357,6 +357,14 @@ async fn a_device_the_origin_never_saw_is_carried_with_its_credential() {
         until(&mut b, channel, |t| t.len() == 3).await,
         ["hello", "hi", "from the phone"]
     );
+    // And the copy at B takes it back: SIP-31's step 2 at a copy asks the
+    // origin's registry by the *account* the entry names, which is where
+    // a linked device is listed. (Asked by the device key, it found
+    // nothing, and every linked device's entry was refused at copies.)
+    assert_eq!(
+        until(&mut at_b, channel, |t| t.len() == 3).await,
+        ["hello", "hi", "from the phone"]
+    );
     let (_, body) = a
         .post("/device/list", ListDevices { account: alice }.encode())
         .await
