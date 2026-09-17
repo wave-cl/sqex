@@ -109,6 +109,13 @@ pub enum Op {
     PeerRemove(PubKey),
     /// SIP-39: read the relay-peer allowlist.
     PeerList,
+    /// SIP-58: register a device of an account by its own signed credential,
+    /// carried by an administrator -- for an account whose key cannot be a
+    /// transport identity and so cannot present it itself.
+    DeviceRegister(crate::credential::Credential),
+    /// SIP-58: revoke a device by the account's own signed revocation
+    /// (SIP-32), carried the same way.
+    DeviceRevoke(crate::credential::Revocation),
 }
 
 impl Op {
@@ -131,6 +138,8 @@ impl Op {
             Op::PeerAdd { .. } => 0x0f,
             Op::PeerRemove(_) => 0x10,
             Op::PeerList => 0x11,
+            Op::DeviceRegister(_) => 0x12,
+            Op::DeviceRevoke(_) => 0x13,
         }
     }
 
@@ -175,6 +184,8 @@ impl Op {
             Op::WhitelistRemove(k) | Op::AdmissionDeny(k) | Op::PeerRemove(k) => {
                 out.extend_from_slice(k.as_bytes())
             }
+            Op::DeviceRegister(c) => out.extend_from_slice(&c.encode()),
+            Op::DeviceRevoke(r) => out.extend_from_slice(&r.encode()),
             Op::AuditTail(n) => out.extend_from_slice(&n.to_be_bytes()),
             // Fixed-width account first, then the variable-length name — the
             // same layout AdmissionApprove uses for its key-then-label.
@@ -219,6 +230,8 @@ impl Op {
             }
             0x10 => Op::PeerRemove(key(rest)?),
             0x11 => Op::PeerList,
+            0x12 => Op::DeviceRegister(crate::credential::Credential::decode(rest)?),
+            0x13 => Op::DeviceRevoke(crate::credential::Revocation::decode(rest)?),
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
         // Every op consumes its payload exactly; reject trailing bytes.
@@ -248,6 +261,8 @@ impl Op {
             Op::PeerAdd { .. } => "peer-add",
             Op::PeerRemove(_) => "peer-remove",
             Op::PeerList => "peer-list",
+            Op::DeviceRegister(_) => "device-register",
+            Op::DeviceRevoke(_) => "device-revoke",
         }
     }
 
@@ -271,6 +286,8 @@ impl Op {
             Op::PeerAdd { .. } => "Add a relay peer".into(),
             Op::PeerRemove(_) => "Remove a relay peer".into(),
             Op::PeerList => "Read the relay peers".into(),
+            Op::DeviceRegister(c) => format!("Register device {} of {}", c.delegate, c.account),
+            Op::DeviceRevoke(r) => format!("Revoke device {} of {}", r.device, r.account),
         }
     }
 
@@ -328,6 +345,8 @@ impl Op {
                 | Op::NameRelease(_)
                 | Op::PeerAdd { .. }
                 | Op::PeerRemove(_)
+                | Op::DeviceRegister(_)
+                | Op::DeviceRevoke(_)
         )
     }
 
@@ -342,6 +361,8 @@ impl Op {
             Op::NameRelease(name) => Some(name.clone()),
             Op::PeerAdd { key, .. } => Some(key.to_base58()),
             Op::PeerRemove(k) => Some(k.to_base58()),
+            Op::DeviceRegister(c) => Some(c.delegate.to_base58()),
+            Op::DeviceRevoke(r) => Some(r.device.to_base58()),
             _ => None,
         }
     }

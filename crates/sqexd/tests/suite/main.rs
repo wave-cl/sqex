@@ -35,6 +35,7 @@ mod backup_flow;
 mod beacon_flow;
 mod blob_flow;
 mod call_flow;
+mod carried_device_flow;
 mod channel_flow;
 mod device_flow;
 mod forgetting_flow;

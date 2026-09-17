@@ -88,6 +88,8 @@ sqex-chat device link <key>  # authorise another of your own clients
 sqex-chat device sync        # trade history with them, past what the exchange keeps
 sqex succession will <key>   # name the key that takes your account if this one is lost
 sqex wake register <url>     # a push endpoint the exchange knocks on while you are away
+sqex device link <key>       # sign a credential for a device, offline (--yubikey works)
+sqex admin device register   # an administrator carries it to an exchange the key cannot reach
 sqex-chat backup key         # 24 words that open a sealed copy of this store at the exchange
 sqex-chat backup now         # write the copy; `backup restore <words>` on a fresh machine
 ```

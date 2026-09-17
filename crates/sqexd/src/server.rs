@@ -3959,6 +3959,36 @@ impl Server {
                 );
                 json!({ "ok": true, "added": changed, "peers": state.peer_count() })
             }
+            // SIP-58: the account's own signed grant, carried by an
+            // administrator. Registered exactly as the delegate presenting
+            // it would be: the credential is verified, the administrator is
+            // not checked against the account, and the audit log says who
+            // carried it. Admission follows under SIP-47 when the account
+            // is listed; `sync_transport` runs after every mutation.
+            Op::DeviceRegister(credential) => {
+                match self.devices.register(&credential.delegate, credential) {
+                    Ok(()) => json!({
+                        "ok": true,
+                        "device": credential.delegate.to_base58(),
+                        "account": credential.account.to_base58(),
+                        "not_after": credential.not_after,
+                    }),
+                    Err(e) => json!({ "ok": false, "error": e.as_str() }),
+                }
+            }
+            Op::DeviceRevoke(revocation) => {
+                match self
+                    .devices
+                    .revoke(&revocation.account, &revocation.device, Some(revocation))
+                {
+                    Ok(()) => json!({
+                        "ok": true,
+                        "device": revocation.device.to_base58(),
+                        "account": revocation.account.to_base58(),
+                    }),
+                    Err(e) => json!({ "ok": false, "error": e.as_str() }),
+                }
+            }
             Op::PeerRemove(key) => {
                 let changed = state.remove_peer(key);
                 // Said plainly, because it is the question an operator asks

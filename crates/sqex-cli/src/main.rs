@@ -135,6 +135,15 @@ enum Cmd {
     /// the domain it is reached at where the operator recorded one. A hint:
     /// reach one by discovering its domain, and refuse it if the key differs.
     Peers,
+    /// A device that acts for this account (SIP-20/58): sign a credential
+    /// for it, or a revocation, with no exchange in reach -- with a YubiKey
+    /// too, which is the point. Give what this prints to an administrator
+    /// (`sqex admin device register`), or to the device (`sqex-chat device
+    /// claim`).
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
     /// Account succession (SIP-44): name who takes your account when your
     /// key is gone -- a successor key you sign for now, or guardians a
     /// quorum of whom may name one later -- and, as the successor, claim it.
@@ -342,6 +351,20 @@ enum AttestCmd {
 }
 
 #[derive(Subcommand)]
+enum DeviceCmd {
+    /// Sign a credential naming `key` as a device of this account, for
+    /// `--days`. Printed base58; nothing is sent anywhere.
+    Link {
+        /// The device's identity, base58 -- its own `whoami`.
+        key: String,
+        #[arg(long, default_value_t = 90)]
+        days: u64,
+    },
+    /// Sign a revocation of `key`. Printed base58; nothing is sent.
+    Revoke { key: String },
+}
+
+#[derive(Subcommand)]
 enum WakeCmd {
     /// Leave an endpoint: an https:// address your push distributor gave
     /// this device. Replaces any it held. Registered for `--days` (at most
@@ -483,6 +506,21 @@ enum AdminCmd {
         #[command(subcommand)]
         action: PeerCmd,
     },
+    /// SIP-58: register or revoke a device by the account's own signed
+    /// credential or revocation (`sqex device link` / `revoke`), carried by
+    /// you -- for an account whose key cannot connect.
+    Device {
+        #[command(subcommand)]
+        action: AdminDeviceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminDeviceCmd {
+    /// Register a device: the credential, base58, as `sqex device link` printed it.
+    Register { credential: String },
+    /// Revoke a device: the revocation, base58, as `sqex device revoke` printed it.
+    Revoke { revocation: String },
 }
 
 #[derive(Subcommand)]
@@ -565,6 +603,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Peers => peers(&cli, &cfg).await,
         Cmd::Succession { cmd } => succession(&cli, &cfg, cmd).await,
+        Cmd::Device { cmd } => device(&cli, &cfg, cmd).await,
         Cmd::Wake { cmd } => wake(&cli, &cfg, cmd).await,
         Cmd::Meet {
             peer,
@@ -2126,6 +2165,31 @@ async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
     match cmd {
         AdminCmd::Whitelist { action } => whitelist(cli, cfg, action).await,
         AdminCmd::Peer { action } => peer(cli, cfg, action).await,
+        AdminCmd::Device { action } => {
+            let op = match action {
+                AdminDeviceCmd::Register { credential } => {
+                    let raw = bs58::decode(credential.trim())
+                        .into_vec()
+                        .map_err(|e| format!("not base58: {e}"))?;
+                    Op::DeviceRegister(
+                        sqex_proto::credential::Credential::decode(&raw)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+                AdminDeviceCmd::Revoke { revocation } => {
+                    let raw = bs58::decode(revocation.trim())
+                        .into_vec()
+                        .map_err(|e| format!("not base58: {e}"))?;
+                    Op::DeviceRevoke(
+                        sqex_proto::credential::Revocation::decode(&raw)
+                            .map_err(|e| e.to_string())?,
+                    )
+                }
+            };
+            let v = submit(cli, cfg, vec![op.to_operation()]).await?;
+            println!("{}", result(&v, 0));
+            Ok(())
+        }
         AdminCmd::Audit { count } => {
             let v = submit(cli, cfg, vec![Op::AuditTail(*count).to_operation()]).await?;
             print_audit(&result(&v, 0));
@@ -2383,6 +2447,64 @@ async fn succession(cli: &Cli, cfg: &Config, cmd: &SuccessionCmd) -> Result<(), 
                     println!("    {g}");
                 }
             }
+            Ok(())
+        }
+    }
+}
+
+/// SIP-58: a credential or a revocation, signed here and sent nowhere --
+/// with whatever signs for this account, a YubiKey included.
+async fn device(cli: &Cli, cfg: &Config, cmd: &DeviceCmd) -> Result<(), String> {
+    use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
+    let backend = signing_backend(cli, cfg).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match cmd {
+        DeviceCmd::Link { key, days } => {
+            let device: PubKey = key.parse().map_err(|e| format!("bad key: {e}"))?;
+            let account = backend.public();
+            let (issued, not_after) = (now.saturating_sub(60), now + days * 86_400);
+            if backend.is_yubikey() {
+                eprintln!("touch the YubiKey to sign the credential");
+            }
+            let signature = backend
+                .sign(&Credential::to_sign(
+                    &account, &device, SCOPE_CHAT, issued, not_after,
+                ))
+                .await?;
+            let credential = Credential::from_signature(
+                account, device, SCOPE_CHAT, issued, not_after, signature,
+            );
+            credential
+                .verify(&account, SCOPE_CHAT, now)
+                .map_err(|e| format!("the credential does not verify: {e:?}"))?;
+            println!("{}", bs58::encode(credential.encode()).into_string());
+            eprintln!(
+                "a credential for {device} to act as {} for {days} day(s). Give it to an \
+                 administrator (`sqex admin device register`) or to the device itself \
+                 (`sqex-chat device claim`).",
+                credential.account
+            );
+            Ok(())
+        }
+        DeviceCmd::Revoke { key } => {
+            let device: PubKey = key.parse().map_err(|e| format!("bad key: {e}"))?;
+            let account = backend.public();
+            if backend.is_yubikey() {
+                eprintln!("touch the YubiKey to sign the revocation");
+            }
+            let signature = backend
+                .sign(&Revocation::to_sign(&account, &device, now))
+                .await?;
+            let revocation = Revocation::from_signature(account, device, now, signature);
+            println!("{}", bs58::encode(revocation.encode()).into_string());
+            eprintln!(
+                "a revocation of {device} as a device of {}. Give it to an administrator \
+                 (`sqex admin device revoke`), or to any device of the account.",
+                revocation.account
+            );
             Ok(())
         }
     }

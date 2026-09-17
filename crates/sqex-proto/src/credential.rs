@@ -31,7 +31,7 @@
 //! it rather than keep a second copy.
 
 use crate::refusal::Code;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use sqnr_core::{Error, PubKey, Result};
 
@@ -162,7 +162,69 @@ impl Credential {
             ));
         }
         let signing = SigningKey::from_bytes(account_seed);
-        let account = PubKey::new(signing.verifying_key().to_bytes());
+        Self::issue_with(
+            &sqnr_core::SoftwareSigner::new(signing),
+            delegate,
+            scope,
+            issued,
+            not_after,
+        )
+    }
+
+    /// SIP-58: what a signer signs to issue this credential -- for a signer
+    /// that signs elsewhere or asynchronously (a hardware token). Pair with
+    /// [`Credential::from_signature`].
+    pub fn to_sign(
+        account: &PubKey,
+        delegate: &PubKey,
+        scope: &str,
+        issued: u64,
+        not_after: u64,
+    ) -> Vec<u8> {
+        signing_input(&body(account, delegate, scope, issued, not_after))
+    }
+
+    /// SIP-58: the credential, given the account's signature over
+    /// [`Credential::to_sign`].
+    pub fn from_signature(
+        account: PubKey,
+        delegate: PubKey,
+        scope: &str,
+        issued: u64,
+        not_after: u64,
+        signature: [u8; 64],
+    ) -> Credential {
+        Credential {
+            account,
+            delegate,
+            scope: scope.to_string(),
+            issued,
+            not_after,
+            signature,
+        }
+    }
+
+    /// SIP-58: issue with any signer -- a hardware token that signs and
+    /// never yields its key included -- and with no exchange in reach.
+    pub fn issue_with(
+        signer: &dyn sqnr_core::Signer,
+        delegate: &PubKey,
+        scope: &str,
+        issued: u64,
+        not_after: u64,
+    ) -> Result<Credential> {
+        if scope.len() > MAX_SCOPE {
+            return Err(Error::Malformed(format!(
+                "scope is {} bytes, limit is {MAX_SCOPE}",
+                scope.len()
+            )));
+        }
+        if not_after <= issued {
+            return Err(Error::Malformed(
+                "a credential must expire after it was issued".into(),
+            ));
+        }
+        let account = PubKey::new(signer.public());
         let b = body(&account, delegate, scope, issued, not_after);
         Ok(Credential {
             account,
@@ -170,7 +232,7 @@ impl Credential {
             scope: scope.to_string(),
             issued,
             not_after,
-            signature: signing.sign(&signing_input(&b)).to_bytes(),
+            signature: signer.sign(&signing_input(&b)),
         })
     }
 
@@ -438,13 +500,38 @@ impl Revocation {
     /// Sign one. The account withdraws; the device is named and not consulted.
     pub fn issue(account_seed: &[u8; 32], device: &PubKey, issued: u64) -> Revocation {
         let signing = SigningKey::from_bytes(account_seed);
-        let account = PubKey::new(signing.verifying_key().to_bytes());
+        Self::issue_with(&sqnr_core::SoftwareSigner::new(signing), device, issued)
+    }
+
+    /// SIP-58: what a signer signs to revoke `device`; pair with
+    /// [`Revocation::from_signature`].
+    pub fn to_sign(account: &PubKey, device: &PubKey, issued: u64) -> Vec<u8> {
+        revocation_input(&revocation_body(account, device, issued))
+    }
+
+    pub fn from_signature(
+        account: PubKey,
+        device: PubKey,
+        issued: u64,
+        signature: [u8; 64],
+    ) -> Revocation {
+        Revocation {
+            account,
+            device,
+            issued,
+            signature,
+        }
+    }
+
+    /// SIP-58: issue with any signer, offline.
+    pub fn issue_with(signer: &dyn sqnr_core::Signer, device: &PubKey, issued: u64) -> Revocation {
+        let account = PubKey::new(signer.public());
         let body = revocation_body(&account, device, issued);
         Revocation {
             account,
             device: *device,
             issued,
-            signature: signing.sign(&revocation_input(&body)).to_bytes(),
+            signature: signer.sign(&revocation_input(&body)),
         }
     }
 
