@@ -338,6 +338,68 @@ pub async fn pull_once(
     server: &crate::server::Server,
     origin: &Origin,
 ) -> Result<HashMap<[u8; 32], Took>, String> {
+    pull_once_from(client, server, origin, &HashMap::new()).await
+}
+
+/// Entries this replica refused and will ask for again: per channel, the
+/// position to pull from and how many times it has tried. A refusal can be
+/// the moment's -- the origin's registry answered late, a credential the
+/// copy could not yet bind -- and a copy that pulled from its highest
+/// stored position would never see the entry again. Bounded: an entry
+/// refused `HOLE_TRIES` times is left where it is, and the wait (SIP-61)
+/// is told not to fire on it.
+pub type Holes = HashMap<[u8; 32], (u64, u32)>;
+
+/// How many pulls a refused entry is asked for again.
+pub const HOLE_TRIES: u32 = 30;
+
+/// SIP-61/62: remember the holes a pull left, drop the ones it filled, and
+/// give up on the ones that will not fill.
+pub fn note_holes(holes: &mut Holes, took: &HashMap<[u8; 32], Took>) {
+    for (channel, t) in took {
+        match t.refused.iter().map(|(seq, _)| *seq).min() {
+            Some(lowest) => {
+                let e = holes
+                    .entry(*channel)
+                    .or_insert((lowest.saturating_sub(1), 0));
+                e.0 = e.0.min(lowest.saturating_sub(1));
+                e.1 += 1;
+                if e.1 >= HOLE_TRIES {
+                    tracing::warn!(
+                        channel = %bs58::encode(channel).into_string(),
+                        seq = lowest,
+                        "an entry refused {HOLE_TRIES} times is left behind"
+                    );
+                    holes.remove(channel);
+                }
+            }
+            None if t.stored > 0 => {
+                holes.remove(channel);
+            }
+            None => {}
+        }
+    }
+}
+
+/// SIP-62: the holes a replica finds in what it already holds, when it
+/// starts -- entries refused before this process began. Seeded once, so a
+/// hole nothing will fill costs `HOLE_TRIES` pulls per start and not one
+/// per cycle.
+pub fn holes_in(store: &Channels, channels: &[[u8; 32]]) -> Holes {
+    channels
+        .iter()
+        .filter_map(|c| store.lowest_gap(c).map(|at| (*c, (at, 0))))
+        .collect()
+}
+
+/// [`pull_once`], pulling each channel in `holes` from the position noted
+/// there rather than from the highest held.
+pub async fn pull_once_from(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    origin: &Origin,
+    holes: &Holes,
+) -> Result<HashMap<[u8; 32], Took>, String> {
     let store = server.channels();
     let (code, body) = client
         .post(
@@ -394,7 +456,10 @@ pub async fn pull_once(
         if store.equivocation_for(channel).is_some() {
             continue;
         }
-        let since = store.highest(channel);
+        let since = match holes.get(channel) {
+            Some((from, _)) => store.highest(channel).min(*from),
+            None => store.highest(channel),
+        };
         let (code, body) = client
             .post(
                 "/peer/pull",
@@ -1131,6 +1196,7 @@ pub async fn run(
     };
     let mut waits_from = tokio::time::Instant::now();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut holes: Holes = holes_in(server.channels(), &origin.channels);
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
@@ -1140,7 +1206,7 @@ pub async fn run(
                 // One connection, many pulls: a fresh handshake per pull would
                 // cost more than the pull.
                 loop {
-                    match pull_once(&mut client, &server, &origin).await {
+                    match pull_once_from(&mut client, &server, &origin, &holes).await {
                         Err(e) => {
                             tracing::warn!(origin = %origin.key, error = %e, "pull failed");
                             break;
@@ -1148,6 +1214,7 @@ pub async fn run(
                         Ok(took) => {
                             report(&origin, &took);
                             note_seen(&mut seen, &took);
+                            note_holes(&mut holes, &took);
                         }
                     }
                     if !pause_or_wait(
@@ -1183,6 +1250,8 @@ pub async fn run_moved(
     let never = tokio::sync::Notify::new();
     let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut holes: Holes = HashMap::new();
+    let mut seeded: std::collections::HashSet<PubKey> = std::collections::HashSet::new();
     loop {
         wait_any(&server, std::mem::take(&mut waits), &seen, interval, &never).await;
         for (origin, domain, channels) in server.channels().moved_channels(&configured) {
@@ -1205,17 +1274,22 @@ pub async fn run_moved(
                 interval,
                 predecessors: Vec::new(),
             };
+            if !seeded.contains(&origin) {
+                holes.extend(holes_in(server.channels(), &task.channels));
+                seeded.insert(origin);
+            }
             match H3Client::connect(task.addr, task.key.as_bytes(), &seed).await {
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "cannot reach a moved origin")
                 }
-                Ok(mut client) => match pull_once(&mut client, &server, &task).await {
+                Ok(mut client) => match pull_once_from(&mut client, &server, &task, &holes).await {
                     Err(e) => {
                         tracing::warn!(origin = %origin, error = %e, "pull from a moved origin failed")
                     }
                     Ok(took) => {
                         report(&task, &took);
                         note_seen(&mut seen, &took);
+                        note_holes(&mut holes, &took);
                         waits.push((client, task.channels.clone()));
                     }
                 },
@@ -1240,6 +1314,8 @@ pub async fn run_homed(
 ) {
     let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut holes: Holes = HashMap::new();
+    let mut seeded: std::collections::HashSet<PubKey> = std::collections::HashSet::new();
     loop {
         // SIP-61: wait on every origin pulled last cycle; a move here or a
         // forward through here comes back early either way.
@@ -1325,13 +1401,18 @@ pub async fn run_homed(
                 interval,
                 predecessors: Vec::new(),
             };
-            match pull_once(&mut client, &server, &task).await {
+            if !seeded.contains(&origin) {
+                holes.extend(holes_in(server.channels(), &task.channels));
+                seeded.insert(origin);
+            }
+            match pull_once_from(&mut client, &server, &task, &holes).await {
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "pull for a homed account failed")
                 }
                 Ok(took) => {
                     report(&task, &took);
                     note_seen(&mut seen, &took);
+                    note_holes(&mut holes, &took);
                     waits.push((client, task.channels.clone()));
                 }
             }

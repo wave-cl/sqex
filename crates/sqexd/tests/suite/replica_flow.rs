@@ -554,6 +554,37 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
         .unwrap();
     assert_eq!(took[&channel].stored, 0);
 
+    // **A gap in the middle is a hole, and a hole is asked for again.** A
+    // replica that refused one entry -- the origin's registry answered late
+    // -- and stored what came after would pull from its highest for ever
+    // and never see the entry again (SIP-62 found it). The holes a replica
+    // finds in what it holds are pulled from, and filled.
+    let holed_dir = tempfile::tempdir().unwrap();
+    std::fs::write(holed_dir.path().join("host_key"), hex::encode(peer_seed)).unwrap();
+    let holed = bind_replica(holed_dir.path()).await;
+    let mut without_middle = pulled.clone();
+    let middle = without_middle.entries.len() / 2;
+    let missing = without_middle.entries.remove(middle).seq;
+    let took = take(holed.channels(), &origin, &channel, &without_middle, &never);
+    assert_eq!(took.stored as usize, pulled.entries.len() - 1);
+    assert_eq!(holed.channels().lowest_gap(&channel), Some(missing - 1));
+    // Pulling from the highest held fills nothing.
+    let took = sqexd::replica::pull_once(&mut h3, &holed, &spec)
+        .await
+        .unwrap();
+    assert_eq!(
+        took[&channel].stored, 0,
+        "a plain pull filled a middle hole"
+    );
+    // Pulling from the hole fills it, and the hole is gone.
+    let holes = sqexd::replica::holes_in(holed.channels(), &[channel]);
+    assert_eq!(holes.get(&channel), Some(&(missing - 1, 0)));
+    let took = sqexd::replica::pull_once_from(&mut h3, &holed, &spec, &holes)
+        .await
+        .unwrap();
+    assert_eq!(took[&channel].stored, 1, "{took:?}");
+    assert_eq!(holed.channels().lowest_gap(&channel), None);
+
     // A tampered body. SIP-31 step 1 fails and the entry is not written.
     let mut forged = pulled.clone();
     let victim = forged

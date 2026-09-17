@@ -897,6 +897,27 @@ impl Channels {
         let db = self.db.lock().unwrap();
         window(&db, channel).1
     }
+
+    /// SIP-62: the position just before the first `seq` missing from a
+    /// channel this exchange holds -- an entry a pull refused, since the
+    /// origin serves its log contiguously and a tombstone keeps its row.
+    /// `None` where nothing is missing.
+    pub fn lowest_gap(&self, channel: &[u8; 32]) -> Option<u64> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT e.seq FROM entry e
+             WHERE e.channel = ?1
+               AND e.seq < (SELECT MAX(seq) FROM entry WHERE channel = ?1)
+               AND NOT EXISTS (SELECT 1 FROM entry f WHERE f.channel = ?1 AND f.seq = e.seq + 1)
+             ORDER BY e.seq LIMIT 1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|s| s as u64)
+    }
 }
 
 /// SIP-54: a channel's numbered signal log -- the next number, and the
