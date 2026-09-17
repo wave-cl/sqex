@@ -438,6 +438,48 @@ impl Server {
             .or_insert_with(|| Arc::new(crate::replica::Forwarder::new(origin, addr, domain)));
     }
 
+    /// SIP-54: a signal pulled from the origin's log, handed to this
+    /// exchange's members as if its sender had sent it here. Skipped when
+    /// the sender's device is connected here: it did send it here, and
+    /// was delivered at the time.
+    pub(crate) fn deliver_pulled_signal(&self, channel: &[u8; 32], l: &sqex_proto::peer::Logged) {
+        if !self.live_conns.get(&l.device).is_empty() {
+            return;
+        }
+        if self
+            .channels
+            .signal(&l.account, &l.device, channel, l.kind, &l.body)
+            .is_err()
+        {
+            return;
+        }
+        self.tell_others(channel, &l.account, EventKind::Signal { channel: *channel });
+        if let Ok(Some(Signal::CallState { target, state, .. })) = Signal::decode(&l.body)
+            && state == RING_RINGING
+        {
+            self.tell_others(
+                channel,
+                &l.account,
+                EventKind::Ringing {
+                    channel: *channel,
+                    seq: target,
+                },
+            );
+        }
+    }
+
+    /// SIP-54: marks pulled from the origin, merged; the members are told
+    /// where anything moved.
+    pub(crate) fn merge_pulled_cursors(
+        &self,
+        channel: &[u8; 32],
+        marks: &sqex_proto::channel::Marks,
+    ) {
+        if self.channels.merge_cursors(channel, marks).unwrap_or(false) {
+            self.tell(channel, EventKind::Cursor { channel: *channel });
+        }
+    }
+
     /// SIP-53: where a domain's exchange is, by the relay's finder.
     pub(crate) async fn relay_find(
         self: &Arc<Self>,
@@ -2712,6 +2754,13 @@ async fn route(
                     .set_cursor(&me, &req.channel, req.read, req.receipts)
                 {
                     Ok(()) => {
+                        // SIP-54: recorded here for this exchange's readers,
+                        // and carried to the origin for everybody else's.
+                        // Best effort: a mark the origin did not get is a
+                        // mark the next one covers.
+                        let _ =
+                            forward_action(server, &device.unwrap_or(me), &req.channel, path, body)
+                                .await;
                         server.tell_others(
                             &req.channel,
                             &me,
@@ -2772,6 +2821,9 @@ async fn route(
                     .signal(&me, &dev, &req.channel, req.kind, &req.body)
                 {
                     Ok(()) => {
+                        // SIP-54: delivered here at once, and carried to
+                        // the origin, whose log every copy pulls.
+                        let _ = forward_action(server, &dev, &req.channel, path, body).await;
                         // Not to the sender: a client does not need telling
                         // that its own keyboard is being used.
                         server.tell_others(
@@ -2888,6 +2940,41 @@ async fn route(
             _ => peering_refused(),
         },
 
+        // SIP-54: a replica pulls every member's marks, and the signal log.
+        ("POST", "/peer/cursors") => {
+            match (peer.identity, sqex_proto::peer::PullCursors::decode(body)) {
+                (Some(who), Ok(req))
+                    if server
+                        .peering(&who)
+                        .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                {
+                    match server.channels.all_cursors(&req.channel) {
+                        Ok(marks) => (200, "application/octet-stream", marks.encode()),
+                        Err(_) => peering_refused(),
+                    }
+                }
+                _ => peering_refused(),
+            }
+        }
+        ("POST", "/peer/signals") => {
+            match (peer.identity, sqex_proto::peer::PullSignals::decode(body)) {
+                (Some(who), Ok(req))
+                    if server
+                        .peering(&who)
+                        .is_some_and(|p| server.may_pull(p, &req.channel)) =>
+                {
+                    (
+                        200,
+                        "application/octet-stream",
+                        server
+                            .channels
+                            .signals_since(&req.channel, req.since)
+                            .encode(),
+                    )
+                }
+                _ => peering_refused(),
+            }
+        }
         // SIP-53: the new origin, or another replica, telling this exchange
         // a channel moved. Gated as a pull is.
         ("POST", "/peer/rehomed") => {
@@ -2989,6 +3076,77 @@ async fn route(
                                             what: MEMBER_LEFT,
                                         },
                                     );
+                                    (200, ChannelAck { now: now_unix() }.encode())
+                                }
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
+                        }
+                        _ => return peering_refused(),
+                    },
+                    // SIP-54: a member's read mark, set at a copy.
+                    "/channel/cursor" => match ChannelCursor::decode(&req.body) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            match server
+                                .channels
+                                .set_cursor_forwarded(&account, &r.channel, r.read, r.receipts)
+                            {
+                                Ok(()) => {
+                                    server.tell_others(
+                                        &r.channel,
+                                        &account,
+                                        EventKind::Cursor { channel: r.channel },
+                                    );
+                                    (200, ChannelAck { now: now_unix() }.encode())
+                                }
+                                Err(e) => {
+                                    let (s, _, b) = refused(e);
+                                    (s, b)
+                                }
+                            }
+                        }
+                        _ => return peering_refused(),
+                    },
+                    // SIP-54: a signal sent at a copy, queued here and logged
+                    // for every copy to pull.
+                    "/channel/signal" => match SignalOut::decode(&req.body) {
+                        Ok(r)
+                            if server
+                                .peering(&who)
+                                .is_some_and(|p| server.may_forward(p, &r.channel, &account)) =>
+                        {
+                            match server.channels.signal(
+                                &account,
+                                &req.device,
+                                &r.channel,
+                                r.kind,
+                                &r.body,
+                            ) {
+                                Ok(()) => {
+                                    server.tell_others(
+                                        &r.channel,
+                                        &account,
+                                        EventKind::Signal { channel: r.channel },
+                                    );
+                                    if let Ok(Some(Signal::CallState { target, state, .. })) =
+                                        Signal::decode(&r.body)
+                                        && state == RING_RINGING
+                                    {
+                                        server.tell_others(
+                                            &r.channel,
+                                            &account,
+                                            EventKind::Ringing {
+                                                channel: r.channel,
+                                                seq: target,
+                                            },
+                                        );
+                                    }
                                     (200, ChannelAck { now: now_unix() }.encode())
                                 }
                                 Err(e) => {

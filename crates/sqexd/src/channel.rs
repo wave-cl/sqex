@@ -55,7 +55,8 @@ use sqex_proto::entry_sig::{
 };
 use sqex_proto::message::SIGNAL_CALL_STATE;
 use sqex_proto::peer::{
-    BLOB_LIST, MAX_PULL, MAX_PULL_BYTES, MAX_REPLICAS, Pulled, PulledBlob, PulledEnvelopes,
+    BLOB_LIST, Logged, MAX_PULL, MAX_PULL_BYTES, MAX_REPLICAS, Pulled, PulledBlob, PulledEnvelopes,
+    SIGNAL_LOG, Signals,
 };
 use sqex_proto::receipt::{self, HEAD_GENESIS, ReceiptTerms};
 use sqnr_core::PubKey;
@@ -358,6 +359,13 @@ pub struct Channels {
     /// is at. SIP-16 forbids storing these at all, and an exchange that dropped
     /// every one of them would still conform.
     signals: Mutex<SignalQueues>,
+    /// SIP-54: the last `SIGNAL_LOG` signals queued per channel, numbered,
+    /// for replicas to pull. In memory, like the queues: a signal is
+    /// nothing after `SIGNAL_TTL`.
+    signal_log: Mutex<HashMap<[u8; 32], SignalLog>>,
+    /// SIP-54: at a replica, how far into each origin's signal log this
+    /// exchange has pulled.
+    signal_since: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 /// What an exchange holds about one numbered position: `posted`, the entry
@@ -744,6 +752,8 @@ impl Channels {
             backup_quota: sqex_proto::backup::DEFAULT_QUOTA,
             waiters: Mutex::new(HashMap::new()),
             signals: Mutex::new(HashMap::new()),
+            signal_log: Mutex::new(HashMap::new()),
+            signal_since: Mutex::new(HashMap::new()),
         })
     }
 
@@ -829,6 +839,10 @@ impl Channels {
         }
     }
 }
+
+/// SIP-54: a channel's numbered signal log -- the next number, and the
+/// signals kept.
+type SignalLog = (u64, std::collections::VecDeque<Logged>);
 
 /// The role of somebody who is *present*: a member who may read and post.
 fn role_of(db: &Connection, channel: &[u8; 32], who: &PubKey) -> Option<Role> {
@@ -5891,6 +5905,39 @@ impl Channels {
         Ok(())
     }
 
+    /// SIP-54: a mark carried from a copy. The copy served the member what
+    /// they read, so delivery here is raised to the mark before the
+    /// ordinary clamp applies; the origin never served them itself.
+    pub fn set_cursor_forwarded(
+        &self,
+        caller: &PubKey,
+        channel: &[u8; 32],
+        read: u64,
+        receipts: bool,
+    ) -> Result<(), ChannelError> {
+        {
+            let db = self.db.lock().unwrap();
+            visibility_of(&db, channel)?;
+            if role_of(&db, channel, caller).is_none() {
+                return Err(Self::unreadable(&db, channel));
+            }
+            let (_, last) = window(&db, channel);
+            db.execute(
+                "INSERT INTO cursor (channel, account, delivered, read, receipts)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT (channel, account) DO UPDATE SET delivered = MAX(delivered, ?3)",
+                params![
+                    &channel[..],
+                    caller.as_bytes(),
+                    read.min(last) as i64,
+                    i64::from(receipts)
+                ],
+            )
+            .map_err(storage("raise delivered"))?;
+        }
+        self.set_cursor(caller, channel, read, receipts)
+    }
+
     /// Everyone's marks.
     ///
     /// A caller that has opted out of receipts is not shown anybody else's
@@ -6043,6 +6090,24 @@ impl Channels {
         };
 
         let now = now_unix();
+        // SIP-54: logged for replicas to pull, whoever it was for.
+        {
+            let mut log = self.signal_log.lock().unwrap();
+            let (next, q) = log.entry(*channel).or_insert((1, Default::default()));
+            q.retain(|l| now.saturating_sub(l.at) < SIGNAL_TTL);
+            while q.len() >= SIGNAL_LOG {
+                q.pop_front();
+            }
+            q.push_back(Logged {
+                seq: *next,
+                account: *caller,
+                device: *device,
+                kind,
+                at: now,
+                body: body.to_vec(),
+            });
+            *next += 1;
+        }
         let mut pending = self.signals.lock().unwrap();
         for who in recipients {
             let q = pending.entry((*channel, who)).or_default();
@@ -6062,6 +6127,91 @@ impl Channels {
         drop(pending);
         self.wake(channel);
         Ok(())
+    }
+
+    /// SIP-54: the channel's signal log above `since`, for a replica.
+    pub fn signals_since(&self, channel: &[u8; 32], since: u64) -> Signals {
+        let now = now_unix();
+        let mut log = self.signal_log.lock().unwrap();
+        let Some((next, q)) = log.get_mut(channel) else {
+            return Signals::default();
+        };
+        q.retain(|l| now.saturating_sub(l.at) < SIGNAL_TTL);
+        Signals {
+            next: *next,
+            signals: q.iter().filter(|l| l.seq > since).cloned().collect(),
+        }
+    }
+
+    /// SIP-54: where this replica's pull of a channel's signals got to.
+    pub fn signal_mark(&self, channel: &[u8; 32]) -> u64 {
+        *self.signal_since.lock().unwrap().get(channel).unwrap_or(&0)
+    }
+
+    pub fn set_signal_mark(&self, channel: &[u8; 32], next: u64) {
+        self.signal_since
+            .lock()
+            .unwrap()
+            .insert(*channel, next.saturating_sub(1));
+    }
+
+    /// SIP-54: every present member's marks, for a peer holding the channel
+    /// whole -- receipts withheld from nobody.
+    pub fn all_cursors(&self, channel: &[u8; 32]) -> Result<Marks, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        let mut stmt = db
+            .prepare(
+                "SELECT m.account, COALESCE(c.delivered, 0), COALESCE(c.read, 0)
+                 FROM member m
+                 LEFT JOIN cursor c ON c.channel = m.channel AND c.account = m.account
+                 WHERE m.channel = ?1 AND m.present = 1 ORDER BY m.account ASC",
+            )
+            .map_err(storage("prepare cursors"))?;
+        let marks = stmt
+            .query_map(params![&channel[..]], |r| {
+                Ok(Mark {
+                    account: PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                    delivered: r.get::<_, i64>(1)? as u64,
+                    read: r.get::<_, i64>(2)? as u64,
+                })
+            })
+            .map_err(storage("query cursors"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage("read cursors"))?;
+        Ok(Marks {
+            now: now_unix(),
+            marks,
+        })
+    }
+
+    /// SIP-54: merge marks pulled from the origin, higher wins. Returns
+    /// whether anything moved.
+    pub fn merge_cursors(&self, channel: &[u8; 32], marks: &Marks) -> Result<bool, ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin merge cursors"))?;
+        let mut moved = false;
+        for m in &marks.marks {
+            let changed = tx
+                .execute(
+                    "INSERT INTO cursor (channel, account, delivered, read, receipts)
+                     VALUES (?1, ?2, ?3, ?4, 1)
+                     ON CONFLICT (channel, account) DO UPDATE SET
+                         delivered = MAX(delivered, ?3),
+                         read = MAX(read, ?4)
+                     WHERE delivered < ?3 OR read < ?4",
+                    params![
+                        &channel[..],
+                        m.account.as_bytes(),
+                        m.delivered as i64,
+                        m.read as i64
+                    ],
+                )
+                .map_err(storage("merge cursor"))?;
+            moved |= changed > 0;
+        }
+        tx.commit().map_err(storage("commit merge cursors"))?;
+        Ok(moved)
     }
 
     /// Collect and discard whatever is waiting. Delivered at most once.

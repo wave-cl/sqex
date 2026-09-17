@@ -68,6 +68,12 @@ pub const TYPE_FORWARD_ACTION: u8 = 0x09;
 /// SIP-17 counter -- which a replica does not track and a device with a
 /// fresh store cannot otherwise learn.
 pub const TYPE_STANDING: u8 = 0x08;
+/// SIP-54: a replica asks the origin for every member's read marks.
+pub const TYPE_CURSORS: u8 = 0x0a;
+/// SIP-54: a replica asks the origin for the signals logged since a point.
+pub const TYPE_SIGNALS: u8 = 0x0b;
+/// SIP-54: signals the origin keeps per channel for replicas to pull.
+pub const SIGNAL_LOG: usize = 256;
 
 /// Agree on a version, and say who is asking.
 ///
@@ -829,6 +835,136 @@ mod shape_tests {
         assert!(Shape::decode(&cut).is_err());
         let p = PullShape { channel: [3; 32] };
         assert_eq!(PullShape::decode(&p.encode()).unwrap(), p);
+    }
+}
+
+/// SIP-54: `POST /peer/cursors`, answered with SIP-16's `Marks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullCursors {
+    pub channel: [u8; 32],
+}
+
+impl PullCursors {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_CURSORS);
+        out.extend_from_slice(&self.channel);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullCursors> {
+        if b.len() != 33 || b[0] != TYPE_CURSORS {
+            return Err(Error::Malformed("not a cursors pull".into()));
+        }
+        Ok(PullCursors {
+            channel: b[1..33].try_into().unwrap(),
+        })
+    }
+}
+
+/// SIP-54: `POST /peer/signals`: the channel's signal log above `since`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullSignals {
+    pub channel: [u8; 32],
+    pub since: u64,
+}
+
+impl PullSignals {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(TYPE_SIGNALS);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.since.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullSignals> {
+        if b.len() != 41 || b[0] != TYPE_SIGNALS {
+            return Err(Error::Malformed("not a signals pull".into()));
+        }
+        Ok(PullSignals {
+            channel: b[1..33].try_into().unwrap(),
+            since: u64::from_be_bytes(b[33..41].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-54: one signal as the origin logged it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Logged {
+    pub seq: u64,
+    pub account: PubKey,
+    pub device: PubKey,
+    pub kind: u8,
+    pub at: u64,
+    pub body: Vec<u8>,
+}
+
+/// SIP-54: the answer to a signals pull.
+///
+/// `| next: u64 | count: u16 | count × (seq: u64 | account[32] | device[32] | kind: u8 | at: u64 | len: u16 | body) |`
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Signals {
+    pub next: u64,
+    pub signals: Vec<Logged>,
+}
+
+impl Signals {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.signals.len() * 90);
+        out.extend_from_slice(&self.next.to_be_bytes());
+        out.extend_from_slice(&(self.signals.len() as u16).to_be_bytes());
+        for l in &self.signals {
+            out.extend_from_slice(&l.seq.to_be_bytes());
+            out.extend_from_slice(l.account.as_bytes());
+            out.extend_from_slice(l.device.as_bytes());
+            out.push(l.kind);
+            out.extend_from_slice(&l.at.to_be_bytes());
+            out.extend_from_slice(&(l.body.len().min(u16::MAX as usize) as u16).to_be_bytes());
+            out.extend_from_slice(&l.body[..l.body.len().min(u16::MAX as usize)]);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Signals> {
+        if b.len() < 10 {
+            return Err(Error::Malformed("signals cut short".into()));
+        }
+        let next = u64::from_be_bytes(b[..8].try_into().unwrap());
+        let count = u16::from_be_bytes([b[8], b[9]]) as usize;
+        if count > SIGNAL_LOG {
+            return Err(Error::Malformed("too many signals".into()));
+        }
+        let mut at = 10;
+        let mut signals = Vec::with_capacity(count);
+        for _ in 0..count {
+            if at + 83 > b.len() {
+                return Err(Error::Malformed("signals cut short".into()));
+            }
+            let seq = u64::from_be_bytes(b[at..at + 8].try_into().unwrap());
+            let account = PubKey::new(b[at + 8..at + 40].try_into().unwrap());
+            let device = PubKey::new(b[at + 40..at + 72].try_into().unwrap());
+            let kind = b[at + 72];
+            let when = u64::from_be_bytes(b[at + 73..at + 81].try_into().unwrap());
+            let len = u16::from_be_bytes([b[at + 81], b[at + 82]]) as usize;
+            at += 83;
+            if at + len > b.len() {
+                return Err(Error::Malformed("signals cut short".into()));
+            }
+            signals.push(Logged {
+                seq,
+                account,
+                device,
+                kind,
+                at: when,
+                body: b[at..at + len].to_vec(),
+            });
+            at += len;
+        }
+        if at != b.len() {
+            return Err(Error::Malformed("trailing bytes after signals".into()));
+        }
+        Ok(Signals { next, signals })
     }
 }
 

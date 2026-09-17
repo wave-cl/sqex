@@ -295,6 +295,19 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::Forwarder::standing"),
         ReplicationPeer,
     ),
+    // SIP-54: a replica pulls the members' marks and the signal log.
+    (
+        "POST",
+        "/peer/cursors",
+        Peer("replica::pull_soft_state"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/signals",
+        Peer("replica::pull_soft_state"),
+        ReplicationPeer,
+    ),
     // SIP-53: the new origin telling a peer the channel moved.
     (
         "POST",

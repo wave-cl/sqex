@@ -432,6 +432,9 @@ pub async fn pull_once(
         let mut predecessors = origin.predecessors.clone();
         predecessors.extend(store.origin_history(channel));
         let mut took = take_under(store, &origin.key, &predecessors, channel, &pulled, &lookup);
+        // SIP-54: the members' marks and the signal log, merged and handed
+        // on as if made here.
+        pull_soft_state(client, server, channel).await;
         // SIP-53: a rehome among what was pulled moved the channel. Where it
         // went is asked of the origin, which recorded the hint, so the task
         // for moved channels can find it.
@@ -985,6 +988,47 @@ pub async fn run_moved(
                     Ok(took) => report(&task, &took),
                 },
             }
+        }
+    }
+}
+
+/// SIP-54: pull the origin's read marks and signal log for a channel and
+/// apply them here. Best effort: an origin from before SIP-54 refuses both
+/// as it refuses any peering route it lacks, and nothing changes.
+async fn pull_soft_state(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    channel: &[u8; 32],
+) {
+    let store = server.channels();
+    if let Ok((200, body)) = client
+        .post(
+            "/peer/cursors",
+            sqex_proto::peer::PullCursors { channel: *channel }.encode(),
+        )
+        .await
+        && let Ok(marks) = sqex_proto::channel::Marks::decode(&body)
+    {
+        server.merge_pulled_cursors(channel, &marks);
+    }
+    let since = store.signal_mark(channel);
+    if let Ok((200, body)) = client
+        .post(
+            "/peer/signals",
+            sqex_proto::peer::PullSignals {
+                channel: *channel,
+                since,
+            }
+            .encode(),
+        )
+        .await
+        && let Ok(signals) = sqex_proto::peer::Signals::decode(&body)
+    {
+        for l in &signals.signals {
+            server.deliver_pulled_signal(channel, l);
+        }
+        if signals.next > 0 {
+            store.set_signal_mark(channel, signals.next);
         }
     }
 }
