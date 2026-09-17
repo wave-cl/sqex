@@ -106,8 +106,12 @@ impl Subscribers {
     }
 
     /// Forget one stream, and the identity entirely once its last one goes.
-    pub fn unsubscribe(&self, feed: &Feed) {
+    /// Returns whether this was the device's last open stream -- SIP-47's
+    /// moment: a device that held a stream and let it go has answered any
+    /// wake it was sent.
+    pub fn unsubscribe(&self, feed: &Feed) -> bool {
         let mut map = self.by_identity.lock().unwrap();
+        let mut last = false;
         if let Some(subs) = map.get_mut(&feed.who) {
             let before = subs.len();
             subs.retain(|s| s.id != feed.id);
@@ -117,6 +121,7 @@ impl Subscribers {
                     *n = n.saturating_sub(1);
                     if *n == 0 {
                         devices.remove(&feed.device);
+                        last = true;
                     }
                 }
             }
@@ -124,6 +129,7 @@ impl Subscribers {
                 map.remove(&feed.who);
             }
         }
+        last
     }
 
     /// Tell everybody in `to` that something changed.

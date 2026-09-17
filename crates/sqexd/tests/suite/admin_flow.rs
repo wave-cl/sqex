@@ -58,6 +58,9 @@ impl Client {
             SquicConfig {
                 alpn_protocols: vec![b"h3".to_vec()],
                 client_key: Some(hex::encode(client_seed)),
+                // SIP-3: named, so the chat routes know who is asking. The
+                // whitelist decides on the transport key either way.
+                advertise_identity: true,
                 ..Default::default()
             },
         );
@@ -408,6 +411,172 @@ async fn full_admin_flow() {
     assert_eq!(status["whitelist_enabled"], true, "enabled state persisted");
     assert_eq!(status["whitelist_count"], 1, "one key persisted");
     handle2.abort();
+}
+
+/// SIP-47: a registered device of an admitted account is admitted, for as
+/// long as the registration stands. The phone's key is on no list; the
+/// account registers it and it is let in; revoked, or its credential run
+/// out, it is closed and refused at the door like any stranger.
+#[tokio::test]
+async fn a_registered_device_of_a_listed_account_is_let_in_until_it_is_not() {
+    use sqex_proto::credential::{Credential, SCOPE_CHAT};
+    use sqex_proto::device::{Register, Revoke};
+
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("host_key");
+    let (server_sk, _) = squic::generate_keypair();
+    std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    let admin_sk = SigningKey::from_bytes(&[17u8; 32]);
+    let admin_pub = PubKey::new(admin_sk.verifying_key().to_bytes());
+    let admin_signer = SoftwareSigner::new(admin_sk);
+    let account_seed = [52u8; 32];
+    let account_pub = PubKey::new(
+        SigningKey::from_bytes(&account_seed)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let phone_seed = [53u8; 32];
+    let phone_pub = PubKey::new(
+        SigningKey::from_bytes(&phone_seed)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let brief_seed = [54u8; 32];
+    let brief_pub = PubKey::new(
+        SigningKey::from_bytes(&brief_seed)
+            .verifying_key()
+            .to_bytes(),
+    );
+
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{:?}]\n",
+        key_path.to_string_lossy(),
+        dir.path().join("sqex.state").to_string_lossy(),
+        admin_pub.to_base58(),
+    );
+    let config_path = dir.path().join("sqexd.toml");
+    std::fs::write(&config_path, &config_toml).unwrap();
+    let (addr, server_pub_bytes, _handle) = spawn_server(&config_toml, config_path).await;
+    let server_pub = PubKey::new(server_pub_bytes);
+    let mut admin = Client::connect(addr, &server_pub_bytes, &[17u8; 32]).await;
+    let (s, _) = admin
+        .admin(Op::WhitelistEnable, &server_pub, &admin_signer)
+        .await;
+    assert_eq!(s, 200);
+    let (s, _) = admin
+        .admin(
+            Op::WhitelistAdd {
+                key: account_pub,
+                label: None,
+            },
+            &server_pub,
+            &admin_signer,
+        )
+        .await;
+    assert_eq!(s, 200);
+
+    // The account is in; its phone, on no list, is not.
+    let mut account = Client::try_connect(addr, &server_pub_bytes, &account_seed)
+        .await
+        .expect("the listed account is let in");
+    assert!(
+        Client::try_connect(addr, &server_pub_bytes, &phone_seed)
+            .await
+            .is_none(),
+        "an unregistered device was let in"
+    );
+
+    // Registered by the account (SIP-22), the phone is admitted -- and is
+    // not on the list, which is the account's alone.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // The account is its own first device (SIP-22: a sibling registers
+    // the next, and an unregistered account is nobody's sibling).
+    let own =
+        Credential::issue(&account_seed, &account_pub, SCOPE_CHAT, now - 1, now + 3600).unwrap();
+    let (s, body) = account
+        .post("/device/register", Register { credential: own }.encode())
+        .await;
+    assert_eq!(s, 200, "{}", String::from_utf8_lossy(&body));
+    let credential =
+        Credential::issue(&account_seed, &phone_pub, SCOPE_CHAT, now - 1, now + 3600).unwrap();
+    let (s, body) = account
+        .post("/device/register", Register { credential }.encode())
+        .await;
+    assert_eq!(s, 200, "{}", String::from_utf8_lossy(&body));
+    let mut phone = Client::try_connect(addr, &server_pub_bytes, &phone_seed)
+        .await
+        .expect("a registered device is let in");
+    assert_eq!(phone.get("/exchange/ping").await.0, 200);
+    let (s, body) = admin
+        .admin(Op::WhitelistList, &server_pub, &admin_signer)
+        .await;
+    assert_eq!(s, 200);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["results"][0]["keys"].as_array().map(Vec::len),
+        Some(1),
+        "the device was listed beside the account: {v}"
+    );
+
+    // A second device, on a credential about to run out.
+    let credential =
+        Credential::issue(&account_seed, &brief_pub, SCOPE_CHAT, now - 1, now + 2).unwrap();
+    let (s, _) = account
+        .post("/device/register", Register { credential }.encode())
+        .await;
+    assert_eq!(s, 200);
+    let mut brief = Client::try_connect(addr, &server_pub_bytes, &brief_seed)
+        .await
+        .expect("a briefly registered device is let in");
+    assert_eq!(brief.get("/exchange/ping").await.0, 200);
+    // Whole seconds: a credential good through `now + 2` is good at
+    // `now + 2`, so wait past the next second boundary after it.
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+
+    // Revoked, the phone's connection is closed and its key refused; and
+    // the door, re-derived, no longer rests on a credential that has run
+    // out. (The sweeper would find that by itself within its minute; the
+    // revoke is what makes it prompt here.)
+    let (s, body) = account
+        .post(
+            "/device/revoke",
+            Revoke {
+                device: phone_pub,
+                revocation: None,
+            }
+            .encode(),
+        )
+        .await;
+    assert_eq!(s, 200, "{}", String::from_utf8_lossy(&body));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(
+        phone.try_get("/health").await.is_none(),
+        "a revoked device's connection survived"
+    );
+    assert!(
+        Client::try_connect(addr, &server_pub_bytes, &phone_seed)
+            .await
+            .is_none(),
+        "a revoked device was let back in"
+    );
+    assert!(
+        brief.try_get("/health").await.is_none(),
+        "a device whose credential ran out kept its connection"
+    );
+    assert!(
+        Client::try_connect(addr, &server_pub_bytes, &brief_seed)
+            .await
+            .is_none(),
+        "a device whose credential ran out was let back in"
+    );
+    assert_eq!(
+        account.get("/exchange/ping").await.0,
+        200,
+        "the account itself is unaffected"
+    );
 }
 
 /// `/status` reports what sQUIC accepts and what is actually arriving.

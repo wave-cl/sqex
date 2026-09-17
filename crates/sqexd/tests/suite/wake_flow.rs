@@ -278,6 +278,17 @@ async fn an_absent_device_is_woken_once_and_a_listening_one_not_at_all() {
     );
     drop(stream);
 
+    // SIP-47: the stream held and let go answered the wake. The next event
+    // -- an ordinary post, seconds after the last wake -- wakes him afresh
+    // rather than waiting out the interval.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let before = pushes.bodies.lock().unwrap().len();
+    say(&mut a, &s, &mut chain, channel, b"three").await;
+    assert!(
+        wakes_within(&pushes, before + 1, 5).await,
+        "a device that came and went was held to a wake it had answered"
+    );
+
     // Forgotten: nothing arrives after.
     let (code, _) = b.post("/wake/forget", forget()).await.unwrap();
     assert_eq!(code, 200);

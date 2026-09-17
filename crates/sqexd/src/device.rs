@@ -653,6 +653,45 @@ impl Registry {
         );
     }
 
+    /// SIP-47: `device` held a stream and let it go. Whatever wake it was
+    /// sent has been answered, so the coalescing interval is over: the next
+    /// event is the first of a new absence.
+    pub fn released(&self, device: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE wake SET woken = 0 WHERE device = ?1",
+            params![device.as_bytes()],
+        );
+    }
+
+    /// SIP-47: every device currently registered to any of `accounts`, for
+    /// the transport whitelist -- and the soonest their admission changes
+    /// by itself, which is the earliest credential expiry among them.
+    pub fn registered_to(&self, accounts: &[PubKey]) -> (Vec<PubKey>, Option<u64>) {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        let mut out = Vec::new();
+        let mut soonest: Option<u64> = None;
+        let Ok(mut stmt) = db
+            .prepare("SELECT device, not_after FROM device WHERE account = ?1 AND not_after >= ?2")
+        else {
+            return (out, None);
+        };
+        for account in accounts {
+            let rows = stmt.query_map(params![account.as_bytes(), now as i64], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)? as u64))
+            });
+            let Ok(rows) = rows else { continue };
+            for (device, not_after) in rows.flatten() {
+                if let Ok(b) = device.try_into() {
+                    out.push(PubKey::new(b));
+                    soonest = Some(soonest.map_or(not_after, |s| s.min(not_after)));
+                }
+            }
+        }
+        (out, soonest)
+    }
+
     pub fn account_for(&self, device: &PubKey) -> PubKey {
         let now = now_unix();
         let db = self.db.lock().unwrap();

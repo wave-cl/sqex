@@ -302,6 +302,9 @@ pub struct Server {
     /// SIP-45: wakes for devices that cannot hold a stream, posted off the
     /// request path. Set once the `Arc` exists, since the task holds it.
     waker: std::sync::OnceLock<crate::wake::Waker>,
+    /// SIP-47: when the earliest device credential the whitelist admits
+    /// runs out -- the one moment the door changes with nobody at it.
+    admission_expiry: Mutex<Option<u64>>,
     /// SIP-45: whether `http://` to loopback is an acceptable endpoint --
     /// for the tests, which stand a listener up there.
     wake_loopback: bool,
@@ -381,6 +384,13 @@ impl Server {
         let mut allowed: Vec<[u8; 32]> = state.transport_keys();
         allowed.extend(self.admins.read().unwrap().iter().filter_map(derive));
         allowed.extend(self.replication_peers.iter().filter_map(|p| derive(&p.key)));
+        // SIP-47: a registered device of an admitted account is admitted for
+        // as long as the registration stands. Admitted *because of* the
+        // account, not listed beside it -- `whitelist list` does not show
+        // it, and removing the account removes its devices with it.
+        let (devices, expiry) = self.devices.registered_to(&state.keys());
+        allowed.extend(devices.iter().filter_map(derive));
+        *self.admission_expiry.lock().unwrap() = expiry;
         self.transport.enable_whitelist(&allowed);
         // Whoever is connected and no longer allowed goes -- a moment from
         // now, not this instant: the op that enabled the list may have come
@@ -402,6 +412,25 @@ impl Server {
             closed = gone,
             "transport whitelist enabled"
         );
+    }
+
+    /// SIP-47: a device was registered or revoked, or a credential the
+    /// door was relying on has run out. Re-derive the whitelist if it is
+    /// on; nothing to do if it is not.
+    fn resync_transport(&self) {
+        let state = self.state.lock().unwrap();
+        if state.enabled() {
+            self.sync_transport(&state);
+        }
+    }
+
+    /// Whether the soonest device-credential expiry the whitelist rests on
+    /// has passed, so the door must be re-derived without anybody asking.
+    fn admission_due(&self) -> bool {
+        self.admission_expiry
+            .lock()
+            .unwrap()
+            .is_some_and(|t| t < now_unix())
     }
 
     /// SIP-39: whether this exchange federates with `key`.
@@ -739,6 +768,7 @@ pub async fn bind_with(
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
         waker: std::sync::OnceLock::new(),
+        admission_expiry: Mutex::new(None),
         wake_loopback: config.wake_loopback,
         carried_uploads: Mutex::new(HashMap::new()),
         next_carried: AtomicU64::new(0),
@@ -1036,6 +1066,12 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 // nobody is calling still has to tidy up the ones abandoned
                 // mid-ring.
                 server.relay.sweep(now_unix());
+                // SIP-47: a device is admitted for as long as its credential
+                // stands, and a credential runs out with nobody at the door
+                // to say so. The one time-driven change to the whitelist.
+                if server.admission_due() {
+                    server.resync_transport();
+                }
             }
         }
     };
@@ -1246,12 +1282,16 @@ async fn serve_events(
         .map_err(|e| Error::Malformed(format!("response build: {e}")))?;
     let opened = stream.send_response(head).await;
     if opened.is_err() {
-        server.events.unsubscribe(&feed);
+        let _ = server.events.unsubscribe(&feed);
         return Ok(());
     }
 
     crate::events::pump(&mut feed, &mut H3Sink { stream }, HEARTBEAT).await;
-    server.events.unsubscribe(&feed);
+    if server.events.unsubscribe(&feed) {
+        // SIP-47: the device held a stream and let it go. Whatever wake
+        // brought it has been answered; the next event wakes it afresh.
+        server.devices.released(&feed.device);
+    }
     Ok(())
 }
 
@@ -1771,11 +1811,14 @@ async fn route(
             // device of the same account. The account is never required to
             // connect, because a hardware-held one cannot.
             (Some(me), Ok(req)) => match server.devices.register(&me, &req.credential) {
-                Ok(()) => (
-                    200,
-                    "application/octet-stream",
-                    ChannelAck { now: now_unix() }.encode(),
-                ),
+                Ok(()) => {
+                    server.resync_transport();
+                    (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    )
+                }
                 Err(e) => refuse(e.status(), e.code(), None),
             },
         },
@@ -1787,11 +1830,14 @@ async fn route(
                     .devices
                     .revoke(&me, &req.device, req.revocation.as_ref())
                 {
-                    Ok(()) => (
-                        200,
-                        "application/octet-stream",
-                        ChannelAck { now: now_unix() }.encode(),
-                    ),
+                    Ok(()) => {
+                        server.resync_transport();
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
                     Err(e) => refuse(e.status(), e.code(), None),
                 }
             }
