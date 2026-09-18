@@ -55,16 +55,23 @@ codegen-units = 1
 strip = true
 
 # Debug info is the bulk of what a test binary carries, and every test target
-# statically links the whole workspace plus its dependency tree. Workspace
-# crates keep full symbols — that is where a backtrace has to be readable.
-# Dependencies drop to line tables, which still give file:line in a panic.
+# statically links the whole workspace plus its dependency tree. Line tables
+# still give file:line in a panic, which is what a backtrace has to be
+# readable for; full DWARF is for a debugger, and nothing here is stepped
+# through in one.
 #
-# Measured: 78.1 MB -> 50.0 MB for a test binary on x86_64-unknown-linux-gnu,
-# and nothing worth having on macOS, which defaults to
-# split-debuginfo=unpacked and so never carried the debug info in the binary.
-# This is a CI change, not a local one.
+# Measured (2026-09-04, dependencies only): 78.1 MB -> 50.0 MB for a test
+# binary on x86_64-unknown-linux-gnu. On macOS split-debuginfo=unpacked keeps
+# the debug info out of the binary and in `.rcgu.o` object files that stay in
+# target/debug/deps beside it — one set per metadata hash, and a workspace
+# built against a path dependency gets a new hash on every edit of it. That
+# is how sigil's target reached 343 GB in six days (2026-09-18), and why the
+# workspace crates now take line tables too and dependencies none.
 #
 # profile.test inherits from profile.dev, so this reaches test targets without
-# naming them; package."*" restricts it to non-workspace crates.
-[profile.dev.package."*"]
+# naming them; package."*" restricts the second block to non-workspace crates.
+[profile.dev]
 debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
