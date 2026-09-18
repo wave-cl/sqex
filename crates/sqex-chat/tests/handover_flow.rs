@@ -334,6 +334,63 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         "a sync that was not asked gave the key"
     );
 
+    // SIP-70: mail sent to the account is listed on the phone beside its
+    // own; without the key the phone can read what was sealed to it and
+    // only list what was sealed to the account -- and must not delete that.
+    {
+        let (carol_seed, _) = identity(14);
+        let carol = Client::connect_as(addr, &server_pub, &carol_seed)
+            .await
+            .unwrap();
+        let mut carol = carol;
+        let send = |to: PubKey, text: &[u8]| {
+            sqex_proto::mailbox::Send {
+                recipient: to,
+                sealed: sqex_proto::mailbox::seal(&to, text).unwrap(),
+            }
+            .encode()
+        };
+        let (code, body) = carol
+            .post("/mailbox/send", send(new, b"for the account"))
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+        let to_account = sqex_proto::mailbox::SendAck::decode(&body).unwrap().id;
+        let (code, body) = carol
+            .post("/mailbox/send", send(phone_key, b"for the phone"))
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+        let to_phone = sqex_proto::mailbox::SendAck::decode(&body).unwrap().id;
+        let listed = phone.mail_list().await.unwrap();
+        assert_eq!(
+            listed.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![to_account, to_phone]
+        );
+        assert_eq!(
+            phone.mail_read(to_phone).await.unwrap().map(|(_, t)| t),
+            Some(b"for the phone".to_vec())
+        );
+        assert!(matches!(
+            phone.mail_read(to_account).await,
+            Err(sqex_chat::ChatError::MailSealedElsewhere(_))
+        ));
+        assert!(
+            matches!(
+                phone.mail_delete(to_account).await,
+                Err(sqex_chat::ChatError::MailSealedElsewhere(_))
+            ),
+            "the phone deleted what it could not read"
+        );
+        // The laptop, which holds the key, reads it.
+        assert_eq!(
+            laptop.mail_read(to_account).await.unwrap().map(|(_, t)| t),
+            Some(b"for the account".to_vec())
+        );
+        assert!(laptop.mail_delete(to_account).await.unwrap());
+        assert!(phone.mail_delete(to_phone).await.unwrap());
+    }
+
     // The laptop entrusts the key; the phone holds it and signs a Move.
     let seed = laptop.account_seed().unwrap();
     let ((mut ll, sl), (mut lp, sp)) = meet(&laptop, &phone).await;
@@ -348,6 +405,32 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         phone.ensure_home().await.unwrap(),
         "the entrusted phone signed no Move"
     );
+    // SIP-70: and, entrusted, it opens what is sealed to the account.
+    {
+        let (carol_seed, _) = identity(14);
+        let mut carol = Client::connect_as(addr, &server_pub, &carol_seed)
+            .await
+            .unwrap();
+        let (code, body) = carol
+            .post(
+                "/mailbox/send",
+                sqex_proto::mailbox::Send {
+                    recipient: new,
+                    sealed: sqex_proto::mailbox::seal(&new, b"for the account, again").unwrap(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+        let id = sqex_proto::mailbox::SendAck::decode(&body).unwrap().id;
+        assert_eq!(
+            phone.mail_read(id).await.unwrap().map(|(_, t)| t),
+            Some(b"for the account, again".to_vec()),
+            "the entrusted phone could not open the account's mail"
+        );
+        assert!(phone.mail_delete(id).await.unwrap());
+    }
     assert!(xl.gave_key);
 
     // The phone, holding the key, hands over; the laptop's stored seed is

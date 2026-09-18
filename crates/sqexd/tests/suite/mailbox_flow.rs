@@ -288,3 +288,117 @@ async fn a_malformed_or_oversized_send_is_refused() {
     let _ = (TYPE_FETCH, TYPE_DELETE, TYPE_STATUS);
     handle.abort();
 }
+
+/// SIP-70: a device registered to an account is shown the account's mail
+/// beside its own, fetches and deletes either by id, and a stranger sees
+/// neither. Sealing is untouched: what was sealed to the account opens
+/// with the account's key alone.
+#[tokio::test]
+async fn a_device_reads_its_accounts_mail_beside_its_own() {
+    use sqex_proto::credential::{Credential, SCOPE_CHAT};
+    use sqex_proto::device::Register;
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = bare_server(dir.path()).await;
+    let (account_seed, account) = identity(71);
+    let (phone_seed, phone) = identity(72);
+    let (carol_seed, _) = identity(73);
+    let (stranger_seed, _) = identity(74);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // The phone is the account's device; the account itself never connects.
+    let mut p = as_identity(addr, &server_pub, &phone_seed).await;
+    let credential =
+        Credential::issue(&account_seed, &phone, SCOPE_CHAT, now - 1, now + 3600).unwrap();
+    let (code, _) = p
+        .post("/device/register", Register { credential }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    // Carol writes to the account, and separately to the phone.
+    let mut c = as_identity(addr, &server_pub, &carol_seed).await;
+    let send = |to: PubKey, text: &'static [u8]| {
+        let sealed = mailbox::seal(&to, text).unwrap();
+        MailSend {
+            recipient: to,
+            sealed,
+        }
+        .encode()
+    };
+    let (code, body) = c
+        .post("/mailbox/send", send(account, b"for the account"))
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let to_account = SendAck::decode(&body).unwrap().id;
+    let (code, body) = c
+        .post("/mailbox/send", send(phone, b"for the phone"))
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let to_phone = SendAck::decode(&body).unwrap().id;
+
+    // The phone lists both, oldest first.
+    let (code, body) = p.post("/mailbox/list", Vec::new()).await.unwrap();
+    assert_eq!(code, 200);
+    let listing = Listing::decode(&body).unwrap();
+    assert_eq!(
+        listing.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![to_account, to_phone],
+        "the phone was not shown its account's mail beside its own"
+    );
+    // A stranger sees neither.
+    let mut s = as_identity(addr, &server_pub, &stranger_seed).await;
+    let (_, body) = s.post("/mailbox/list", Vec::new()).await.unwrap();
+    assert!(Listing::decode(&body).unwrap().entries.is_empty());
+    let (_, body) = s
+        .post("/mailbox/fetch", ById::fetch(to_account).encode())
+        .await
+        .unwrap();
+    assert!(!Fetched::decode(&body).unwrap().found);
+
+    // The phone fetches both; the account's opens with the account's key
+    // alone, and the phone's with the phone's.
+    let (_, body) = p
+        .post("/mailbox/fetch", ById::fetch(to_account).encode())
+        .await
+        .unwrap();
+    let f = Fetched::decode(&body).unwrap();
+    assert!(f.found);
+    assert!(
+        mailbox::open(&phone_seed, &f.sealed).is_err(),
+        "sealing changed"
+    );
+    assert_eq!(
+        mailbox::open(&account_seed, &f.sealed).unwrap(),
+        b"for the account"
+    );
+    let (_, body) = p
+        .post("/mailbox/fetch", ById::fetch(to_phone).encode())
+        .await
+        .unwrap();
+    let f = Fetched::decode(&body).unwrap();
+    assert_eq!(
+        mailbox::open(&phone_seed, &f.sealed).unwrap(),
+        b"for the phone"
+    );
+
+    // And deletes either; Carol is told each was collected.
+    for id in [to_account, to_phone] {
+        let (_, body) = p
+            .post("/mailbox/delete", ById::delete(id).encode())
+            .await
+            .unwrap();
+        assert_eq!(body, vec![1u8]);
+        let (_, body) = c
+            .post("/mailbox/status", ById::status(id).encode())
+            .await
+            .unwrap();
+        assert_eq!(Status::decode(&body).unwrap().state, State::Collected);
+    }
+    let (_, body) = p.post("/mailbox/list", Vec::new()).await.unwrap();
+    assert!(Listing::decode(&body).unwrap().entries.is_empty());
+}

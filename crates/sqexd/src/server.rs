@@ -858,6 +858,17 @@ impl Server {
         self.names.resolve(label)
     }
 
+    /// SIP-70: the keys whose mailbox `device` reads: its own, and its
+    /// account's where the registry binds it to one.
+    pub(crate) fn mine_and_accounts(&self, device: &PubKey) -> Vec<PubKey> {
+        let account = self.account_of(device);
+        if account == *device {
+            vec![*device]
+        } else {
+            vec![*device, account]
+        }
+    }
+
     /// SIP-65: whether calls are carried for an exchange nobody listed.
     pub(crate) fn open_calls(&self) -> bool {
         self.open_calls
@@ -4612,19 +4623,29 @@ async fn route(
                 Err(e) => refuse(507, e.code(), None),
             },
         },
+        // SIP-70: a device reads its account's queue beside its own -- the
+        // registry says whose device it is (SIP-22), as it does for every
+        // other service. Nothing is re-sealed: an item sealed to the account
+        // opens only where the account's key is.
         ("POST", "/mailbox/list") => match peer.identity {
             None => no_identity("listing"),
             Some(me) => (
                 200,
                 "application/octet-stream",
-                server.mailbox.list(&me).encode(),
+                server
+                    .mailbox
+                    .list_for(&server.mine_and_accounts(&me))
+                    .encode(),
             ),
         },
         ("POST", "/mailbox/fetch") => match (peer.identity, ById::decode(body, TYPE_FETCH)) {
             (None, _) => no_identity("fetching"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
-                let out = match server.mailbox.fetch(&me, req.id) {
+                let out = match server
+                    .mailbox
+                    .fetch_for(&server.mine_and_accounts(&me), req.id)
+                {
                     Some((sender, received, sealed)) => Fetched {
                         found: true,
                         sender,
@@ -4640,7 +4661,9 @@ async fn route(
             (None, _) => no_identity("deleting"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
-                let deleted = server.mailbox.delete(&me, req.id);
+                let deleted = server
+                    .mailbox
+                    .delete_for(&server.mine_and_accounts(&me), req.id);
                 (200, "application/octet-stream", vec![u8::from(deleted)])
             }
         },

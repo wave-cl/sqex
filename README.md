@@ -97,6 +97,7 @@ sqex home sign <key>         # the same statement signed offline (--yubikey work
 sqex home locate a@b.org     # find somebody at another exchange; ^N a@b.org does it in the client
 sqex-chat handover           # a new account key, devices kept, conversations and contacts follow
 sqex-chat device entrust <k> # give another of your devices the account key (it becomes the account)
+sqex-chat mail list|read|delete # mail for this device and for its account, opened with every key here
 sqex lineage                 # the exchange's earlier keys, verified back from the one you pinned
 ```
 

@@ -170,6 +170,24 @@ enum Cmd {
         /// The account, base58, or a name here. Yours if omitted.
         who: Option<String>,
     },
+    /// Mail (SIP-5) for this device and for its account (SIP-70), read
+    /// with every key this store holds -- the account's included, where
+    /// this device made it or was entrusted with it.
+    Mail {
+        #[command(subcommand)]
+        cmd: MailCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum MailCmd {
+    /// What is waiting, for this device and for its account.
+    List,
+    /// Fetch and open one item. Stays on the exchange until `delete`.
+    Read { id: u64 },
+    /// Complete collection of an item read here. An item this device could
+    /// not open is refused: deleting takes it from the device that can.
+    Delete { id: u64 },
 }
 
 #[derive(Subcommand)]
@@ -390,6 +408,45 @@ async fn run(cli: Cli) -> Result<(), String> {
                     .await
                     .map_err(|e| e.to_string())?;
                 println!("handed over: {was} is now {}", chat.me);
+            }
+        }
+        return Ok(());
+    }
+    if let Some(Cmd::Mail { cmd }) = &cli.cmd {
+        match cmd {
+            MailCmd::List => {
+                let listing = chat.mail_list().await.map_err(|e| e.to_string())?;
+                if listing.entries.is_empty() {
+                    println!("no messages waiting for this device or its account");
+                    return Ok(());
+                }
+                println!("{} message(s) waiting:", listing.entries.len());
+                for e in &listing.entries {
+                    println!(
+                        "  [{}] from {}  {} bytes  {}s ago",
+                        e.id,
+                        e.sender,
+                        e.len,
+                        listing.now.saturating_sub(e.received)
+                    );
+                }
+            }
+            MailCmd::Read { id } => match chat.mail_read(*id).await.map_err(|e| e.to_string())? {
+                Some((sender, plain)) => {
+                    println!("from {sender}:");
+                    println!("{}", String::from_utf8_lossy(&plain));
+                    println!(
+                        "\n(still on the exchange -- `mail delete {id}` to complete collection)"
+                    );
+                }
+                None => return Err(format!("no message {id} for this device or its account")),
+            },
+            MailCmd::Delete { id } => {
+                if chat.mail_delete(*id).await.map_err(|e| e.to_string())? {
+                    println!("collected {id}");
+                } else {
+                    println!("nothing to collect under {id}");
+                }
             }
         }
         return Ok(());

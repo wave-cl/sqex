@@ -217,6 +217,38 @@ impl Mailbox {
         Ok(true)
     }
 
+    /// SIP-70: the messages waiting for any of `recipients` -- a device's
+    /// own and its account's -- together, oldest first by arrival.
+    pub fn list_for(&self, recipients: &[PubKey]) -> Listing {
+        let now = now_unix();
+        let mut inner = self.inner.lock().unwrap();
+        inner.expire(now);
+        let mut entries: Vec<Entry> = recipients
+            .iter()
+            .flat_map(|r| inner.queues.get(r).cloned().unwrap_or_default())
+            .filter_map(|id| inner.messages.get(&id))
+            .map(|m| Entry {
+                id: m.id,
+                sender: m.sender,
+                received: m.received,
+                len: m.len() as u32,
+            })
+            .collect();
+        entries.sort_by_key(|e| (e.received, e.id));
+        entries.dedup_by_key(|e| e.id);
+        Listing { entries, now }
+    }
+
+    /// SIP-70: [`Self::fetch`] for whichever of `recipients` the item is for.
+    pub fn fetch_for(&self, recipients: &[PubKey], id: u64) -> Option<(PubKey, u64, Sealed)> {
+        recipients.iter().find_map(|r| self.fetch(r, id))
+    }
+
+    /// SIP-70: [`Self::delete`] for whichever of `recipients` the item is for.
+    pub fn delete_for(&self, recipients: &[PubKey], id: u64) -> bool {
+        recipients.iter().any(|r| self.delete(r, id))
+    }
+
     /// The messages waiting for `recipient`, oldest first.
     pub fn list(&self, recipient: &PubKey) -> Listing {
         let now = now_unix();

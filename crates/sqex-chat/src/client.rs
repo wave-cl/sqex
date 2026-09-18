@@ -251,6 +251,10 @@ pub enum ChatError {
     /// its key, and the domain it is reached by where the refusing exchange
     /// knew one. This exchange hands the key's services off there.
     Moved(Option<PubKey>, String),
+    /// SIP-70: a mail item this device fetched is sealed to a key it does
+    /// not hold -- its account's, on a device that was not entrusted with
+    /// it -- and must not be deleted from here.
+    MailSealedElsewhere(u64),
 }
 
 /// SIP-59: what a move did.
@@ -374,6 +378,12 @@ impl std::fmt::Display for ChatError {
                 f,
                 "this conversation lives at another exchange, which cannot be reached right now; \
                  nothing was sent"
+            ),
+            ChatError::MailSealedElsewhere(id) => write!(
+                f,
+                "message {id} is sealed to a key this device does not hold -- the account's; a \
+                 device that holds it can read it (`device entrust`), and it stays on the \
+                 exchange until one does"
             ),
             ChatError::Moved(key, domain) => {
                 let at = match (key, domain.is_empty()) {
@@ -733,6 +743,8 @@ pub struct Chat {
     /// SIP-60: where people this client located live -- their home's key
     /// and domain -- for opening a direct message where it belongs.
     located: HashMap<PubKey, (PubKey, String)>,
+    /// SIP-70: mail items this device has opened, and so may delete.
+    mail_opened: std::collections::HashSet<u64>,
     /// SIP-62: channels whose store gap was asked for this run.
     gap_asked: std::collections::HashSet<[u8; 32]>,
     /// SIP-57: the timer this client puts on what it sends, per channel;
@@ -830,6 +842,7 @@ impl Chat {
             told_about: HashMap::new(),
             homes: HashMap::new(),
             located: HashMap::new(),
+            mail_opened: std::collections::HashSet::new(),
             gap_asked: std::collections::HashSet::new(),
             former: HashMap::new(),
             timers: HashMap::new(),
@@ -2601,6 +2614,60 @@ impl Chat {
         Ok(Devices::decode(&body)
             .map_err(|e| ChatError::Protocol(e.to_string()))?
             .devices)
+    }
+
+    /// SIP-70: the mail waiting for this device and for its account, as
+    /// the exchange lists them together.
+    pub async fn mail_list(&mut self) -> Result<sqex_proto::mailbox::Listing> {
+        let body = self.post("/mailbox/list", Vec::new()).await?;
+        sqex_proto::mailbox::Listing::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// SIP-70: fetch and open one item with every key this device holds --
+    /// its own, then the account's (SIP-62, SIP-67). `Ok(None)` where
+    /// there is no such item; `Err(MailSealedElsewhere)` where it is for a
+    /// key this device does not hold, which it must then not delete.
+    pub async fn mail_read(&mut self, id: u64) -> Result<Option<(PubKey, Vec<u8>)>> {
+        let body = self
+            .post(
+                "/mailbox/fetch",
+                sqex_proto::mailbox::ById::fetch(id).encode(),
+            )
+            .await?;
+        let f = sqex_proto::mailbox::Fetched::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        if !f.found {
+            return Ok(None);
+        }
+        let mut keys = vec![self.seed];
+        if let Some(seed) = self.account_seed()
+            && seed != self.seed
+        {
+            keys.push(seed);
+        }
+        for seed in &keys {
+            if let Ok(plain) = sqex_proto::mailbox::open(seed, &f.sealed) {
+                self.mail_opened.insert(id);
+                return Ok(Some((f.sender, plain)));
+            }
+        }
+        Err(ChatError::MailSealedElsewhere(id))
+    }
+
+    /// SIP-70: complete collection of an item this device has read. An
+    /// item it has not opened is refused here rather than at the exchange:
+    /// deleting completes collection for every device of the account.
+    pub async fn mail_delete(&mut self, id: u64) -> Result<bool> {
+        if !self.mail_opened.contains(&id) {
+            return Err(ChatError::MailSealedElsewhere(id));
+        }
+        let body = self
+            .post(
+                "/mailbox/delete",
+                sqex_proto::mailbox::ById::delete(id).encode(),
+            )
+            .await?;
+        Ok(body.first().copied().unwrap_or(0) != 0)
     }
 
     /// SIP-67: whose device this is, as the registry has it -- the one party
