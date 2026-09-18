@@ -360,6 +360,9 @@ pub struct Sync {
     entrust: Option<[u8; 32]>,
     /// SIP-67: whether this side was given the key this session.
     pub entrusted: bool,
+    /// SIP-67: whether this side gave the key this session -- sent once the
+    /// sibling was admitted, whatever the history trade did afterwards.
+    pub gave_key: bool,
     got_done: bool,
 
     /// Timelines for the channels being imported, so entries fold in order
@@ -390,6 +393,7 @@ impl Sync {
             sent_done: false,
             entrust: None,
             entrusted: false,
+            gave_key: false,
             got_done: false,
             timelines: HashMap::new(),
             blobs_wanted: HashSet::new(),
@@ -576,6 +580,7 @@ impl Sync {
                 // so here, give them the key (SIP-67).
                 if let Some(seed) = self.entrust.take() {
                     self.queue(&Message::Key(seed))?;
+                    self.gave_key = true;
                 }
                 let held = chat.held_for_siblings()?;
                 self.queue(&Message::Have(held))?;

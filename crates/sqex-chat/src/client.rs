@@ -4005,7 +4005,16 @@ impl Chat {
         if self.me == self.device {
             return Some(self.seed);
         }
-        self.store.account_seed().ok().flatten()
+        // Only the key of the account this device is *now*: a seed kept
+        // from before a handover another device presented (SIP-67) would
+        // sign as a retired account, and every verifier would take it.
+        self.store.account_seed().ok().flatten().filter(|seed| {
+            PubKey::new(
+                ed25519_dalek::SigningKey::from_bytes(seed)
+                    .verifying_key()
+                    .to_bytes(),
+            ) == self.me
+        })
     }
 
     /// SIP-67: keep an account seed a sibling entrusted to this device.

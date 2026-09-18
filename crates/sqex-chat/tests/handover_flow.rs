@@ -348,6 +348,20 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         phone.ensure_home().await.unwrap(),
         "the entrusted phone signed no Move"
     );
+    assert!(xl.gave_key);
+
+    // The phone, holding the key, hands over; the laptop's stored seed is
+    // the retired account's now, and it must not sign with it -- the
+    // laptop follows on its next look and holds no key until entrusted.
+    let newer = phone.handover(None).await.unwrap();
+    assert_eq!(laptop.follow_account().await.unwrap(), Some(newer));
+    assert_eq!(laptop.me, newer);
+    assert!(
+        !laptop.holds_account_key(),
+        "a retired account's seed still counted"
+    );
+    assert!(!laptop.ensure_home().await.unwrap());
+    assert!(phone.holds_account_key());
 
     // A key for another account ends the session on the phone's side.
     let (carol_seed, _) = identity(14);
@@ -361,11 +375,12 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         "{:?}",
         xp.why
     );
-    assert_eq!(
+    assert_ne!(
         phone.account_seed(),
-        Some(seed),
+        Some(carol_seed),
         "a stranger's key was kept"
     );
+    assert!(phone.holds_account_key());
 }
 
 async fn meet(

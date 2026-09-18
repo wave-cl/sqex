@@ -906,13 +906,23 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                 }
             }
             link.close().await;
+            // The key goes the moment the sibling is admitted; the history
+            // trade that follows is `device sync`'s and may end on its own
+            // account without taking the key back.
+            if sync.gave_key {
+                println!("{sibling}  was given the account key");
+            }
             match sync.phase() {
-                Phase::Finished => {
-                    println!("{sibling}  holds the account key now");
+                Phase::Finished => Ok(()),
+                _ if sync.gave_key => {
+                    println!(
+                        "{sibling}  the history trade after it ended: {}",
+                        sync.why.as_deref().unwrap_or("no reason given")
+                    );
                     Ok(())
                 }
                 _ => Err(format!(
-                    "{sibling}  ended: {}",
+                    "{sibling}  ended before the key was given: {}",
                     sync.why.as_deref().unwrap_or("no reason given")
                 )),
             }
