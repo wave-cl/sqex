@@ -72,6 +72,12 @@ challenge_ttl_secs = 30
 # to it. See SIP-35 for the account-signed form, which is the stronger one.
 # replication_peers = []
 
+# SIP-71: the mailbox (SIP-5) lives beside the other stores as mailbox.db
+# when state_file is set, so a restart keeps every waiting item, its
+# collection record and the identifier sequence for the item's TTL. A
+# memory-only deployment (no state_file) says `mailbox_durable: false` on
+# /status.
+
 # SIP-64: the handovers this exchange has signed (SIP-40), one per line as
 # `<domain> <record>` -- `sqexd handover` appends the record it prints, and
 # a rotation done before 0.81.0 is added by hand from the TXT value that was

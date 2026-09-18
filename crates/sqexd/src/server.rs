@@ -1248,6 +1248,12 @@ pub async fn bind_with(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("prekeys.db"));
+    // SIP-71: mail is a promise measured in days, and a process restarts
+    // between deploys; the queue lives beside the other stores.
+    let mailbox_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("mailbox.db"));
     // Durable like the device registry, for the same reason: a name is the
     // identity a person keeps, and one that vanished on a restart would be
     // worse than none.
@@ -1351,7 +1357,8 @@ pub async fn bind_with(
         endpoints: Endpoints::new(),
         attestations: Attestations::new(),
         rendezvous: Rendezvous::new(),
-        mailbox: Mailbox::new(),
+        mailbox: Mailbox::open(mailbox_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open the mailbox: {e}")))?,
         rooms: Rooms::new(),
         // The channel log lives beside the state file, so a memory-only
         // deployment gets a memory-only log and nothing has to be configured
@@ -4805,6 +4812,9 @@ impl Server {
             "requests": self.requests(),
             "event_streams": self.events.total(),
             "mail_waiting": self.mailbox.waiting(),
+            // SIP-71: a memory-only deployment says so here, since a client
+            // cannot tell and should not have to.
+            "mailbox_durable": self.mailbox.durable(),
             "sessions": self.sessions.len(),
             "rooms": self.rooms.len(),
             "admins": self.admins.read().unwrap().len(),
