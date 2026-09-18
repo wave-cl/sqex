@@ -1337,6 +1337,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
         replication_peers = server.replication_peers.len(),
         peering = if server.open_peering { "open" } else { "listed" },
         lineage = server.lineage.read().unwrap().0.links.len(),
+        lineage_file = %server.lineage_file.display(),
         "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");

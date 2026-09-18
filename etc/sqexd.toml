@@ -78,7 +78,10 @@ challenge_ttl_secs = 30
 # published. Served at /exchange/lineage so a peer that never held the old
 # key can verify what was receipted under it. Defaults to `lineage` beside
 # key_file; a missing file means no rotation behind us. The daemon refuses
-# to start on a file whose chain does not end at its own key.
+# to start on a file whose chain does not end at its own key. **Set it when
+# key_file is a systemd credential** (/run/credentials/...): the default
+# beside the key is then a path nothing writes, and the startup line's
+# `lineage_file=` says where the daemon looked.
 # lineage_file = "/etc/sqex/lineage"
 # lineage_retry_secs = 600
 

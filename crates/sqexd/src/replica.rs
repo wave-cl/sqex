@@ -1586,15 +1586,19 @@ fn report(origin: &Origin, took: &HashMap<[u8; 32], Took>) {
             // `Unattributed` run is a registry the origin cannot answer
             // for, a `Diverged` one is the origin's head moving over
             // something this replica was never shown.
-            let why: Vec<String> = t
-                .refused
+            // The pull below the lowest held entry meets the same entries
+            // the main pull did, so one position is counted once.
+            let mut distinct: Vec<&(u64, Refused)> = t.refused.iter().collect();
+            distinct.sort_by_key(|(seq, _)| *seq);
+            distinct.dedup_by_key(|(seq, _)| *seq);
+            let why: Vec<String> = distinct
                 .iter()
                 .take(8)
                 .map(|(seq, r)| format!("{seq}:{r:?}"))
                 .collect();
             tracing::warn!(
                 origin = %origin.key, %channel,
-                stored = t.stored, refused = t.refused.len(),
+                stored = t.stored, refused = distinct.len(),
                 why = %why.join(" "),
                 "pulled, with entries refused"
             );
