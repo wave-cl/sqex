@@ -373,9 +373,12 @@ impl Membership {
         id: PubKey,
         home: PubKey,
     ) -> Result<Bridged, String> {
+        // SIP-49's device invite stays with the relay peer list, so the
+        // open is the plain one (SIP-65 §What stays listed).
         let open = CallOpen {
             ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
             target: format!("{id}@{home}"),
+            word: None,
         };
         let (code, body) = client.post("/session/call", open.encode()).await?;
         if code != 200 {

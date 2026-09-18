@@ -54,6 +54,9 @@ pub const TYPE_CLOSE: u8 = 0x05;
 pub const TYPE_ROOM_SHARE: u8 = 0x06;
 /// SIP-49: an invite addressed to one device, never rung.
 pub const TYPE_INVITE_DEVICE: u8 = 0x07;
+/// SIP-65: an invite carrying the caller's own signed word, which is what
+/// an exchange nobody listed rings on.
+pub const TYPE_INVITE_SIGNED: u8 = 0x08;
 
 /// Why a bridged call did not connect (`Reject`) or ended (`Close`).
 ///
@@ -67,10 +70,11 @@ pub const REASON_BUSY: u8 = 3;
 pub const REASON_REFUSED: u8 = 4;
 pub const REASON_ENDED: u8 = 5;
 
-/// Longest a control frame may be, decoded off the stream. An `Invite` carries
-/// three keys and a domain label; this is comfortably more and bounds a broken
-/// or hostile peer's length prefix.
-pub const MAX_CONTROL: usize = 512;
+/// Longest a control frame may be, decoded off the stream. A signed `Invite`
+/// (SIP-65) carries three keys, a domain, a target, a credential and a
+/// signature; this is comfortably more and bounds a broken or hostile
+/// peer's length prefix. Was 512 before SIP-65.
+pub const MAX_CONTROL: usize = 1536;
 
 /// Bytes of length prefix ahead of every control frame on the stream.
 pub const LENGTH_PREFIX: usize = 4;
@@ -86,12 +90,17 @@ pub enum Control {
     /// offering `caller_eph`. `caller_domain` is X's domain, carried for display
     /// and provenance; Y routes on the link the invite arrived on, never on the
     /// string.
+    ///
+    /// SIP-65: with a `word`, the frame is `0x08` and carries the target
+    /// the caller signed over and the word itself, so Y verifies who is
+    /// calling rather than taking X's word for it.
     Invite {
         bridge: Bridge,
         caller: PubKey,
         caller_eph: [u8; 32],
         account: PubKey,
         caller_domain: String,
+        word: Option<Box<(String, crate::session::CallWord)>>,
     },
     /// Y → X: `account`'s devices are ringing.
     Ringing { bridge: Bridge },
@@ -140,16 +149,28 @@ impl Control {
                 caller_eph,
                 account,
                 caller_domain,
+                word,
             } => {
                 let dom = caller_domain.as_bytes();
                 let mut out = Vec::with_capacity(1 + BRIDGE_LEN + 32 + 32 + 32 + 1 + dom.len());
-                out.push(TYPE_INVITE);
+                out.push(if word.is_some() {
+                    TYPE_INVITE_SIGNED
+                } else {
+                    TYPE_INVITE
+                });
                 out.extend_from_slice(bridge);
                 out.extend_from_slice(caller.as_bytes());
                 out.extend_from_slice(caller_eph);
                 out.extend_from_slice(account.as_bytes());
                 out.push(dom.len() as u8);
                 out.extend_from_slice(dom);
+                if let Some(boxed) = word {
+                    let (target, w) = boxed.as_ref();
+                    let t = target.as_bytes();
+                    out.push(t.len() as u8);
+                    out.extend_from_slice(t);
+                    w.encode_into(&mut out);
+                }
                 out
             }
             Control::Ringing { bridge } => {
@@ -249,8 +270,9 @@ impl Control {
         let bridge = Self::bridge_of(b)?;
         let rest = &b[1 + BRIDGE_LEN..];
         Ok(match kind {
-            TYPE_INVITE => {
+            TYPE_INVITE | TYPE_INVITE_SIGNED => {
                 // caller[32] | caller_eph[32] | account[32] | dom_len | domain
+                // | (SIP-65) tgt_len | target | CallWord
                 if rest.len() < 32 + 32 + 32 + 1 {
                     return Err(Error::Malformed("invite truncated".into()));
                 }
@@ -258,13 +280,32 @@ impl Control {
                 let caller_eph: [u8; 32] = rest[32..64].try_into().unwrap();
                 let account = PubKey::new(rest[64..96].try_into().unwrap());
                 let dom_len = rest[96] as usize;
-                let dom = &rest[97..];
-                if dom.len() != dom_len {
+                let dom = rest
+                    .get(97..97 + dom_len)
+                    .ok_or_else(|| Error::Malformed("invite domain cut short".into()))?;
+                let after = &rest[97 + dom_len..];
+                let word = if kind == TYPE_INVITE_SIGNED {
+                    let tgt_len = *after
+                        .first()
+                        .ok_or_else(|| Error::Malformed("invite target cut short".into()))?
+                        as usize;
+                    let tgt = after
+                        .get(1..1 + tgt_len)
+                        .ok_or_else(|| Error::Malformed("invite target cut short".into()))?;
+                    let target = String::from_utf8(tgt.to_vec())
+                        .map_err(|_| Error::Malformed("invite target is not UTF-8".into()))?;
+                    Some(Box::new((
+                        target,
+                        crate::session::CallWord::decode(&after[1 + tgt_len..])?,
+                    )))
+                } else if after.is_empty() {
+                    None
+                } else {
                     return Err(Error::Malformed(format!(
                         "invite domain is {} bytes, header says {dom_len}",
-                        dom.len()
+                        dom_len + after.len()
                     )));
-                }
+                };
                 let caller_domain = String::from_utf8(dom.to_vec())
                     .map_err(|_| Error::Malformed("invite domain is not UTF-8".into()))?;
                 Control::Invite {
@@ -273,6 +314,7 @@ impl Control {
                     caller_eph,
                     account,
                     caller_domain,
+                    word,
                 }
             }
             TYPE_RINGING => {
@@ -395,6 +437,25 @@ mod tests {
                 caller_eph: [2u8; 32],
                 account: k(3),
                 caller_domain: "squic.org".into(),
+                word: None,
+            },
+            // SIP-65: the signed form, with and without a credential.
+            Control::Invite {
+                bridge: [8u8; 16],
+                caller: k(1),
+                caller_eph: [2u8; 32],
+                account: k(3),
+                caller_domain: "squic.org".into(),
+                word: Some(Box::new((
+                    "bob@trunk.exchange".into(),
+                    crate::session::CallWord::sign(
+                        &[1u8; 32],
+                        &[2u8; 32],
+                        "bob@trunk.exchange",
+                        5,
+                        None,
+                    ),
+                ))),
             },
             Control::Ringing { bridge: [7u8; 16] },
             Control::Reject {
@@ -430,6 +491,7 @@ mod tests {
             caller_eph: [0u8; 32],
             account: k(2),
             caller_domain: "a.example".into(),
+            word: None,
         }
         .encode();
         // Corrupt the declared domain length; decode must refuse, not panic.

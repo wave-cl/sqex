@@ -73,6 +73,108 @@ pub const TYPE_CALL_OPEN: u8 = 0x05;
 /// Refuse a ringing cross-exchange call (SIP-39), so the caller is told rather
 /// than left polling until it gives up.
 pub const TYPE_CALL_DECLINE: u8 = 0x06;
+/// SIP-65: a cross-exchange call open the caller's device signed, so the
+/// far exchange can verify who is calling rather than take the near one's
+/// word for it.
+pub const TYPE_CALL_OPEN_SIGNED: u8 = 0x08;
+
+/// SIP-65: the domain-separation prefix of a call's signing input.
+pub const CALL_CONTEXT: &[u8] = b"sqex-call-v1";
+/// SIP-65: how far from the verifier's clock a call's `issued` may be, and
+/// how long a `(caller, eph)` is remembered so a word is honoured once.
+pub const CALL_WORD_SECS: u64 = 120;
+
+/// SIP-65: the caller's word -- a signature by the caller's device over the
+/// call itself, with the credential that binds the device to its account
+/// when the device is not the account.
+///
+/// `| issued: u64 | cred_len: u16 | credential | sig[64] |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallWord {
+    pub issued: u64,
+    pub credential: Option<crate::credential::Credential>,
+    pub sig: [u8; 64],
+}
+
+impl CallWord {
+    /// `CALL_CONTEXT || eph || tgt_len || target || issued`.
+    pub fn input(eph: &[u8; 32], target: &str, issued: u64) -> Vec<u8> {
+        let t = target.as_bytes();
+        let mut out = Vec::with_capacity(CALL_CONTEXT.len() + 32 + 1 + t.len() + 8);
+        out.extend_from_slice(CALL_CONTEXT);
+        out.extend_from_slice(eph);
+        out.push(t.len() as u8);
+        out.extend_from_slice(t);
+        out.extend_from_slice(&issued.to_be_bytes());
+        out
+    }
+
+    /// Sign a call with the device's seed.
+    pub fn sign(
+        seed: &[u8; 32],
+        eph: &[u8; 32],
+        target: &str,
+        issued: u64,
+        credential: Option<crate::credential::Credential>,
+    ) -> CallWord {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+        let sig = sk.sign(&Self::input(eph, target, issued)).to_bytes();
+        CallWord {
+            issued,
+            credential,
+            sig,
+        }
+    }
+
+    /// Whether `device` signed this word for `eph` and `target`.
+    pub fn verify(&self, device: &PubKey, eph: &[u8; 32], target: &str) -> bool {
+        let Ok(vk) = device.verifying_key() else {
+            return false;
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
+        ed25519_dalek::Verifier::verify(&vk, &Self::input(eph, target, self.issued), &sig).is_ok()
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.issued.to_be_bytes());
+        match &self.credential {
+            Some(c) => {
+                let b = c.encode();
+                out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.extend_from_slice(&0u16.to_be_bytes()),
+        }
+        out.extend_from_slice(&self.sig);
+    }
+
+    /// Decode a word that fills `b` exactly.
+    pub fn decode(b: &[u8]) -> Result<CallWord> {
+        let short = || Error::Malformed("call word cut short".into());
+        let issued = u64::from_be_bytes(b.get(0..8).ok_or_else(short)?.try_into().unwrap());
+        let n = u16::from_be_bytes(b.get(8..10).ok_or_else(short)?.try_into().unwrap()) as usize;
+        let cred = b.get(10..10 + n).ok_or_else(short)?;
+        let credential = if n == 0 {
+            None
+        } else {
+            Some(crate::credential::Credential::decode(cred)?)
+        };
+        let sig: [u8; 64] = b
+            .get(10 + n..10 + n + 64)
+            .ok_or_else(short)?
+            .try_into()
+            .unwrap();
+        if b.len() != 10 + n + 64 {
+            return Err(Error::Malformed("trailing bytes after a call word".into()));
+        }
+        Ok(CallWord {
+            issued,
+            credential,
+            sig,
+        })
+    }
+}
 
 /// Which end of the session a peer is, fixed by lexicographic order of the two
 /// identities so that both ends agree without negotiating.
@@ -326,20 +428,55 @@ impl OpenAck {
 ///
 /// `target` is `name@domain` (SIP-38) or `key@domain` — a peer qualified by its
 /// home domain, which is exactly what the plain [`Open`] cannot express.
+///
+/// SIP-65: with a `word`, the open is `| type=0x08 | ephemeral[32] |
+/// tgt_len | target | CallWord |` -- signed by the device, which is what
+/// lets an exchange nobody listed carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOpen {
     pub ephemeral: [u8; 32],
     pub target: String,
+    pub word: Option<CallWord>,
 }
 
 impl CallOpen {
+    /// SIP-65: an open signed by the device holding `seed`, now.
+    pub fn signed(
+        seed: &[u8; 32],
+        ephemeral: [u8; 32],
+        target: &str,
+        issued: u64,
+        credential: Option<crate::credential::Credential>,
+    ) -> CallOpen {
+        let word = CallWord::sign(seed, &ephemeral, target, issued, credential);
+        CallOpen {
+            ephemeral,
+            target: target.to_string(),
+            word: Some(word),
+        }
+    }
+
+    /// SIP-65: whether the word, if any, is `device`'s over this open.
+    pub fn verify_word(&self, device: &PubKey) -> bool {
+        self.word
+            .as_ref()
+            .is_some_and(|w| w.verify(device, &self.ephemeral, &self.target))
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let t = self.target.as_bytes();
-        let mut out = Vec::with_capacity(1 + 32 + 1 + t.len());
-        out.push(TYPE_CALL_OPEN);
+        let mut out = Vec::with_capacity(1 + 32 + 1 + t.len() + 96);
+        out.push(if self.word.is_some() {
+            TYPE_CALL_OPEN_SIGNED
+        } else {
+            TYPE_CALL_OPEN
+        });
         out.extend_from_slice(&self.ephemeral);
         out.push(t.len() as u8);
         out.extend_from_slice(t);
+        if let Some(w) = &self.word {
+            w.encode_into(&mut out);
+        }
         out
     }
 
@@ -350,24 +487,38 @@ impl CallOpen {
                 b.len()
             )));
         }
-        if b[0] != TYPE_CALL_OPEN {
-            return Err(Error::Malformed(format!(
-                "not a call open (type {:#x})",
-                b[0]
-            )));
-        }
+        let signed = match b[0] {
+            TYPE_CALL_OPEN => false,
+            TYPE_CALL_OPEN_SIGNED => true,
+            other => {
+                return Err(Error::Malformed(format!(
+                    "not a call open (type {other:#x})"
+                )));
+            }
+        };
         let ephemeral: [u8; 32] = b[1..33].try_into().unwrap();
         let tgt_len = b[33] as usize;
-        let tgt = &b[34..];
-        if tgt.len() != tgt_len {
+        let tgt = b
+            .get(34..34 + tgt_len)
+            .ok_or_else(|| Error::Malformed("call target cut short".into()))?;
+        let rest = &b[34 + tgt_len..];
+        let word = if signed {
+            Some(CallWord::decode(rest)?)
+        } else if rest.is_empty() {
+            None
+        } else {
             return Err(Error::Malformed(format!(
                 "call target is {} bytes, header says {tgt_len}",
-                tgt.len()
+                tgt_len + rest.len()
             )));
-        }
+        };
         let target = String::from_utf8(tgt.to_vec())
             .map_err(|_| Error::Malformed("call target is not UTF-8".into()))?;
-        Ok(CallOpen { ephemeral, target })
+        Ok(CallOpen {
+            ephemeral,
+            target,
+            word,
+        })
     }
 }
 
@@ -952,8 +1103,31 @@ mod tests {
         let o = CallOpen {
             ephemeral: [7u8; 32],
             target: "bob@indra.org".into(),
+            word: None,
         };
         assert_eq!(CallOpen::decode(&o.encode()).unwrap(), o);
+        // SIP-65: the signed form round-trips, verifies under the device
+        // that signed it and under nobody else, and binds the ephemeral
+        // and the target.
+        let seed = [9u8; 32];
+        let device = PubKey::new(
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let s = CallOpen::signed(&seed, [7u8; 32], "bob@indra.org", 1_800_000_000, None);
+        assert_eq!(s.encode()[0], TYPE_CALL_OPEN_SIGNED);
+        let back = CallOpen::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert!(back.verify_word(&device));
+        assert!(!back.verify_word(&PubKey::new([1u8; 32])));
+        let mut other = back.clone();
+        other.ephemeral[0] ^= 1;
+        assert!(!other.verify_word(&device));
+        let mut other = back.clone();
+        other.target = "bob@z.test".into();
+        assert!(!other.verify_word(&device));
+        assert!(!o.verify_word(&device), "an unsigned open has no word");
 
         let a = CallAck {
             state: CallState::Established,
@@ -990,6 +1164,7 @@ mod tests {
         let mut b = CallOpen {
             ephemeral: [0u8; 32],
             target: "a@b".into(),
+            word: None,
         }
         .encode();
         b[33] = 200;

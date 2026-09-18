@@ -3197,6 +3197,28 @@ impl Channels {
         role_of(&db, channel, account).is_some()
     }
 
+    /// SIP-65: whether `a` and `b` are both present members of some
+    /// channel this exchange holds -- ordered here or a copy. The consent a
+    /// call between two strangers' exchanges rests on: each already said,
+    /// in the log, that they talk to the other.
+    pub fn share_membership(&self, a: &PubKey, b: &PubKey) -> bool {
+        if a == b {
+            return false;
+        }
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM member x JOIN member y ON x.channel = y.channel
+             WHERE x.account = ?1 AND x.present = 1 AND y.account = ?2 AND y.present = 1
+             LIMIT 1",
+            params![a.as_bytes(), b.as_bytes()],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
     /// SIP-59: whether `account` is a present member of anything this
     /// exchange orders -- one of the ways an exchange knows an account at
     /// all. A copy's derived roster does not count: the account is known

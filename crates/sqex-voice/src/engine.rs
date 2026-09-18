@@ -604,16 +604,29 @@ pub async fn establish_cross(
 ) -> Result<(Client, Session, u64), String> {
     let mut client = connect(endpoint, signer, report).await?;
     let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-    let request = CallOpen {
-        ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
-        target: target.to_string(),
-    };
+    // SIP-65: signed by this device, so an exchange nobody listed can carry
+    // it on our word. An exchange from before SIP-65 refuses the signed
+    // form as malformed, and gets the plain one.
+    let mut request = CallOpen::signed(
+        &signer.seed(),
+        x25519_dalek::PublicKey::from(&eph).to_bytes(),
+        target,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        None,
+    );
 
     let started = Instant::now();
     let deadline = started + Duration::from_secs(wait);
     let mut hinted = false;
     let ack = loop {
         let (code, body) = client.post("/session/call", request.encode()).await?;
+        if code == 400 && request.word.is_some() {
+            request.word = None;
+            continue;
+        }
         if code != 200 {
             return Err(format!("call failed ({code}): {}", said(&body)));
         }

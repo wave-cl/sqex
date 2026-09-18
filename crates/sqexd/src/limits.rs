@@ -20,6 +20,8 @@ pub enum Kind {
     /// SIP-63: the writes a peer causes -- hints, Moves, rehome notices,
     /// carried registrations -- per caller key.
     Peering,
+    /// SIP-65: cross-exchange calls dialled or rung, per caller account.
+    Calls,
 }
 
 /// A limit: `burst` tokens, refilled at `per_sec`. Zero burst is unlimited.
@@ -56,6 +58,7 @@ pub struct Limits {
     pub uploads: Limit,
     pub reports: Limit,
     pub peering: Limit,
+    pub calls: Limit,
 }
 
 impl Default for Limits {
@@ -69,6 +72,7 @@ impl Default for Limits {
             uploads: Limit::per(60, 3600),
             reports: Limit::per(20, 3600),
             peering: Limit::per(60, 3600),
+            calls: Limit::per(20, 3600),
         }
     }
 }
@@ -83,6 +87,7 @@ impl Limits {
             Kind::Uploads => self.uploads,
             Kind::Reports => self.reports,
             Kind::Peering => self.peering,
+            Kind::Calls => self.calls,
         }
     }
 }

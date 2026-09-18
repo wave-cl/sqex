@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use sqex_proto::h3::H3Client;
 use sqex_proto::name;
 use sqex_proto::relay::{self, Control, RelayData};
-use sqex_proto::session::{CallAck, CallState, DatagramFrame, OpenAck, OpenState};
+use sqex_proto::session::{CallAck, CallOpen, CallState, DatagramFrame, OpenAck, OpenState};
 use squic::Config as SquicConfig;
 
 use crate::server::Server;
@@ -87,6 +87,12 @@ struct BridgeRec {
     /// has a TTL and a sweep; a bridged one had neither.
     created: u64,
     index: Index,
+    /// SIP-65, caller side: the word the caller signed, kept so a plain
+    /// invite refused by a peer that wanted the word can be sent again
+    /// signed, once. `None` on the callee side and for unsigned opens.
+    word: Option<(String, sqex_proto::session::CallWord)>,
+    /// SIP-65: whether the signed invite has been sent for this bridge.
+    signed_sent: bool,
 }
 
 /// How the relay turns a domain into an exchange to dial.
@@ -345,13 +351,12 @@ fn expire(inner: &mut RelayInner, now: u64) {
 /// `(caller, target)`: the first call resolves the far side and sends the
 /// invite; later ones report where it stands, so the client polls it like an
 /// [`crate::session::Sessions`] open.
-pub async fn place_call(
-    server: &Arc<Server>,
-    caller: PubKey,
-    eph: [u8; 32],
-    target: String,
-    now: u64,
-) -> CallAck {
+pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, now: u64) -> CallAck {
+    let eph = open.ephemeral;
+    let target = open.target.clone();
+    // SIP-65: a word that does not verify is no word; the open goes on as
+    // an unsigned one, where only the list can carry it.
+    let word = open.word.clone().filter(|_| open.verify_word(&caller));
     // Clear anything that has outlived itself first. The re-poll below answers
     // from whatever is indexed under `(caller, target)`, so a bridge left
     // behind by a caller that gave up would answer here for ever — which is
@@ -409,8 +414,11 @@ pub async fn place_call(
             }
         },
     };
-    if !server.peers_with(&peer_key) {
-        // Found, but not somebody this operator federates with.
+    // Found, but not somebody this operator federates with: refused, unless
+    // (SIP-65) calls are open and the caller's own word can carry it --
+    // judged below, once the callee's account is known.
+    let listed = server.peers_with(&peer_key);
+    if !listed && !(server.open_calls() && word.is_some()) {
         return CallAck::rejected(relay::REASON_REFUSED, now);
     }
     if server.relay.at_capacity() {
@@ -435,12 +443,39 @@ pub async fn place_call(
         && !home_domain.is_empty()
     {
         match find_peer(server, &home_domain).await {
-            Ok((found, addr)) if found == home && server.peers_with(&found) => (found, addr),
+            Ok((found, addr)) if found == home && server.may_link(&found) => (found, addr),
             _ => return CallAck::rejected(relay::REASON_UNREACHABLE, now),
         }
     } else {
         (peer_key, peer_addr)
     };
+    let listed = server.peers_with(&peer_key);
+
+    // SIP-65 §Dialling: over a link to an exchange nobody listed, the
+    // caller's account and the callee must already share a conversation
+    // held here, and the caller is under the calls limit. A device invite
+    // (SIP-49, by key) has no word to stand on and stays with the list.
+    if !listed {
+        let Some(word) = &word else {
+            return CallAck::rejected(relay::REASON_REFUSED, now);
+        };
+        if by_key.is_some() {
+            return CallAck::rejected(relay::REASON_REFUSED, now);
+        }
+        let Some(callers_account) = server.account_behind(&caller, word, now) else {
+            return CallAck::rejected(relay::REASON_REFUSED, now);
+        };
+        if callers_account != server.account_of(&caller)
+            || !server
+                .channels()
+                .share_membership(&callers_account, &account)
+            || server
+                .limit(crate::limits::Kind::Calls, &callers_account, [0; 32])
+                .is_err()
+        {
+            return CallAck::rejected(relay::REASON_REFUSED, now);
+        }
+    }
 
     if ensure_link(server, peer_key, peer_addr).await.is_err() {
         return CallAck::rejected(relay::REASON_UNREACHABLE, now);
@@ -472,9 +507,11 @@ pub async fn place_call(
                 caller,
                 target: target.clone(),
             },
+            word: word.clone().map(|w| (target.clone(), w)),
+            signed_sent: !listed && word.is_some(),
         },
     );
-    inner.caller_index.insert((caller, target), bridge);
+    inner.caller_index.insert((caller, target.clone()), bridge);
     // SIP-49: a peer named by key is a room member's home, and the target
     // is that one device; nobody is rung for it.
     let invite = if by_key.is_some() {
@@ -491,6 +528,13 @@ pub async fn place_call(
             caller_eph: eph,
             account,
             caller_domain: String::new(),
+            // SIP-65: the word travels only where it is needed; a listed
+            // peer from before SIP-65 would not decode the signed frame.
+            word: if listed {
+                None
+            } else {
+                word.map(|w| Box::new((target.clone(), w)))
+            },
         }
     };
     send_control(&inner, &peer_key, invite);
@@ -657,6 +701,62 @@ pub fn maybe_divert(server: &Server, from: &PubKey, frame: &DatagramFrame) -> bo
     true
 }
 
+/// SIP-65 §Ringing, rules 1 to 6, for a signed invite: the word verifies
+/// under `caller` for this `eph` and `target`; it is fresh and not yet
+/// honoured; `target` names this exchange and `account`; the caller's
+/// account stands behind the word; the two share a conversation held
+/// here; the caller is under the calls limit.
+fn word_rings(
+    server: &Server,
+    caller: &PubKey,
+    eph: &[u8; 32],
+    account: &PubKey,
+    target: &str,
+    word: &sqex_proto::session::CallWord,
+) -> bool {
+    let now = crate::state::now_unix();
+    if !word.verify(caller, eph, target) {
+        return false;
+    }
+    if now.abs_diff(word.issued) > sqex_proto::session::CALL_WORD_SECS {
+        return false;
+    }
+    let Some((label, domain)) = target.rsplit_once('@') else {
+        return false;
+    };
+    let own = server.own_domain();
+    if !own.is_empty() && domain.to_ascii_lowercase() != own {
+        return false;
+    }
+    let names_account = match label.parse::<PubKey>() {
+        Ok(k) => k == *account,
+        Err(_) => {
+            let r = server.resolve_name(label);
+            r.found && r.account == *account
+        }
+    };
+    if !names_account {
+        return false;
+    }
+    let Some(callers_account) = server.account_behind(caller, word, now) else {
+        return false;
+    };
+    if !server
+        .channels()
+        .share_membership(&callers_account, account)
+    {
+        return false;
+    }
+    if server
+        .limit(crate::limits::Kind::Calls, &callers_account, [0; 32])
+        .is_err()
+    {
+        return false;
+    }
+    // Last, so a word refused above can be presented again once fixed.
+    server.first_word(caller, eph, now)
+}
+
 fn inject(server: &Server, data: RelayData) {
     let (sid, local) = {
         let inner = server.relay.inner.lock().unwrap();
@@ -684,8 +784,39 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             caller,
             caller_eph,
             account,
+            word,
             ..
         } => {
+            // SIP-65 §Ringing: over a link from an exchange nobody listed,
+            // only the caller's own verified word rings anyone; a signed
+            // invite from a listed peer is checked too. Every failure is
+            // the same coarse refusal.
+            if let Some(boxed) = &word
+                && !word_rings(server, &caller, &caller_eph, &account, &boxed.0, &boxed.1)
+            {
+                let inner = server.relay.inner.lock().unwrap();
+                send_control(
+                    &inner,
+                    &peer,
+                    Control::Reject {
+                        bridge,
+                        reason: relay::REASON_REFUSED,
+                    },
+                );
+                return;
+            }
+            if word.is_none() && !server.peers_with(&peer) {
+                let inner = server.relay.inner.lock().unwrap();
+                send_control(
+                    &inner,
+                    &peer,
+                    Control::Reject {
+                        bridge,
+                        reason: relay::REASON_REFUSED,
+                    },
+                );
+                return;
+            }
             if server.relay.at_capacity() {
                 let inner = server.relay.inner.lock().unwrap();
                 send_control(
@@ -735,6 +866,8 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
                         outcome: Outcome::Ringing,
                         created: crate::state::now_unix(),
                         index: Index::Callee { caller, account },
+                        word: None,
+                        signed_sent: false,
                     },
                 );
                 inner.callee_index.insert((caller, account), bridge);
@@ -753,7 +886,10 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             caller_eph,
             device,
         } => {
-            if server.relay.at_capacity() {
+            // SIP-65 §What stays listed: a device invite rests on a room
+            // roster the exchanges shared, not on a member's word, so it
+            // is served only over a link to a listed peer.
+            if server.relay.at_capacity() || !server.peers_with(&peer) {
                 let inner = server.relay.inner.lock().unwrap();
                 send_control(
                     &inner,
@@ -792,6 +928,8 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
                         caller,
                         account: owner,
                     },
+                    word: None,
+                    signed_sent: false,
                 },
             );
             inner.callee_index.insert((caller, owner), bridge);
@@ -832,6 +970,26 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
         }
         Control::Reject { bridge, reason } => {
             let mut inner = server.relay.inner.lock().unwrap();
+            // SIP-65: a listed peer that refused the plain invite may be
+            // one that does not list *us* and wanted the caller's word.
+            // Sent again signed, once; a second refusal stands.
+            if reason == relay::REASON_REFUSED
+                && let Some(rec) = inner.bridges.get_mut(&bridge)
+                && !rec.signed_sent
+                && let Some((target, w)) = rec.word.clone()
+            {
+                rec.signed_sent = true;
+                let again = Control::Invite {
+                    bridge,
+                    caller: rec.caller,
+                    caller_eph: rec.caller_eph,
+                    account: rec.account,
+                    caller_domain: String::new(),
+                    word: Some(Box::new((target, w))),
+                };
+                send_control(&inner, &peer, again);
+                return;
+            }
             if let Some(rec) = inner.bridges.get_mut(&bridge) {
                 rec.outcome = Outcome::Rejected(reason);
             }
@@ -843,6 +1001,10 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
         // SIP-49: a peer's view of a room. Reciprocal: the first share of a
         // room from a peer is answered with this exchange's view of it.
         Control::RoomShare { handle, members } => {
+            // SIP-65 §What stays listed.
+            if !server.peers_with(&peer) {
+                return;
+            }
             let fresh = server.rooms.take_share(peer, handle, members);
             if fresh {
                 let view = server.rooms.view_for(&handle, &peer);
@@ -1181,7 +1343,9 @@ pub async fn serve_relay(server: &Arc<Server>, conn: Connection, identity: Optio
         conn.close(0u32.into(), b"");
         return;
     };
-    if !server.peers_with(&who) {
+    // SIP-65: an open exchange takes a link from anyone identified, and
+    // grants it nothing by that; each invite is judged on its own.
+    if !server.may_link(&who) {
         conn.close(0u32.into(), b"");
         return;
     }
@@ -1238,6 +1402,8 @@ mod tests {
                         caller: key(1),
                         target: target.clone(),
                     },
+                    word: None,
+                    signed_sent: false,
                 },
             );
             inner.caller_index.insert((key(1), target.clone()), bridge);
@@ -1286,6 +1452,8 @@ mod tests {
                         caller: key(1),
                         account: key(2),
                     },
+                    word: None,
+                    signed_sent: false,
                 },
             );
         }

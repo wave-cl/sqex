@@ -242,6 +242,7 @@ async fn a_room_spans_two_exchanges_and_the_pair_meets_without_a_ring() {
                 CallOpen {
                     ephemeral: pub_l,
                     target: target.clone(),
+                    word: None,
                 }
                 .encode(),
             )

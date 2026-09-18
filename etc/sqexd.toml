@@ -97,6 +97,15 @@ challenge_ttl_secs = 30
 # with SIP-39's peer list. A transport whitelist still closes the door.
 # open_peering = false
 
+# SIP-65: ring this exchange's users for, and dial out to, an exchange nobody
+# listed -- when the caller's device signed the call and the two people are
+# already present members of a conversation held here. The caller's word is
+# verified here, not the far exchange's; a stranger exchange can carry a
+# call and cannot invent one. Independent of open_peering: a copy costs
+# storage a member was entitled to, a ring costs a person's attention.
+# Rooms (SIP-49) stay with the relay peer list.
+# open_calls = false
+
 # ---------------------------------------------------------------------------
 # SIP-39: cross-exchange calls.
 # ---------------------------------------------------------------------------
@@ -182,3 +191,4 @@ seed_relay_peers = [
 # uploads = [60, 3600]
 # reports = [20, 3600]
 # peering = [60, 3600]    # SIP-63: per caller key, the writes a peer causes
+# calls = [20, 3600]      # SIP-65: per caller account, cross-exchange calls

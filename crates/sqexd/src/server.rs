@@ -334,6 +334,11 @@ pub struct Server {
     /// modification time as last read.
     lineage: RwLock<(sqex_proto::lineage::Lineage, Option<std::time::SystemTime>)>,
     lineage_file: PathBuf,
+    /// SIP-65: calls are carried for an exchange nobody listed.
+    open_calls: bool,
+    /// SIP-65: the `(caller, eph)` pairs rung on lately, so a word is
+    /// honoured once within `CALL_WORD_SECS`. Value: when it was seen.
+    call_words: Mutex<HashMap<(PubKey, [u8; 32]), u64>>,
     /// SIP-64: when each origin's lineage was last asked for, so a
     /// repudiated entry at a pre-SIP-64 origin does not ask every pull.
     lineage_asked: Mutex<HashMap<PubKey, std::time::Instant>>,
@@ -762,6 +767,59 @@ impl Server {
         held.0.clone()
     }
 
+    /// SIP-65: a name as this exchange resolves it, for the callee check.
+    pub(crate) fn resolve_name(&self, label: &str) -> sqex_proto::name::Resolved {
+        self.names.resolve(label)
+    }
+
+    /// SIP-65: whether calls are carried for an exchange nobody listed.
+    pub(crate) fn open_calls(&self) -> bool {
+        self.open_calls
+    }
+
+    /// SIP-65: whether `key` may be dialled or accepted on the link -- a
+    /// listed relay peer, or anyone when calls are open. What such a link
+    /// may then carry is decided per invite.
+    pub(crate) fn may_link(&self, key: &PubKey) -> bool {
+        self.open_calls || self.peers_with(key)
+    }
+
+    /// SIP-65: honour a caller's word once. `true` the first time this
+    /// `(caller, eph)` is seen within `CALL_WORD_SECS`; the cache is swept
+    /// as it is consulted.
+    pub(crate) fn first_word(&self, caller: &PubKey, eph: &[u8; 32], now: u64) -> bool {
+        let mut seen = self.call_words.lock().unwrap();
+        seen.retain(|_, at| now.saturating_sub(*at) < sqex_proto::session::CALL_WORD_SECS);
+        if seen.contains_key(&(*caller, *eph)) {
+            return false;
+        }
+        seen.insert((*caller, *eph), now);
+        true
+    }
+
+    /// SIP-65: the account behind a caller's word -- the device itself, or
+    /// the account its credential names, verified. `None` when the
+    /// credential does not hold.
+    pub(crate) fn account_behind(
+        &self,
+        caller: &PubKey,
+        word: &sqex_proto::session::CallWord,
+        now: u64,
+    ) -> Option<PubKey> {
+        match &word.credential {
+            None => Some(*caller),
+            Some(c) => {
+                if c.delegate != *caller
+                    || c.verify(&c.account, sqex_proto::credential::SCOPE_CHAT, now)
+                        .is_err()
+                {
+                    return None;
+                }
+                Some(c.account)
+            }
+        }
+    }
+
     /// SIP-64: whether to ask `origin` for its lineage now -- never asked
     /// this process, or (`again`) a repudiated entry and the last ask is
     /// `lineage_retry` behind us. Marks the ask.
@@ -1153,6 +1211,8 @@ pub async fn bind_with(
         lineage_file: config.lineage_file.clone(),
         lineage_asked: Mutex::new(HashMap::new()),
         lineage_retry: config.lineage_retry,
+        open_calls: config.open_calls,
+        call_words: Mutex::new(HashMap::new()),
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
         waker: std::sync::OnceLock::new(),
@@ -1336,6 +1396,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
         relay_peers = server.state.lock().unwrap().peer_count(),
         replication_peers = server.replication_peers.len(),
         peering = if server.open_peering { "open" } else { "listed" },
+        calls = if server.open_calls { "open" } else { "listed" },
         lineage = server.lineage.read().unwrap().0.links.len(),
         lineage_file = %server.lineage_file.display(),
         "sqexd {} listening (HTTP/3)", VERSION
@@ -4458,9 +4519,9 @@ async fn route(
             (None, _) => no_identity("placing a call"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(call)) => {
-                let ack = if server.peering_enabled() {
-                    crate::relay::place_call(server, me, call.ephemeral, call.target, now_unix())
-                        .await
+                // SIP-65: an open exchange dials with no list at all.
+                let ack = if server.peering_enabled() || server.open_calls {
+                    crate::relay::place_call(server, me, call, now_unix()).await
                 } else {
                     // Federated with nobody: refuse identically, no oracle.
                     CallAck::rejected(sqex_proto::relay::REASON_REFUSED, now_unix())

@@ -95,6 +95,7 @@ async fn call(client: &mut Client, target: &str, eph: [u8; 32]) -> CallAck {
             CallOpen {
                 ephemeral: eph,
                 target: target.to_string(),
+                word: None,
             }
             .encode(),
         )
