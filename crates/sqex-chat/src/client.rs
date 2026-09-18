@@ -2724,11 +2724,21 @@ impl Chat {
         let new = whose.account;
         // The direct messages this device holds by the old derivation,
         // before the account changes under them.
+        //
+        // The exchange has already moved the membership to the new key
+        // (SIP-62: channels follow), so the members are `new` and the
+        // other party, in whichever order the exchange lists them. The
+        // other party is the one that is neither -- taking "the first that
+        // is not `old`" found `new` half the time and derived nothing.
         let mut dms: Vec<(PubKey, [u8; 32])> = Vec::new();
         for m in self.mine().await? {
             if let Ok(info) = self.info(&m.channel).await
                 && info.members.len() == 2
-                && let Some(other) = info.members.iter().map(|x| x.account).find(|a| *a != old)
+                && let Some(other) = info
+                    .members
+                    .iter()
+                    .map(|x| x.account)
+                    .find(|a| *a != old && *a != new)
                 && direct_message_id(&old, &other) == m.channel
             {
                 dms.push((other, m.channel));
