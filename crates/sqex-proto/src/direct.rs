@@ -123,6 +123,33 @@ pub enum Meeting {
     NoSharedFamily,
 }
 
+/// Wait until the port we are about to reuse is free, up to `within`.
+///
+/// Dropping the exchange connection aborts its driver and the socket goes
+/// with it -- but not synchronously, and this used to be a flat 200 ms
+/// floor. **The second party to ask barely waits at all**: it reads back the
+/// start time the first computed, so its lead has usually elapsed by the
+/// time it has the answer, and 200 ms was the whole of its pause. The
+/// listener then bound the port the exchange connection had not yet let go
+/// and failed with "address already in use", which the caller reported as a
+/// punch that did not work -- the wrong reason again, and the one this half
+/// of the code exists to stop giving.
+///
+/// Returns whether it came free. Binding and dropping leaves it free for
+/// squic to take a moment later; nothing else here is competing for it.
+async fn wait_until_free(addr: SocketAddr, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if std::net::UdpSocket::bind(addr).is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// SIP-69: whether an address the exchange disclosed is one this side could
 /// dial from the port it asked over.
 ///
@@ -184,6 +211,10 @@ pub async fn introduce(
     // one of them is shared.
     let lead = Duration::from_secs(got.start_at.saturating_sub(got.now));
     tokio::time::sleep(lead.max(Duration::from_millis(200))).await;
+    // Whatever the lead was, do not hand `link` a port the exchange
+    // connection still holds. Bounded, because a port that never comes free
+    // is a reason to relay rather than to wait out the call.
+    wait_until_free(ours, Duration::from_secs(2)).await;
     Ok(Meeting::Introduced(Introduction { ours, theirs, lead }))
 }
 
@@ -337,6 +368,29 @@ mod tests {
         assert!(dials(&a, &b));
         assert!(!dials(&b, &a));
         assert!(!dials(&a, &a));
+    }
+
+    /// The port a just-dropped socket held comes free, and the wait says so
+    /// rather than guessing at a fixed pause.
+    #[tokio::test]
+    async fn a_port_in_use_is_waited_for_and_a_free_one_is_not() {
+        let held = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let addr = held.local_addr().unwrap();
+
+        // Still held: the wait runs out and says so.
+        let began = std::time::Instant::now();
+        assert!(!wait_until_free(addr, Duration::from_millis(200)).await);
+        assert!(began.elapsed() >= Duration::from_millis(200));
+
+        // Released: the wait returns, and well inside its budget.
+        drop(held);
+        let began = std::time::Instant::now();
+        assert!(wait_until_free(addr, Duration::from_secs(2)).await);
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "waited {:?} for a port that was already free",
+            began.elapsed()
+        );
     }
 
     /// SIP-69: an address of the other family is not one this side can dial,
