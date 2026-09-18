@@ -2658,8 +2658,11 @@ impl Chat {
     /// item it has not opened is refused here rather than at the exchange:
     /// deleting completes collection for every device of the account.
     pub async fn mail_delete(&mut self, id: u64) -> Result<bool> {
-        if !self.mail_opened.contains(&id) {
-            return Err(ChatError::MailSealedElsewhere(id));
+        // Not opened in this process -- a command-line client runs one
+        // command per process -- so it is fetched and opened now; an item
+        // this device cannot open is refused by the read.
+        if !self.mail_opened.contains(&id) && self.mail_read(id).await?.is_none() {
+            return Ok(false);
         }
         let body = self
             .post(
