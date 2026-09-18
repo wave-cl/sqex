@@ -234,6 +234,21 @@ enum DeviceCmd {
         #[arg(long, default_value_t = 60)]
         wait: u64,
     },
+    /// Give one other device of this account the account key (SIP-67),
+    /// over the same session `device sync` uses, once it has proved
+    /// itself. That device can then sign what only the account may -- a
+    /// Move, a will, a handover -- and **cannot be put out of the account
+    /// by revoking it**: it is the account. The remedy for losing it is a
+    /// handover from another device that holds the key, which is the
+    /// reason to give it to a second one at all. The other device runs
+    /// `device sync`.
+    Entrust {
+        /// The device's key, base58, as `device list` shows it.
+        device: String,
+        /// How long to wait for it to turn up, in seconds.
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
 }
 
 #[tokio::main]
@@ -311,6 +326,16 @@ async fn run(cli: Cli) -> Result<(), String> {
     chat.top_up_prekeys()
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
+    // SIP-67: whose device this is, before anything is signed -- a handover
+    // presented from a sibling moves this device to the successor, and the
+    // registry is what says so.
+    match chat.follow_account().await {
+        Ok(Some(account)) => {
+            eprintln!("this device's account is now {account}; the store followed")
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("note: could not ask whose device this is: {e}"),
+    }
     // SIP-60: say where this account lives, once, so its exchange can act
     // for it when another exchange puts it in a channel. Not fatal: an
     // exchange from before SIP-59 has no such record to keep.
@@ -792,6 +817,13 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                 }
                 link.close().await;
                 let p = &sync.progress;
+                if sync.entrusted {
+                    println!(
+                        "{sibling}  gave this device the account key (SIP-67): this device is the \
+                         account now, and revoking it would not put it out. If it is lost, hand \
+                         the account over from another device that holds the key."
+                    );
+                }
                 match sync.phase() {
                     Phase::Finished => {
                         synced += 1;
@@ -815,6 +847,75 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
             }
             println!("synced with {synced} device(s)");
             Ok(())
+        }
+        DeviceCmd::Entrust { device, wait } => {
+            use sqex_chat::sync::{Phase, Sync};
+            let sibling: PubKey = device.trim().parse().map_err(|e| format!("bad key: {e}"))?;
+            let Some(seed) = chat.account_seed() else {
+                return Err(
+                    "this device does not hold the account key; only one that does can give it"
+                        .into(),
+                );
+            };
+            if sibling == chat.device() {
+                return Err("that is this device".into());
+            }
+            let listed = chat
+                .my_devices()
+                .await
+                .map_err(|e| e.to_string())?
+                .iter()
+                .any(|d| d.device == sibling);
+            if !listed {
+                return Err(format!(
+                    "{sibling} is not a device of this account (`device list`)"
+                ));
+            }
+            println!("giving {sibling} the account key.");
+            println!(
+                "Once it holds the key it is the account: revoking it (`device revoke`) will not put \
+                 it out. If it is lost, hand the account over (`handover`) from a device that \
+                 still holds the key."
+            );
+            println!("waiting for it to run `device sync`…");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(*wait);
+            let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+            let live = loop {
+                if let Some(live) = chat
+                    .meet_sibling(&eph, &sibling)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    break live;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("{sibling} did not turn up"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            };
+            let (mut link, session) = live;
+            let mut sync = Sync::new(session, sibling).entrusting(seed);
+            loop {
+                match sync.step(chat, &mut link).await {
+                    Ok(true) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                    Ok(false) => break,
+                    Err(e) => {
+                        println!("{sibling}  {e}");
+                        break;
+                    }
+                }
+            }
+            link.close().await;
+            match sync.phase() {
+                Phase::Finished => {
+                    println!("{sibling}  holds the account key now");
+                    Ok(())
+                }
+                _ => Err(format!(
+                    "{sibling}  ended: {}",
+                    sync.why.as_deref().unwrap_or("no reason given")
+                )),
+            }
         }
     }
 }

@@ -34,6 +34,8 @@ pub const TYPE_ENTRIES: u8 = 0x04;
 pub const TYPE_KEYS: u8 = 0x05;
 pub const TYPE_BLOB: u8 = 0x06;
 pub const TYPE_DONE: u8 = 0x07;
+/// SIP-67: the account's key, entrusted to a sibling.
+pub const TYPE_KEY: u8 = 0x08;
 
 /// Entries per page, as SIP-35's pull.
 pub const PAGE: usize = 256;
@@ -81,6 +83,10 @@ pub enum Message {
         bytes: Vec<u8>,
     },
     Done,
+    /// SIP-67: the account's Ed25519 seed, given to a sibling the person
+    /// named on the device that holds it. In the clear inside the sealed
+    /// frame, as the epoch keys are.
+    Key([u8; 32]),
 }
 
 impl Message {
@@ -151,6 +157,10 @@ impl Message {
                 out.extend_from_slice(bytes);
             }
             Message::Done => out.push(TYPE_DONE),
+            Message::Key(seed) => {
+                out.push(TYPE_KEY);
+                out.extend_from_slice(seed);
+            }
         }
         out
     }
@@ -256,6 +266,7 @@ impl Message {
                 }
             }
             TYPE_DONE => Message::Done,
+            TYPE_KEY => Message::Key(take32(&mut at)?),
             other => return Err(Malformed(format!("unknown sync message {other:#x}"))),
         };
         if at != b.len() {
@@ -344,6 +355,11 @@ pub struct Sync {
     got_have: bool,
     got_want: bool,
     sent_done: bool,
+    /// SIP-67: the account key to give this sibling once admitted, because
+    /// the person said so on this device. Taken when sent.
+    entrust: Option<[u8; 32]>,
+    /// SIP-67: whether this side was given the key this session.
+    pub entrusted: bool,
     got_done: bool,
 
     /// Timelines for the channels being imported, so entries fold in order
@@ -372,6 +388,8 @@ impl Sync {
             got_have: false,
             got_want: false,
             sent_done: false,
+            entrust: None,
+            entrusted: false,
             got_done: false,
             timelines: HashMap::new(),
             blobs_wanted: HashSet::new(),
@@ -381,6 +399,14 @@ impl Sync {
 
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// SIP-67: give this sibling the account key, once its `Hello` has
+    /// been verified. The person asked for it on this device; a sibling
+    /// cannot ask.
+    pub fn entrusting(mut self, seed: [u8; 32]) -> Sync {
+        self.entrust = Some(seed);
+        self
     }
 
     pub fn peer(&self) -> PubKey {
@@ -546,7 +572,11 @@ impl Sync {
                         }
                     }
                 }
-                // Admitted: say what we hold.
+                // Admitted: say what we hold -- and, where the person said
+                // so here, give them the key (SIP-67).
+                if let Some(seed) = self.entrust.take() {
+                    self.queue(&Message::Key(seed))?;
+                }
                 let held = chat.held_for_siblings()?;
                 self.queue(&Message::Have(held))?;
             }
@@ -666,6 +696,23 @@ impl Sync {
             }
             Message::Done => {
                 self.got_done = true;
+            }
+            // SIP-67: the account key from a verified sibling. Kept only
+            // where it is this account's; anything else ends the session.
+            Message::Key(seed) => {
+                let public = PubKey::new(
+                    ed25519_dalek::SigningKey::from_bytes(&seed)
+                        .verifying_key()
+                        .to_bytes(),
+                );
+                if public != chat.me {
+                    self.fail("the key given is not this account's");
+                    return Ok(());
+                }
+                if chat.account_seed() != Some(seed) {
+                    chat.take_account_seed(seed);
+                }
+                self.entrusted = true;
             }
         }
         Ok(())

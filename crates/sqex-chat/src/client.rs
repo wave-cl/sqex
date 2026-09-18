@@ -2603,6 +2603,80 @@ impl Chat {
             .devices)
     }
 
+    /// SIP-67: whose device this is, as the registry has it -- the one party
+    /// that knows after a handover moved it.
+    pub async fn whose(&mut self) -> Result<sqex_proto::device::Whose> {
+        if self.offline() {
+            return Err(ChatError::Transport(
+                "not connected to the exchange".to_string(),
+            ));
+        }
+        let got = match tokio::time::timeout(PATIENCE, self.client.get("/device/account")).await {
+            Ok(Ok(got)) => {
+                self.up();
+                got
+            }
+            Ok(Err(e)) => {
+                self.down();
+                return Err(ChatError::Transport(e));
+            }
+            Err(_) => {
+                self.down();
+                return Err(ChatError::Transport(
+                    "the exchange stopped answering".into(),
+                ));
+            }
+        };
+        let (code, body) = got;
+        if code != 200 {
+            return Err(classify("/device/account", code, &body));
+        }
+        sqex_proto::device::Whose::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// SIP-67: follow this device's own account as the registry has it.
+    /// Where the account answered is not the one the store names -- a
+    /// handover (SIP-62) presented from a sibling moved this device -- the
+    /// store's account, its credential and its direct messages follow, as
+    /// the presenting device's did. Returns the account followed to, if any.
+    pub async fn follow_account(&mut self) -> Result<Option<PubKey>> {
+        let whose = match self.whose().await {
+            Ok(w) => w,
+            // An exchange from before SIP-67 has no such answer; the store
+            // stands.
+            Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if whose.device != self.device || whose.account == self.me {
+            return Ok(None);
+        }
+        let old = self.me;
+        let new = whose.account;
+        // The direct messages this device holds by the old derivation,
+        // before the account changes under them.
+        let mut dms: Vec<(PubKey, [u8; 32])> = Vec::new();
+        for m in self.mine().await? {
+            if let Ok(info) = self.info(&m.channel).await
+                && info.members.len() == 2
+                && let Some(other) = info.members.iter().map(|x| x.account).find(|a| *a != old)
+                && direct_message_id(&old, &other) == m.channel
+            {
+                dms.push((other, m.channel));
+            }
+        }
+        if new == self.device {
+            // The account itself now, which needs no credential.
+            self.store.set_account(&new)?;
+            self.me = new;
+        } else {
+            self.claim_listed(&new).await?;
+        }
+        for (other, channel) in dms {
+            self.store.set_dm_alias(&other, &channel)?;
+        }
+        Ok(Some(new))
+    }
+
     /// SIP-47 §Pairing, step 3: a device that was registered by a sibling
     /// and holds no credential finds itself in `account`'s device list, with
     /// the credential the sibling presented (SIP-32), and only then treats
@@ -3924,11 +3998,25 @@ impl Chat {
     /// device is the account, or the account seed the store keeps from a
     /// handover this client made (SIP-62). `None` for a linked device of an
     /// account held elsewhere.
-    fn account_seed(&self) -> Option<[u8; 32]> {
+    /// The account's seed, where this device holds it: its own where it
+    /// is the account, the one it made (SIP-62) or was entrusted with
+    /// (SIP-67) otherwise.
+    pub fn account_seed(&self) -> Option<[u8; 32]> {
         if self.me == self.device {
             return Some(self.seed);
         }
         self.store.account_seed().ok().flatten()
+    }
+
+    /// SIP-67: keep an account seed a sibling entrusted to this device.
+    /// The store keeps it sealed; the caller checked it is this account's.
+    pub fn take_account_seed(&mut self, seed: [u8; 32]) {
+        let _ = self.store.set_account_seed(&seed);
+    }
+
+    /// SIP-67: whether this device holds the account key.
+    pub fn holds_account_key(&self) -> bool {
+        self.account_seed().is_some()
     }
 
     /// Where this account's channels live, as this client knows: this

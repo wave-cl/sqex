@@ -126,6 +126,38 @@ pub struct ListDevices {
     pub account: PubKey,
 }
 
+/// SIP-67: `GET /device/account`, the account the caller's transport
+/// identity is registered to, and the identity itself -- the caller's own
+/// key twice where it is registered to nobody.
+/// `| account[32] | device[32] |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Whose {
+    pub account: PubKey,
+    pub device: PubKey,
+}
+
+impl Whose {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(self.account.as_bytes());
+        out.extend_from_slice(self.device.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Whose> {
+        if b.len() != 64 {
+            return Err(Error::Malformed(format!(
+                "whose is {} bytes, want 64",
+                b.len()
+            )));
+        }
+        Ok(Whose {
+            account: PubKey::new(b[0..32].try_into().unwrap()),
+            device: PubKey::new(b[32..64].try_into().unwrap()),
+        })
+    }
+}
+
 impl ListDevices {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(33);

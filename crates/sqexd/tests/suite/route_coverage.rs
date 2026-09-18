@@ -519,6 +519,8 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     // SIP-64: a client asks with GET, a replica -- whose H3 client only
     // posts -- with an empty POST. Public: every link was in a zone once.
     ("GET", "/exchange/lineage", Cli("sqex lineage"), Anyone),
+    // SIP-67: a client asks whose device it is before it signs anything.
+    ("GET", "/device/account", Chat("Chat::whose"), Identity),
     (
         "POST",
         "/exchange/lineage",

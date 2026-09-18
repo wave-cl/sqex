@@ -2653,6 +2653,22 @@ async fn route(
         // every credential carries both keys in the clear to whoever verifies
         // one. Pretending otherwise would protect something already published
         // while making a member list impossible to render.
+        // SIP-67: whose device the caller is, from the registry -- the one
+        // party that knows after a handover moved it. Its own key twice
+        // where it is registered to nobody: every key is an account until
+        // the registry says otherwise (SIP-22).
+        ("GET", "/device/account") => match peer.identity {
+            None => no_identity("asking whose device this is"),
+            Some(me) => (
+                200,
+                "application/octet-stream",
+                sqex_proto::device::Whose {
+                    account: server.devices.account_for(&me),
+                    device: me,
+                }
+                .encode(),
+            ),
+        },
         ("POST", "/device/list") => match ListDevices::decode(body) {
             Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(req) => match server.devices.list(&req.account) {
