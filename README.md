@@ -96,6 +96,7 @@ sqex-chat move <domain>      # make another exchange your home; your conversatio
 sqex home sign <key>         # the same statement signed offline (--yubikey works)
 sqex home locate a@b.org     # find somebody at another exchange; ^N a@b.org does it in the client
 sqex-chat handover           # a new account key, devices kept, conversations and contacts follow
+sqex lineage                 # the exchange's earlier keys, verified back from the one you pinned
 ```
 
 Inside: `/public <name>` makes a channel anybody may find, `/find [query]`

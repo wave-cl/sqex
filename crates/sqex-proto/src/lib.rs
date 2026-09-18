@@ -27,6 +27,7 @@ pub mod exchange;
 pub mod h3;
 pub mod handles;
 pub mod home;
+pub mod lineage;
 pub mod locate;
 pub mod mailbox;
 pub mod message;

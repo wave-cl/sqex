@@ -72,6 +72,16 @@ challenge_ttl_secs = 30
 # to it. See SIP-35 for the account-signed form, which is the stronger one.
 # replication_peers = []
 
+# SIP-64: the handovers this exchange has signed (SIP-40), one per line as
+# `<domain> <record>` -- `sqexd handover` appends the record it prints, and
+# a rotation done before 0.81.0 is added by hand from the TXT value that was
+# published. Served at /exchange/lineage so a peer that never held the old
+# key can verify what was receipted under it. Defaults to `lineage` beside
+# key_file; a missing file means no rotation behind us. The daemon refuses
+# to start on a file whose chain does not end at its own key.
+# lineage_file = "/etc/sqex/lineage"
+# lineage_retry_secs = 600
+
 # SIP-63: serve the peering routes to *any* identified caller, listed or not.
 # This grants nothing: an unlisted caller may pull, wait on, carry into or be
 # told of a channel exactly where a member's signed statement entitles it --

@@ -328,6 +328,16 @@ pub struct Server {
     open_peering: bool,
     /// SIP-63: how many `/peer/wait` requests each caller holds open now.
     waits: Mutex<HashMap<PubKey, usize>>,
+    /// SIP-64: the handovers this exchange signed, oldest first, served
+    /// to anyone who asks; re-read when the file changes, so a rotation
+    /// done before 0.81.0 can be added without a restart. With the file's
+    /// modification time as last read.
+    lineage: RwLock<(sqex_proto::lineage::Lineage, Option<std::time::SystemTime>)>,
+    lineage_file: PathBuf,
+    /// SIP-64: when each origin's lineage was last asked for, so a
+    /// repudiated entry at a pre-SIP-64 origin does not ask every pull.
+    lineage_asked: Mutex<HashMap<PubKey, std::time::Instant>>,
+    lineage_retry: std::time::Duration,
     /// SIP-35: the origins this one replicates *from*, and the seed it dials
     /// them with — its own SIP-9 identity, because a peering connection is an
     /// ordinary SIP-3 one and an exchange's identity is that key.
@@ -724,6 +734,49 @@ impl Server {
         self.open_peering || self.peers_with(key)
     }
 
+    /// SIP-64: this exchange's lineage, re-read when the file changed. A
+    /// file that has gone wrong since start is logged and the last good
+    /// lineage kept: a peer is never served a chain that fails its own
+    /// check, and the operator sees why.
+    pub(crate) fn lineage_now(&self) -> sqex_proto::lineage::Lineage {
+        let now = crate::lineage::modified(&self.lineage_file);
+        {
+            let held = self.lineage.read().unwrap();
+            if held.1 == now {
+                return held.0.clone();
+            }
+        }
+        let mut held = self.lineage.write().unwrap();
+        if held.1 != now {
+            match crate::lineage::load(&self.lineage_file, &self.public_key) {
+                Ok(l) => {
+                    tracing::info!(links = l.links.len(), "lineage file re-read");
+                    *held = (l, now);
+                }
+                Err(e) => {
+                    tracing::error!(%e, "lineage file changed and is refused; serving the last good one");
+                    held.1 = now;
+                }
+            }
+        }
+        held.0.clone()
+    }
+
+    /// SIP-64: whether to ask `origin` for its lineage now -- never asked
+    /// this process, or (`again`) a repudiated entry and the last ask is
+    /// `lineage_retry` behind us. Marks the ask.
+    pub(crate) fn lineage_due(&self, origin: &PubKey, again: bool) -> bool {
+        let mut asked = self.lineage_asked.lock().unwrap();
+        let due = match asked.get(origin) {
+            None => true,
+            Some(at) => again && at.elapsed() >= self.lineage_retry,
+        };
+        if due {
+            asked.insert(*origin, std::time::Instant::now());
+        }
+        due
+    }
+
     /// SIP-63: hold one more wait for `who`, or say the caller is over
     /// `MAX_WAITS_PER_PEER`. The guard lets go when dropped.
     fn hold_wait(self: &Arc<Self>, who: PubKey) -> Option<WaitHeld> {
@@ -1007,6 +1060,11 @@ pub async fn bind_with(
     find: crate::relay::Find,
 ) -> Result<Bound> {
     let public_key = PubKey::new(signing_key.verifying_key().to_bytes());
+    // SIP-64: a lineage that does not end at this key is not this
+    // exchange's, and is refused here rather than served.
+    let lineage =
+        crate::lineage::load(&config.lineage_file, &public_key).map_err(Error::Malformed)?;
+    let lineage_mtime = crate::lineage::modified(&config.lineage_file);
     let state = State::load(
         config.state_file.clone(),
         &config.seed_whitelist,
@@ -1091,6 +1149,10 @@ pub async fn bind_with(
         replication_peers: config.replication_peers.clone(),
         open_peering: config.open_peering,
         waits: Mutex::new(HashMap::new()),
+        lineage: RwLock::new((lineage, lineage_mtime)),
+        lineage_file: config.lineage_file.clone(),
+        lineage_asked: Mutex::new(HashMap::new()),
+        lineage_retry: config.lineage_retry,
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
         waker: std::sync::OnceLock::new(),
@@ -1274,6 +1336,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
         relay_peers = server.state.lock().unwrap().peer_count(),
         replication_peers = server.replication_peers.len(),
         peering = if server.open_peering { "open" } else { "listed" },
+        lineage = server.lineage.read().unwrap().0.links.len(),
         "sqexd {} listening (HTTP/3)", VERSION
     );
     tracing::info!("connection string: sqx://{local_addr}/{public_key}");
@@ -4452,6 +4515,13 @@ async fn route(
         // The runtime peer list and nothing else; a peer's label is its
         // domain when the label is a DNS name, and empty otherwise -- an
         // operator's note is not a place to be reached.
+        // SIP-64: this exchange's earlier keys, to anyone. Every link was
+        // in a public zone once; a peer's `post` with no body asks too.
+        ("GET", "/exchange/lineage") | ("POST", "/exchange/lineage") => (
+            200,
+            "application/octet-stream",
+            server.lineage_now().encode(),
+        ),
         ("GET", "/exchange/peers") => {
             let peers = server.peer_directory();
             (200, "application/octet-stream", peers.encode())

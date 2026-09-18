@@ -417,6 +417,10 @@ pub async fn pull_once_from(
         return Err(format!("the origin refused peering ({code})"));
     }
     let hi = Hi::decode(&body).map_err(|e| e.to_string())?;
+    // SIP-64: the origin's earlier keys, before the first pull from it.
+    if server.lineage_due(&origin.key, false) {
+        learn_lineage(client, server, origin).await;
+    }
     if hi.exchange != origin.key {
         // The connection was authenticated against the pinned key, so this
         // cannot normally differ — and if it ever does, the party supplying the
@@ -496,6 +500,8 @@ pub async fn pull_once_from(
         // them, as SIP-40's predecessors do.
         let mut predecessors = origin.predecessors.clone();
         predecessors.extend(store.origin_history(channel));
+        // SIP-64: and the keys the origin's lineage said it moved from.
+        predecessors.extend(store.lineage_of(&origin.key));
         let mut took = take_under(store, &origin.key, &predecessors, channel, &pulled, &lookup);
         // SIP-54: the members' marks and the signal log, merged and handed
         // on as if made here.
@@ -558,6 +564,15 @@ pub async fn pull_once_from(
                 took.equivocated |= again.equivocated;
             }
         }
+        // SIP-64: a receipt under a key this replica does not hold is the
+        // ordinary sign of a rotation since the lineage was last asked.
+        // Asked again, bounded; what it learns takes effect on the next
+        // pull, which the hole left here already asks for.
+        if took.refused.iter().any(|(_, r)| *r == Refused::Repudiated)
+            && server.lineage_due(&origin.key, true)
+        {
+            learn_lineage(client, server, origin).await;
+        }
 
         // SIP-44: a succession by guardians carries a policy's signature the
         // entry cannot be checked against on its own. The origin's record
@@ -610,6 +625,49 @@ pub async fn pull_once_from(
 /// covers and this replica cannot recover from it. Until answered the row
 /// reads as private and unnamed; an origin from before SIP-43 refuses the
 /// route, and the row stays so.
+/// SIP-64: ask the origin for its lineage, verify it back from the key
+/// this replica holds (and the domain, where it holds one), and keep the
+/// predecessors with the origin. An origin from before SIP-64 answers
+/// `not_found`, which is an empty lineage; a lineage that fails a rule is
+/// dropped whole and what was held stays. `true` when something changed.
+async fn learn_lineage(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    origin: &Origin,
+) -> bool {
+    let Ok((code, body)) = client.post("/exchange/lineage", Vec::new()).await else {
+        return false;
+    };
+    if code != 200 {
+        return false;
+    }
+    let Ok(lineage) = sqex_proto::lineage::Lineage::decode(&body) else {
+        tracing::debug!(origin = %origin.key, "an undecodable lineage");
+        return false;
+    };
+    let domain = server
+        .forwarder(&origin.key)
+        .map(|f| f.domain.clone())
+        .filter(|d| !d.is_empty());
+    match lineage.predecessors_for(&origin.key, domain.as_deref()) {
+        Ok(predecessors) => {
+            let changed = server.channels().learn_lineage(&origin.key, &predecessors);
+            if changed {
+                tracing::info!(
+                    origin = %origin.key,
+                    earlier_keys = predecessors.len(),
+                    "learned the origin's lineage"
+                );
+            }
+            changed
+        }
+        Err(e) => {
+            tracing::warn!(origin = %origin.key, %e, "the origin's lineage was refused");
+            false
+        }
+    }
+}
+
 async fn pull_shape(client: &mut H3Client, store: &Channels, channel: &[u8; 32]) {
     if store.shape_known(channel) {
         return;

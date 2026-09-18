@@ -609,6 +609,15 @@ CREATE TABLE IF NOT EXISTS origin_history (
     moved_at INTEGER NOT NULL,
     PRIMARY KEY (channel, from_seq)
 );
+-- SIP-64: an origin's earlier keys, as its lineage said and this exchange
+-- verified. Kept with the origin, so a restart does not ask again and an
+-- origin since gone still has its past verified.
+CREATE TABLE IF NOT EXISTS lineage (
+    origin      BLOB    NOT NULL,
+    position    INTEGER NOT NULL,
+    predecessor BLOB    NOT NULL,
+    PRIMARY KEY (origin, position)
+);
 -- SIP-53: entries this exchange ordered past a fork it then lost. Kept for
 -- their authors for a while; never served as the conversation.
 CREATE TABLE IF NOT EXISTS stranded (
@@ -3787,6 +3796,47 @@ impl Channels {
 
     /// SIP-53: every exchange that has ordered `channel`, for verifying
     /// entries from before a move. The creator where the history has none.
+    /// SIP-64: the origin's earlier keys as learned from its lineage,
+    /// newest first.
+    pub fn lineage_of(&self, origin: &PubKey) -> Vec<PubKey> {
+        let db = self.db.lock().unwrap();
+        db.prepare("SELECT predecessor FROM lineage WHERE origin = ?1 ORDER BY position")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![origin.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(|r| r.ok())
+                            .filter_map(|b| b.try_into().ok().map(PubKey::new))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    /// SIP-64: keep what an origin's verified lineage said. `true` when it
+    /// differs from what was held.
+    pub fn learn_lineage(&self, origin: &PubKey, predecessors: &[PubKey]) -> bool {
+        if self.lineage_of(origin) == predecessors {
+            return false;
+        }
+        let mut db = self.db.lock().unwrap();
+        let Ok(tx) = db.transaction() else {
+            return false;
+        };
+        let _ = tx.execute(
+            "DELETE FROM lineage WHERE origin = ?1",
+            params![origin.as_bytes()],
+        );
+        for (i, p) in predecessors.iter().enumerate() {
+            let _ = tx.execute(
+                "INSERT INTO lineage (origin, position, predecessor) VALUES (?1, ?2, ?3)",
+                params![origin.as_bytes(), i as i64, p.as_bytes()],
+            );
+        }
+        tx.commit().is_ok()
+    }
+
     pub fn origin_history(&self, channel: &[u8; 32]) -> Vec<PubKey> {
         let db = self.db.lock().unwrap();
         let mut out: Vec<PubKey> = db

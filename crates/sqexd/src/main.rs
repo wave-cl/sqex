@@ -91,6 +91,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let config = build_config(&cli)?;
 
     if let Some(Command::Handover { to, domain, days }) = &cli.command {
+        let lineage_file = config.lineage_file.clone();
         // Never `load_or_create`: a handover from a key that did not exist
         // until this moment is a handover from nobody, and the created key
         // would look like the exchange's identity to whoever read the file
@@ -103,7 +104,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             .into());
         }
         let signing_key = load_or_create_key(&config.key_file, true)?;
-        handover(&signing_key, to, domain, *days)?;
+        handover(&signing_key, to, domain, *days, &lineage_file)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -211,6 +212,7 @@ fn handover(
     to: &str,
     domain: &str,
     days: u64,
+    lineage_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ed25519_dalek::Signer;
     use sqex_discovery::{HANDOVER_MAX_SECS, Handover};
@@ -267,6 +269,18 @@ fn handover(
     eprintln!(
         "It grants nothing until `k={to}` is published too, and cannot be withdrawn once \
          published — only outlived, at {until}."
+    );
+    // SIP-64: kept, so the successor serves it as its lineage for as long
+    // as the history it covers -- the zone keeps it thirty days at most.
+    sqexd::lineage::append(lineage_file, &domain, &h).map_err(|e| {
+        format!(
+            "cannot keep the handover in {}: {e}",
+            lineage_file.display()
+        )
+    })?;
+    eprintln!(
+        "Kept in {} (SIP-64): the daemon running as `{to}` serves it as its lineage.",
+        lineage_file.display()
     );
     Ok(())
 }

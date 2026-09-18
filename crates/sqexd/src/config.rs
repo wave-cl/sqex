@@ -59,6 +59,15 @@ pub struct FileConfig {
     pub listen: String,
     /// Hex Ed25519 seed for this server's identity.
     pub key_file: PathBuf,
+    /// SIP-64: the handovers this exchange has signed, one per line as
+    /// `<domain> <record>`; `sqexd handover` appends to it. Defaults to
+    /// `lineage` beside the key file. Absent means no rotation behind us.
+    #[serde(default)]
+    pub lineage_file: Option<PathBuf>,
+    /// SIP-64: seconds before a repudiated entry from an origin makes this
+    /// exchange ask for that origin's lineage again. Default 600.
+    #[serde(default)]
+    pub lineage_retry_secs: Option<u64>,
     /// Where the managed whitelist and audit log are snapshotted. Omit to keep
     /// them in memory only (lost on restart).
     #[serde(default)]
@@ -360,6 +369,11 @@ fn default_pull_interval() -> u64 {
 pub struct Config {
     pub listen: SocketAddr,
     pub key_file: PathBuf,
+    /// SIP-64: where this exchange's signed handovers are kept.
+    pub lineage_file: PathBuf,
+    /// SIP-64: how long after asking an origin's lineage a repudiated
+    /// entry may make this exchange ask again.
+    pub lineage_retry: std::time::Duration,
     pub state_file: Option<PathBuf>,
     pub admins: Vec<PubKey>,
     pub seed_whitelist: Vec<PubKey>,
@@ -576,6 +590,10 @@ impl FileConfig {
 
         Ok(Config {
             listen,
+            lineage_file: self
+                .lineage_file
+                .unwrap_or_else(|| self.key_file.with_file_name("lineage")),
+            lineage_retry: std::time::Duration::from_secs(self.lineage_retry_secs.unwrap_or(600)),
             key_file: self.key_file,
             state_file: self.state_file,
             admins,

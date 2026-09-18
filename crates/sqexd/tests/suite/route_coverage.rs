@@ -516,6 +516,15 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ),
     ("GET", "/exchange/ping", Probe, Whitelisted),
     ("GET", "/exchange/peers", Cli("sqex peers"), Anyone),
+    // SIP-64: a client asks with GET, a replica -- whose H3 client only
+    // posts -- with an empty POST. Public: every link was in a zone once.
+    ("GET", "/exchange/lineage", Cli("sqex lineage"), Anyone),
+    (
+        "POST",
+        "/exchange/lineage",
+        Peer("replica::learn_lineage"),
+        Anyone,
+    ),
 ];
 
 /// Pull the dispatch arms out of `server.rs`.

@@ -135,6 +135,10 @@ enum Cmd {
     /// the domain it is reached at where the operator recorded one. A hint:
     /// reach one by discovering its domain, and refuse it if the key differs.
     Peers,
+    /// The exchange's earlier keys (SIP-64): the SIP-40 handovers it has
+    /// signed, oldest first, verified back from the key this command
+    /// connected under. What a peer or a client reads its past under.
+    Lineage,
     /// A device that acts for this account (SIP-20/58): sign a credential
     /// for it, or a revocation, with no exchange in reach -- with a YubiKey
     /// too, which is the point. Give what this prints to an administrator
@@ -645,6 +649,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Peers => peers(&cli, &cfg).await,
+        Cmd::Lineage => lineage(&cli, &cfg).await,
         Cmd::Succession { cmd } => succession(&cli, &cfg, cmd).await,
         Cmd::Home { cmd } => home(&cli, &cfg, cmd).await,
         Cmd::Device { cmd } => device(&cli, &cfg, cmd).await,
@@ -2777,6 +2782,40 @@ async fn peers(cli: &Cli, cfg: &Config) -> Result<(), String> {
     println!(
         "A hint, not an introduction: discover a domain (sqex discover) and refuse it if \
          the key differs."
+    );
+    Ok(())
+}
+
+async fn lineage(cli: &Cli, cfg: &Config) -> Result<(), String> {
+    let (mut client, server) = connect(cli, cfg).await?;
+    let (code, body) = client.get("/exchange/lineage").await?;
+    if code == 404 {
+        return Err("this exchange serves no lineage (before sqex 0.81.0)".into());
+    }
+    if code != 200 {
+        return Err(format!("lineage failed ({code}): {}", said(&body)));
+    }
+    let l = sqex_proto::lineage::Lineage::decode(&body).map_err(|e| e.to_string())?;
+    let earlier = l
+        .predecessors_for(&server, None)
+        .map_err(|e| format!("the lineage served does not verify: {e}"))?;
+    if earlier.is_empty() {
+        println!("{server}: no rotation behind it");
+        return Ok(());
+    }
+    for (i, link) in l.links.iter().enumerate() {
+        println!(
+            "{}. {}  ->  {}   for {} (window until {})",
+            i + 1,
+            link.from,
+            link.to,
+            link.domain,
+            link.until
+        );
+    }
+    println!(
+        "Verified back from {server}: what it receipted under {} earlier key(s) reads as its own.",
+        earlier.len()
     );
     Ok(())
 }

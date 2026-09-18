@@ -11,6 +11,7 @@ pub mod device;
 pub mod directory;
 pub mod events;
 pub mod limits;
+pub mod lineage;
 pub mod mailbox;
 pub mod name;
 pub mod prekey;
