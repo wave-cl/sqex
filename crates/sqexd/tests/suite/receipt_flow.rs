@@ -408,11 +408,14 @@ fn an_exchange_that_cannot_sign_refuses_rather_than_answering_in_the_other_shape
 /// failure that would matter most, because a receipt checked under a key
 /// nobody pinned is worth nothing.
 ///
-/// Ignored so CI stays hermetic. Run it against `ex` with:
+/// Ignored so CI stays hermetic. It connects as a fresh identity, so the
+/// exchange must admit strangers: trunk.exchange does, and `ex` (squic.org)
+/// does not -- its SIP-8 transport whitelist drops the handshake, which
+/// reads here as "handshake timed out". Run it against trunk with:
 ///
 /// ```text
-/// SQEX_LIVE_ADDR=95.216.183.51:443 \
-/// SQEX_LIVE_KEY=2j68p8rZKXE6W1f6LerRGB2SPTH8JkbfMmZRFTzcLKyW \
+/// SQEX_LIVE_ADDR=2.28.46.155:443 \
+/// SQEX_LIVE_KEY=3kHiw569h8s6d5FvQvaTEjWyc8ZCh6QgqAbMR5VGQdnz \
 ///   cargo test -p sqexd --test suite -- --ignored receipts_verify_against_a_deployed_exchange
 /// ```
 ///
