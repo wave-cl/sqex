@@ -79,9 +79,22 @@ async fn resolver() -> Result<&'static TokioResolver> {
 /// while `dig` reported the chain Secure. Four kilobytes is the size these
 /// resolvers actually send up to; TCP is tried after that, not instead of
 /// it, so the common case stays one datagram each way.
+///
+/// **One server at a time.** A network that clamps DNS over UDP at 1232
+/// bytes whatever the client advertises -- Hetzner's, where both exchanges
+/// live, does -- answers the DNSKEY query truncated, and hickory retries
+/// over TCP. But it asks its servers in parallel, and the retry is
+/// abandoned the moment a *second* server's truncated datagram lands ("UDP
+/// already disabled, giving up"), which with two servers in the pool is
+/// every time: the same zone that `dig +tcp` calls Secure came back
+/// "DNSSEC validation failed" from every resolver, public ones included,
+/// on 2026-09-18, and discovery from both exchanges was dead. With the
+/// pool asked one server at a time the retry completes. The cost is the
+/// latency of a failed first server, which is not the common case.
 fn room_for_a_key_rollover(opts: &mut hickory_resolver::config::ResolverOpts) {
     opts.edns_payload_len = 4096;
     opts.try_tcp_on_error = true;
+    opts.num_concurrent_reqs = 1;
 }
 
 /// Resolvers that carry DNSSEC records intact, as transport for a lookup the
