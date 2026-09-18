@@ -47,10 +47,11 @@ use sqex_proto::channel::{
     Directory as ChannelDirectory, Fetch as ChannelFetch, Home, Invite as ChannelInvite, Invitee,
     List as ChannelList, Mine as ChannelMine, Post as ChannelPost, Retain as ChannelRetain,
     SignalOut, TYPE_CLOSE as CH_CLOSE, TYPE_CURSORS as CH_CURSORS, TYPE_DISMISS as CH_DISMISS,
-    TYPE_EQUIVOCATION as CH_EQUIVOCATION, TYPE_HOME as CH_HOME, TYPE_INFO as CH_INFO,
-    TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE, TYPE_MUTE as CH_MUTE, TYPE_REDACT as CH_REDACT,
-    TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE, TYPE_REPORTS as CH_REPORTS,
-    TYPE_STRANDED as CH_STRANDED, TYPE_UNMUTE as CH_UNMUTE, TYPE_UNREPLICATE as CH_UNREPLICATE,
+    TYPE_EQUIVOCATION as CH_EQUIVOCATION, TYPE_FOLDED as CH_FOLDED, TYPE_HOME as CH_HOME,
+    TYPE_INFO as CH_INFO, TYPE_JOIN as CH_JOIN, TYPE_LEAVE as CH_LEAVE, TYPE_MUTE as CH_MUTE,
+    TYPE_REDACT as CH_REDACT, TYPE_REMOVE as CH_REMOVE, TYPE_REPLICATE as CH_REPLICATE,
+    TYPE_REPORTS as CH_REPORTS, TYPE_STRANDED as CH_STRANDED, TYPE_UNMUTE as CH_UNMUTE,
+    TYPE_UNREPLICATE as CH_UNREPLICATE,
 };
 use sqex_proto::channel_key::{Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING};
 use sqex_proto::device::{
@@ -66,7 +67,7 @@ use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
     Carried, Changed, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi,
-    Mine, PEER_VERSION, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBlob,
+    Mine, PEER_VERSION, PeerFolded, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBlob,
     PullEnvelopes, PullMail, PullMine, PullRecord, PullShape, PullStanding, TookMail,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
@@ -3186,10 +3187,37 @@ async fn route(
                 .encode(),
             ),
         },
+        // SIP-71: the folded log of a direct message this exchange ended,
+        // to either of its members, as a fetch would have answered it.
+        ("POST", "/channel/folded") => match (account, ByChannel::decode(body, CH_FOLDED)) {
+            (None, _) => no_identity("reading a folded log"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => match server.channels.folded_log(&req.channel, &me) {
+                Ok(entries) => (200, "application/octet-stream", entries.encode()),
+                Err(e) => refused(e),
+            },
+        },
         ("POST", "/channel/home") => match (account, ByChannel::decode(body, CH_HOME)) {
             (None, _) => no_identity("asking where a channel lives"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
+                // SIP-71: a folded identifier points at the conversation,
+                // to the two it was between and to nobody else.
+                if let Some((into, domain, first, second)) =
+                    server.channels.folded_into(&req.channel)
+                    && (me == first || me == second)
+                {
+                    return (
+                        200,
+                        "application/octet-stream",
+                        Home {
+                            origin: into,
+                            domain,
+                            former: Vec::new(),
+                        }
+                        .encode(),
+                    );
+                }
                 if let Err(e) = server.channels.info(
                     &me,
                     &device.unwrap_or(me),
@@ -3968,6 +3996,70 @@ async fn route(
                     return refused(e);
                 }
                 record_move(server, &req.mv, &req.domain, &[])
+            }
+            _ => peering_refused(),
+        },
+        // SIP-71: the home of a direct message's lower key says the channel
+        // of that identifier ordered here is a stray. Verified in the
+        // document's order -- ordered here, a direct message with that
+        // lower key, the caller is that key's home by its own signed Move,
+        // the instance is not ours -- and refused uniformly otherwise.
+        ("POST", "/peer/folded") => match (peer.identity, PeerFolded::decode(body)) {
+            (Some(who), Ok(req)) if server.peering(&who).is_some() => {
+                if let Err(e) = server.peer_write(&who) {
+                    return refused(e);
+                }
+                let Some((first, _)) = server.channels.direct_pair(&req.channel) else {
+                    return if server.channels.instance_of(&req.channel).is_none() {
+                        refuse(409, Code::NotFound, Some("no such channel here"))
+                    } else {
+                        peering_refused()
+                    };
+                };
+                if first != req.first
+                    || !server
+                        .devices
+                        .home_of(&first)
+                        .is_some_and(|(home, _, _)| home == who)
+                {
+                    return peering_refused();
+                }
+                let domain = req.domain.trim().to_ascii_lowercase();
+                match server
+                    .channels
+                    .fold(&req.channel, &who, &domain, &req.instance)
+                {
+                    Ok((first, second)) => {
+                        tracing::info!(
+                            channel = %bs58::encode(req.channel).into_string(),
+                            home = %who,
+                            "folded a stray direct message into the conversation at its lower key's home"
+                        );
+                        // The other member, where homed here, reads the
+                        // conversation as any channel of theirs elsewhere:
+                        // the fold record is the home task's hint for it
+                        // (a Move replaces the account's own hints, so the
+                        // record is kept apart from them).
+                        let other = if first == req.first { second } else { first };
+                        if server
+                            .devices
+                            .home_of(&other)
+                            .is_some_and(|(h, _, _)| h == server.public_key)
+                        {
+                            server.homed.notify_one();
+                        }
+                        server.channels.wake(&req.channel);
+                        (
+                            200,
+                            "application/octet-stream",
+                            ChannelAck { now: now_unix() }.encode(),
+                        )
+                    }
+                    Err(ChannelError::NoSuchChannel) => {
+                        refuse(409, Code::NotFound, Some("no such channel here"))
+                    }
+                    Err(_) => peering_refused(),
+                }
             }
             _ => peering_refused(),
         },

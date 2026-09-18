@@ -24,7 +24,7 @@ use crate::common::{Chain, Signer, instance_for};
 
 /// An exchange that knows its own domain, federates with `peers` for
 /// calls and replication both, and finds `found` without DNS.
-async fn exchange_in(
+pub(crate) async fn exchange_in(
     dir: &Path,
     listen: SocketAddr,
     domain: &str,
@@ -68,26 +68,26 @@ async fn exchange_in(
     (addr, server_pub)
 }
 
-fn identity(b: u8) -> ([u8; 32], PubKey) {
+pub(crate) fn identity(b: u8) -> ([u8; 32], PubKey) {
     let sk = SigningKey::from_bytes(&[b; 32]);
     (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
 }
 
-fn key_in(dir: &Path) -> PubKey {
+pub(crate) fn key_in(dir: &Path) -> PubKey {
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(dir.join("host_key"), hex::encode(server_sk.to_bytes())).unwrap();
     let vk = SigningKey::from_bytes(&server_sk.to_bytes()).verifying_key();
     PubKey::new(vk.to_bytes())
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
 }
 
-async fn texts(c: &mut Client, channel: [u8; 32]) -> Vec<String> {
+pub(crate) async fn texts(c: &mut Client, channel: [u8; 32]) -> Vec<String> {
     let (code, body) = c
         .post(
             "/channel/fetch",
@@ -111,7 +111,11 @@ async fn texts(c: &mut Client, channel: [u8; 32]) -> Vec<String> {
         .collect()
 }
 
-async fn until<F: Fn(&[String]) -> bool>(c: &mut Client, channel: [u8; 32], ok: F) -> Vec<String> {
+pub(crate) async fn until<F: Fn(&[String]) -> bool>(
+    c: &mut Client,
+    channel: [u8; 32],
+    ok: F,
+) -> Vec<String> {
     for _ in 0..80 {
         let (code, _) = c
             .post("/channel/info", ByChannel { channel }.encode(TYPE_INFO))
@@ -129,7 +133,7 @@ async fn until<F: Fn(&[String]) -> bool>(c: &mut Client, channel: [u8; 32], ok: 
 }
 
 /// A client says where it lives: a Move naming the exchange it is at.
-async fn i_live_here(c: &mut Client, seed: &[u8; 32], here: PubKey, domain: &str) {
+pub(crate) async fn i_live_here(c: &mut Client, seed: &[u8; 32], here: PubKey, domain: &str) {
     let (code, body) = c
         .post(
             "/account/move",
@@ -148,22 +152,22 @@ async fn i_live_here(c: &mut Client, seed: &[u8; 32], here: PubKey, domain: &str
 /// A loopback address nobody is listening on right now, so two exchanges
 /// can each be told where the other will be before either is bound: a
 /// finder is fixed at bind, and each needs the other's address in it.
-fn free_port() -> SocketAddr {
+pub(crate) fn free_port() -> SocketAddr {
     let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     s.local_addr().unwrap()
 }
 
 /// Two federated exchanges, each knowing its own domain and finding the
 /// other by its domain.
-struct Pair {
-    a_addr: SocketAddr,
-    a_pub: [u8; 32],
-    b_addr: SocketAddr,
-    b_pub: [u8; 32],
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+pub(crate) struct Pair {
+    pub(crate) a_addr: SocketAddr,
+    pub(crate) a_pub: [u8; 32],
+    pub(crate) b_addr: SocketAddr,
+    pub(crate) b_pub: [u8; 32],
+    pub(crate) _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
-async fn pair() -> Pair {
+pub(crate) async fn pair() -> Pair {
     let a_dir = tempfile::tempdir().unwrap();
     let b_dir = tempfile::tempdir().unwrap();
     let a_key = key_in(a_dir.path());

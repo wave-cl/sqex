@@ -428,6 +428,14 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_mail"),
         ReplicationPeer,
     ),
+    // SIP-71: the lower key's home tells an origin its copy of a direct
+    // message is a stray.
+    (
+        "POST",
+        "/peer/folded",
+        Peer("replica::tell_folded"),
+        ReplicationPeer,
+    ),
     // SIP-48: the account's sealed backup. Written by its devices; read by
     // them, or by the account that succeeded it.
     ("POST", "/backup/write", Chat("Chat::backup"), SelfOnly),
@@ -467,6 +475,14 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         "/channel/stranded",
         Chat("Chat::stranded_entries"),
         SelfOnly,
+    ),
+    // SIP-71: the folded log of a direct message this exchange ended, to
+    // either of its two members.
+    (
+        "POST",
+        "/channel/folded",
+        Chat("Chat::folded_entries"),
+        Member,
     ),
     // Reached when a fetch is refused with `equivocated`: the client asks for
     // the evidence rather than reporting a bare refusal.

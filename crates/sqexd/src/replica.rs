@@ -1446,7 +1446,32 @@ pub async fn run_homed(
             .into_iter()
             .map(|(a, o, _)| (a, o))
             .collect();
-        for (origin, domain, accounts) in server.devices.homed_here(&me) {
+        // SIP-71: a fold record points a member homed here at the
+        // conversation, beside the hints the accounts gave themselves.
+        let mut by_origin = server.devices.homed_here(&me);
+        for (into, domain, pair) in server.channels().folded_hints() {
+            let homed: Vec<PubKey> = pair
+                .into_iter()
+                .filter(|a| server.devices.home_of(a).is_some_and(|(h, _, _)| h == me))
+                .collect();
+            if homed.is_empty() || into == me {
+                continue;
+            }
+            match by_origin.iter_mut().find(|(o, _, _)| *o == into) {
+                Some((_, d, accounts)) => {
+                    if d.is_empty() {
+                        *d = domain;
+                    }
+                    for a in homed {
+                        if !accounts.contains(&a) {
+                            accounts.push(a);
+                        }
+                    }
+                }
+                None => by_origin.push((into, domain, homed)),
+            }
+        }
+        for (origin, domain, accounts) in by_origin {
             if origin == me {
                 continue;
             }
@@ -1495,12 +1520,37 @@ pub async fn run_homed(
                     Ok((200, body)) => {
                         if let Ok(mine) = sqex_proto::peer::Mine::decode(&body) {
                             for c in mine.channels {
-                                if !already.contains(&c)
-                                    && !channels.contains(&c)
-                                    && !server.channels().orders(&c)
-                                {
-                                    channels.push(c);
+                                if already.contains(&c) || channels.contains(&c) {
+                                    continue;
                                 }
+                                // SIP-71: a direct message this home already
+                                // holds -- ordered, or as a copy from
+                                // elsewhere -- is the conversation, and what
+                                // the origin holds under the identifier is a
+                                // stray. This home is the lower key's home
+                                // only when the account it pulls for is that
+                                // key; otherwise the identifier is left alone
+                                // and its home will say.
+                                let held_elsewhere = server.channels().orders(&c)
+                                    || server.channels().origin_of(&c).is_some_and(|o| o != origin);
+                                if held_elsewhere {
+                                    if let Some((first, _)) = server.channels().held_direct_pair(&c)
+                                        && first == *account
+                                        && let Some(instance) = server.channels().instance_of(&c)
+                                    {
+                                        tell_folded(
+                                            &mut client,
+                                            &server,
+                                            &origin,
+                                            &c,
+                                            account,
+                                            &instance,
+                                        )
+                                        .await;
+                                    }
+                                    continue;
+                                }
+                                channels.push(c);
                             }
                         }
                     }
@@ -1613,6 +1663,39 @@ async fn pull_soft_state(
         }
         if signals.next > 0 {
             store.set_signal_mark(channel, signals.next);
+        }
+    }
+}
+
+/// SIP-71: tell an origin that the direct message it orders under
+/// `channel` is a stray -- this home, `first`'s by its Move, holds the
+/// conversation under `instance`. The origin verifies and folds, or says
+/// why not; either way this home has done its part for the cycle.
+async fn tell_folded(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    origin: &PubKey,
+    channel: &[u8; 32],
+    first: &PubKey,
+    instance: &[u8; 32],
+) {
+    let req = sqex_proto::peer::PeerFolded {
+        channel: *channel,
+        first: *first,
+        instance: *instance,
+        domain: server.own_domain(),
+    };
+    let channel = bs58::encode(channel).into_string();
+    match client.post("/peer/folded", req.encode()).await {
+        Ok((200, _)) => {
+            tracing::info!(%origin, %channel, account = %first, "an origin folded a stray direct message")
+        }
+        Ok((409, _)) => tracing::debug!(%origin, %channel, "the origin no longer holds the stray"),
+        Ok((code, _)) => {
+            tracing::debug!(%origin, %channel, code, "the origin did not fold the stray")
+        }
+        Err(e) => {
+            tracing::debug!(%origin, %channel, error = %e, "telling an origin of a stray failed")
         }
     }
 }

@@ -304,6 +304,9 @@ impl Pulled {
 pub const TYPE_PULL_MAIL: u8 = 0x12;
 /// SIP-68: the ids the home stored, for the former home to delete.
 pub const TYPE_TOOK_MAIL: u8 = 0x13;
+/// SIP-71: the home of a direct message's lower key tells an exchange that
+/// the channel of that identifier it orders is a stray, to be folded.
+pub const TYPE_FOLDED: u8 = 0x14;
 
 /// `POST /peer/mailbox`: `| type=0x12 | account[32] |`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1530,6 +1533,54 @@ impl PeerMoved {
     }
 }
 
+/// SIP-71: `first`'s home holds the conversation of `channel` under
+/// `instance`; the exchange told orders a stray of the same identifier.
+///
+/// `| type: u8 = 0x14 | channel[32] | first[32] | instance[32] | dom_len: u8 | domain |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerFolded {
+    pub channel: [u8; 32],
+    pub first: PubKey,
+    pub instance: [u8; 32],
+    pub domain: String,
+}
+
+impl PeerFolded {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(98 + self.domain.len());
+        out.push(TYPE_FOLDED);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(self.first.as_bytes());
+        out.extend_from_slice(&self.instance);
+        let d = self.domain.as_bytes();
+        out.push(d.len().min(255) as u8);
+        out.extend_from_slice(&d[..d.len().min(255)]);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PeerFolded> {
+        let short = || Error::Malformed("peer fold cut short".into());
+        if b.first() != Some(&TYPE_FOLDED) {
+            return Err(Error::Malformed("not a peer fold".into()));
+        }
+        if b.len() < 98 {
+            return Err(short());
+        }
+        let len = b[97] as usize;
+        let domain = b.get(98..98 + len).ok_or_else(short)?;
+        if 98 + len != b.len() {
+            return Err(Error::Malformed("trailing bytes after a peer fold".into()));
+        }
+        Ok(PeerFolded {
+            channel: b[1..33].try_into().unwrap(),
+            first: PubKey::new(b[33..65].try_into().unwrap()),
+            instance: b[65..97].try_into().unwrap(),
+            domain: String::from_utf8(domain.to_vec())
+                .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod home_peer_tests {
     use super::*;
@@ -1573,6 +1624,17 @@ mod home_peer_tests {
             mv,
             domain: "home.example".into(),
         };
+        let pf = PeerFolded {
+            channel: [9; 32],
+            first: PubKey::new([1; 32]),
+            instance: [2; 32],
+            domain: "home.example".into(),
+        };
+        assert_eq!(PeerFolded::decode(&pf.encode()).unwrap(), pf);
+        assert!(PeerFolded::decode(&pf.encode()[..97]).is_err());
+        let mut long = pf.encode();
+        long.push(0);
+        assert!(PeerFolded::decode(&long).is_err());
         assert_eq!(PeerMoved::decode(&pm.encode()).unwrap(), pm);
         let mut trailing = pm.encode();
         trailing.push(0);

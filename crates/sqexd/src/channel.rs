@@ -256,6 +256,9 @@ impl ChannelError {
             ChannelError::RateLimited(secs) => Some(secs.to_string()),
             ChannelError::StaleGeneration(g) => Some(g.to_string()),
             ChannelError::OriginReachable(a) => Some(a.to_string()),
+            // SIP-35: the refusal names the origin, so a client can go there
+            // -- and SIP-71 sends a create there by the same word.
+            ChannelError::Replicated(origin) => Some(origin.to_string()),
             _ => None,
         }
     }
@@ -627,6 +630,40 @@ CREATE TABLE IF NOT EXISTS stranded (
     body     BLOB    NOT NULL,
     posted   INTEGER NOT NULL,
     PRIMARY KEY (channel, seq)
+);
+-- SIP-71: direct messages this exchange ordered that were strays -- the
+-- conversation lives at the lower key's home -- and were folded on the
+-- home's word. The identifier points at the conversation while the row
+-- stands; the log is kept beside it for both members to read.
+CREATE TABLE IF NOT EXISTS folded (
+    channel  BLOB PRIMARY KEY,
+    instance BLOB NOT NULL,
+    into_key BLOB NOT NULL,
+    domain   TEXT NOT NULL,
+    first    BLOB NOT NULL,
+    second   BLOB NOT NULL,
+    at       INTEGER NOT NULL
+);
+-- SIP-71: the folded log, the entry table's columns under the stray's
+-- incarnation. Never served as the conversation; served whole to the
+-- two members at `/channel/folded` for `FOLDED_SECS`.
+CREATE TABLE IF NOT EXISTS folded_entry (
+    channel       BLOB    NOT NULL,
+    instance      BLOB    NOT NULL,
+    seq           INTEGER NOT NULL,
+    kind          INTEGER NOT NULL,
+    account       BLOB    NOT NULL,
+    device        BLOB    NOT NULL,
+    posted        INTEGER NOT NULL,
+    expires_after INTEGER NOT NULL,
+    epoch         INTEGER NOT NULL,
+    msg_seq       INTEGER NOT NULL,
+    chain_seq     INTEGER NOT NULL,
+    prev          BLOB    NOT NULL,
+    body_hash     BLOB    NOT NULL,
+    sig           BLOB    NOT NULL,
+    body          BLOB    NOT NULL,
+    PRIMARY KEY (channel, instance, seq)
 );
 -- SIP-57: what was redacted here, for copies to pull. Kept for the
 -- channel's retention, after which the entry would have gone anyway.
@@ -1089,6 +1126,15 @@ impl Channels {
                 // only whatever the squatter put there.
                 DmClaim::Squatted => destroy(&tx, &req.channel)?,
             }
+        }
+
+        // SIP-71: while a fold record stands, the identifier points at the
+        // conversation, and one of its two parties opening it here is sent
+        // there -- the refusal a copy gives a write, for the same reason.
+        if let Some((into, _, first, second)) = folded_row(&tx, &req.channel, now)
+            && (*caller == first || *caller == second)
+        {
+            return Err(ChannelError::Replicated(into));
         }
 
         let mine: i64 = tx
@@ -2432,6 +2478,16 @@ impl Channels {
         };
 
         let _ = expire_uploads(&tx, now);
+        // SIP-71: a fold record and its log outlive their window by nothing.
+        let _ = tx.execute(
+            "DELETE FROM folded_entry WHERE channel IN
+                (SELECT channel FROM folded WHERE at + ?1 <= ?2)",
+            params![FOLDED_SECS as i64, now as i64],
+        );
+        let _ = tx.execute(
+            "DELETE FROM folded WHERE at + ?1 <= ?2",
+            params![FOLDED_SECS as i64, now as i64],
+        );
 
         let (mut pruned, mut closed) = (0usize, 0usize);
         for id in ids {
@@ -3276,9 +3332,13 @@ impl Channels {
     /// and not a copy.
     pub fn orders(&self, channel: &[u8; 32]) -> bool {
         let db = self.db.lock().unwrap();
+        // `id`, not `channel`: the column was misnamed here from SIP-59
+        // until SIP-71, the query failed quietly, and this answered false
+        // for every channel -- so a home pulled its own channels from any
+        // origin that listed them and `adopt` marked them replicated.
         let here: bool = db
             .query_row(
-                "SELECT 1 FROM channel WHERE channel = ?1",
+                "SELECT 1 FROM channel WHERE id = ?1",
                 params![&channel[..]],
                 |_| Ok(()),
             )
@@ -4000,6 +4060,234 @@ impl Channels {
             .collect()
     }
 
+    /// SIP-71: the two accounts of a direct message this exchange orders,
+    /// lesser first -- `None` for a channel it does not order, or one that is
+    /// not a direct message by SIP-16's arithmetic.
+    pub fn direct_pair(&self, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
+        let db = self.db.lock().unwrap();
+        if origin_row(&db, channel).is_some() {
+            return None;
+        }
+        pair_of(&db, channel)
+    }
+
+    /// SIP-71: the same, for a direct message this exchange holds either
+    /// way -- ordered, or as a copy.
+    pub fn held_direct_pair(&self, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
+        let db = self.db.lock().unwrap();
+        pair_of(&db, channel)
+    }
+
+    /// SIP-31: the incarnation this exchange holds for a channel, ordered
+    /// or as a copy.
+    pub fn instance_of(&self, channel: &[u8; 32]) -> Option<[u8; 32]> {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT instance FROM channel WHERE id = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|i| i.try_into().ok())
+    }
+
+    /// SIP-71: fold a stray. The channel this exchange orders under
+    /// `channel` is a direct message whose lesser member's home, `into`,
+    /// holds the conversation under `instance`; its log is kept for both
+    /// members and the channel is destroyed, its incarnation retired, and
+    /// the identifier pointed at `into` for `FOLDED_SECS`. Answers the pair.
+    ///
+    /// Everything but the Move is checked here again, inside the
+    /// transaction: that this exchange orders the channel, that it is a
+    /// direct message, and that the instance told is not its own.
+    pub fn fold(
+        &self,
+        channel: &[u8; 32],
+        into: &PubKey,
+        domain: &str,
+        instance: &[u8; 32],
+    ) -> Result<(PubKey, PubKey), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin fold"))?;
+        if origin_row(&tx, channel).is_some() {
+            return Err(ChannelError::NotAMember);
+        }
+        let own: Vec<u8> = tx
+            .query_row(
+                "SELECT instance FROM channel WHERE id = ?1",
+                params![&channel[..]],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read instance"))?
+            .ok_or(ChannelError::NoSuchChannel)?;
+        if own.as_slice() == instance {
+            return Err(ChannelError::NotAMember);
+        }
+        if !is_direct_message(&tx, channel)? {
+            return Err(ChannelError::NotAMember);
+        }
+        let (first, second) = {
+            let mut stmt = tx
+                .prepare("SELECT account FROM member WHERE channel = ?1 AND present = 1 ORDER BY account ASC")
+                .map_err(storage("prepare pair"))?;
+            let members: Vec<PubKey> = stmt
+                .query_map(params![&channel[..]], |r| {
+                    Ok(PubKey::new(
+                        r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    ))
+                })
+                .map_err(storage("query pair"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            match members.as_slice() {
+                [a, b] => (*a, *b),
+                _ => return Err(ChannelError::NotAMember),
+            }
+        };
+        // One folded log per identifier: the most recent.
+        tx.execute(
+            "DELETE FROM folded_entry WHERE channel = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("drop older folded log"))?;
+        tx.execute(
+            "INSERT INTO folded_entry
+                (channel, instance, seq, kind, account, device, posted, expires_after,
+                 epoch, msg_seq, chain_seq, prev, body_hash, sig, body)
+             SELECT channel, ?2, seq, kind, account, device, posted, expires_after,
+                    epoch, msg_seq, chain_seq, prev, body_hash, sig, body
+             FROM entry WHERE channel = ?1",
+            params![&channel[..], &own[..]],
+        )
+        .map_err(storage("keep folded log"))?;
+        tx.execute(
+            "INSERT INTO folded (channel, instance, into_key, domain, first, second, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (channel) DO UPDATE SET instance = ?2, into_key = ?3,
+                domain = ?4, first = ?5, second = ?6, at = ?7",
+            params![
+                &channel[..],
+                &own[..],
+                into.as_bytes(),
+                domain,
+                first.as_bytes(),
+                second.as_bytes(),
+                now as i64
+            ],
+        )
+        .map_err(storage("record fold"))?;
+        // Retired, as a destroyed direct message's incarnation is (SIP-31):
+        // nothing signed under it is admitted again. `destroy` leaves the
+        // retired set alone, which is its whole purpose.
+        tx.execute(
+            "INSERT OR IGNORE INTO retired_instance (channel, instance) VALUES (?1, ?2)",
+            params![&channel[..], &own[..]],
+        )
+        .map_err(storage("retire folded instance"))?;
+        destroy(&tx, channel)?;
+        tx.commit().map_err(storage("commit fold"))?;
+        Ok((first, second))
+    }
+
+    /// SIP-71: where a folded identifier points, with the domain hint and
+    /// the pair, while the record stands.
+    pub fn folded_into(&self, channel: &[u8; 32]) -> Option<(PubKey, String, PubKey, PubKey)> {
+        let db = self.db.lock().unwrap();
+        folded_row(&db, channel, now_unix())
+    }
+
+    /// SIP-71: standing fold records as origin hints -- where each folded
+    /// identifier's conversation lives, and the two accounts it is between.
+    /// The home task reads these beside the accounts' own hints, which a
+    /// Move replaces and a fold must outlast.
+    pub fn folded_hints(&self) -> Vec<(PubKey, String, Vec<PubKey>)> {
+        let db = self.db.lock().unwrap();
+        let now = now_unix();
+        let Ok(mut stmt) =
+            db.prepare("SELECT into_key, domain, first, second FROM folded WHERE at + ?1 > ?2")
+        else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map(params![FOLDED_SECS as i64, now as i64], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        }) else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(i, d, f, s)| {
+                Some((
+                    PubKey::new(i.try_into().ok()?),
+                    d,
+                    vec![
+                        PubKey::new(f.try_into().ok()?),
+                        PubKey::new(s.try_into().ok()?),
+                    ],
+                ))
+            })
+            .collect()
+    }
+
+    /// SIP-71: the folded log, whole, to either of its two members.
+    /// Anybody else, and an identifier with no standing fold, is answered
+    /// as the channel would have answered them: not found.
+    pub fn folded_log(&self, channel: &[u8; 32], caller: &PubKey) -> Result<Entries, ChannelError> {
+        let db = self.db.lock().unwrap();
+        let now = now_unix();
+        let (_, _, first, second) =
+            folded_row(&db, channel, now).ok_or(ChannelError::NoSuchChannel)?;
+        if *caller != first && *caller != second {
+            return Err(ChannelError::NoSuchChannel);
+        }
+        let mut stmt = db
+            .prepare(
+                "SELECT seq, kind, account, device, posted, expires_after, epoch, msg_seq,
+                        chain_seq, prev, body_hash, sig, body
+                 FROM folded_entry WHERE channel = ?1 ORDER BY seq ASC",
+            )
+            .map_err(storage("prepare folded log"))?;
+        let entries: Vec<Entry> = stmt
+            .query_map(params![&channel[..]], |r| {
+                Ok(Entry {
+                    seq: r.get::<_, i64>(0)? as u64,
+                    kind: r.get::<_, i64>(1)? as u8,
+                    account: PubKey::new(r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32])),
+                    device: PubKey::new(r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 32])),
+                    posted: r.get::<_, i64>(4)? as u64,
+                    expires_after: r.get::<_, i64>(5)? as u32,
+                    epoch: r.get::<_, i64>(6)? as u32,
+                    msg_seq: r.get::<_, i64>(7)? as u64,
+                    chain_seq: r.get::<_, i64>(8)? as u64,
+                    prev: r.get::<_, Vec<u8>>(9)?.try_into().unwrap_or(GENESIS),
+                    body_hash: r.get::<_, Vec<u8>>(10)?.try_into().unwrap_or([0; 32]),
+                    sig: r.get::<_, Vec<u8>>(11)?.try_into().unwrap_or([0; 64]),
+                    body: r.get(12)?,
+                    stamp: None,
+                })
+            })
+            .map_err(storage("query folded log"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage("read folded log"))?;
+        let first_seq = entries.first().map(|e| e.seq).unwrap_or(0);
+        let last_seq = entries.last().map(|e| e.seq).unwrap_or(0);
+        Ok(Entries {
+            now,
+            first: first_seq,
+            last: last_seq,
+            entries,
+            signals: Vec::new(),
+            tip: None,
+        })
+    }
+
     /// SIP-53: an author's stranded entries here.
     pub fn stranded_for(&self, channel: &[u8; 32], account: &PubKey) -> Vec<(u64, u64, Vec<u8>)> {
         let db = self.db.lock().unwrap();
@@ -4034,6 +4322,36 @@ impl Channels {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(storage("begin adopt"))?;
+        // A channel this exchange orders is never adopted over: `INSERT OR
+        // IGNORE` below would keep the row and mark it replicated, and the
+        // origin's entries would land in a log this exchange signed for.
+        // SIP-71 makes the case ordinary -- a direct message ordered here
+        // and at the origin -- and the stray is folded first, not adopted.
+        // A copy already held under another incarnation is a recreation
+        // (SIP-32): what it holds belongs to a channel that no longer exists,
+        // and a position carried across is refused as a broken chain for
+        // good, so it is dropped and taken afresh.
+        let held: Option<(Option<Vec<u8>>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT (SELECT origin FROM replicated WHERE channel = c.id), instance
+                 FROM channel c WHERE id = ?1",
+                params![&channel[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(storage("read adopted channel"))?;
+        match held {
+            Some((None, _)) => return Err(ChannelError::NotAMember),
+            Some((Some(_), held_instance)) if held_instance != instance => {
+                destroy(&tx, channel)?;
+                tx.execute(
+                    "DELETE FROM replicated WHERE channel = ?1",
+                    params![&channel[..]],
+                )
+                .map_err(storage("drop replica row"))?;
+            }
+            _ => {}
+        }
         // **This exchange's own window, not the origin's.** SIP-35 lets a
         // replica hold *more* than the origin does — it pulled entries the
         // origin has since pruned, and outliving that window is half the reason
@@ -6075,6 +6393,67 @@ pub const MAX_TOMBSTONES: usize = 256;
 pub const REHOME_MIN_SECS: u64 = 3600;
 /// SIP-53: stranded entries are kept this long for their authors.
 pub const STRANDED_SECS: u64 = 7 * 24 * 60 * 60;
+/// SIP-71: a fold record and its log are kept this long.
+pub const FOLDED_SECS: u64 = STRANDED_SECS;
+
+/// SIP-71: the two present members of a direct message, lesser first, or
+/// `None` where the channel is not one by SIP-16's arithmetic.
+fn pair_of(db: &Connection, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
+    if !is_direct_message(db, channel).ok()? {
+        return None;
+    }
+    let mut stmt = db
+        .prepare(
+            "SELECT account FROM member WHERE channel = ?1 AND present = 1 ORDER BY account ASC",
+        )
+        .ok()?;
+    let members: Vec<PubKey> = stmt
+        .query_map(params![&channel[..]], |r| {
+            Ok(PubKey::new(
+                r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+            ))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    match members.as_slice() {
+        [a, b] => Some((*a, *b)),
+        _ => None,
+    }
+}
+
+/// SIP-71: the standing fold record for an identifier: where the
+/// conversation lives, its domain hint, and the two members.
+fn folded_row(
+    db: &Connection,
+    channel: &[u8; 32],
+    now: u64,
+) -> Option<(PubKey, String, PubKey, PubKey)> {
+    db.query_row(
+        "SELECT into_key, domain, first, second FROM folded
+         WHERE channel = ?1 AND at + ?2 > ?3",
+        params![&channel[..], FOLDED_SECS as i64, now as i64],
+        |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|(i, d, f, s)| {
+        Some((
+            PubKey::new(i.try_into().ok()?),
+            d,
+            PubKey::new(f.try_into().ok()?),
+            PubKey::new(s.try_into().ok()?),
+        ))
+    })
+}
 
 /// The `replicated` row's origin and domain hint, if this is a replica.
 fn origin_row(db: &Connection, channel: &[u8; 32]) -> Option<(PubKey, String)> {

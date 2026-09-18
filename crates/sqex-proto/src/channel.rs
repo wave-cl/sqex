@@ -114,6 +114,9 @@ pub const TYPE_REHOMED: u8 = 0x1a;
 /// SIP-60: a create for a channel that is to live at another exchange --
 /// a direct message at the lower key's home -- carried there by this one.
 pub const TYPE_CREATE_AT: u8 = 0x22;
+/// SIP-71: read the folded log of a direct message this exchange ended,
+/// a `ByChannel` answered with `Entries` to either member.
+pub const TYPE_FOLDED: u8 = 0x23;
 
 /// SIP-60: `POST /channel/create_at`: `| type = 0x22 | origin[32] | Create |`.
 /// The `Create` is signed under `origin`, as every act made through a copy
