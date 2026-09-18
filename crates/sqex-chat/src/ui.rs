@@ -351,6 +351,12 @@ pub struct App {
     /// somebody mid-sentence into a channel they had not chosen.
     pub selected: Option<[u8; 32]>,
     pub said: Vec<Said>,
+    /// SIP-71: how many rows at the head of `said` are from earlier copies
+    /// of this conversation -- a direct message folded into the one at its
+    /// lower key's home, or a channel rebuilt (SIP-16). Read, kept, shown
+    /// above a divider, and never acted on: their sequence numbers belong
+    /// to channels that no longer exist.
+    pub earlier_rows: usize,
     pub input: String,
     pub trouble: Trouble,
     pub peer_typing: bool,
@@ -1463,9 +1469,20 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
             owners.push(None);
             day = this_day;
         }
+        // SIP-71: where the earlier copies end and the conversation begins.
+        if app.earlier_rows > 0 && i == app.earlier_rows {
+            lines.push(
+                Line::from(Span::styled(
+                    "─── an earlier copy of this conversation ends here; what follows is the one that continues ───",
+                    dim,
+                ))
+                .alignment(Alignment::Center),
+            );
+            owners.push(None);
+        }
         // Where you had got to when you opened this. Above the first message
         // you had not seen, and it stays there while you read past it.
-        if app.divider == Some(s.seq) {
+        if app.divider == Some(s.seq) && i >= app.earlier_rows {
             let n = app.said.len() - i;
             lines.push(
                 Line::from(Span::styled(

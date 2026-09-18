@@ -1004,6 +1004,9 @@ struct Open {
     /// client starting offline folds its own history correctly.
     admins: Vec<PubKey>,
     timeline: Timeline,
+    /// SIP-71: earlier copies of this conversation this client read, oldest
+    /// first -- shown before `timeline` and never merged into it.
+    earlier: Vec<Timeline>,
     /// How many messages we had last time, so a new one can be counted unread
     /// without diffing two timelines.
     timeline_len: usize,
@@ -1174,6 +1177,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             .map_err(ChatError::Store)?;
 
         let timeline = chat.history(&m.channel, &admins).unwrap_or_default();
+        let earlier = chat.earlier(&m.channel, &admins).unwrap_or_default();
         let timeline_len = activity(&timeline);
         let last_at = newest_at(&timeline).unwrap_or(m.joined);
         // The exchange's record of our own read mark. Seeding from it is what
@@ -1187,6 +1191,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             channel: m.channel,
             admins,
             timeline,
+            earlier,
             timeline_len,
             trouble: Trouble::default(),
             note: None,
@@ -1217,6 +1222,7 @@ async fn sync_channels(chat: &mut Chat) -> std::result::Result<Vec<Open>, ChatEr
             channel,
             admins: vec![chat.me, c.account],
             timeline: Timeline::default(),
+            earlier: Vec::new(),
             timeline_len: 0,
             trouble: Trouble::default(),
             note: None,
@@ -1755,6 +1761,13 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             conv.trouble.no_key = got.no_key;
             conv.trouble.gap = got.gap;
             conv.trouble.restarted = got.restarted;
+            if got.restarted {
+                // SIP-71: what was read of the copy that ended is history
+                // now, and is shown as such.
+                conv.earlier = chat
+                    .earlier(&conv.channel, &conv.admins)
+                    .unwrap_or_default();
+            }
             // SIP-31 reports three states and not two, and until now only
             // `Forged` was acted on — the others were classified, folded into
             // the timeline, and never read by anything. A fork in particular
@@ -2037,6 +2050,20 @@ async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: K
     };
     let (seq, mine, redacted, text) = (said.seq, said.mine, said.redacted, said.text.clone());
     let key = said.key.clone();
+    // SIP-71: a row from an earlier copy of the conversation can be read and
+    // moved past, and nothing else: its sequence number names an entry in a
+    // channel that no longer exists.
+    if i < app.earlier_rows
+        && !matches!(
+            code,
+            KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Char('k') | KeyCode::Char('j')
+        )
+    {
+        app.reacting = false;
+        app.trouble.message =
+            Some("that is from an earlier copy of this conversation; it can only be read".into());
+        return;
+    }
 
     if app.reacting {
         match code {
@@ -3745,6 +3772,7 @@ async fn message_account(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, a
         divider: None,
         admins: vec![chat.me, account],
         timeline: Timeline::new(),
+        earlier: Vec::new(),
         timeline_len: 0,
         trouble: Trouble::default(),
         note: None,
@@ -3915,15 +3943,17 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         app.has_avatar = false;
         return;
     };
-    app.said = conv
-        .timeline
-        .messages()
-        // Deliberately not filtered on `is_visible`. A redacted message is a
-        // tombstone, and SIP-16 keeps the entry so that a reader can see
-        // something was removed rather than find a conversation that silently
-        // does not follow. Dropping it here is what made /redact look like it
-        // deleted messages without trace.
-        .map(|m| {
+    // Deliberately not filtered on `is_visible`. A redacted message is a
+    // tombstone, and SIP-16 keeps the entry so that a reader can see
+    // something was removed rather than find a conversation that silently
+    // does not follow. Dropping it here is what made /redact look like it
+    // deleted messages without trace.
+    //
+    // One row-maker for the conversation and for its earlier copies
+    // (SIP-71): a reply's target is looked up in the timeline the message
+    // came from, never across copies.
+    let said_of = |timeline: &Timeline, m: &sqex_proto::timeline::Message| -> Said {
+        {
             // An attachment is described on the line rather than fetched: a
             // transcript should not pull megabytes to draw itself, and the
             // sender's `mime` is a claim this client must not act on beyond
@@ -3980,7 +4010,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 // number: "answering something we cannot see" is the truth,
                 // and dropping the marker would hide that a reply is a reply.
                 reply_to: m.post.reply_to().map(|t| {
-                    let target = conv.timeline.get(t);
+                    let target = timeline.get(t);
                     // Named the same way the author column names anybody, so a
                     // reply carries the key with the name (SIP-21) rather than
                     // a sequence number nobody has memorised.
@@ -4013,8 +4043,17 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                     .collect(),
                 mentions: m.post.mentions().map(short).collect(),
             }
-        })
-        .collect();
+        }
+    };
+    // SIP-71: the earlier copies first, oldest first, and a count of their
+    // rows so the transcript can draw the divider and nothing acts on them.
+    let mut said: Vec<Said> = Vec::new();
+    for t in &conv.earlier {
+        said.extend(t.messages().map(|m| said_of(t, m)));
+    }
+    app.earlier_rows = said.len();
+    said.extend(conv.timeline.messages().map(|m| said_of(&conv.timeline, m)));
+    app.said = said;
     // SIP-36 calls are entries too, and the transcript drew none of them: a
     // call arrived, rang, and left no visible trace whatever. They are folded
     // in here rather than inside `messages()`, which is deliberately only
@@ -4086,8 +4125,11 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
             }
         })
         .collect();
+    // Sorted back into sequence within the conversation that continues; the
+    // earlier copies keep their place above it.
+    let head = app.earlier_rows;
     app.said.extend(calls);
-    app.said.sort_by_key(|s| s.seq);
+    app.said[head..].sort_by_key(|s| s.seq);
     app.peer_typing = conv.typing;
     app.members = conv.members;
     app.topic = conv.timeline.topic.clone();
@@ -4601,6 +4643,7 @@ mod tests {
             members: 2,
             admins: vec![PubKey::new([1; 32]), PubKey::new([peer; 32])],
             timeline: Timeline::new(),
+            earlier: Vec::new(),
             timeline_len: 0,
             marks: Vec::new(),
             marks_at: None,

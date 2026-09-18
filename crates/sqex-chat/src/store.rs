@@ -124,6 +124,24 @@ CREATE TABLE IF NOT EXISTS message (
     sealed  BLOB,
     PRIMARY KEY (exchange, channel, seq)
 );
+-- SIP-71: what this client read of an earlier incarnation of a channel --
+-- a direct message folded into the conversation at the lower key's home,
+-- or one destroyed and rebuilt (SIP-16). Kept, not deleted: SIP-17 forbids
+-- decrypting a counter twice and the exchange serves an epoch key once,
+-- so a message dropped here is one this person can never read again.
+-- `generation` counts the incarnations archived, oldest first. Sealed at
+-- rest like `message`, because this is the plaintext.
+CREATE TABLE IF NOT EXISTS message_history (
+    exchange   BLOB    NOT NULL,
+    channel    BLOB    NOT NULL,
+    generation INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    account    BLOB    NOT NULL,
+    posted     INTEGER NOT NULL,
+    kind       INTEGER NOT NULL,
+    sealed     BLOB,
+    PRIMARY KEY (exchange, channel, generation, seq)
+);
 -- Note for whoever adds a column here next: this store is on people's
 -- machines, so `CREATE TABLE IF NOT EXISTS` is no longer enough. It creates
 -- tables and never alters one that already exists, so a new column needs an
@@ -668,6 +686,7 @@ pub struct Followed {
 const SCOPED: &[(&str, bool)] = &[
     ("channel_key", false),
     ("message", true),
+    ("message_history", true),
     ("entry", true),
     ("timed", true),
     ("asset", true),
@@ -2374,7 +2393,94 @@ impl Store {
         Ok(false)
     }
 
+    /// SIP-71: move what this client read of the incarnation that just
+    /// ended into the channel's history, as its next generation. Called
+    /// before `reset_sequence_space`, which would otherwise delete it.
+    pub fn archive_messages(&self, channel: &[u8; 32]) -> Result<usize> {
+        let scope = self.scope()?;
+        let held: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], scope],
+                |r| r.get(0),
+            )
+            .map_err(storage("count messages"))?;
+        if held == 0 {
+            return Ok(0);
+        }
+        let generation: i64 = self
+            .db
+            .query_row(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM message_history
+                 WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], scope],
+                |r| r.get(0),
+            )
+            .map_err(storage("next generation"))?;
+        let moved = self
+            .db
+            .execute(
+                "INSERT INTO message_history
+                    (exchange, channel, generation, seq, account, posted, kind, sealed)
+                 SELECT exchange, channel, ?3, seq, account, posted, kind, sealed
+                 FROM message WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], scope, generation],
+            )
+            .map_err(storage("archive messages"))?;
+        Ok(moved)
+    }
+
+    /// SIP-71: the archived incarnations of a channel, oldest first, each
+    /// in the shape `messages` answers.
+    #[allow(clippy::type_complexity)]
+    pub fn message_history(
+        &self,
+        channel: &[u8; 32],
+    ) -> Result<Vec<Vec<(u64, PubKey, u64, u8, Option<Vec<u8>>)>>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT generation, seq, account, posted, kind, sealed FROM message_history
+                 WHERE channel = ?1 AND exchange = ?2 ORDER BY generation ASC, seq ASC",
+            )
+            .map_err(storage("prepare history"))?;
+        let rows = stmt
+            .query_map(params![&channel[..], self.scope()?], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    PubKey::new(r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, i64>(4)? as u8,
+                    r.get::<_, Option<Vec<u8>>>(5)?,
+                ))
+            })
+            .map_err(storage("query history"))?;
+        let mut out: Vec<Vec<_>> = Vec::new();
+        let mut current: Option<i64> = None;
+        for row in rows {
+            let (generation, seq, account, posted, kind, sealed) =
+                row.map_err(storage("read history"))?;
+            if current != Some(generation) {
+                out.push(Vec::new());
+                current = Some(generation);
+            }
+            let plain = match sealed {
+                Some(s) => Some(self.unseal_bytes(&s)?),
+                None => None,
+            };
+            out.last_mut()
+                .unwrap()
+                .push((seq, account, posted, kind, plain));
+        }
+        Ok(out)
+    }
+
     pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
+        // SIP-71: what was read of the incarnation that ended is history,
+        // not waste. Archived here, at the one place every reset passes.
+        self.archive_messages(channel)?;
         for sql in [
             "DELETE FROM message WHERE channel = ?1 AND exchange = ?2",
             "DELETE FROM seen WHERE channel = ?1 AND exchange = ?2",
@@ -2881,6 +2987,59 @@ mod tests {
             "{first:?} vs {next:?}"
         );
         s.save_pool(&pool).unwrap();
+    }
+
+    /// SIP-71: a reset keeps what was read as an earlier generation, and a
+    /// second reset a second one, oldest first; the live table starts empty.
+    #[test]
+    fn a_reset_archives_what_was_read() {
+        let s = scoped(&seed(1), None);
+        let channel = [7; 32];
+        for (seq, text) in [(1u64, &b"stray one"[..]), (2, b"stray two")] {
+            s.put_message(
+                &channel,
+                Kept {
+                    seq,
+                    account: key(2),
+                    posted: 100 + seq,
+                    kind: 1,
+                    plain: Some(text),
+                },
+            )
+            .unwrap();
+        }
+        assert!(s.message_history(&channel).unwrap().is_empty());
+        s.reset_sequence_space(&channel).unwrap();
+        assert!(s.messages(&channel).unwrap().is_empty());
+        let history = s.message_history(&channel).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0]
+                .iter()
+                .map(|m| m.4.clone().unwrap())
+                .collect::<Vec<_>>(),
+            [b"stray one".to_vec(), b"stray two".to_vec()]
+        );
+        // The same numbers again, in the next incarnation, collide with
+        // nothing: generations are kept apart.
+        s.put_message(
+            &channel,
+            Kept {
+                seq: 1,
+                account: key(3),
+                posted: 200,
+                kind: 1,
+                plain: Some(b"second one"),
+            },
+        )
+        .unwrap();
+        s.reset_sequence_space(&channel).unwrap();
+        let history = s.message_history(&channel).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1][0].4.as_deref(), Some(&b"second one"[..]));
+        // A reset with nothing read archives nothing.
+        s.reset_sequence_space(&channel).unwrap();
+        assert_eq!(s.message_history(&channel).unwrap().len(), 2);
     }
 
     #[test]

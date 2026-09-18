@@ -2047,30 +2047,61 @@ impl Chat {
                 .entry(*home)
                 .or_insert_with(|| predecessors_of(home));
         }
-        self.create_signed_at(
-            Create {
-                channel,
-                // Both are filled in by `create_signed`, which proposes the
-                // incarnation and signs one action per invitee against it.
-                instance: [0u8; 32],
-                actions: Vec::new(),
-                visibility: Visibility::Private,
-                retention_secs: RETENTION_SECS,
-                max_entries: 0,
-                // A private channel's name is carried sealed (SIP-19); at the
-                // exchange it must be empty, because a membership graph plus a
-                // name says far more than the graph.
-                name: String::new(),
-                topic: String::new(),
-                invites: vec![Invitee {
-                    account: *them,
-                    role: Role::Admin,
-                }],
-            },
-            origin.as_ref().map(|(h, _)| *h),
-        )
-        .await?;
-        if origin.is_some() {
+        let created = self
+            .create_signed_at(
+                Create {
+                    channel,
+                    // Both are filled in by `create_signed`, which proposes the
+                    // incarnation and signs one action per invitee against it.
+                    instance: [0u8; 32],
+                    actions: Vec::new(),
+                    visibility: Visibility::Private,
+                    retention_secs: RETENTION_SECS,
+                    max_entries: 0,
+                    // A private channel's name is carried sealed (SIP-19); at the
+                    // exchange it must be empty, because a membership graph plus a
+                    // name says far more than the graph.
+                    name: String::new(),
+                    topic: String::new(),
+                    invites: vec![Invitee {
+                        account: *them,
+                        role: Role::Admin,
+                    }],
+                },
+                origin.as_ref().map(|(h, _)| *h),
+            )
+            .await;
+        // SIP-71: the identifier was folded here -- the conversation lives
+        // at the lower key's home, and this exchange says so by refusing the
+        // create as a copy refuses a write. Opened there instead, as SIP-60
+        // would have opened it; the copy is read here once it is pulled.
+        let mut wait = origin.is_some();
+        match created {
+            Ok(_) => {}
+            Err(ChatError::Refused(_, r))
+                if r.code == RefusalCode::Replicated && origin.is_none() =>
+            {
+                let home = self.home(&channel).await?;
+                let there = Create {
+                    channel,
+                    instance: [0u8; 32],
+                    actions: Vec::new(),
+                    visibility: Visibility::Private,
+                    retention_secs: RETENTION_SECS,
+                    max_entries: 0,
+                    name: String::new(),
+                    topic: String::new(),
+                    invites: vec![Invitee {
+                        account: *them,
+                        role: Role::Admin,
+                    }],
+                };
+                self.create_signed_at(there, Some(home.origin)).await?;
+                wait = true;
+            }
+            Err(e) => return Err(e),
+        }
+        if wait {
             // The copy arrives once their home has told this exchange and
             // it has pulled; a message opened elsewhere is not readable
             // here until then.
@@ -2536,6 +2567,113 @@ impl Chat {
             self.top_up_prekeys().await?;
         }
         Ok(opened)
+    }
+
+    /// SIP-71: the folded log of a direct message this exchange ended, as
+    /// `/channel/folded` answers it to either member -- `None` where there
+    /// is none, or this client is not one of the two.
+    pub async fn folded_entries(&mut self, channel: &[u8; 32]) -> Result<Option<Entries>> {
+        let body = match self
+            .post(
+                "/channel/folded",
+                ByChannel { channel: *channel }.encode(sqex_proto::channel::TYPE_FOLDED),
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(ChatError::Refused(_, r)) if r.code == RefusalCode::NoSuchChannel => {
+                return Ok(None);
+            }
+            Err(ChatError::Refused(_, r)) if r.code == RefusalCode::NotFound => {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        Entries::decode(&body, false)
+            .map(Some)
+            .map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// SIP-71: before the incarnation this client holds is reset, read what
+    /// it had not yet read of it from the folded log, under the keys still
+    /// held and the incarnation it was signed in -- so what goes to history
+    /// is whole. Best effort: an exchange with no folded log, or a channel
+    /// that was simply rebuilt, has nothing to add.
+    async fn read_folded(
+        &mut self,
+        timeline: &mut Timeline,
+        channel: &[u8; 32],
+        info: &ChannelInfo,
+        known: [u8; 32],
+        admins: &[PubKey],
+    ) {
+        let Ok(Some(folded)) = self.folded_entries(channel).await else {
+            return;
+        };
+        let (since, _, _) = self.store.cursor(channel).unwrap_or_default();
+        let unread: Vec<Entry> = folded
+            .entries
+            .into_iter()
+            .filter(|e| e.seq > since)
+            .collect();
+        if unread.is_empty() {
+            return;
+        }
+        // The stray was ordered by the exchange this client is at, whatever
+        // `/channel/home` says of the identifier now; SIP-53 keeps the
+        // exchanges that ordered a channel before, and this is one.
+        let here = self.exchange;
+        let former = self.former.entry(*channel).or_default();
+        if !former.contains(&here) {
+            former.push(here);
+        }
+        let was = ChannelInfo {
+            instance: known,
+            ..info.clone()
+        };
+        let bound = self.bindings(&members_of(&was)).await.unwrap_or_default();
+        // A failure here loses nothing that was read: the fold below keeps
+        // what the store holds, and the log stays at the exchange.
+        let _ = self.fold_entries(
+            timeline, channel, &was, admins, &bound, &unread, since, false,
+        );
+    }
+
+    /// SIP-71: the earlier incarnations of a channel this client read --
+    /// each folded as `history` folds the current one, oldest first. Shown
+    /// before the conversation, and never merged into it: their sequence
+    /// numbers belong to channels that no longer exist.
+    pub fn earlier(&self, channel: &[u8; 32], admins: &[PubKey]) -> Result<Vec<Timeline>> {
+        let mut out = Vec::new();
+        for generation in self.store.message_history(channel)? {
+            let mut timeline = Timeline::new();
+            for (seq, account, posted, kind, plain) in generation {
+                timeline.apply(
+                    &Received {
+                        seq,
+                        account,
+                        posted,
+                        kind,
+                        verdict: Verdict::Valid,
+                        tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
+                        standing: Standing::Unclaimed,
+                        system: (kind == KIND_SYSTEM)
+                            .then(|| {
+                                plain
+                                    .as_deref()
+                                    .and_then(|p| System::decode(p).ok().flatten())
+                            })
+                            .flatten(),
+                        body: (kind == KIND_MEMBER)
+                            .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
+                            .flatten(),
+                    },
+                    admins,
+                );
+            }
+            out.push(timeline);
+        }
+        Ok(out)
     }
 
     /// Rebuild a conversation from what this client kept.
@@ -5383,10 +5521,80 @@ impl Chat {
         // incarnation that changed under us before we got here. The second is
         // the sharper signal and usually fires first, because it is checked
         // before anything is signed rather than after something is fetched.
-        let restarted = (since > 0 && entries.last > 0 && entries.last < since)
+        // SIP-71 adds the third and plainest: the exchange's `info` names an
+        // incarnation other than the one this store holds -- the copy this
+        // client read replaced by another under the same identifier, a direct
+        // message folded into the conversation at its lower key's home, or
+        // one rebuilt. A conversation longer than what it replaced never
+        // trips the cursor rule, and a reader that signs nothing never trips
+        // the announcement. Asked cheaply: `info` is cached per `POLL_TTL`
+        // and needed below in any case -- and refreshed when anything
+        // arrived, as below, because what arrived may be the first of the
+        // new incarnation and must not be opened under the old one's keys.
+        let arrived = !entries.entries.is_empty();
+        let mut fresh = false;
+        let mut told = match self.told_about.get(channel) {
+            Some((info, at)) if !arrived && at.elapsed() < POLL_TTL => info.clone(),
+            _ => {
+                fresh = true;
+                let info = self.info(channel).await?;
+                self.told_about
+                    .insert(*channel, (info.clone(), std::time::Instant::now()));
+                info
+            }
+        };
+        let known = self.store.incarnation(channel)?;
+        let differs = |told: &ChannelInfo| {
+            told.instance != [0u8; 32] && known.is_some_and(|k| k != told.instance)
+        };
+        let restarted = differs(&told)
+            || (since > 0 && entries.last > 0 && entries.last < since)
             || self.store.take_announcement(channel)?;
         if restarted {
+            // Whichever rule fired, the incarnation recorded below must be
+            // the one the exchange serves *now*, or the next poll finds it
+            // changed again and resets a second time -- taking with it a key
+            // collected in between, which the exchange serves once.
+            if !fresh {
+                told = self.info(channel).await?;
+                self.told_about
+                    .insert(*channel, (told.clone(), std::time::Instant::now()));
+            }
+            let changed = differs(&told);
+            // SIP-71: what was read of the incarnation that ended is kept
+            // (the reset archives it), and what was not yet read is read
+            // first, under the keys still held, so the history is whole.
+            if let Some(known) = known {
+                let admins: Vec<PubKey> = told
+                    .members
+                    .iter()
+                    .filter(|m| m.role == Role::Admin)
+                    .map(|m| m.account)
+                    .collect();
+                self.read_folded(timeline, channel, &told, known, &admins)
+                    .await;
+            }
             self.store.reset_sequence_space(channel)?;
+            if told.instance != [0u8; 32] {
+                self.store.set_incarnation(channel, &told.instance, false)?;
+            }
+            if changed {
+                // Where it lives may have changed with it -- a folded
+                // identifier's conversation is ordered elsewhere -- and the
+                // answer cached on this connection is the old one. Asked
+                // again; the exchange that ordered the copy that ended
+                // joins the keys the log may verify under (SIP-53).
+                let was = self.exchange_of(channel);
+                self.homes.remove(channel);
+                if let Ok(home) = self.home(channel).await
+                    && home.origin != was
+                {
+                    let former = self.former.entry(*channel).or_default();
+                    if !former.contains(&was) {
+                        former.push(was);
+                    }
+                }
+            }
             // The caller's fold goes too. Every message in it is filed under a
             // sequence number that now belongs to a different channel, so
             // keeping it would merge two conversations — and where the numbers
@@ -5433,7 +5641,7 @@ impl Chat {
         // told has gone stale: see `POLL_TTL`. A poll that fetched no entries
         // has nothing to attribute and nothing to fold, and the membership it
         // would be asking about cannot have moved without an entry saying so.
-        let arrived = !entries.entries.is_empty();
+        let arrived = arrived || !entries.entries.is_empty();
         let mut info = match self.told_about.get(channel) {
             Some((info, at)) if !arrived && at.elapsed() < POLL_TTL => info.clone(),
             _ => {
