@@ -41,6 +41,7 @@ mod device_flow;
 mod forgetting_flow;
 mod handover_flow;
 mod lineage_flow;
+mod mail_home_flow;
 mod mailbox_flow;
 mod migration_flow;
 mod moving_flow;

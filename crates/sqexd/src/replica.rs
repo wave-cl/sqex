@@ -625,6 +625,60 @@ pub async fn pull_once_from(
 /// covers and this replica cannot recover from it. Until answered the row
 /// reads as private and unnamed; an origin from before SIP-43 refuses the
 /// route, and the row stays so.
+/// SIP-68: collect `account`'s waiting mail at `origin` into this
+/// exchange's mailbox, as the origin observed it, and tell the origin
+/// what was stored. The hint is marked collected only on an answer; a
+/// refusal or a failure leaves it for the next cycle. What the quota
+/// here would not take is left where it was.
+async fn collect_mail(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    origin: &PubKey,
+    account: &PubKey,
+) {
+    let ask = sqex_proto::peer::PullMail { account: *account };
+    let mail = match client.post("/peer/mailbox", ask.encode()).await {
+        Ok((200, body)) => match sqex_proto::peer::Mail::decode(&body) {
+            Ok(m) => m,
+            Err(_) => return,
+        },
+        Ok((code, _)) => {
+            tracing::debug!(%origin, %account, code, "the origin did not answer a mail pull");
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(%origin, %account, error = %e, "a mail pull failed");
+            return;
+        }
+    };
+    let mut took = Vec::new();
+    let mut stored = 0usize;
+    for item in &mail.items {
+        match server.mailbox.deliver(*account, origin, item) {
+            Ok(true) => {
+                stored += 1;
+                took.push(item.id);
+            }
+            Ok(false) => took.push(item.id),
+            Err(_) => break,
+        }
+    }
+    let all = took.len() == mail.items.len();
+    if !took.is_empty() {
+        let ack = sqex_proto::peer::TookMail {
+            account: *account,
+            ids: took,
+        };
+        let _ = client.post("/peer/mailbox/took", ack.encode()).await;
+    }
+    if all {
+        server.devices.mark_mail_collected(account, origin);
+    }
+    if stored > 0 {
+        tracing::info!(%origin, %account, stored, "collected an account's mail from its former home (SIP-68)");
+    }
+}
+
 /// SIP-64: ask the origin for its lineage, verify it back from the key
 /// this replica holds (and the domain, where it holds one), and keep the
 /// predecessors with the origin. An origin from before SIP-64 answers
@@ -1386,6 +1440,12 @@ pub async fn run_homed(
         )
         .await;
         let me = server.public_key;
+        let pending_mail: std::collections::HashSet<(PubKey, PubKey)> = server
+            .devices
+            .mail_pending(&me)
+            .into_iter()
+            .map(|(a, o, _)| (a, o))
+            .collect();
         for (origin, domain, accounts) in server.devices.homed_here(&me) {
             if origin == me {
                 continue;
@@ -1451,6 +1511,10 @@ pub async fn run_homed(
                         tracing::warn!(origin = %origin, error = %e, "a mine pull failed");
                         break;
                     }
+                }
+                // SIP-68: the account's mail waiting at this origin, once.
+                if pending_mail.contains(&(*account, origin)) {
+                    collect_mail(&mut client, &server, &origin, account).await;
                 }
             }
             if channels.is_empty() {

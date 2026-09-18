@@ -90,6 +90,9 @@ struct Inner {
     messages: HashMap<u64, Message>,
     /// Waiting message ids per recipient, oldest first — the queue.
     queues: HashMap<PubKey, Vec<u64>>,
+    /// SIP-68: `(origin, id there, recipient)` of every item collected from
+    /// a former home, so a pull answered twice stores nothing twice.
+    collected_from: std::collections::HashSet<(PubKey, u64, PubKey)>,
 }
 
 /// Every message the exchange is holding.
@@ -142,6 +145,76 @@ impl Mailbox {
             },
         );
         Ok((id, now))
+    }
+
+    /// SIP-68: every item waiting for `recipient`, oldest first, as the
+    /// home collects it -- what this exchange observed, and the sealed
+    /// payload. Nothing is removed by asking.
+    pub fn waiting_for(&self, recipient: &PubKey) -> Vec<sqex_proto::peer::MailItem> {
+        let now = now_unix();
+        let mut inner = self.inner.lock().unwrap();
+        inner.expire(now);
+        let ids: Vec<u64> = inner.queues.get(recipient).cloned().unwrap_or_default();
+        ids.iter()
+            .filter_map(|id| inner.messages.get(id))
+            .filter_map(|m| {
+                Some(sqex_proto::peer::MailItem {
+                    id: m.id,
+                    sender: m.sender,
+                    received: m.received,
+                    sealed: m.sealed.clone()?,
+                })
+            })
+            .collect()
+    }
+
+    /// SIP-68: store an item collected from `origin` for `recipient` as the
+    /// former home observed it -- its sender and time kept -- once per
+    /// `(origin, id)`. `Ok(true)` stored, `Ok(false)` already held, `Err`
+    /// over the recipient's quota.
+    pub fn deliver(
+        &self,
+        recipient: PubKey,
+        origin: &PubKey,
+        item: &sqex_proto::peer::MailItem,
+    ) -> Result<bool, SendError> {
+        let now = now_unix();
+        let mut inner = self.inner.lock().unwrap();
+        inner.expire(now);
+        if inner
+            .collected_from
+            .contains(&(*origin, item.id, recipient))
+        {
+            return Ok(false);
+        }
+        let queued: Vec<u64> = inner.queues.get(&recipient).cloned().unwrap_or_default();
+        if queued.len() >= MAX_MESSAGES {
+            return Err(SendError::TooManyMessages);
+        }
+        let waiting: usize = queued
+            .iter()
+            .filter_map(|id| inner.messages.get(id))
+            .map(Message::len)
+            .sum();
+        if waiting + item.sealed.ciphertext.len() > MAX_BYTES {
+            return Err(SendError::QuotaExceeded);
+        }
+        inner.next_id += 1;
+        let id = inner.next_id;
+        inner.queues.entry(recipient).or_default().push(id);
+        inner.messages.insert(
+            id,
+            Message {
+                id,
+                sender: item.sender,
+                recipient,
+                received: item.received,
+                sealed: Some(item.sealed.clone()),
+                collected: None,
+            },
+        );
+        inner.collected_from.insert((*origin, item.id, recipient));
+        Ok(true)
     }
 
     /// The messages waiting for `recipient`, oldest first.

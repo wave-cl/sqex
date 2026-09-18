@@ -227,6 +227,13 @@ impl Registry {
         // The account's own signed withdrawal, where there is one. A
         // device-initiated revocation is legitimate and local, and stores none.
         add_column(&db, "revoked", "revocation", "BLOB NOT NULL DEFAULT x''")?;
+        // SIP-68: whether the account's mail at this origin was collected.
+        add_column(
+            &db,
+            "home_origin",
+            "mail_collected",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Registry { db: Mutex::new(db) })
     }
 
@@ -1096,6 +1103,50 @@ impl Registry {
             params![account.as_bytes(), origin.as_bytes(), domain],
         )
         .is_ok()
+    }
+
+    /// SIP-68: the (account, origin, domain) hints of accounts homed here
+    /// whose mail at that origin has not been collected yet.
+    pub fn mail_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey, String)> {
+        let db = self.db.lock().unwrap();
+        db.prepare(
+            "SELECT o.account, o.origin, o.domain FROM home_origin o
+             JOIN home h ON h.account = o.account
+             WHERE h.home = ?1 AND o.mail_collected = 0",
+        )
+        .ok()
+        .and_then(|mut st| {
+            st.query_map(params![me.as_bytes()], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .ok()
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .filter_map(|(a, o, d)| {
+                        Some((
+                            PubKey::new(a.try_into().ok()?),
+                            PubKey::new(o.try_into().ok()?),
+                            d,
+                        ))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+    }
+
+    /// SIP-68: the account's mail at `origin` has been collected (or the
+    /// origin answered it holds none).
+    pub fn mark_mail_collected(&self, account: &PubKey, origin: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE home_origin SET mail_collected = 1 WHERE account = ?1 AND origin = ?2",
+            params![account.as_bytes(), origin.as_bytes()],
+        );
     }
 
     /// SIP-59: the accounts whose home on record is `peer`.

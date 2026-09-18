@@ -415,6 +415,19 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("Server::tell_home"),
         ReplicationPeer,
     ),
+    // SIP-68: the account's home collects its mail here, on the Move.
+    (
+        "POST",
+        "/peer/mailbox",
+        Peer("replica::collect_mail"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/mailbox/took",
+        Peer("replica::collect_mail"),
+        ReplicationPeer,
+    ),
     // SIP-48: the account's sealed backup. Written by its devices; read by
     // them, or by the account that succeeded it.
     ("POST", "/backup/write", Chat("Chat::backup"), SelfOnly),

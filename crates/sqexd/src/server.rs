@@ -67,7 +67,7 @@ use sqex_proto::name;
 use sqex_proto::peer::{
     Carried, Changed, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi,
     Mine, PEER_VERSION, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBlob,
-    PullEnvelopes, PullMine, PullRecord, PullShape, PullStanding,
+    PullEnvelopes, PullMail, PullMine, PullRecord, PullShape, PullStanding, TookMail,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -264,7 +264,7 @@ pub struct Server {
     /// exchange *saw*, and a resolution carries both so a consumer can tell
     /// them apart.
     endpoints: Endpoints,
-    mailbox: Mailbox,
+    pub(crate) mailbox: Mailbox,
     pub(crate) rooms: Rooms,
     channels: Channels,
     prekeys: Prekeys,
@@ -3881,6 +3881,49 @@ async fn route(
                         channels: server.channels.ordered_with(&req.account),
                     }
                     .encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
+        // SIP-68: the account's home collects its waiting mail here -- the
+        // home by the account's own Move, and nobody else: an operator's
+        // `for` list confers no mailbox. Nothing is removed by asking;
+        // `/peer/mailbox/took` names what the home stored.
+        ("POST", "/peer/mailbox") => match (peer.identity, PullMail::decode(body)) {
+            (Some(who), Ok(req))
+                if server.peering(&who).is_some()
+                    && server
+                        .devices
+                        .home_of(&req.account)
+                        .is_some_and(|(h, _, _)| h == who) =>
+            {
+                (
+                    200,
+                    "application/octet-stream",
+                    sqex_proto::peer::Mail {
+                        now: now_unix(),
+                        items: server.mailbox.waiting_for(&req.account),
+                    }
+                    .encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
+        ("POST", "/peer/mailbox/took") => match (peer.identity, TookMail::decode(body)) {
+            (Some(who), Ok(req))
+                if server.peering(&who).is_some()
+                    && server
+                        .devices
+                        .home_of(&req.account)
+                        .is_some_and(|(h, _, _)| h == who) =>
+            {
+                for id in &req.ids {
+                    server.mailbox.delete(&req.account, *id);
+                }
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
                 )
             }
             _ => peering_refused(),

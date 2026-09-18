@@ -300,6 +300,167 @@ impl Pulled {
     }
 }
 
+/// SIP-68: the home collects an account's waiting mail at its former home.
+pub const TYPE_PULL_MAIL: u8 = 0x12;
+/// SIP-68: the ids the home stored, for the former home to delete.
+pub const TYPE_TOOK_MAIL: u8 = 0x13;
+
+/// `POST /peer/mailbox`: `| type=0x12 | account[32] |`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullMail {
+    pub account: PubKey,
+}
+
+impl PullMail {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_PULL_MAIL);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullMail> {
+        if b.len() != 33 || b[0] != TYPE_PULL_MAIL {
+            return Err(Error::Malformed("not a mail pull".into()));
+        }
+        Ok(PullMail {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// One waiting item as the former home holds it: what it observed, and
+/// the sealed payload it cannot read.
+/// `| id: u64 | sender[32] | received: u64 | ephemeral[32] | len: u32 | ciphertext |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailItem {
+    pub id: u64,
+    pub sender: PubKey,
+    pub received: u64,
+    pub sealed: crate::mailbox::Sealed,
+}
+
+/// The answer to a mail pull: `| now: u64 | count: u8 | count × MailItem |`,
+/// oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mail {
+    pub now: u64,
+    pub items: Vec<MailItem>,
+}
+
+impl Mail {
+    pub fn encode(&self) -> Vec<u8> {
+        let n = self.items.len().min(crate::mailbox::MAX_MESSAGES);
+        let mut out = Vec::with_capacity(9 + n * 100);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.push(n as u8);
+        for i in &self.items[..n] {
+            out.extend_from_slice(&i.id.to_be_bytes());
+            out.extend_from_slice(i.sender.as_bytes());
+            out.extend_from_slice(&i.received.to_be_bytes());
+            out.extend_from_slice(&i.sealed.ephemeral);
+            out.extend_from_slice(&(i.sealed.ciphertext.len() as u32).to_be_bytes());
+            out.extend_from_slice(&i.sealed.ciphertext);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Mail> {
+        let short = || Error::Malformed("mail cut short".into());
+        let now = u64::from_be_bytes(b.get(0..8).ok_or_else(short)?.try_into().unwrap());
+        let n = *b.get(8).ok_or_else(short)? as usize;
+        if n > crate::mailbox::MAX_MESSAGES {
+            return Err(Error::Malformed(format!(
+                "mail carries at most {} items, not {n}",
+                crate::mailbox::MAX_MESSAGES
+            )));
+        }
+        let mut at = 9;
+        let mut items = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = u64::from_be_bytes(b.get(at..at + 8).ok_or_else(short)?.try_into().unwrap());
+            let sender = PubKey::new(
+                b.get(at + 8..at + 40)
+                    .ok_or_else(short)?
+                    .try_into()
+                    .unwrap(),
+            );
+            let received = u64::from_be_bytes(
+                b.get(at + 40..at + 48)
+                    .ok_or_else(short)?
+                    .try_into()
+                    .unwrap(),
+            );
+            let ephemeral: [u8; 32] = b
+                .get(at + 48..at + 80)
+                .ok_or_else(short)?
+                .try_into()
+                .unwrap();
+            let len = u32::from_be_bytes(
+                b.get(at + 80..at + 84)
+                    .ok_or_else(short)?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            if len > crate::mailbox::MAX_PLAINTEXT + 64 {
+                return Err(Error::Malformed("a mail item is too long".into()));
+            }
+            let ciphertext = b.get(at + 84..at + 84 + len).ok_or_else(short)?.to_vec();
+            at += 84 + len;
+            items.push(MailItem {
+                id,
+                sender,
+                received,
+                sealed: crate::mailbox::Sealed {
+                    ephemeral,
+                    ciphertext,
+                },
+            });
+        }
+        if at != b.len() {
+            return Err(Error::Malformed("trailing bytes after mail".into()));
+        }
+        Ok(Mail { now, items })
+    }
+}
+
+/// `POST /peer/mailbox/took`: `| type=0x13 | account[32] | count: u8 | count × id: u64 |`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TookMail {
+    pub account: PubKey,
+    pub ids: Vec<u64>,
+}
+
+impl TookMail {
+    pub fn encode(&self) -> Vec<u8> {
+        let n = self.ids.len().min(crate::mailbox::MAX_MESSAGES);
+        let mut out = Vec::with_capacity(34 + n * 8);
+        out.push(TYPE_TOOK_MAIL);
+        out.extend_from_slice(self.account.as_bytes());
+        out.push(n as u8);
+        for id in &self.ids[..n] {
+            out.extend_from_slice(&id.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<TookMail> {
+        let short = || Error::Malformed("took mail cut short".into());
+        if b.first() != Some(&TYPE_TOOK_MAIL) {
+            return Err(Error::Malformed("not a took mail".into()));
+        }
+        let account = PubKey::new(b.get(1..33).ok_or_else(short)?.try_into().unwrap());
+        let n = *b.get(33).ok_or_else(short)? as usize;
+        if b.len() != 34 + n * 8 {
+            return Err(short());
+        }
+        let ids = (0..n)
+            .map(|i| u64::from_be_bytes(b[34 + i * 8..42 + i * 8].try_into().unwrap()))
+            .collect();
+        Ok(TookMail { account, ids })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,5 +1755,46 @@ mod wait_tests {
         };
         assert_eq!(Changed::decode(&c.encode()).unwrap(), c);
         assert!(Changed::decode(&c.encode()[..20]).is_err());
+    }
+
+    #[test]
+    fn mail_pulls_and_takings_round_trip() {
+        let account = PubKey::new([5u8; 32]);
+        let p = PullMail { account };
+        assert_eq!(PullMail::decode(&p.encode()).unwrap(), p);
+        let m = Mail {
+            now: 7,
+            items: vec![MailItem {
+                id: 3,
+                sender: PubKey::new([6u8; 32]),
+                received: 9,
+                sealed: crate::mailbox::Sealed {
+                    ephemeral: [1u8; 32],
+                    ciphertext: vec![4, 5, 6],
+                },
+            }],
+        };
+        assert_eq!(Mail::decode(&m.encode()).unwrap(), m);
+        assert_eq!(
+            Mail::decode(
+                &Mail {
+                    now: 1,
+                    items: vec![]
+                }
+                .encode()
+            )
+            .unwrap()
+            .items
+            .len(),
+            0
+        );
+        let t = TookMail {
+            account,
+            ids: vec![3, 9],
+        };
+        assert_eq!(TookMail::decode(&t.encode()).unwrap(), t);
+        let mut cut = m.encode();
+        cut.truncate(cut.len() - 1);
+        assert!(Mail::decode(&cut).is_err());
     }
 }
