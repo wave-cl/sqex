@@ -57,7 +57,12 @@ fn who(b: u8) -> ([u8; 32], PubKey) {
 async fn ask(c: &mut Client, peer: PubKey, wait_secs: u16) -> (u16, Vec<u8>) {
     c.post(
         "/rendezvous/introduce",
-        Introduce { peer, wait_secs }.encode(),
+        Introduce {
+            peer,
+            wait_secs,
+            family_aware: true,
+        }
+        .encode(),
     )
     .await
     .unwrap()
@@ -79,7 +84,7 @@ async fn one_side_asking_discloses_nothing_at_all() {
     let (code, body) = ask(&mut a, bob, 0).await;
     assert_eq!(code, 200, "{}", common::said(&body));
     let got = Introduced::decode(&body).unwrap();
-    assert!(!got.ready);
+    assert!(!got.is_ready());
     assert!(
         got.addr.is_none(),
         "an address was disclosed to one side alone"
@@ -96,7 +101,7 @@ async fn one_side_asking_discloses_nothing_at_all() {
     // not asked yet" versus "there is no such identity" would be probing.
     for _ in 0..3 {
         let (_, body) = ask(&mut a, bob, 0).await;
-        assert!(!Introduced::decode(&body).unwrap().ready);
+        assert!(!Introduced::decode(&body).unwrap().is_ready());
     }
 }
 
@@ -117,12 +122,15 @@ async fn both_asking_completes_the_pair_with_one_start_for_both() {
         .unwrap();
 
     let (_, first) = ask(&mut a, bob, 0).await;
-    assert!(!Introduced::decode(&first).unwrap().ready);
+    assert!(!Introduced::decode(&first).unwrap().is_ready());
 
     let (code, body) = ask(&mut b, alice, 0).await;
     assert_eq!(code, 200, "{}", common::said(&body));
     let for_bob = Introduced::decode(&body).unwrap();
-    assert!(for_bob.ready, "the second ask did not complete the pair");
+    assert!(
+        for_bob.is_ready(),
+        "the second ask did not complete the pair"
+    );
     let alice_at = for_bob.addr.expect("no address for the peer");
 
     // **More than a second later**, deliberately. Alice's answer must carry the
@@ -135,7 +143,7 @@ async fn both_asking_completes_the_pair_with_one_start_for_both() {
     // Alice asks again and is told about Bob.
     let (_, body) = ask(&mut a, bob, 0).await;
     let for_alice = Introduced::decode(&body).unwrap();
-    assert!(for_alice.ready);
+    assert!(for_alice.is_ready());
     let bob_at = for_alice.addr.expect("no address for the peer");
 
     // Both are loopback, and both are the addresses the exchange saw — the
@@ -193,10 +201,10 @@ async fn the_first_to_ask_waits_and_is_woken_by_the_second() {
     // wait, short enough that a ten second timeout is not what ends it.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let (_, body) = ask(&mut b, alice, 0).await;
-    assert!(Introduced::decode(&body).unwrap().ready);
+    assert!(Introduced::decode(&body).unwrap().is_ready());
 
     let (got, waited) = waiting.await.unwrap();
-    assert!(got.ready, "the waiting side was not woken: {got:?}");
+    assert!(got.is_ready(), "the waiting side was not woken: {got:?}");
     assert!(
         waited < Duration::from_secs(5),
         "the waiting side was not woken by the second ask, it timed out: {waited:?}"
@@ -222,7 +230,7 @@ async fn a_wait_that_nobody_joins_ends_saying_nothing() {
     let (code, body) = ask(&mut a, nobody, 1).await;
     assert_eq!(code, 200);
     let got = Introduced::decode(&body).unwrap();
-    assert!(!got.ready);
+    assert!(!got.is_ready());
     assert!(got.addr.is_none());
     assert!(
         started.elapsed() >= Duration::from_millis(900),
@@ -245,7 +253,7 @@ async fn an_identity_cannot_introduce_itself_to_itself() {
     let (code, body) = ask(&mut a, alice, 0).await;
     assert_eq!(code, 200);
     assert!(
-        !Introduced::decode(&body).unwrap().ready,
+        !Introduced::decode(&body).unwrap().is_ready(),
         "an identity was introduced to itself"
     );
 }
@@ -309,6 +317,7 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
             Introduce {
                 peer: bob,
                 wait_secs: 0,
+                family_aware: true,
             }
             .encode(),
         )
@@ -321,6 +330,7 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
             Introduce {
                 peer: alice,
                 wait_secs: 0,
+                family_aware: true,
             }
             .encode(),
         )
@@ -328,7 +338,7 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
         .unwrap();
     assert_eq!(code, 200);
     let for_bob = Introduced::decode(&body).unwrap();
-    assert!(for_bob.ready);
+    assert!(for_bob.is_ready());
 
     // **The address the exchange observed is the port Alice chose.** Without
     // that, everything below would be dialling somewhere nobody is listening.

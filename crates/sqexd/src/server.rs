@@ -73,7 +73,7 @@ use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
     Block as ProfileBlock, ByAccount, Put as ProfilePut, TYPE_GET as PR_GET,
 };
-use sqex_proto::rendezvous::Introduce;
+use sqex_proto::rendezvous::{Answer, Introduce, Introduced};
 use sqex_proto::resolve::{
     Publish as ResolvePublish, Resolve as ResolveGet, Successor as ResolveSuccessor,
 };
@@ -2105,10 +2105,23 @@ async fn route(
                 // Recorded with the observed address first, so a wait that
                 // finds the pair already complete answers from real data.
                 let first = server.rendezvous.request(&me, peer.addr, &req.peer);
-                let out = if first.ready || req.wait_secs == 0 {
+                let settled = !matches!(first.answer, Answer::Waiting);
+                let out = if settled || req.wait_secs == 0 {
                     first
                 } else {
-                    server.rendezvous.wait(&me, &req.peer, req.wait_secs).await
+                    server
+                        .rendezvous
+                        .wait(&me, peer.addr, &req.peer, req.wait_secs)
+                        .await
+                };
+                // SIP-69: a caller that sent SIP-25's type byte is never told
+                // the two share no family. It receives the same waiting it
+                // would have had if the peer had not asked -- which is what it
+                // already knows how to read, and discloses no more than SIP-25
+                // ever did.
+                let out = match out.answer {
+                    Answer::NoSharedFamily if !req.family_aware => Introduced::waiting(out.now),
+                    _ => out,
                 };
                 (200, "application/octet-stream", out.encode())
             }

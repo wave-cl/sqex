@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::h3::H3Client;
-use crate::rendezvous::{Introduce, Introduced, MAX_WAIT};
+use crate::rendezvous::{Answer, Introduce, Introduced, MAX_WAIT};
 use crate::session::Session;
 use sqnr_core::PubKey;
 
@@ -75,6 +75,14 @@ pub const UNREACHABLE: &str = "no direct connection: this needs endpoint-indepen
                                mapping at both ends, and symmetric NAT allocates a fresh \
                                external port per destination";
 
+/// SIP-69: said instead of [`UNREACHABLE`] when the two never had a path to
+/// try. The distinction is the point -- one is a punch that failed and the
+/// other is a punch that could not be attempted, and blaming the NAT for the
+/// second sends whoever reads it to look in the wrong place.
+pub const NO_SHARED_FAMILY: &str = "no direct connection: the two of you reached the exchange \
+                                    on different address families, so neither was given an \
+                                    address it could dial. This is the network, not the NAT";
+
 /// A local port this process can hold and then hand to squic, in the same
 /// address family as `reach`.
 ///
@@ -100,24 +108,51 @@ fn pick_local_port(reach: SocketAddr) -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
+/// What came of asking to be introduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Meeting {
+    /// Both asked, on a family they share, and here is the address.
+    Introduced(Introduction),
+    /// The wait ended without the peer asking. Nothing is said about whether
+    /// they asked at all, which is SIP-25's rule, and nothing was disclosed.
+    NobodyAsked,
+    /// SIP-69: both asked, and the two are on networks with no address family
+    /// in common, so neither could dial the other. Told by the exchange, or
+    /// found here when an exchange that predates SIP-69 discloses an address
+    /// this side has no route to.
+    NoSharedFamily,
+}
+
+/// SIP-69: whether an address the exchange disclosed is one this side could
+/// dial from the port it asked over.
+///
+/// **Checked whatever the exchange said.** An exchange is not the authority
+/// on what this machine's network can reach, and one that predates SIP-69
+/// pairs on identity alone -- it will hand over an address of any family.
+/// Dialling one there is no route to fails inside the transport, which
+/// reports it as a punch that did not work and sends whoever reads that to
+/// look at a NAT which was never the problem.
+fn dialable_from(ours: SocketAddr, theirs: SocketAddr) -> bool {
+    ours.is_ipv6() == theirs.is_ipv6()
+}
+
 /// Ask the exchange to introduce us to `peer`, from a port of our own.
 ///
-/// `Ok(None)` when the wait ended without the peer asking: nothing is said
-/// about whether they asked at all, which is SIP-25's rule, and nothing has
-/// been disclosed. Sleeps out the lead before returning, so the caller may
-/// go straight on to [`link`].
+/// Sleeps out the lead before returning [`Meeting::Introduced`], so the caller
+/// may go straight on to [`link`].
 pub async fn introduce(
     exchange: SocketAddr,
     server: &[u8; 32],
     seed: &[u8; 32],
     peer: PubKey,
     wait: u16,
-) -> Result<Option<Introduction>, String> {
+) -> Result<Meeting, String> {
     let ours = pick_local_port(exchange)?;
     let mut client = H3Client::connect_from(exchange, server, seed, Some(ours)).await?;
     let req = Introduce {
         peer,
         wait_secs: wait.min(MAX_WAIT),
+        family_aware: true,
     };
     // A long poll, by design.
     let (code, body) = client
@@ -135,16 +170,21 @@ pub async fn introduce(
     // is what actually lets the socket go; the pause is for the kernel to
     // agree.
     drop(client);
-    if !got.ready {
-        return Ok(None);
+    match got.answer {
+        Answer::Waiting => return Ok(Meeting::NobodyAsked),
+        Answer::NoSharedFamily => return Ok(Meeting::NoSharedFamily),
+        Answer::Ready => {}
     }
     let theirs = got.addr.ok_or("an introduction with no address")?;
+    if !dialable_from(ours, theirs) {
+        return Ok(Meeting::NoSharedFamily);
+    }
     // Measured as a delay from the exchange's own clock rather than as an
     // absolute time on ours, because the three clocks do not agree and only
     // one of them is shared.
     let lead = Duration::from_secs(got.start_at.saturating_sub(got.now));
     tokio::time::sleep(lead.max(Duration::from_millis(200))).await;
-    Ok(Some(Introduction { ours, theirs, lead }))
+    Ok(Meeting::Introduced(Introduction { ours, theirs, lead }))
 }
 
 /// Whether this side dials: lower key dials, higher key listens. The
@@ -297,6 +337,18 @@ mod tests {
         assert!(dials(&a, &b));
         assert!(!dials(&b, &a));
         assert!(!dials(&a, &a));
+    }
+
+    /// SIP-69: an address of the other family is not one this side can dial,
+    /// whatever the exchange said about it.
+    #[test]
+    fn an_address_of_the_other_family_is_not_dialable() {
+        let v4: SocketAddr = "203.0.113.7:5400".parse().unwrap();
+        let v6: SocketAddr = "[2a02:8084:d05:2a80::1]:52555".parse().unwrap();
+        assert!(dialable_from(v4, v4));
+        assert!(dialable_from(v6, v6));
+        assert!(!dialable_from(v4, v6), "this is the live run's failure");
+        assert!(!dialable_from(v6, v4));
     }
 
     /// The local port matches the family of what it will reach: an IPv4

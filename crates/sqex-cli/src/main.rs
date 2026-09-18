@@ -1217,13 +1217,21 @@ async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> 
     let me = PubKey::new(signer.public());
 
     // The request is a long poll and may sit for `wait` seconds by design.
-    let Some(intro) =
-        direct::introduce(addr, server.as_bytes(), &signer.seed(), them, wait).await?
-    else {
-        // Deliberately says nothing about whether they asked. That would be a
-        // signal about somebody who has not consented.
-        println!("no introduction: both sides must ask, and this one has not completed");
-        return Ok(());
+    let intro = match direct::introduce(addr, server.as_bytes(), &signer.seed(), them, wait).await?
+    {
+        direct::Meeting::Introduced(intro) => intro,
+        direct::Meeting::NobodyAsked => {
+            // Deliberately says nothing about whether they asked. That would be
+            // a signal about somebody who has not consented.
+            println!("no introduction: both sides must ask, and this one has not completed");
+            return Ok(());
+        }
+        // SIP-69. Both asked, so saying so discloses nothing that being
+        // introduced would not have.
+        direct::Meeting::NoSharedFamily => {
+            println!("no introduction: {}", direct::NO_SHARED_FAMILY);
+            return Ok(());
+        }
     };
     println!("{them} was seen at {}", intro.theirs);
     println!(

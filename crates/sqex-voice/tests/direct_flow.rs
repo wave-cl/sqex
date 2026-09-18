@@ -102,10 +102,10 @@ async fn two_peers_introduced_by_an_exchange_call_each_other_directly() {
     let (mut a_report, mut b_report) = (Recorder::default(), Recorder::default());
 
     let a = async {
-        let got = direct::connect(endpoint, &a_signer.seed(), b_id, quick(), &mut a_report)
-            .await?
-            .ok_or("A was not introduced")?;
-        let (conn, session, id) = got;
+        let (conn, session, id) =
+            direct::connect(endpoint, &a_signer.seed(), b_id, quick(), &mut a_report)
+                .await?
+                .ok_or("A was not introduced")?;
         assert_eq!(id, DIRECT_SESSION);
         assert!(
             conn.max_datagram_size().is_some(),
@@ -114,10 +114,10 @@ async fn two_peers_introduced_by_an_exchange_call_each_other_directly() {
         engine::call(conn, session, id, tone_call(&a_wav, 1), &mut a_report).await
     };
     let b = async {
-        let got = direct::connect(endpoint, &b_signer.seed(), a_id, quick(), &mut b_report)
-            .await?
-            .ok_or("B was not introduced")?;
-        let (conn, session, id) = got;
+        let (conn, session, id) =
+            direct::connect(endpoint, &b_signer.seed(), a_id, quick(), &mut b_report)
+                .await?
+                .ok_or("B was not introduced")?;
         engine::call(conn, session, id, tone_call(&b_wav, 1), &mut b_report).await
     };
     let (a_result, b_result) = tokio::join!(a, b);
@@ -210,15 +210,19 @@ async fn the_listener_admits_only_the_peer_it_was_introduced_to() {
     assert!(direct::dials(&a_id, &b_id));
 
     let a = async {
-        let intro = direct::introduce(addr, &server_pub, &a_signer.seed(), b_id, 5)
-            .await?
-            .ok_or("A was not introduced")?;
+        let intro = direct::introduce(addr, &server_pub, &a_signer.seed(), b_id, 5).await?;
+        let intro = match intro {
+            direct::Meeting::Introduced(i) => i,
+            other => return Err(format!("A was not introduced: {other:?}")),
+        };
         direct::link(intro, &a_signer.seed(), b_id, quick()).await
     };
     let b = async {
-        let intro = direct::introduce(addr, &server_pub, &b_signer.seed(), a_id, 5)
-            .await?
-            .ok_or("B was not introduced")?;
+        let intro = direct::introduce(addr, &server_pub, &b_signer.seed(), a_id, 5).await?;
+        let intro = match intro {
+            direct::Meeting::Introduced(i) => i,
+            other => return Err(format!("B was not introduced: {other:?}")),
+        };
         // Introduced to A, but told to admit C.
         direct::listen_for(intro, &b_signer.seed(), c_id, quick()).await
     };

@@ -11,8 +11,8 @@
 //! either case, and says why in the second.
 
 pub use sqex_proto::direct::{
-    Budget, DIRECT_SESSION, Introduction, UNREACHABLE, agree, dial_peer, dials, introduce, link,
-    listen_for,
+    Budget, DIRECT_SESSION, Introduction, Meeting, NO_SHARED_FAMILY, UNREACHABLE, agree, dial_peer,
+    dials, introduce, link, listen_for,
 };
 use sqex_proto::session::Session;
 use sqnr_core::PubKey;
@@ -32,7 +32,7 @@ pub async fn connect(
     budget: Budget,
     report: &mut dyn Report,
 ) -> Result<Option<(quinn::Connection, Session, u64)>, String> {
-    let Some(intro) = introduce(
+    let intro = match introduce(
         endpoint.address,
         endpoint.server.as_bytes(),
         seed,
@@ -40,8 +40,16 @@ pub async fn connect(
         budget.introduce_wait,
     )
     .await?
-    else {
-        return Ok(None);
+    {
+        Meeting::Introduced(intro) => intro,
+        Meeting::NobodyAsked => return Ok(None),
+        // SIP-69. An `Err` rather than `Ok(None)`, because there is something
+        // to report: `Ok(None)` is SIP-25's silence, which says nothing about
+        // whether the peer asked, and this says they did and why it cannot
+        // work. The words matter -- what this used to produce was a report
+        // that symmetric NAT had defeated the punch, which sends whoever
+        // reads it to look at a NAT that was never the problem.
+        Meeting::NoSharedFamily => return Err(NO_SHARED_FAMILY.into()),
     };
     let conn = link(intro, seed, peer, budget).await?;
     let me = PubKey::new(
