@@ -240,6 +240,8 @@ async fn pair(y_open_calls: bool, x_lists_y: bool, a: u8, b: u8) -> Pair {
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
+    // A private group: the consent a call rests on. And a public one with
+    // Carol in it, which is no consent -- anyone joins a public channel.
     let sa = Signer::new(alice_seed, alice, x_pub);
     let mut ca = Chain::default();
     let channel = [a; 32];
@@ -247,7 +249,7 @@ async fn pair(y_open_calls: bool, x_lists_y: bool, a: u8, b: u8) -> Pair {
         &mut ca,
         channel,
         instance_for(channel, 0),
-        Visibility::Public,
+        Visibility::Private,
         3600,
         "we talk",
         vec![Invitee {
@@ -260,23 +262,50 @@ async fn pair(y_open_calls: bool, x_lists_y: bool, a: u8, b: u8) -> Pair {
         .await
         .unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
-    // Y holds the membership once it has pulled the group.
-    let mut held = false;
-    for _ in 0..80 {
-        let (code, _) = bob_at_y
-            .post(
-                "/channel/info",
-                sqex_proto::channel::ByChannel { channel }.encode(sqex_proto::channel::TYPE_INFO),
-            )
-            .await
-            .unwrap();
-        if code == 200 {
-            held = true;
-            break;
+    let (carol_seed, carol) = identity(a + 2);
+    let mut carol_at_x = Client::connect_as(x_addr, &x_pub, &carol_seed)
+        .await
+        .unwrap();
+    let sc = Signer::new(carol_seed, carol, x_pub);
+    let mut cc = Chain::default();
+    let public = [a + 1; 32];
+    let req = sc.create_chained(
+        &mut cc,
+        public,
+        instance_for(public, 0),
+        Visibility::Public,
+        3600,
+        "everyone",
+        vec![Invitee {
+            account: bob,
+            role: Role::Member,
+        }],
+    );
+    let (code, body) = carol_at_x
+        .post("/channel/create", req.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    // Y holds both memberships once it has pulled the groups.
+    for ch in [channel, public] {
+        let mut held = false;
+        for _ in 0..80 {
+            let (code, _) = bob_at_y
+                .post(
+                    "/channel/info",
+                    sqex_proto::channel::ByChannel { channel: ch }
+                        .encode(sqex_proto::channel::TYPE_INFO),
+                )
+                .await
+                .unwrap();
+            if code == 200 {
+                held = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(held, "Y never pulled a group for Bob");
     }
-    assert!(held, "Y never pulled the group for Bob");
     Pair {
         x_addr,
         x_pub,
@@ -333,8 +362,9 @@ async fn a_signed_call_rings_across_two_exchanges_that_list_nobody() {
     assert_eq!(ack.state, CallState::Ringing, "reason {}", ack.reason);
     assert_eq!(ring_within(&mut ring, 10).await, Some(p.alice));
 
-    // Carol shares no conversation with Bob: refused at X, signed or not,
-    // and Bob's phone stays quiet.
+    // Carol shares only a public channel with Bob, which is no
+    // conversation: refused at X, signed or not, and Bob's phone stays
+    // quiet.
     let mut carol = Client::connect_as(p.x_addr, &p.x_pub, &carol_seed)
         .await
         .unwrap();
@@ -381,14 +411,14 @@ async fn an_exchange_that_keeps_to_its_list_closes_the_link() {
 /// refused by Y's own check.
 #[tokio::test]
 async fn the_callees_exchange_checks_the_word_itself() {
-    let p = pair(true, true, 231, 232).await;
+    let p = pair(true, true, 241, 242).await;
     let bob_at_y = Client::connect_as(p.y_addr, &p.y_pub, &p.bob_seed)
         .await
         .unwrap();
     let mut ring = subscribe(&bob_at_y).await;
     let target = format!("{}@y.test", p.bob);
 
-    let (carol_seed, _) = identity(233);
+    let (carol_seed, _) = identity(243);
     let mut carol = Client::connect_as(p.x_addr, &p.x_pub, &carol_seed)
         .await
         .unwrap();

@@ -3198,17 +3198,24 @@ impl Channels {
     }
 
     /// SIP-65: whether `a` and `b` are both present members of some
-    /// channel this exchange holds -- ordered here or a copy. The consent a
-    /// call between two strangers' exchanges rests on: each already said,
-    /// in the log, that they talk to the other.
+    /// **private** channel this exchange holds -- ordered here or a copy.
+    /// The consent a call between two strangers' exchanges rests on: each
+    /// was put there by an invitation or opened the conversation, which is
+    /// saying they talk to the other. A public channel says nothing --
+    /// anyone joins one -- and a copy that has not been told its shape
+    /// (SIP-43) is written private by default and cannot vouch either.
     pub fn share_membership(&self, a: &PubKey, b: &PubKey) -> bool {
         if a == b {
             return false;
         }
         let db = self.db.lock().unwrap();
         db.query_row(
-            "SELECT 1 FROM member x JOIN member y ON x.channel = y.channel
+            "SELECT 1 FROM member x
+             JOIN member y ON x.channel = y.channel
+             JOIN channel c ON c.id = x.channel
+             LEFT JOIN replicated r ON r.channel = x.channel
              WHERE x.account = ?1 AND x.present = 1 AND y.account = ?2 AND y.present = 1
+               AND c.visibility = 0 AND (r.channel IS NULL OR r.shaped = 1)
              LIMIT 1",
             params![a.as_bytes(), b.as_bytes()],
             |_| Ok(()),
