@@ -1248,7 +1248,7 @@ pub async fn bind_with(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("prekeys.db"));
-    // SIP-71: mail is a promise measured in days, and a process restarts
+    // SIP-5 §Durability: mail is a promise measured in days, and a process restarts
     // between deploys; the queue lives beside the other stores.
     let mailbox_db = config
         .state_file
@@ -4812,7 +4812,7 @@ impl Server {
             "requests": self.requests(),
             "event_streams": self.events.total(),
             "mail_waiting": self.mailbox.waiting(),
-            // SIP-71: a memory-only deployment says so here, since a client
+            // SIP-5 §Durability: a memory-only deployment says so here, since a client
             // cannot tell and should not have to.
             "mailbox_durable": self.mailbox.durable(),
             "sessions": self.sessions.len(),

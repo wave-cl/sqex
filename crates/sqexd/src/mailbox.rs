@@ -16,7 +16,7 @@
 //! sender can ask what became of what it left. That is a deliberate disclosure
 //! of recipient behaviour, chosen over silence; see SIP-5's security notes.
 //!
-//! **State is durable (SIP-71).** The mailbox is SQLite beside the other
+//! **State is durable (SIP-5 §Durability).** The mailbox is SQLite beside the other
 //! stores, so an operator's restart is not a delivery failure: items,
 //! collection records, the identifier sequence and what a home collected
 //! from a former home (SIP-68) survive for the item's TTL. A memory-only
@@ -111,7 +111,7 @@ impl Mailbox {
         Mailbox::open(None).expect("an in-memory mailbox opens")
     }
 
-    /// SIP-71: the mailbox on disk at `path`, or in memory with `None`.
+    /// SIP-5 §Durability: the mailbox on disk at `path`, or in memory with `None`.
     pub fn open(path: Option<&Path>) -> rusqlite::Result<Mailbox> {
         let db = match path {
             Some(p) => Connection::open(p)?,
@@ -126,7 +126,7 @@ impl Mailbox {
         })
     }
 
-    /// SIP-71: whether a restart keeps what is here.
+    /// SIP-5 §Durability: whether a restart keeps what is here.
     pub fn durable(&self) -> bool {
         self.durable
     }
@@ -337,7 +337,7 @@ impl Mailbox {
     /// Complete collection: drop the payload, keep the tombstone. Only the
     /// recipient may. Returns whether anything was collected. The payload
     /// columns are set to NULL, which SQLite may or may not scrub from the
-    /// file: SIP-71 says deletion is still not erasure.
+    /// file: SIP-5 says deletion is still not erasure.
     pub fn delete(&self, recipient: &PubKey, id: u64) -> bool {
         let now = now_unix();
         let db = self.db.lock().unwrap();
@@ -546,7 +546,7 @@ mod durable {
         PubKey::new([b; 32])
     }
 
-    /// SIP-71: an item, its collection record and the identifier sequence
+    /// SIP-5 §Durability: an item, its collection record and the identifier sequence
     /// are there after the store is opened again; a collected item's payload
     /// is not.
     #[test]
