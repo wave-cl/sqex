@@ -79,9 +79,47 @@ pub const UNREACHABLE: &str = "no direct connection: this needs endpoint-indepen
 /// try. The distinction is the point -- one is a punch that failed and the
 /// other is a punch that could not be attempted, and blaming the NAT for the
 /// second sends whoever reads it to look in the wrong place.
-pub const NO_SHARED_FAMILY: &str = "no direct connection: the two of you reached the exchange \
-                                    on different address families, so neither was given an \
-                                    address it could dial. This is the network, not the NAT";
+///
+/// There are two of these because SIP-69 reaches the same conclusion in two
+/// places, and they are **not the same finding**. A live run on 2026-09-18
+/// could not tell which had fired, because both said one sentence: the
+/// exchange's half of SIP-69 could not be shown to have run at all, and the
+/// timestamps on two devices were half a second apart with no shared clock
+/// to order them by. Whoever reads a log should not have to infer this.
+///
+/// Both open with the same clause, so anything matching on "no direct
+/// connection" still matches, and both close by naming the network rather
+/// than the NAT, which is the wrong answer this pair exists to stop giving.
+pub const NO_SHARED_FAMILY_BY_EXCHANGE: &str = "no direct connection: the exchange says you both asked for one, from different address \
+     families, so neither of you could be given an address to dial. This is the network, \
+     not the NAT";
+
+/// The other half: an exchange introduced the two and disclosed an address
+/// this host has no route to. SIP-69's compatibility rule -- an exchange is
+/// not the authority on what a client's network can reach -- and the only
+/// answer available from an exchange predating SIP-69.
+pub const NO_SHARED_FAMILY_IN_THE_ADDRESS: &str = "no direct connection: the exchange offered an address on an address family this device \
+     has no route to, so there was nothing to dial. This is the network, not the NAT";
+
+/// Which side worked out that the two are on different address families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Learned {
+    /// The exchange answered `ready = 2`. Nothing else produces this, so a
+    /// log carrying it **is** the evidence that SIP-69's server half ran.
+    FromExchange,
+    /// We were introduced and refused the address ourselves.
+    FromTheAddress,
+}
+
+impl Learned {
+    /// What to tell whoever is reading, which differs by who found it out.
+    pub fn why(self) -> &'static str {
+        match self {
+            Learned::FromExchange => NO_SHARED_FAMILY_BY_EXCHANGE,
+            Learned::FromTheAddress => NO_SHARED_FAMILY_IN_THE_ADDRESS,
+        }
+    }
+}
 
 /// A local port this process can hold and then hand to squic, in the same
 /// address family as `reach`.
@@ -117,10 +155,10 @@ pub enum Meeting {
     /// they asked at all, which is SIP-25's rule, and nothing was disclosed.
     NobodyAsked,
     /// SIP-69: both asked, and the two are on networks with no address family
-    /// in common, so neither could dial the other. Told by the exchange, or
-    /// found here when an exchange that predates SIP-69 discloses an address
-    /// this side has no route to.
-    NoSharedFamily,
+    /// in common, so neither could dial the other. Carries which side worked
+    /// that out, because the two are different findings and a log that cannot
+    /// separate them cannot show the exchange's half ran.
+    NoSharedFamily(Learned),
 }
 
 /// Wait until the port we are about to reuse is free, up to `within`.
@@ -199,12 +237,14 @@ pub async fn introduce(
     drop(client);
     match got.answer {
         Answer::Waiting => return Ok(Meeting::NobodyAsked),
-        Answer::NoSharedFamily => return Ok(Meeting::NoSharedFamily),
+        Answer::NoSharedFamily => {
+            return Ok(Meeting::NoSharedFamily(Learned::FromExchange));
+        }
         Answer::Ready => {}
     }
     let theirs = got.addr.ok_or("an introduction with no address")?;
     if !dialable_from(ours, theirs) {
-        return Ok(Meeting::NoSharedFamily);
+        return Ok(Meeting::NoSharedFamily(Learned::FromTheAddress));
     }
     // Measured as a delay from the exchange's own clock rather than as an
     // absolute time on ours, because the three clocks do not agree and only
@@ -391,6 +431,38 @@ mod tests {
             "waited {:?} for a port that was already free",
             began.elapsed()
         );
+    }
+
+    /// The two ways SIP-69 reaches its conclusion say different things, and
+    /// a reader can tell which fired. This is the whole of the change: on
+    /// 2026-09-18 a live run produced this message on both devices and
+    /// nothing in either log said whether the exchange had refused the pair
+    /// or the caller had refused the address.
+    #[test]
+    fn each_side_of_the_family_answer_says_which_side_found_it() {
+        let by_exchange = Learned::FromExchange.why();
+        let in_the_address = Learned::FromTheAddress.why();
+        assert_ne!(
+            by_exchange, in_the_address,
+            "a log cannot show the exchange's half ran if both paths say one thing"
+        );
+        // Only the exchange's answer can mention that both asked: the other
+        // path knows nothing of the peer's request.
+        assert!(by_exchange.contains("you both asked"), "{by_exchange}");
+        assert!(!in_the_address.contains("both asked"), "{in_the_address}");
+        // And only ours can name the address it was handed.
+        assert!(
+            in_the_address.contains("offered an address"),
+            "{in_the_address}"
+        );
+
+        for why in [by_exchange, in_the_address] {
+            // The opening clause anything matches on, and the closing one
+            // that keeps a reader away from the NAT.
+            assert!(why.starts_with("no direct connection: "), "{why}");
+            assert!(why.ends_with("This is the network, not the NAT"), "{why}");
+            assert!(!why.contains("symmetric"), "{why}");
+        }
     }
 
     /// SIP-69: an address of the other family is not one this side can dial,

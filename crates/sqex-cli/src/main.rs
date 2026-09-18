@@ -1228,8 +1228,8 @@ async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> 
         }
         // SIP-69. Both asked, so saying so discloses nothing that being
         // introduced would not have.
-        direct::Meeting::NoSharedFamily => {
-            println!("no introduction: {}", direct::NO_SHARED_FAMILY);
+        direct::Meeting::NoSharedFamily(learned) => {
+            println!("no introduction: {}", learned.why());
             return Ok(());
         }
     };

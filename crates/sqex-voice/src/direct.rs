@@ -11,8 +11,8 @@
 //! either case, and says why in the second.
 
 pub use sqex_proto::direct::{
-    Budget, DIRECT_SESSION, Introduction, Meeting, NO_SHARED_FAMILY, UNREACHABLE, agree, dial_peer,
-    dials, introduce, link, listen_for,
+    Budget, DIRECT_SESSION, Introduction, Meeting, UNREACHABLE, agree, dial_peer, dials, introduce,
+    link, listen_for,
 };
 use sqex_proto::session::Session;
 use sqnr_core::PubKey;
@@ -49,7 +49,10 @@ pub async fn connect(
         // work. The words matter -- what this used to produce was a report
         // that symmetric NAT had defeated the punch, which sends whoever
         // reads it to look at a NAT that was never the problem.
-        Meeting::NoSharedFamily => return Err(NO_SHARED_FAMILY.into()),
+        // Which side found it out is in the words: only the exchange's
+        // answer proves SIP-69's server half ran, and a reader cannot infer
+        // that from a sentence both paths share.
+        Meeting::NoSharedFamily(learned) => return Err(learned.why().into()),
     };
     let conn = link(intro, seed, peer, budget).await?;
     let me = PubKey::new(
