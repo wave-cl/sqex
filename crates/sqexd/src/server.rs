@@ -508,6 +508,11 @@ impl Server {
             .or_insert_with(|| Arc::new(crate::replica::Forwarder::new(origin, addr, domain)));
     }
 
+    /// SIP-66: drop the way to `origin`, so the next reach resolves anew.
+    pub(crate) fn forget_forwarder(&self, origin: &PubKey) {
+        self.origins.write().unwrap().remove(origin);
+    }
+
     /// SIP-56: take a token or say how long to wait, as a refusal.
     pub(crate) fn limit(
         &self,
@@ -612,13 +617,94 @@ impl Server {
                     .map(|p| p.domain)
                     .filter(|d| !d.is_empty())
             })?;
-        let (found, addr) = self.relay_find(&domain).await.ok()?;
+        let (found, moved_from, addr) = crate::relay::find_peer_moved(self, &domain).await.ok()?;
         if found != *key {
-            tracing::warn!(%domain, expected = %key, found = %found, "a domain names another key");
-            return None;
+            // SIP-66: the domain names another key. Its successor, on the
+            // retiring key's own word -- a handover the pin followed, or the
+            // successor's lineage naming the key held -- and never on the
+            // zone's word alone.
+            let succeeded =
+                moved_from == Some(*key) || self.lineage_names(&found, addr, &domain, key).await;
+            if !succeeded {
+                tracing::warn!(%domain, expected = %key, found = %found, "a domain names another key");
+                return None;
+            }
+            // A configured origin is the operator's: SIP-40's `predecessors`
+            // in `[[replicate]]` is how they say a rotation happened.
+            if self.replicate.iter().any(|o| o.origin == *key) {
+                tracing::warn!(
+                    %domain, from = %key, to = %found,
+                    "a configured origin rotated; update [[replicate]] (SIP-40 predecessors)"
+                );
+                return None;
+            }
+            self.follow_exchange(key, &found, addr, &domain).await;
+            return Some((addr, domain));
         }
         self.add_forwarder(*key, addr, domain.clone());
         Some((addr, domain))
+    }
+
+    /// SIP-66: whether `successor`, reached at `addr` for `domain`, serves a
+    /// lineage that verifies for it and names `held` among its earlier keys.
+    async fn lineage_names(
+        &self,
+        successor: &PubKey,
+        addr: std::net::SocketAddr,
+        domain: &str,
+        held: &PubKey,
+    ) -> bool {
+        let Ok(mut client) =
+            sqex_proto::h3::H3Client::connect(addr, successor.as_bytes(), &self.exchange_seed)
+                .await
+        else {
+            return false;
+        };
+        let Ok((200, body)) = client.post("/exchange/lineage", Vec::new()).await else {
+            return false;
+        };
+        let Ok(lineage) = sqex_proto::lineage::Lineage::decode(&body) else {
+            return false;
+        };
+        match lineage.predecessors_for(successor, Some(domain)) {
+            Ok(earlier) => earlier.contains(held),
+            Err(e) => {
+                tracing::warn!(%domain, key = %successor, %e, "a successor's lineage was refused");
+                false
+            }
+        }
+    }
+
+    /// SIP-66: re-key every holding of `from` to `to` -- the registry's
+    /// homes and hints, the channel store's copies and lineage, the way
+    /// there -- and learn `to`'s lineage, so what `from` receipted goes on
+    /// verifying. Logged once: the one time an operator sees it happen.
+    pub(crate) async fn follow_exchange(
+        self: &Arc<Self>,
+        from: &PubKey,
+        to: &PubKey,
+        addr: std::net::SocketAddr,
+        domain: &str,
+    ) {
+        let registry = self.devices.follow_exchange(from, to);
+        let copies = self.channels.follow_origin(from, to);
+        self.origins.write().unwrap().remove(from);
+        self.add_forwarder(*to, addr, domain.to_string());
+        tracing::info!(
+            %domain, from = %from, to = %to, registry, copies,
+            "an exchange rotated its key; every holding of it followed (SIP-66)"
+        );
+        // Asked now rather than on the next pull, since the copies' past
+        // is under the old key and the next pull is what verifies it.
+        if let Ok(mut client) =
+            sqex_proto::h3::H3Client::connect(addr, to.as_bytes(), &self.exchange_seed).await
+            && let Ok((200, body)) = client.post("/exchange/lineage", Vec::new()).await
+            && let Ok(lineage) = sqex_proto::lineage::Lineage::decode(&body)
+            && let Ok(earlier) = lineage.predecessors_for(to, Some(domain))
+        {
+            self.channels.learn_lineage(to, &earlier);
+            self.lineage_due(to, false);
+        }
     }
 
     /// SIP-60: after writing a membership for `account`, tell its home --
@@ -1123,6 +1209,9 @@ pub async fn bind_with(
     let lineage =
         crate::lineage::load(&config.lineage_file, &public_key).map_err(Error::Malformed)?;
     let lineage_mtime = crate::lineage::modified(&config.lineage_file);
+    let own_predecessors = lineage
+        .predecessors_for(&public_key, None)
+        .unwrap_or_default();
     let state = State::load(
         config.state_file.clone(),
         &config.seed_whitelist,
@@ -1319,6 +1408,17 @@ pub async fn bind_with(
         connections: AtomicU64::new(0),
         requests: AtomicU64::new(0),
     });
+    // SIP-66: what this exchange held for its own earlier keys is its own
+    // now -- an account's Move naming the key it rotated from, an origin
+    // hint, a learned home -- with the Move's signature cleared, as at any
+    // other holder. Done at every start, so a store from before the
+    // rotation is repaired the same way.
+    for earlier in &own_predecessors {
+        let n = server.devices.follow_exchange(earlier, &public_key);
+        if n > 0 {
+            tracing::info!(from = %earlier, rows = n, "holdings of this exchange's earlier key followed to it (SIP-66)");
+        }
+    }
     // The front door, made once and found by name thereafter. An exchange
     // with nothing in it is a room with no doors: a new account can reach
     // nobody, and be reached by nobody, until somebody hands it a sixty-four

@@ -1400,6 +1400,10 @@ pub async fn run_homed(
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "cannot reach an account's origin");
+                    // SIP-66: the way there is forgotten, so the next cycle
+                    // resolves the domain again -- which is how a rotation
+                    // is noticed when the address stayed the same.
+                    server.forget_forwarder(&origin);
                     continue;
                 }
             };

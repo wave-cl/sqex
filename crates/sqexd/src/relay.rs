@@ -106,6 +106,9 @@ pub enum Find {
     /// — an operator able to pin an address by hand would be back to the thing
     /// discovery replaced.
     Fixed(HashMap<String, (PubKey, SocketAddr)>),
+    /// As `Fixed`, but shared with the test, which changes what a domain
+    /// names -- a rotation (SIP-66) is a domain naming another key.
+    Live(Arc<std::sync::RwLock<HashMap<String, (PubKey, SocketAddr)>>>),
 }
 
 /// What finding a domain turned up: the key, where it is, and — when SIP-40
@@ -121,6 +124,17 @@ impl Find {
     async fn find(&self, domain: &str) -> Result<Located, String> {
         match self {
             Find::Fixed(map) => map
+                .get(domain)
+                .copied()
+                .map(|(key, addr)| Located {
+                    key,
+                    addr,
+                    moved_from: None,
+                })
+                .ok_or_else(|| format!("no peer for {domain}")),
+            Find::Live(map) => map
+                .read()
+                .unwrap()
                 .get(domain)
                 .copied()
                 .map(|(key, addr)| Located {
@@ -1054,6 +1068,32 @@ pub async fn find_by_domain(
     domain: &str,
 ) -> Result<(PubKey, SocketAddr), String> {
     find_peer(server, domain).await
+}
+
+/// SIP-66: [`find_peer`], also saying which key the pin moved from on this
+/// lookup, when SIP-40 moved it.
+pub(crate) async fn find_peer_moved(
+    server: &Arc<Server>,
+    domain: &str,
+) -> Result<(PubKey, Option<PubKey>, SocketAddr), String> {
+    let Located {
+        key,
+        addr,
+        moved_from,
+    } = server.relay.find.find(domain).await?;
+    if let Some(from) = moved_from
+        && server.follow_peer_handover(domain, &from, key)
+    {
+        tracing::info!(domain, from = %from, to = %key, "relay peer entry followed the handover");
+    }
+    server
+        .relay
+        .inner
+        .lock()
+        .unwrap()
+        .domains
+        .insert(domain.to_string(), key);
+    Ok((key, moved_from, addr))
 }
 
 /// The address of a live link to `key`, bringing one up by the domain the

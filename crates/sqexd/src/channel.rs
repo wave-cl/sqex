@@ -3825,6 +3825,47 @@ impl Channels {
 
     /// SIP-53: every exchange that has ordered `channel`, for verifying
     /// entries from before a move. The creator where the history has none.
+    /// SIP-66: an origin this store copies from rotated. Every copy of
+    /// `from` becomes a copy of `to`, with `from` in the channel's origin
+    /// history so what it receipted goes on verifying; the lineage held
+    /// for `from` is dropped, to be learned again for `to`. How many
+    /// copies moved.
+    pub fn follow_origin(&self, from: &PubKey, to: &PubKey) -> usize {
+        let mut db = self.db.lock().unwrap();
+        let Ok(tx) = db.transaction() else {
+            return 0;
+        };
+        let channels: Vec<Vec<u8>> = tx
+            .prepare("SELECT channel FROM replicated WHERE origin = ?1")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![from.as_bytes()], |r| r.get::<_, Vec<u8>>(0))
+                    .ok()
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        let now = now_unix();
+        for c in &channels {
+            let _ = tx.execute(
+                "INSERT OR IGNORE INTO origin_history (channel, from_seq, origin, moved_at)
+                 VALUES (?1, 1, ?2, ?3)",
+                params![c, from.as_bytes(), now as i64],
+            );
+        }
+        let _ = tx.execute(
+            "UPDATE replicated SET origin = ?2 WHERE origin = ?1",
+            params![from.as_bytes(), to.as_bytes()],
+        );
+        let _ = tx.execute(
+            "DELETE FROM lineage WHERE origin = ?1",
+            params![from.as_bytes()],
+        );
+        if tx.commit().is_err() {
+            return 0;
+        }
+        channels.len()
+    }
+
     /// SIP-64: the origin's earlier keys as learned from its lineage,
     /// newest first.
     pub fn lineage_of(&self, origin: &PubKey) -> Vec<PubKey> {

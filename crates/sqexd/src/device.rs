@@ -667,6 +667,35 @@ impl Registry {
         let _ = follow_succession(&db, account, successor);
     }
 
+    /// SIP-66: an exchange this registry holds a key for rotated. Every
+    /// holding of `from` becomes one of `to`: an account's signed home
+    /// **with its signature cleared** (the account named `from`; SIP-62's
+    /// shape for a record the exchange acts on and does not vouch for),
+    /// the origin hints, the learned homes. How many rows moved.
+    pub fn follow_exchange(&self, from: &PubKey, to: &PubKey) -> usize {
+        let db = self.db.lock().unwrap();
+        let mut n = 0;
+        n += db
+            .execute(
+                "UPDATE home SET home = ?2, sig = x'' WHERE home = ?1",
+                params![from.as_bytes(), to.as_bytes()],
+            )
+            .unwrap_or(0);
+        n += db
+            .execute(
+                "UPDATE OR IGNORE home_origin SET origin = ?2 WHERE origin = ?1",
+                params![from.as_bytes(), to.as_bytes()],
+            )
+            .unwrap_or(0);
+        n += db
+            .execute(
+                "UPDATE learned_home SET home = ?2 WHERE home = ?1",
+                params![from.as_bytes(), to.as_bytes()],
+            )
+            .unwrap_or(0);
+        n
+    }
+
     /// SIP-44: keep a policy for `account` ahead of need.
     pub fn lodge(&self, account: &PubKey, policy: &[u8]) -> Result<(), DeviceError> {
         let db = self.db.lock().unwrap();
