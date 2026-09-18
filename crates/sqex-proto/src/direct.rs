@@ -75,13 +75,26 @@ pub const UNREACHABLE: &str = "no direct connection: this needs endpoint-indepen
                                mapping at both ends, and symmetric NAT allocates a fresh \
                                external port per destination";
 
-/// A local port this process can hold and then hand to squic.
+/// A local port this process can hold and then hand to squic, in the same
+/// address family as `reach`.
 ///
 /// Bound, read back, released. Racy in principle, and the alternative --
 /// letting squic bind first and asking what it got -- would mean the
 /// exchange connection and the peer connection could not share one.
-fn pick_local_port() -> Result<SocketAddr, String> {
-    let probe = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+///
+/// **The family has to match what this port will dial.** An IPv4 wildcard
+/// cannot connect to an IPv6 remote: quinn refuses it as an invalid remote
+/// address, and a call to an exchange that resolves to IPv6 could never
+/// take the direct path -- it always fell back to the relay. The same port
+/// then dials the peer, whose address the exchange reports in the family it
+/// saw, which is this one.
+fn pick_local_port(reach: SocketAddr) -> Result<SocketAddr, String> {
+    let wildcard: SocketAddr = if reach.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let probe = std::net::UdpSocket::bind(wildcard).map_err(|e| e.to_string())?;
     let addr = probe.local_addr().map_err(|e| e.to_string())?;
     drop(probe);
     Ok(addr)
@@ -100,7 +113,7 @@ pub async fn introduce(
     peer: PubKey,
     wait: u16,
 ) -> Result<Option<Introduction>, String> {
-    let ours = pick_local_port()?;
+    let ours = pick_local_port(exchange)?;
     let mut client = H3Client::connect_from(exchange, server, seed, Some(ours)).await?;
     let req = Introduce {
         peer,
@@ -284,6 +297,17 @@ mod tests {
         assert!(dials(&a, &b));
         assert!(!dials(&b, &a));
         assert!(!dials(&a, &a));
+    }
+
+    /// The local port matches the family of what it will reach: an IPv4
+    /// wildcard cannot dial an IPv6 exchange, and a call to one that
+    /// resolved to IPv6 could never take the direct path.
+    #[test]
+    fn the_local_port_matches_the_family_it_will_reach() {
+        let v6: SocketAddr = "[2a01:4f8:c015:2190::1]:443".parse().unwrap();
+        assert!(pick_local_port(v6).unwrap().is_ipv6());
+        let v4: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        assert!(pick_local_port(v4).unwrap().is_ipv4());
     }
 
     /// The budget is bounded by what the exchange will wait, and its
