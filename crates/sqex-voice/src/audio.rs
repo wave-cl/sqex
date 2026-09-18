@@ -295,37 +295,61 @@ fn microphone(want: Option<&str>) -> Result<(UnboundedReceiver<Vec<f32>>, Rate),
             let frame = chosen.rate.frame();
             let (device_hz, rate_hz) = (chosen.device_hz, chosen.rate.hz());
             let mut pending: Vec<f32> = Vec::with_capacity(frame * 2);
-            let stream = device
-                .build_input_stream::<f32, _, _>(
-                    chosen.config,
-                    move |data, _| {
-                        let mono: Vec<f32> = data
-                            .chunks(channels)
-                            .map(|g| g.iter().sum::<f32>() / channels as f32)
-                            .collect();
-                        // Only when the device speaks no rate Opus does.
-                        pending.extend(if device_hz == rate_hz {
-                            mono
-                        } else {
-                            resample(&mono, device_hz, rate_hz)
-                        });
-                        while pending.len() >= frame {
-                            let f: Vec<f32> = pending.drain(..frame).collect();
-                            if tx.send(f).is_err() {
-                                return; // the call ended
-                            }
-                        }
-                    },
-                    |e| eprintln!("microphone: {e}"),
-                    None,
-                )
-                .map_err(|e| format!("open microphone: {e}"))?;
+            // To know when the call is over: the receiver is dropped with
+            // it, and this side of the channel says so.
+            let alive = tx.clone();
+            // One callback for either format: every sample becomes f32 at the
+            // door, and nothing past it knows what the device speaks.
+            let mut on_data = move |data: &[f32]| {
+                let mono: Vec<f32> = data
+                    .chunks(channels)
+                    .map(|g| g.iter().sum::<f32>() / channels as f32)
+                    .collect();
+                // Only when the device speaks no rate Opus does.
+                pending.extend(if device_hz == rate_hz {
+                    mono
+                } else {
+                    resample(&mono, device_hz, rate_hz)
+                });
+                while pending.len() >= frame {
+                    let f: Vec<f32> = pending.drain(..frame).collect();
+                    if tx.send(f).is_err() {
+                        return; // the call ended
+                    }
+                }
+            };
+            let stream = match chosen.format {
+                SampleFormat::I16 => device
+                    .build_input_stream::<i16, _, _>(
+                        chosen.config,
+                        move |data, _| {
+                            let floats: Vec<f32> =
+                                data.iter().map(|&x| x as f32 / 32768.0).collect();
+                            on_data(&floats);
+                        },
+                        |e| eprintln!("microphone: {e}"),
+                        None,
+                    )
+                    .map_err(|e| format!("open microphone: {e}"))?,
+                _ => device
+                    .build_input_stream::<f32, _, _>(
+                        chosen.config,
+                        move |data, _| on_data(data),
+                        |e| eprintln!("microphone: {e}"),
+                        None,
+                    )
+                    .map_err(|e| format!("open microphone: {e}"))?,
+            };
             stream.play().map_err(|e| format!("start capture: {e}"))?;
             let _ = ready_tx.send(Ok((name, chosen)));
-            loop {
-                // Holding `stream` is the whole job.
-                std::thread::park();
+            // Holding `stream` is the whole job -- for as long as the call
+            // lasts. Parked for ever, the thread kept the microphone open
+            // after every call, and the light stayed on.
+            while !alive.is_closed() {
+                std::thread::park_timeout(std::time::Duration::from_millis(500));
             }
+            drop(stream);
+            Ok(())
         };
         if let Err(e) = run() {
             let _ = report.send(Err(e));
@@ -442,42 +466,70 @@ fn speaker(want: Option<&str>) -> Result<(Output, Rate), String> {
             )?;
             let channels = chosen.config.channels as usize;
             let (device_hz, rate_hz) = (chosen.device_hz, chosen.rate.hz());
-            let stream = device
-                .build_output_stream::<f32, _, _>(
-                    chosen.config,
-                    move |data, _| {
-                        let frames = data.len() / channels;
-                        let mut r = for_device.lock().expect("audio ring");
-                        // Underrun is silence, not a stall: the far end is
-                        // simply not talking yet.
-                        let take = |r: &mut VecDeque<f32>, n: usize| -> Vec<f32> {
-                            (0..n).map(|_| r.pop_front().unwrap_or(0.0)).collect()
-                        };
-                        let mono = if device_hz == rate_hz {
-                            take(&mut r, frames)
-                        } else {
-                            // Pull the working-rate samples this many device
-                            // frames are worth, then stretch them.
-                            let want =
-                                (frames as f64 * rate_hz as f64 / device_hz as f64).ceil() as usize;
-                            let src = take(&mut r, want);
-                            let mut out = resample(&src, rate_hz, device_hz);
-                            out.resize(frames, 0.0);
-                            out
-                        };
-                        for (group, s) in data.chunks_mut(channels).zip(mono) {
-                            group.fill(s);
-                        }
-                    },
-                    |e| eprintln!("speaker: {e}"),
-                    None,
-                )
-                .map_err(|e| speaker_error(&name, &e.to_string()))?;
+            // To know when the call is over: the ring's other holders are the
+            // call's, and when only this thread's two are left it has ended.
+            let watch = Arc::clone(&for_device);
+            // One callback for either format: it fills floats, and a 16-bit
+            // device gets them scaled at the door.
+            let on_data = move |data: &mut [f32]| {
+                let frames = data.len() / channels;
+                let mut r = for_device.lock().expect("audio ring");
+                // Underrun is silence, not a stall: the far end is
+                // simply not talking yet.
+                let take = |r: &mut VecDeque<f32>, n: usize| -> Vec<f32> {
+                    (0..n).map(|_| r.pop_front().unwrap_or(0.0)).collect()
+                };
+                let mono = if device_hz == rate_hz {
+                    take(&mut r, frames)
+                } else {
+                    // Pull the working-rate samples this many device
+                    // frames are worth, then stretch them.
+                    let want = (frames as f64 * rate_hz as f64 / device_hz as f64).ceil() as usize;
+                    let src = take(&mut r, want);
+                    let mut out = resample(&src, rate_hz, device_hz);
+                    out.resize(frames, 0.0);
+                    out
+                };
+                for (group, s) in data.chunks_mut(channels).zip(mono) {
+                    group.fill(s);
+                }
+            };
+            let stream = match chosen.format {
+                SampleFormat::I16 => {
+                    let mut floats: Vec<f32> = Vec::new();
+                    device
+                        .build_output_stream::<i16, _, _>(
+                            chosen.config,
+                            move |data, _| {
+                                floats.clear();
+                                floats.resize(data.len(), 0.0);
+                                on_data(&mut floats);
+                                for (out, &x) in data.iter_mut().zip(floats.iter()) {
+                                    *out = (x.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                }
+                            },
+                            |e| eprintln!("speaker: {e}"),
+                            None,
+                        )
+                        .map_err(|e| speaker_error(&name, &e.to_string()))?
+                }
+                _ => device
+                    .build_output_stream::<f32, _, _>(
+                        chosen.config,
+                        move |data, _| on_data(data),
+                        |e| eprintln!("speaker: {e}"),
+                        None,
+                    )
+                    .map_err(|e| speaker_error(&name, &e.to_string()))?,
+            };
             stream.play().map_err(|e| format!("start playback: {e}"))?;
             let _ = ready_tx.send(Ok((name, chosen)));
-            loop {
-                std::thread::park();
+            // As above: the stream is held for the call, not for ever.
+            while Arc::strong_count(&watch) > 2 {
+                std::thread::park_timeout(std::time::Duration::from_millis(500));
             }
+            drop(stream);
+            Ok(())
         };
         if let Err(e) = run() {
             let _ = report.send(Err(e));
@@ -514,6 +566,11 @@ pub struct Chosen {
     pub rate: Rate,
     /// The device's own rate. Equal to `rate.hz()` unless resampling.
     pub device_hz: u32,
+    /// The sample format the device is driven in: `F32` when it offers it,
+    /// else `I16`, converted at the edge. A phone's microphone (AAudio,
+    /// through cpal) offers only 16-bit, and asking it for floats ended
+    /// every call the moment it connected.
+    pub format: SampleFormat,
 }
 
 impl Chosen {
@@ -551,12 +608,27 @@ fn choose(
     device: &str,
     what: &str,
 ) -> Result<Chosen, String> {
-    let usable: Vec<SupportedStreamConfigRange> = configs
-        .filter(|r| r.sample_format() == SampleFormat::F32)
-        .collect();
-    if usable.is_empty() {
-        return Err(format!("{device} offers no f32 {what}"));
-    }
+    let all: Vec<SupportedStreamConfigRange> = configs.collect();
+    let of = |format: SampleFormat| -> Vec<SupportedStreamConfigRange> {
+        all.iter()
+            .filter(|r| r.sample_format() == format)
+            .cloned()
+            .collect()
+    };
+    let (format, usable) = match of(SampleFormat::F32) {
+        f32s if !f32s.is_empty() => (SampleFormat::F32, f32s),
+        _ => match of(SampleFormat::I16) {
+            i16s if !i16s.is_empty() => (SampleFormat::I16, i16s),
+            _ => {
+                let offered: Vec<String> =
+                    all.iter().map(|r| r.sample_format().to_string()).collect();
+                return Err(format!(
+                    "{device} offers neither f32 nor i16 {what} (only {})",
+                    offered.join(", ")
+                ));
+            }
+        },
+    };
 
     // Highest rate at or below 48 kHz; failing that, the lowest above it.
     let device_hz = usable
@@ -583,6 +655,7 @@ fn choose(
         // at 48 kHz with the difference resampled at the device edge.
         rate: Rate::new(device_hz).unwrap_or(Rate::DEFAULT),
         device_hz,
+        format,
     })
 }
 
@@ -1038,6 +1111,50 @@ mod tests {
             cpal::SupportedBufferSize::Unknown,
             SampleFormat::F32,
         )
+    }
+
+    fn range_as(format: SampleFormat, channels: u16, hz: u32) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            channels,
+            hz,
+            hz,
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    /// A phone's microphone offers only 16-bit. It is taken, and said so;
+    /// a device offering floats as well is driven in floats; one offering
+    /// neither is refused with what it does offer.
+    #[test]
+    fn a_device_with_only_sixteen_bit_samples_is_driven_in_them() {
+        let only = choose(
+            [range_as(SampleFormat::I16, 1, 48_000)].into_iter(),
+            "d",
+            "capture",
+        )
+        .unwrap();
+        assert_eq!(only.format, SampleFormat::I16);
+        assert_eq!(only.device_hz, 48_000);
+        let both = choose(
+            [
+                range_as(SampleFormat::I16, 1, 48_000),
+                range_as(SampleFormat::F32, 1, 48_000),
+            ]
+            .into_iter(),
+            "d",
+            "capture",
+        )
+        .unwrap();
+        assert_eq!(both.format, SampleFormat::F32);
+        let neither = choose(
+            [range_as(SampleFormat::U8, 1, 48_000)].into_iter(),
+            "d",
+            "capture",
+        )
+        .unwrap_err();
+        assert!(neither.contains("neither f32 nor i16"), "{neither}");
+        assert!(neither.contains("u8"), "{neither}");
     }
 
     #[test]
