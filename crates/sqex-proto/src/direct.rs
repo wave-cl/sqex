@@ -135,7 +135,9 @@ impl Learned {
 /// then dials the peer, whose address the exchange reports in the family it
 /// saw, which is this one.
 fn pick_local_port(reach: SocketAddr) -> Result<SocketAddr, String> {
-    let wildcard: SocketAddr = if reach.is_ipv6() {
+    // Canonical: an exchange named by a v4-mapped address is reached over
+    // IPv4, and binding IPv6 for it would pick a port in the wrong family.
+    let wildcard: SocketAddr = if canonical(reach).is_ipv6() {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
@@ -198,7 +200,26 @@ async fn wait_until_free(addr: SocketAddr, within: Duration) -> bool {
 /// reports it as a punch that did not work and sends whoever reads that to
 /// look at a NAT which was never the problem.
 fn dialable_from(ours: SocketAddr, theirs: SocketAddr) -> bool {
-    ours.is_ipv6() == theirs.is_ipv6()
+    canonical(ours).is_ipv6() == canonical(theirs).is_ipv6()
+}
+
+/// An IPv4 peer of a **dual-stack** listener is observed as `::ffff:a.b.c.d`,
+/// and `is_ipv6()` calls that IPv6 -- so an exchange bound on `[::]` reports
+/// every IPv4 client in a form that compares unequal to IPv4.
+///
+/// This is not hypothetical. On 2026-09-18, with both parties on IPv4 and
+/// the desktop holding no IPv6 address at all, both ends still reported that
+/// they had reached the exchange on different families and fell back to the
+/// relay. The families were the same; only the spelling differed, and every
+/// comparison in SIP-69 was made on the spelling.
+///
+/// Canonicalising here rather than only at the exchange is deliberate: an
+/// exchange that has not been redeployed still discloses the mapped form,
+/// and a caller that cannot read it has no direct call. Dialling the
+/// canonical address is also the correct thing to do on its own terms --
+/// `a.b.c.d` is what an IPv4 socket can send to.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// Ask the exchange to introduce us to `peer`, from a port of our own.
@@ -242,7 +263,9 @@ pub async fn introduce(
         }
         Answer::Ready => {}
     }
-    let theirs = got.addr.ok_or("an introduction with no address")?;
+    // Canonical, so what we dial is an address of the family we hold, and
+    // so the comparison below is about families and not about spelling.
+    let theirs = canonical(got.addr.ok_or("an introduction with no address")?);
     if !dialable_from(ours, theirs) {
         return Ok(Meeting::NoSharedFamily(Learned::FromTheAddress));
     }
@@ -430,6 +453,52 @@ mod tests {
             began.elapsed() < Duration::from_secs(1),
             "waited {:?} for a port that was already free",
             began.elapsed()
+        );
+    }
+
+    /// Two parties on IPv4 share a family even when the exchange, listening
+    /// dual-stack, spells one of them `::ffff:a.b.c.d`.
+    ///
+    /// This is the live run of 2026-09-18: both ends on IPv4, the desktop
+    /// holding no IPv6 address at all, and both still reporting that they
+    /// had reached the exchange on different families.
+    #[test]
+    fn a_mapped_ipv4_address_is_ipv4_and_not_another_family() {
+        let plain: SocketAddr = "203.0.113.7:9000".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:9000".parse().unwrap();
+        let real_v6: SocketAddr = "[2001:db8::1]:9000".parse().unwrap();
+
+        // The spelling that started this: unequal as written, one family.
+        assert_ne!(plain, mapped, "the two spellings really are different");
+        assert!(
+            dialable_from(plain, mapped),
+            "an IPv4 host cannot dial its own peer because an exchange spelled it in IPv6"
+        );
+        assert!(dialable_from(mapped, plain));
+        assert!(dialable_from(mapped, mapped));
+
+        // And a genuine IPv6 peer is still another family, which is the
+        // distinction SIP-69 exists to draw.
+        assert!(!dialable_from(plain, real_v6));
+        assert!(!dialable_from(mapped, real_v6));
+        assert!(dialable_from(real_v6, real_v6));
+
+        // What we would dial, and the port it keeps.
+        assert_eq!(canonical(mapped), plain);
+        assert_eq!(canonical(plain), plain);
+        assert_eq!(canonical(real_v6), real_v6);
+        assert_eq!(canonical(mapped).port(), 9000);
+    }
+
+    /// The port is picked in the family we will actually reach the exchange
+    /// over, which for a mapped address is IPv4.
+    #[test]
+    fn a_mapped_exchange_address_gets_an_ipv4_local_port() {
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        let ours = pick_local_port(mapped).expect("a local port");
+        assert!(
+            ours.is_ipv4(),
+            "bound {ours}, which cannot send to an IPv4 exchange"
         );
     }
 

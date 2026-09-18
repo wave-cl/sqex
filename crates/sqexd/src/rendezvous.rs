@@ -31,6 +31,13 @@ use crate::state::now_unix;
 /// each other by a second.
 const PENDING_TTL: u64 = 45;
 
+/// An IPv4 peer of a dual-stack listener arrives as `::ffff:a.b.c.d`. Every
+/// address this module keys on, compares, or discloses goes through here
+/// first, so a family is a family and not a spelling.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// SIP-69: which address family a request was made over.
 ///
 /// **Observed, never asserted** -- it is the family of the address the
@@ -44,7 +51,11 @@ pub enum Family {
 
 impl Family {
     fn of(addr: SocketAddr) -> Family {
-        if addr.is_ipv6() {
+        // Canonical first: a dual-stack listener observes an IPv4 peer as
+        // `::ffff:a.b.c.d`, and classifying that as V6 puts two IPv4 parties
+        // in different buckets -- or, worse, pairs a real IPv6 party with a
+        // mapped IPv4 one and discloses an address neither can dial.
+        if canonical(addr).is_ipv6() {
             Family::V6
         } else {
             Family::V4
@@ -105,6 +116,10 @@ impl Rendezvous {
     /// caller to its own address for no purpose and is the degenerate case a
     /// consent rule keyed on a pair has to exclude explicitly.
     pub fn request(&self, asker: &PubKey, addr: SocketAddr, peer: &PubKey) -> Introduced {
+        // Store and disclose the canonical form: an IPv4 party is recorded as
+        // IPv4 whatever socket it happened to arrive on, so the address the
+        // other side is handed is one it can dial.
+        let addr = canonical(addr);
         let now = now_unix();
         if asker == peer {
             return Introduced::waiting(now);
@@ -207,6 +222,7 @@ impl Rendezvous {
         peer: &PubKey,
         wait_secs: u16,
     ) -> Introduced {
+        let addr = canonical(addr);
         let family = Family::of(addr);
         let first = self.request(asker, addr, peer);
         // SIP-69: a pair that shares no family is settled, not pending. Waiting
@@ -360,5 +376,48 @@ mod tests {
         r.sweep();
         assert_eq!(r.len(), 1);
         assert_eq!(r.waiters.lock().unwrap().len(), 1);
+    }
+
+    /// Two IPv4 parties arriving on a dual-stack listener are one family and
+    /// are introduced, and each is handed an address it can dial.
+    ///
+    /// The live failure of 2026-09-18: both on IPv4, both refused, because
+    /// the exchange spelled them `::ffff:a.b.c.d` and every comparison was
+    /// made on the spelling.
+    #[test]
+    fn two_mapped_ipv4_parties_are_one_family_and_are_introduced() {
+        let r = Rendezvous::default();
+        let (a, b) = (PubKey::new([1u8; 32]), PubKey::new([2u8; 32]));
+        let a_at: SocketAddr = "[::ffff:203.0.113.7]:5000".parse().unwrap();
+        let b_at: SocketAddr = "[::ffff:198.51.100.9]:6000".parse().unwrap();
+
+        assert_eq!(r.request(&a, a_at, &b).answer, Answer::Waiting);
+        let got = r.request(&b, b_at, &a);
+        assert_eq!(
+            got.answer,
+            Answer::Ready,
+            "two IPv4 parties were told they share no family"
+        );
+        // And the address handed over is one an IPv4 socket can send to.
+        let told = got.addr.expect("an address");
+        assert_eq!(told, "203.0.113.7:5000".parse::<SocketAddr>().unwrap());
+        assert!(told.is_ipv4(), "handed {told}, which IPv4 cannot dial");
+    }
+
+    /// A mapped IPv4 party and a real IPv6 party still share no family: the
+    /// fix must not collapse the distinction SIP-69 exists to draw.
+    #[test]
+    fn a_mapped_ipv4_party_and_a_real_ipv6_party_share_no_family() {
+        let r = Rendezvous::default();
+        let (a, b) = (PubKey::new([3u8; 32]), PubKey::new([4u8; 32]));
+        let a_at: SocketAddr = "[::ffff:203.0.113.7]:5000".parse().unwrap();
+        let b_at: SocketAddr = "[2001:db8::1]:6000".parse().unwrap();
+
+        assert_eq!(r.request(&a, a_at, &b).answer, Answer::Waiting);
+        assert_eq!(
+            r.request(&b, b_at, &a).answer,
+            Answer::NoSharedFamily,
+            "a mapped IPv4 host has no route to a real IPv6 one"
+        );
     }
 }
