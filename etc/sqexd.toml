@@ -186,6 +186,13 @@ seed_relay_peers = [
 # carried there is answered the origin's limit, or origin_refused where it
 # said no, and origin_away only where it did not answer. What each origin
 # last refused is under `origins` in GET /status. Nothing to configure.
+#
+# SIP-80: an origin the home task cannot find or reach is left alone for a
+# hold that doubles with each miss, from home_secs to an hour, and cleared
+# by its first answer. Every origin an account here hinted at is listed
+# under `origins`, an unfound one with its count and next try; `sqex
+# status` prints them. A hint that stays unfound for hundreds of tries is
+# the account's to withdraw (a Move with no origins). Nothing to configure.
 
 # SIP-76: a device may tell this exchange, as its home, which origin to
 # pull its account's channels from (/account/hint) -- and a create this

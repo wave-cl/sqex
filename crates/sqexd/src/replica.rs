@@ -1661,16 +1661,36 @@ pub async fn run_homed(
             if origin == me {
                 continue;
             }
+            // SIP-80: an origin this home could not find or reach is left
+            // alone for a hold that doubles with each miss, from one cycle
+            // to an hour. A stale hint cost one DNS lookup every cycle for
+            // two days before this; a member's own act still goes out
+            // (SIP-43's forwarder is not this loop) and its answer ends
+            // the hold.
+            if server.origin_unfound_until(&origin).is_some() {
+                continue;
+            }
             // By the hint the account gave, or by whatever else this
             // exchange knows the origin by (SIP-60's `reach`).
             let Some((addr, _)) = server.reach_by(&origin, &domain).await else {
-                tracing::debug!(%origin, %domain, "cannot find an account's origin");
+                server.note_unfound(
+                    &origin,
+                    &domain,
+                    crate::server::UnfoundWhy::NoAddress,
+                    interval.as_secs(),
+                );
                 continue;
             };
             let mut client = match H3Client::connect(addr, origin.as_bytes(), &seed).await {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!(origin = %origin, error = %e, "cannot reach an account's origin");
+                    tracing::debug!(origin = %origin, error = %e, "cannot reach an account's origin");
+                    server.note_unfound(
+                        &origin,
+                        &domain,
+                        crate::server::UnfoundWhy::Unreachable,
+                        interval.as_secs(),
+                    );
                     // SIP-66: the way there is forgotten, so the next cycle
                     // resolves the domain again -- which is how a rotation
                     // is noticed when the address stayed the same.
@@ -1678,6 +1698,8 @@ pub async fn run_homed(
                     continue;
                 }
             };
+            // Connected: found, whatever the cycle goes on to find.
+            server.reached(&origin);
             let already: Vec<[u8; 32]> = configured
                 .iter()
                 .filter(|(k, _)| *k == origin)

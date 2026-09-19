@@ -2937,12 +2937,25 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
                     )
                 })
                 .unwrap_or_default();
+            // SIP-80: an origin the home task could not find or reach,
+            // how many cycles in a row, and when it will look again.
+            let unfound = o["unfound"]
+                .as_object()
+                .map(|u| {
+                    format!(
+                        " · UNFOUND ({}) {} tries, next in {}s",
+                        u["why"].as_str().unwrap_or("?"),
+                        u["tries"].as_u64().unwrap_or(0),
+                        u["next_in"].as_u64().unwrap_or(0),
+                    )
+                })
+                .unwrap_or_default();
             let name = if domain.is_empty() {
                 key.to_string()
             } else {
                 format!("{key} ({domain})")
             };
-            println!("  origin {name}: {reached}{held}{refused}");
+            println!("  origin {name}: {reached}{unfound}{held}{refused}");
         }
     }
     Ok(())

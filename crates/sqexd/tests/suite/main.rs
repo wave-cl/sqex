@@ -72,5 +72,6 @@ mod signed_entry_flow;
 mod soft_state_flow;
 mod sqnr_flow;
 mod succession_flow;
+mod unfound_flow;
 mod waiting_flow;
 mod wake_flow;

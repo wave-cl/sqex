@@ -263,6 +263,37 @@ pub const HOLD_DEFAULT_SECS: u64 = 60;
 /// SIP-78: the most a stated wait holds this exchange off for.
 pub const MAX_HOLD_SECS: u64 = 3600;
 
+/// SIP-80: an origin the home task could not find or reach, and when it
+/// will try again. Cleared by the first answer from it, on any path.
+#[derive(Debug, Clone)]
+pub struct Unfound {
+    pub since: u64,
+    pub tries: u32,
+    pub next: u64,
+    pub why: UnfoundWhy,
+}
+
+/// SIP-80: why an origin was not found on the last attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnfoundWhy {
+    /// No address for its key or hinted domain.
+    NoAddress,
+    /// An address, and no connection to it.
+    Unreachable,
+}
+
+impl UnfoundWhy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnfoundWhy::NoAddress => "no_address",
+            UnfoundWhy::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// SIP-80: the longest a home holds off from an origin it cannot find.
+pub const MAX_UNFOUND_SECS: u64 = MAX_HOLD_SECS;
+
 pub struct Server {
     pub public_key: PubKey,
     config_path: Option<PathBuf>,
@@ -379,6 +410,8 @@ pub struct Server {
     /// where the origin's peering limit spoke, until when writes to it are
     /// held. Kept until replaced: a refusal is a thing to have seen.
     origin_refusals: Mutex<HashMap<PubKey, OriginRefusal>>,
+    /// SIP-80: origins the home task could not find or reach.
+    origin_unfound: Mutex<HashMap<PubKey, Unfound>>,
     /// SIP-59: poked when an account moves here, so the home task pulls
     /// its channels at once rather than at its next interval.
     pub(crate) homed: tokio::sync::Notify,
@@ -860,9 +893,24 @@ impl Server {
         let now = now_unix();
         let contacts = self.contacts.lock().unwrap();
         let refusals = self.origin_refusals.lock().unwrap();
+        let unfound = self.origin_unfound.lock().unwrap();
         let forwarders = self.origins.read().unwrap();
+        // SIP-80: and every origin an account homed here hinted at -- the
+        // reason the home task is trying at all, and the row an operator
+        // needed for an origin that never answered.
+        let hinted: HashMap<PubKey, String> = self
+            .devices
+            .homed_here(&self.public_key)
+            .into_iter()
+            .map(|(origin, domain, _)| (origin, domain))
+            .collect();
         let mut keys: Vec<PubKey> = forwarders.keys().copied().collect();
-        for k in contacts.keys().chain(refusals.keys()) {
+        for k in contacts
+            .keys()
+            .chain(refusals.keys())
+            .chain(unfound.keys())
+            .chain(hinted.keys())
+        {
             if !keys.contains(k) {
                 keys.push(*k);
             }
@@ -872,13 +920,24 @@ impl Server {
             .iter()
             .map(|k| {
                 let r = refusals.get(k);
+                let u = unfound.get(k).filter(|u| u.next > now || u.tries > 0);
                 json!({
                     "key": k.to_string(),
-                    "domain": forwarders.get(k).map(|f| f.domain.clone()).unwrap_or_default(),
+                    "domain": forwarders
+                        .get(k)
+                        .map(|f| f.domain.clone())
+                        .or_else(|| hinted.get(k).cloned())
+                        .unwrap_or_default(),
                     "reached": contacts.get(k).map(|at| now.saturating_sub(*at)),
                     "held_until": r.and_then(|r| r.held_until).filter(|u| *u > now),
                     "last_refused": r.map(|r| json!({
                         "path": r.path, "code": r.code, "wait": r.wait, "at": r.at,
+                    })),
+                    "unfound": u.map(|u| json!({
+                        "since": u.since,
+                        "tries": u.tries,
+                        "next_in": u.next.saturating_sub(now),
+                        "why": u.why.as_str(),
                     })),
                 })
             })
@@ -886,9 +945,59 @@ impl Server {
         json!(rows)
     }
 
-    /// SIP-53: note that `origin` answered just now.
+    /// SIP-53: note that `origin` answered just now. SIP-80: and so is
+    /// no longer unfound.
     pub(crate) fn reached(&self, origin: &PubKey) {
         self.contacts.lock().unwrap().insert(*origin, now_unix());
+        self.origin_unfound.lock().unwrap().remove(origin);
+    }
+
+    /// SIP-80: a home-task cycle could not find or reach `origin`. Holds
+    /// off from it for `interval << (tries - 1)`, at most
+    /// `MAX_UNFOUND_SECS`, and says so once per hold. Returns the hold.
+    pub(crate) fn note_unfound(
+        &self,
+        origin: &PubKey,
+        domain: &str,
+        why: UnfoundWhy,
+        interval: u64,
+    ) -> u64 {
+        let now = now_unix();
+        let mut unfound = self.origin_unfound.lock().unwrap();
+        let (since, tries) = match unfound.get(origin) {
+            Some(u) => (u.since, u.tries.saturating_add(1)),
+            None => (now, 1),
+        };
+        let hold = interval
+            .max(1)
+            .saturating_mul(1u64 << (tries - 1).min(20))
+            .min(MAX_UNFOUND_SECS);
+        unfound.insert(
+            *origin,
+            Unfound {
+                since,
+                tries,
+                next: now + hold,
+                why,
+            },
+        );
+        tracing::warn!(
+            %origin, domain, why = why.as_str(), tries, next_in = hold,
+            "cannot find an account's origin; holding off (SIP-80)"
+        );
+        hold
+    }
+
+    /// SIP-80: whether the home task is holding off from `origin`, and
+    /// until when.
+    pub(crate) fn origin_unfound_until(&self, origin: &PubKey) -> Option<u64> {
+        let now = now_unix();
+        self.origin_unfound
+            .lock()
+            .unwrap()
+            .get(origin)
+            .map(|u| u.next)
+            .filter(|next| *next > now)
     }
 
     /// SIP-53: how long `origin` has been out of reach -- since it last
@@ -1491,6 +1600,7 @@ pub async fn bind_with(
         ),
         contacts: Mutex::new(HashMap::new()),
         origin_refusals: Mutex::new(HashMap::new()),
+        origin_unfound: Mutex::new(HashMap::new()),
         homed: tokio::sync::Notify::new(),
         rehome_away_secs: config.rehome_away_secs,
         limiter: crate::limits::Limiter::new(config.limits),
