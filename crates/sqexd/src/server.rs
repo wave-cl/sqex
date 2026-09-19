@@ -2314,6 +2314,17 @@ async fn route(
                 {
                     Ok(answer) => {
                         if answer.status == 200 {
+                            // SIP-76: this exchange knew the origin before
+                            // the origin could tell it. The creator's home
+                            // hints itself, and the task pulls at once.
+                            if server.devices.add_home_origin(
+                                &me,
+                                &req.origin,
+                                &domain,
+                                &server.public_key,
+                            ) {
+                                tracing::info!(account = %me, origin = %req.origin, "hinted a home to itself after a create");
+                            }
                             server.homed.notify_one();
                         }
                         (answer.status, "application/octet-stream", answer.body)
@@ -2323,6 +2334,35 @@ async fn route(
                         refuse(503, Code::OriginAway, None)
                     }
                 }
+            }
+        },
+        // SIP-76: a device tells its home which origin to pull from. For
+        // the caller's own account as the registry has it, and only where
+        // that account's Move names this exchange.
+        ("POST", "/account/hint") => match (peer.identity, sqex_proto::home::Hint::decode(body)) {
+            (None, _) => no_identity("hinting a home"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(hint)) => {
+                let account = server.account_of(&me);
+                let domain = hint.domain.trim().to_ascii_lowercase();
+                let pulling = server.devices.add_home_origin(
+                    &account,
+                    &hint.origin,
+                    &domain,
+                    &server.public_key,
+                );
+                if pulling {
+                    server.homed.notify_one();
+                }
+                (
+                    200,
+                    "application/octet-stream",
+                    sqex_proto::home::Hinted {
+                        now: now_unix(),
+                        pulling,
+                    }
+                    .encode(),
+                )
             }
         },
         // SIP-59: where an account lives, as this exchange has it.

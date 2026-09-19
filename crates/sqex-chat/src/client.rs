@@ -764,6 +764,8 @@ pub struct Chat {
     /// this client knows -- the first sign, for a client whose cursor is
     /// above a fork, that the origin changed. Its home is asked again.
     reask_home: HashSet<[u8; 32]>,
+    /// SIP-76: origins this client has hinted its home at this run.
+    hinted: HashSet<PubKey>,
     /// SIP-40: the keys each exchange held before its current one, as the
     /// pin store remembers them, newest first. What was signed under them
     /// still verifies under them and under nothing else.
@@ -858,6 +860,7 @@ impl Chat {
             forks_seen: HashSet::new(),
             pending_forks: Vec::new(),
             reask_home: HashSet::new(),
+            hinted: HashSet::new(),
             timers: HashMap::new(),
             bound_in: HashMap::new(),
             domain: None,
@@ -1233,15 +1236,25 @@ impl Chat {
 
         let out = match origin {
             Some(origin) => {
-                self.post(
-                    "/channel/create_at",
-                    sqex_proto::channel::CreateAt {
-                        origin,
-                        create: req.encode(),
-                    }
-                    .encode(),
-                )
-                .await?
+                let out = self
+                    .post(
+                        "/channel/create_at",
+                        sqex_proto::channel::CreateAt {
+                            origin,
+                            create: req.encode(),
+                        }
+                        .encode(),
+                    )
+                    .await?;
+                // SIP-76: the home knows the origin now, and a home from
+                // before it does not hint itself.
+                let domain = self
+                    .homes
+                    .get(&req.channel)
+                    .map(|h| h.domain.clone())
+                    .unwrap_or_default();
+                let _ = self.hint_home(&origin, &domain).await;
+                out
             }
             None => self.post("/channel/create", req.encode()).await?,
         };
@@ -4144,6 +4157,12 @@ impl Chat {
             .entry(home.origin)
             .or_insert_with(|| predecessors_of(&home.origin));
         self.homes.insert(*channel, home.clone());
+        // SIP-76: a channel of this account's that lives elsewhere is one
+        // its home should be pulling; said once per origin.
+        if home.origin != self.exchange {
+            let (origin, domain) = (home.origin, home.domain.clone());
+            let _ = self.hint_home(&origin, &domain).await;
+        }
         // SIP-74: a former origin whose regime ended below what this client
         // holds is a fork this client was on the losing side of.
         let forks: Vec<(u64, PubKey)> = home
@@ -4416,6 +4435,34 @@ impl Chat {
     /// SIP-74: let a stranded post go unsent.
     pub fn forget_stranded(&mut self, channel: &[u8; 32], seq: u64) -> Result<()> {
         Ok(self.store.drop_stranded(channel, seq)?)
+    }
+
+    /// SIP-76: tell this client's home to pull the account's channels from
+    /// `origin`, reached by `domain` where the home does not know it. Once
+    /// per origin per run; `Ok(false)` where the exchange is not this
+    /// account's home, or predates the route.
+    pub async fn hint_home(&mut self, origin: &PubKey, domain: &str) -> Result<bool> {
+        if *origin == self.exchange || !self.hinted.insert(*origin) {
+            return Ok(false);
+        }
+        let body = match self
+            .post(
+                "/account/hint",
+                sqex_proto::home::Hint {
+                    origin: *origin,
+                    domain: domain.to_string(),
+                }
+                .encode(),
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        Ok(sqex_proto::home::Hinted::decode(&body)
+            .map(|h| h.pulling)
+            .unwrap_or(false))
     }
 
     /// The exchange a channel's signatures name and its receipts verify

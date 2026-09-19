@@ -550,6 +550,8 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("GET", "/exchange/lineage", Cli("sqex lineage"), Anyone),
     // SIP-67: a client asks whose device it is before it signs anything.
     ("GET", "/device/account", Chat("Chat::whose"), Identity),
+    // SIP-76: a device tells its home which origin to pull from.
+    ("POST", "/account/hint", Chat("Chat::hint_home"), Identity),
     (
         "POST",
         "/exchange/lineage",

@@ -213,6 +213,67 @@ impl Moved {
     }
 }
 
+/// SIP-76: a device tells its home which origin to pull its channels
+/// from -- `| origin[32] | dom_len: u8 | domain |` at `POST /account/hint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hint {
+    pub origin: PubKey,
+    pub domain: String,
+}
+
+impl Hint {
+    pub fn encode(&self) -> Vec<u8> {
+        let d = self.domain.as_bytes();
+        let mut out = Vec::with_capacity(33 + d.len());
+        out.extend_from_slice(self.origin.as_bytes());
+        out.push(d.len().min(255) as u8);
+        out.extend_from_slice(&d[..d.len().min(255)]);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Hint> {
+        let short = || Error::Malformed("hint cut short".into());
+        let origin = PubKey::new(b.get(..32).ok_or_else(short)?.try_into().unwrap());
+        let n = *b.get(32).ok_or_else(short)? as usize;
+        let domain = b.get(33..33 + n).ok_or_else(short)?;
+        if 33 + n != b.len() {
+            return Err(Error::Malformed("trailing bytes after a hint".into()));
+        }
+        Ok(Hint {
+            origin,
+            domain: String::from_utf8(domain.to_vec())
+                .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?,
+        })
+    }
+}
+
+/// SIP-76: `| now: u64 | pulling: u8 |` -- whether the home took the hint
+/// and woke its task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hinted {
+    pub now: u64,
+    pub pulling: bool,
+}
+
+impl Hinted {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.push(u8::from(self.pulling));
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Hinted> {
+        if b.len() != 9 {
+            return Err(Error::Malformed("hinted is 9 bytes".into()));
+        }
+        Ok(Hinted {
+            now: u64::from_be_bytes(b[..8].try_into().unwrap()),
+            pulling: b[8] == 1,
+        })
+    }
+}
+
 /// The 32-byte ask of `/account/home`.
 pub fn asked(b: &[u8]) -> Result<PubKey> {
     if b.len() != 32 {
@@ -265,6 +326,25 @@ impl Homed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SIP-76: a hint round-trips, with and without a domain, and a short
+    /// one is refused.
+    #[test]
+    fn a_hint_round_trips() {
+        for domain in ["trunk.example", ""] {
+            let h = Hint {
+                origin: PubKey::new([3; 32]),
+                domain: domain.into(),
+            };
+            assert_eq!(Hint::decode(&h.encode()).unwrap(), h);
+        }
+        assert!(Hint::decode(&[0u8; 32]).is_err());
+        let r = Hinted {
+            now: 7,
+            pulling: true,
+        };
+        assert_eq!(Hinted::decode(&r.encode()).unwrap(), r);
+    }
     use ed25519_dalek::Signer;
 
     fn key(b: u8) -> ([u8; 32], PubKey) {

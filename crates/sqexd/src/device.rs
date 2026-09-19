@@ -202,6 +202,9 @@ CREATE INDEX IF NOT EXISTS home_by_home ON home (home);
 /// key it withdrew.
 pub const REVOCATION_SKEW: u64 = 5 * 60;
 
+/// SIP-76: origin hints kept per account; the oldest go past this.
+pub const MAX_HINTS: usize = 32;
+
 pub struct Registry {
     db: Mutex<Connection>,
 }
@@ -1085,7 +1088,8 @@ impl Registry {
 
     /// SIP-60: an origin told this home it put one of its accounts in a
     /// channel; remember the origin so the home task pulls from it. Only
-    /// for an account whose Move names this exchange.
+    /// for an account whose Move names this exchange. SIP-76: also what a
+    /// device's own hint, and a `create_at` this exchange carried, record.
     pub fn add_home_origin(
         &self,
         account: &PubKey,
@@ -1097,12 +1101,21 @@ impl Registry {
             return false;
         }
         let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO home_origin (account, origin, domain) VALUES (?1, ?2, ?3)
-             ON CONFLICT (account, origin) DO UPDATE SET domain = CASE WHEN ?3 = '' THEN domain ELSE ?3 END",
-            params![account.as_bytes(), origin.as_bytes(), domain],
-        )
-        .is_ok()
+        let ok = db
+            .execute(
+                "INSERT INTO home_origin (account, origin, domain) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (account, origin) DO UPDATE SET domain = CASE WHEN ?3 = '' THEN domain ELSE ?3 END",
+                params![account.as_bytes(), origin.as_bytes(), domain],
+            )
+            .is_ok();
+        // SIP-76: bounded per account, the oldest dropped -- a device may
+        // hint as it likes, and a home should not be made to ask everywhere.
+        let _ = db.execute(
+            "DELETE FROM home_origin WHERE account = ?1 AND rowid NOT IN
+                (SELECT rowid FROM home_origin WHERE account = ?1 ORDER BY rowid DESC LIMIT ?2)",
+            params![account.as_bytes(), MAX_HINTS as i64],
+        );
+        ok
     }
 
     /// SIP-68: the (account, origin, domain) hints of accounts homed here
