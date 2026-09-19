@@ -988,6 +988,17 @@ impl Server {
         hold
     }
 
+    /// SIP-80: forget unfound origins not in `keep` -- the ones no account
+    /// hints at any more. Nothing will try them, so nothing would ever
+    /// clear them, and a row for an origin nobody has a reason to contact
+    /// is not a readout.
+    pub(crate) fn retain_unfound(&self, keep: &std::collections::HashSet<PubKey>) {
+        self.origin_unfound
+            .lock()
+            .unwrap()
+            .retain(|k, _| keep.contains(k));
+    }
+
     /// SIP-80: whether the home task is holding off from `origin`, and
     /// until when.
     pub(crate) fn origin_unfound_until(&self, origin: &PubKey) -> Option<u64> {

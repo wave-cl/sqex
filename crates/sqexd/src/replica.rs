@@ -1657,6 +1657,9 @@ pub async fn run_homed(
                 None => by_origin.push((into, domain, homed)),
             }
         }
+        // SIP-80: an unfound record outlives its hint otherwise, since
+        // nothing would try the origin again to clear it.
+        server.retain_unfound(&by_origin.iter().map(|(o, _, _)| *o).collect());
         for (origin, domain, accounts) in by_origin {
             if origin == me {
                 continue;

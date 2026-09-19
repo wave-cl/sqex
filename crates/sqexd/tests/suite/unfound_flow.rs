@@ -97,6 +97,23 @@ async fn an_origin_with_no_address_is_tried_less_and_less() {
         row["unfound"]["since"].as_u64().unwrap_or(0) >= now() - 10,
         "{row}"
     );
+
+    // The hint withdrawn -- a Move with no origins -- the row goes with
+    // it: nothing will try the origin again, so nothing would clear it.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    move_hinting(&mut alice, &alice_seed, &h_key, vec![]).await;
+    let mut gone = false;
+    for _ in 0..40 {
+        if origin_row(&mut alice, &ghost).await.is_none() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        gone,
+        "an unfound origin nobody hints at any more stayed listed"
+    );
 }
 
 #[tokio::test]
