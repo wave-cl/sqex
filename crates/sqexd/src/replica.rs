@@ -960,6 +960,42 @@ pub async fn account_for(
 /// dropped on the first transport error, so the next post redials. One post
 /// at a time per origin -- they are small, and ordering the origin's
 /// answers is the origin's job, not this lock's.
+/// SIP-78: why a forward to an origin did not go through -- told apart so a
+/// member is answered the right thing: a limit is passed on with its wait,
+/// an origin that answered no is `origin_refused`, and only an origin that
+/// did not answer is `origin_away`.
+#[derive(Debug, Clone)]
+pub enum ForwardFailed {
+    /// The origin did not answer at all.
+    Unreachable(String),
+    /// The origin's peering limit: hold writes to it for this many seconds.
+    Limited(u64),
+    /// The origin answered, and refused, with this status.
+    Refused(u16),
+}
+
+impl std::fmt::Display for ForwardFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForwardFailed::Unreachable(e) => write!(f, "the origin did not answer: {e}"),
+            ForwardFailed::Limited(secs) => write!(f, "the origin's peering limit: wait {secs}s"),
+            ForwardFailed::Refused(code) => write!(f, "the origin refused the forward ({code})"),
+        }
+    }
+}
+
+/// SIP-78: read a peering refusal's status into a `ForwardFailed`.
+fn refused_forward(code: u16, body: &[u8]) -> ForwardFailed {
+    if code == 429 {
+        let wait = sqex_proto::refusal::Refusal::decode(body)
+            .ok()
+            .and_then(|r| r.detail.and_then(|d| d.trim().parse::<u64>().ok()))
+            .unwrap_or(crate::server::HOLD_DEFAULT_SECS);
+        return ForwardFailed::Limited(wait);
+    }
+    ForwardFailed::Refused(code)
+}
+
 pub struct Forwarder {
     pub key: PubKey,
     pub addr: SocketAddr,
@@ -990,13 +1026,13 @@ impl Forwarder {
         carry: Option<&sqex_proto::credential::Credential>,
         path: &str,
         body: &[u8],
-    ) -> std::result::Result<Forwarded, String> {
+    ) -> std::result::Result<Forwarded, ForwardFailed> {
         let mut slot = self.client.lock().await;
         if slot.is_none() {
             *slot = Some(
                 H3Client::connect(self.addr, self.key.as_bytes(), seed)
                     .await
-                    .map_err(|e| format!("dial the origin: {e}"))?,
+                    .map_err(|e| ForwardFailed::Unreachable(format!("dial the origin: {e}")))?,
             );
         }
         let client = slot.as_mut().expect("just filled");
@@ -1012,13 +1048,14 @@ impl Forwarder {
             Ok(a) => a,
             Err(e) => {
                 *slot = None;
-                return Err(format!("the origin did not answer: {e}"));
+                return Err(ForwardFailed::Unreachable(e.to_string()));
             }
         };
         if code != 200 {
-            return Err(format!("the origin refused the forward ({code})"));
+            return Err(refused_forward(code, &body));
         }
-        let forwarded = Forwarded::decode(&body).map_err(|e| e.to_string())?;
+        let forwarded =
+            Forwarded::decode(&body).map_err(|e| ForwardFailed::Unreachable(e.to_string()))?;
         if forwarded.status == 200 {
             self.poke.notify_one();
         }
@@ -1088,13 +1125,13 @@ impl Forwarder {
         device: &PubKey,
         carry: Option<&sqex_proto::credential::Credential>,
         post: &sqex_proto::channel::Post,
-    ) -> std::result::Result<Forwarded, String> {
+    ) -> std::result::Result<Forwarded, ForwardFailed> {
         let mut slot = self.client.lock().await;
         if slot.is_none() {
             *slot = Some(
                 H3Client::connect(self.addr, self.key.as_bytes(), seed)
                     .await
-                    .map_err(|e| format!("dial the origin: {e}"))?,
+                    .map_err(|e| ForwardFailed::Unreachable(format!("dial the origin: {e}")))?,
             );
         }
         let client = slot.as_mut().expect("just filled");
@@ -1110,15 +1147,16 @@ impl Forwarder {
             Err(e) => {
                 // The connection is suspect; the next post starts a new one.
                 *slot = None;
-                return Err(format!("the origin did not answer: {e}"));
+                return Err(ForwardFailed::Unreachable(e.to_string()));
             }
         };
         if code != 200 {
-            // SIP-35's uniform peering refusal, or an origin from before
-            // SIP-43: either way it cannot be reached for this.
-            return Err(format!("the origin refused the forward ({code})"));
+            // SIP-35's uniform peering refusal, an origin from before
+            // SIP-43, or (SIP-78) the origin's peering limit, told apart.
+            return Err(refused_forward(code, &body));
         }
-        let forwarded = Forwarded::decode(&body).map_err(|e| e.to_string())?;
+        let forwarded =
+            Forwarded::decode(&body).map_err(|e| ForwardFailed::Unreachable(e.to_string()))?;
         if forwarded.status == 200 {
             self.poke.notify_one();
         }
@@ -1510,7 +1548,11 @@ pub async fn run_homed(
                 // `home_secs` spent it all on saying what the origin had
                 // already recorded -- found live, as a forwarded create
                 // refused because the Move before it had been refused.
+                // SIP-78: a write to an origin whose limit spoke waits for
+                // the seconds it gave; reads go on.
+                let held = server.origin_held(&origin).is_some();
                 if let Some((mv, home_domain)) = server.devices.move_of(account)
+                    && !held
                     && !carried_moves.contains(&(*account, origin, mv.issued))
                 {
                     let issued = mv.issued;
@@ -1522,8 +1564,8 @@ pub async fn run_homed(
                         Ok((200, _)) | Ok((409, _)) => {
                             carried_moves.insert((*account, origin, issued));
                         }
-                        Ok((code, _)) => {
-                            tracing::debug!(origin = %origin, account = %account, code, "the origin did not take the move")
+                        Ok((code, body)) => {
+                            note_refused(&server, &origin, "/peer/moved", code, &body);
                         }
                         Err(e) => {
                             tracing::warn!(origin = %origin, error = %e, "carrying a move failed");
@@ -1554,6 +1596,7 @@ pub async fn run_homed(
                                         && first == *account
                                         && let Some(instance) = server.channels().instance_of(&c)
                                         && !told_folds.contains(&(origin, c))
+                                        && server.origin_held(&origin).is_none()
                                         && tell_folded(
                                             &mut client,
                                             &server,
@@ -1690,6 +1733,24 @@ async fn pull_soft_state(
     }
 }
 
+/// SIP-78: record what an origin refused on a peering write, with the wait
+/// where its limit spoke, so the home holds off and the operator can see.
+fn note_refused(
+    server: &crate::server::Server,
+    origin: &PubKey,
+    path: &str,
+    code: u16,
+    body: &[u8],
+) {
+    let wait = (code == 429).then(|| {
+        sqex_proto::refusal::Refusal::decode(body)
+            .ok()
+            .and_then(|r| r.detail.and_then(|d| d.trim().parse::<u64>().ok()))
+            .unwrap_or(crate::server::HOLD_DEFAULT_SECS)
+    });
+    server.note_origin_refusal(origin, path, code, wait);
+}
+
 /// SIP-71: tell an origin that the direct message it orders under
 /// `channel` is a stray -- this home, `first`'s by its Move, holds the
 /// conversation under `instance`. The origin verifies and folds, or says
@@ -1718,8 +1779,8 @@ async fn tell_folded(
             tracing::debug!(%origin, %channel, "the origin no longer holds the stray");
             true
         }
-        Ok((code, _)) => {
-            tracing::debug!(%origin, %channel, code, "the origin did not fold the stray");
+        Ok((code, body)) => {
+            note_refused(server, origin, "/peer/folded", code, &body);
             false
         }
         Err(e) => {

@@ -157,6 +157,10 @@ pub enum Code {
     /// key's services -- mailbox, prekeys, resolution, wake, backup -- are
     /// handed off there.
     Moved,
+    /// SIP-78: the origin an act was forwarded to answered, and refused it
+    /// -- distinct from `OriginAway`, which is an origin that did not
+    /// answer.
+    OriginRefused,
 
     // SIP-5 mailbox.
     RecipientFull,
@@ -234,6 +238,7 @@ impl Code {
             Code::NotAReplica => 67,
             Code::Muted => 68,
             Code::Moved => 69,
+            Code::OriginRefused => 70,
 
             Code::NoSuchUpload => 36,
             Code::NoSuchBlob => 37,
@@ -322,6 +327,7 @@ impl Code {
             67 => Code::NotAReplica,
             68 => Code::Muted,
             69 => Code::Moved,
+            70 => Code::OriginRefused,
 
             36 => Code::NoSuchUpload,
             37 => Code::NoSuchBlob,
@@ -435,6 +441,7 @@ impl Code {
             Code::NotAReplica => "not_a_replica",
             Code::Muted => "muted",
             Code::Moved => "moved",
+            Code::OriginRefused => "origin_refused",
 
             Code::Unknown(_) => "unknown",
         }
@@ -512,6 +519,7 @@ impl Code {
         Code::NotAReplica,
         Code::Muted,
         Code::Moved,
+        Code::OriginRefused,
     ];
 }
 

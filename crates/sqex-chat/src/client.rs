@@ -243,6 +243,9 @@ pub enum ChatError {
     /// SIP-43: the conversation lives at another exchange, and this one could
     /// not reach it to order the post. Nothing was sent; the draft stands.
     OriginAway,
+    /// SIP-78: the origin answered a forwarded act and refused it, with
+    /// its status where the exchange said.
+    OriginRefused(Option<u16>),
     /// SIP-44: this account has been succeeded by the key named. Everything it
     /// held is that key's now, and this device is nobody's until it is
     /// linked to it.
@@ -292,6 +295,11 @@ fn classify(path: &str, code: u16, body: &[u8]) -> ChatError {
             // own devices, and only the exchange holds the facts to judge it.
             RefusalCode::NotAnAdmin => ChatError::NotAnAdmin,
             RefusalCode::OriginAway => ChatError::OriginAway,
+            // SIP-78: the origin answered, and said no -- a different
+            // situation from one that could not be reached.
+            RefusalCode::OriginRefused => {
+                ChatError::OriginRefused(r.detail.as_deref().and_then(|d| d.parse().ok()))
+            }
             RefusalCode::Succeeded => {
                 ChatError::Succeeded(r.detail.as_deref().and_then(|d| d.parse().ok()))
             }
@@ -378,6 +386,12 @@ impl std::fmt::Display for ChatError {
                 f,
                 "this conversation lives at another exchange, which cannot be reached right now; \
                  nothing was sent"
+            ),
+            ChatError::OriginRefused(code) => write!(
+                f,
+                "this conversation lives at another exchange, which refused what your exchange \
+                 carried there{}; nothing was sent",
+                code.map(|c| format!(" ({c})")).unwrap_or_default()
             ),
             ChatError::MailSealedElsewhere(id) => write!(
                 f,

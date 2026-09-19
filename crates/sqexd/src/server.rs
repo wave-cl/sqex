@@ -246,6 +246,22 @@ impl Connections {
 }
 
 /// Everything a request handler needs.
+/// SIP-78: what an origin last refused this exchange, and the hold it put
+/// on this exchange's writes.
+#[derive(Debug, Clone)]
+pub struct OriginRefusal {
+    pub path: String,
+    pub code: u16,
+    pub wait: Option<u64>,
+    pub at: u64,
+    pub held_until: Option<u64>,
+}
+
+/// SIP-78: how long to hold writes to an origin whose limit gave no wait.
+pub const HOLD_DEFAULT_SECS: u64 = 60;
+/// SIP-78: the most a stated wait holds this exchange off for.
+pub const MAX_HOLD_SECS: u64 = 3600;
+
 pub struct Server {
     pub public_key: PubKey,
     config_path: Option<PathBuf>,
@@ -358,6 +374,10 @@ pub struct Server {
     /// SIP-53: when each origin was last reached, so a replica can say how
     /// long one has been away. An origin never reached counts from start.
     contacts: Mutex<HashMap<PubKey, u64>>,
+    /// SIP-78: per origin, the last refusal this exchange met there and,
+    /// where the origin's peering limit spoke, until when writes to it are
+    /// held. Kept until replaced: a refusal is a thing to have seen.
+    origin_refusals: Mutex<HashMap<PubKey, OriginRefusal>>,
     /// SIP-59: poked when an account moves here, so the home task pulls
     /// its channels at once rather than at its next interval.
     pub(crate) homed: tokio::sync::Notify,
@@ -750,6 +770,119 @@ impl Server {
     /// in `domain`, or is empty.
     pub(crate) fn own_domain(&self) -> String {
         self.domain.clone().unwrap_or_default()
+    }
+
+    /// SIP-78: note what `origin` refused, on which path, and hold this
+    /// exchange's peering writes to it where the refusal was the origin's
+    /// peering limit. Logged at warn once per origin per window.
+    pub(crate) fn note_origin_refusal(
+        &self,
+        origin: &PubKey,
+        path: &str,
+        code: u16,
+        wait: Option<u64>,
+    ) {
+        let now = now_unix();
+        let mut refusals = self.origin_refusals.lock().unwrap();
+        let held_until = wait.map(|w| now + w.min(MAX_HOLD_SECS));
+        let already_held = refusals
+            .get(origin)
+            .and_then(|r| r.held_until)
+            .is_some_and(|until| until > now);
+        if !already_held {
+            match wait {
+                Some(w) => tracing::warn!(
+                    %origin, path, code, wait = w,
+                    "the origin's peering limit: holding writes to it"
+                ),
+                None => tracing::warn!(%origin, path, code, "the origin refused a write"),
+            }
+        }
+        let kept_hold = refusals
+            .get(origin)
+            .and_then(|r| r.held_until)
+            .filter(|u| *u > now);
+        refusals.insert(
+            *origin,
+            OriginRefusal {
+                path: path.to_string(),
+                code,
+                wait,
+                at: now,
+                held_until: held_until.or(kept_hold),
+            },
+        );
+    }
+
+    /// SIP-78: whether peering writes to `origin` are held off, and until
+    /// when.
+    pub(crate) fn origin_held(&self, origin: &PubKey) -> Option<u64> {
+        let now = now_unix();
+        self.origin_refusals
+            .lock()
+            .unwrap()
+            .get(origin)
+            .and_then(|r| r.held_until)
+            .filter(|until| *until > now)
+    }
+
+    /// SIP-78: what to answer a member whose forwarded act did not go
+    /// through, by why -- a limit passed on with its wait, an origin that
+    /// said no as `origin_refused`, and only silence as `origin_away`. The
+    /// refusal is recorded against the origin either way.
+    pub(crate) fn forward_failed(
+        &self,
+        origin: &PubKey,
+        path: &str,
+        e: &crate::replica::ForwardFailed,
+    ) -> (u16, &'static str, Vec<u8>) {
+        use crate::replica::ForwardFailed;
+        match e {
+            ForwardFailed::Limited(secs) => {
+                self.note_origin_refusal(origin, path, 429, Some(*secs));
+                refuse(429, Code::RateLimited, Some(&secs.to_string()))
+            }
+            ForwardFailed::Refused(code) => {
+                self.note_origin_refusal(origin, path, *code, None);
+                refuse(502, Code::OriginRefused, Some(&code.to_string()))
+            }
+            ForwardFailed::Unreachable(why) => {
+                tracing::warn!(%origin, path, "forward failed: {why}");
+                refuse(503, Code::OriginAway, None)
+            }
+        }
+    }
+
+    /// SIP-78: the origins this exchange forwards to or pulls from, with
+    /// when each last answered, any hold in force, and the last refusal.
+    fn origins_value(&self) -> serde_json::Value {
+        let now = now_unix();
+        let contacts = self.contacts.lock().unwrap();
+        let refusals = self.origin_refusals.lock().unwrap();
+        let forwarders = self.origins.read().unwrap();
+        let mut keys: Vec<PubKey> = forwarders.keys().copied().collect();
+        for k in contacts.keys().chain(refusals.keys()) {
+            if !keys.contains(k) {
+                keys.push(*k);
+            }
+        }
+        keys.truncate(256);
+        let rows: Vec<serde_json::Value> = keys
+            .iter()
+            .map(|k| {
+                let r = refusals.get(k);
+                json!({
+                    "key": k.to_string(),
+                    "domain": forwarders.get(k).map(|f| f.domain.clone()).unwrap_or_default(),
+                    "reached": contacts.get(k).map(|at| now.saturating_sub(*at)),
+                    "held_until": r.and_then(|r| r.held_until).filter(|u| *u > now),
+                    "last_refused": r.map(|r| json!({
+                        "path": r.path, "code": r.code, "wait": r.wait, "at": r.at,
+                    })),
+                })
+            })
+            .collect();
+        json!(rows)
     }
 
     /// SIP-53: note that `origin` answered just now.
@@ -1356,6 +1489,7 @@ pub async fn bind_with(
                 .collect(),
         ),
         contacts: Mutex::new(HashMap::new()),
+        origin_refusals: Mutex::new(HashMap::new()),
         homed: tokio::sync::Notify::new(),
         rehome_away_secs: config.rehome_away_secs,
         limiter: crate::limits::Limiter::new(config.limits),
@@ -2329,10 +2463,7 @@ async fn route(
                         }
                         (answer.status, "application/octet-stream", answer.body)
                     }
-                    Err(e) => {
-                        tracing::warn!(origin = %req.origin, %domain, "create-at failed: {e}");
-                        refuse(503, Code::OriginAway, None)
-                    }
+                    Err(e) => server.forward_failed(&req.origin, "/channel/create", &e),
                 }
             }
         },
@@ -3142,10 +3273,7 @@ async fn route(
                             }
                             (answer.status, "application/octet-stream", answer.body)
                         }
-                        Err(e) => {
-                            tracing::warn!(origin = %origin, "forward failed: {e}");
-                            refuse(503, Code::OriginAway, None)
-                        }
+                        Err(e) => server.forward_failed(&origin, "/channel/post", &e),
                     };
                 }
                 let (status, body) = post_here(server, &me, &device, &req);
@@ -5066,6 +5194,9 @@ impl Server {
             // SIP-5 §Durability: a memory-only deployment says so here, since a client
             // cannot tell and should not have to.
             "mailbox_durable": self.mailbox.durable(),
+            // SIP-78: what each origin last refused this exchange, and
+            // whether writes to it are held.
+            "origins": self.origins_value(),
             "sessions": self.sessions.len(),
             "rooms": self.rooms.len(),
             "admins": self.admins.read().unwrap().len(),
@@ -5606,10 +5737,7 @@ async fn forward_action(
                 }
                 (answer.status, "application/octet-stream", answer.body)
             }
-            Err(e) => {
-                tracing::warn!(origin = %origin, "forward failed: {e}");
-                refuse(503, Code::OriginAway, None)
-            }
+            Err(e) => server.forward_failed(&origin, path, &e),
         },
     )
 }
@@ -5738,10 +5866,8 @@ async fn carry_blob(
     path: &str,
     body: &[u8],
 ) -> Option<(u16, &'static str, Vec<u8>)> {
-    let away = |origin: &PubKey, e: String| {
-        tracing::warn!(origin = %origin, "carry failed: {e}");
-        refuse(503, Code::OriginAway, None)
-    };
+    let away =
+        |origin: &PubKey, e: crate::replica::ForwardFailed| server.forward_failed(origin, path, &e);
     match path {
         "/blob/begin" => {
             let req = BlobBegin::decode(body).ok()?;
@@ -5766,7 +5892,12 @@ async fn carry_blob(
                 return Some((answer.status, "application/octet-stream", answer.body));
             }
             let Ok(begun) = Begun::decode(&answer.body) else {
-                return Some(away(&origin, "the origin's answer did not decode".into()));
+                return Some(away(
+                    &origin,
+                    crate::replica::ForwardFailed::Unreachable(
+                        "the origin's answer did not decode".into(),
+                    ),
+                ));
             };
             let local = {
                 let mut carried = server.carried_uploads.lock().unwrap();

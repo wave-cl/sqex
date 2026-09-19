@@ -55,6 +55,7 @@ mod private_channel_flow;
 mod profile_flow;
 mod reaching_flow;
 mod receipt_flow;
+mod refusal_flow;
 mod rehome_flow;
 mod relay_flow;
 mod rendezvous_flow;
