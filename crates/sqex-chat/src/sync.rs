@@ -838,11 +838,26 @@ impl Sync {
                 // SIP-72: a generation this side asked for, verified under
                 // the origin the sibling named and this side knows.
                 let origin = self.asked[&(channel, instance)];
+                let generation = chat.store().generation_of(&channel, &instance)?;
+                let posts: Vec<u64> = entries
+                    .iter()
+                    .filter(|e| {
+                        e.kind == KIND_MEMBER
+                            && !generation
+                                .is_some_and(|g| chat.store().has_history_entry(&channel, g, e.seq))
+                    })
+                    .map(|e| e.seq)
+                    .collect();
                 let n = chat
                     .import_earlier(&channel, instance, &origin, &entries)
                     .await?;
                 self.progress.entries_in += n;
-                self.progress.messages_in += n;
+                if let Some(g) = chat.store().generation_of(&channel, &instance)? {
+                    self.progress.messages_in += posts
+                        .iter()
+                        .filter(|seq| chat.store().has_history_entry(&channel, g, **seq))
+                        .count();
+                }
                 if n > 0 {
                     self.progress.channels_in.insert(channel);
                 }
