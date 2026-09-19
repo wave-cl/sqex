@@ -129,12 +129,15 @@ pub struct Membership {
     /// SIP-49: the relay peers to ask our exchange to share the room with --
     /// the channel's origin, for a member at a copy. Empty for a member at
     /// the origin, who still asks the shared way so as to be told homes.
-    share: Vec<PubKey>,
+    share: Vec<(PubKey, String)>,
     /// SIP-49: where each remote member is. A member not here is local.
     homes: HashMap<PubKey, PubKey>,
     /// SIP-49: the exchange refused the shared join as malformed -- it is
     /// from before SIP-49 -- so the plain join is used from then on.
     unshared: bool,
+    /// SIP-73: the exchange refused the join with words as malformed -- it
+    /// is from before SIP-73 -- so SIP-49's join is used from then on.
+    unworded: bool,
     /// SIP-49: members whose home is not a peer of our exchange, or whose
     /// bridge the exchange refused: in the call and not heard.
     pub unreachable: std::collections::HashSet<PubKey>,
@@ -169,12 +172,14 @@ impl Membership {
             share: Vec::new(),
             homes: HashMap::new(),
             unshared: false,
+            unworded: false,
             unreachable: std::collections::HashSet::new(),
         }
     }
 
-    /// SIP-49: ask the exchange to share the room with these relay peers.
-    pub fn with_share(mut self, share: Vec<PubKey>) -> Membership {
+    /// SIP-49: ask the exchange to share the room with these relay peers,
+    /// each with the domain it is found by where known (SIP-73).
+    pub fn with_share(mut self, share: Vec<(PubKey, String)>) -> Membership {
         self.share = share;
         self
     }
@@ -206,7 +211,20 @@ impl Membership {
         let roster = if self.unshared {
             Self::heartbeat(self.room, self.me, client).await?
         } else {
-            match Self::heartbeat_shared(self.room, self.me, &self.share, client).await? {
+            let homed = if self.unworded {
+                Self::heartbeat_shared(self.room, self.me, &self.share, client).await?
+            } else {
+                match Self::heartbeat_worded(self.room, self.me, self.seed, &self.share, client)
+                    .await?
+                {
+                    Some(homed) => Some(homed),
+                    None => {
+                        self.unworded = true;
+                        Self::heartbeat_shared(self.room, self.me, &self.share, client).await?
+                    }
+                }
+            };
+            match homed {
                 Some(homed) => {
                     self.homes = homed
                         .members
@@ -214,6 +232,18 @@ impl Membership {
                         .filter(|m| !m.is_local())
                         .map(|m| (m.identity, m.home))
                         .collect();
+                    // SIP-73: a member homed at an exchange we have not
+                    // named is named from now on, with a word: that is how
+                    // the second side of an unlisted pair comes to hold a
+                    // word to share back with. The exchange already holds
+                    // the link, so no domain is needed.
+                    for home in self.homes.values() {
+                        if !self.share.iter().any(|(k, _)| k == home)
+                            && self.share.len() < sqex_proto::room::MAX_SHARE
+                        {
+                            self.share.push((*home, String::new()));
+                        }
+                    }
                     Roster {
                         now: homed.now,
                         members: homed
@@ -338,15 +368,48 @@ impl Membership {
     async fn heartbeat_shared(
         room: RoomId,
         me: PubKey,
-        share: &[PubKey],
+        share: &[(PubKey, String)],
         client: &mut Client,
     ) -> Result<Option<Homed>, String> {
+        let keys: Vec<PubKey> = share.iter().map(|(k, _)| *k).collect();
         let (code, body) = client
-            .post(
-                "/room/join",
-                JoinShared::new(&room, &me, share.to_vec()).encode(),
-            )
+            .post("/room/join", JoinShared::new(&room, &me, keys).encode())
             .await?;
+        Self::homed_answer(code, body)
+    }
+
+    /// SIP-73: the shared join with a word per exchange named, signed by
+    /// this device now. `None` when the exchange does not know it.
+    async fn heartbeat_worded(
+        room: RoomId,
+        me: PubKey,
+        seed: [u8; 32],
+        share: &[(PubKey, String)],
+        client: &mut Client,
+    ) -> Result<Option<Homed>, String> {
+        let issued = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let req = sqex_proto::room::JoinSharedWord {
+            handle: room.handle(),
+            proof: room.proof(&me),
+            share: share
+                .iter()
+                .map(|(k, d)| {
+                    (
+                        *k,
+                        d.clone(),
+                        sqex_proto::session::RoomWord::sign(&seed, &room.handle(), k, issued, None),
+                    )
+                })
+                .collect(),
+        };
+        let (code, body) = client.post("/room/join", req.encode()).await?;
+        Self::homed_answer(code, body)
+    }
+
+    fn homed_answer(code: u16, body: Vec<u8>) -> Result<Option<Homed>, String> {
         match code {
             200 => Homed::decode(&body).map(Some).map_err(|e| e.to_string()),
             400 => Ok(None),

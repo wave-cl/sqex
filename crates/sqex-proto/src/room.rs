@@ -47,6 +47,9 @@ pub const TYPE_LEAVE: u8 = 0x02;
 pub const TYPE_LEFT: u8 = 0x03;
 /// SIP-49: a join that also names the relay peers to share the room with.
 pub const TYPE_JOIN_SHARED: u8 = 0x04;
+/// SIP-73: a shared join naming each exchange with a domain and the
+/// member's word for it.
+pub const TYPE_JOIN_SHARED_WORD: u8 = 0x05;
 /// SIP-49: exchanges one join may name.
 pub const MAX_SHARE: usize = 4;
 
@@ -301,6 +304,72 @@ impl JoinShared {
     }
 }
 
+/// SIP-73: `JoinShared` with, per exchange named, where to find it and the
+/// member's word that the room may be shared with it.
+///
+/// `| type = 0x05 | handle[32] | proof[32] | count: u8 | count × (exchange[32] | dom_len: u8 | domain | RoomWord) |`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinSharedWord {
+    pub handle: [u8; 32],
+    pub proof: [u8; 32],
+    pub share: Vec<(PubKey, String, crate::session::RoomWord)>,
+}
+
+impl JoinSharedWord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(66 + self.share.len() * 160);
+        out.push(TYPE_JOIN_SHARED_WORD);
+        out.extend_from_slice(&self.handle);
+        out.extend_from_slice(&self.proof);
+        out.push(self.share.len() as u8);
+        for (e, domain, word) in &self.share {
+            out.extend_from_slice(e.as_bytes());
+            let d = domain.as_bytes();
+            out.push(d.len().min(255) as u8);
+            out.extend_from_slice(&d[..d.len().min(255)]);
+            word.encode_into(&mut out);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<JoinSharedWord> {
+        let short = || Error::Malformed("shared join cut short".into());
+        if b.len() < 66 || b[0] != TYPE_JOIN_SHARED_WORD {
+            return Err(Error::Malformed("not a shared join with words".into()));
+        }
+        let count = b[65] as usize;
+        if count > MAX_SHARE {
+            return Err(Error::Malformed(format!(
+                "a join names at most {MAX_SHARE} exchanges, not {count}"
+            )));
+        }
+        let mut at = 66;
+        let mut share = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = PubKey::new(b.get(at..at + 32).ok_or_else(short)?.try_into().unwrap());
+            at += 32;
+            let n = *b.get(at).ok_or_else(short)? as usize;
+            at += 1;
+            let domain = String::from_utf8(b.get(at..at + n).ok_or_else(short)?.to_vec())
+                .map_err(|_| Error::Malformed("domain is not UTF-8".into()))?;
+            at += n;
+            let (word, len) = crate::session::RoomWord::read(&b[at..])?;
+            at += len;
+            share.push((key, domain, word));
+        }
+        if at != b.len() {
+            return Err(Error::Malformed(
+                "trailing bytes after a shared join".into(),
+            ));
+        }
+        Ok(JoinSharedWord {
+            handle: b[1..33].try_into().unwrap(),
+            proof: b[33..65].try_into().unwrap(),
+            share,
+        })
+    }
+}
+
 /// SIP-49: a member with the exchange it joined at -- zero for "here".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HomedMember {
@@ -441,6 +510,33 @@ mod tests {
     fn identity(b: u8) -> PubKey {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[b; 32]);
         PubKey::new(sk.verifying_key().to_bytes())
+    }
+
+    /// SIP-73: a join with words round-trips, the word verifies for the
+    /// exchange it names and for no other, and a short one is refused.
+    #[test]
+    fn a_shared_join_with_words_round_trips() {
+        let room = RoomId::generate();
+        let seed = [9u8; 32];
+        let me = PubKey::new(
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        let peer = identity(4);
+        let word = crate::session::RoomWord::sign(&seed, &room.handle(), &peer, 1234, None);
+        assert!(word.verify(&me, &room.handle(), &peer));
+        assert!(!word.verify(&me, &room.handle(), &identity(5)));
+        assert!(!word.verify(&identity(6), &room.handle(), &peer));
+        let j = JoinSharedWord {
+            handle: room.handle(),
+            proof: room.proof(&me),
+            share: vec![(peer, "y.test".into(), word)],
+        };
+        let b = j.encode();
+        assert_eq!(JoinSharedWord::decode(&b).unwrap(), j);
+        assert!(JoinSharedWord::decode(&b[..b.len() - 1]).is_err());
+        assert!(JoinShared::decode(&b).is_err(), "a 0x05 decoded as a 0x04");
     }
 
     #[test]

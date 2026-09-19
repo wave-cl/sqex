@@ -57,6 +57,9 @@ pub const TYPE_INVITE_DEVICE: u8 = 0x07;
 /// SIP-65: an invite carrying the caller's own signed word, which is what
 /// an exchange nobody listed rings on.
 pub const TYPE_INVITE_SIGNED: u8 = 0x08;
+/// SIP-73: a room share standing on a member's word, sent over a link to
+/// an exchange the sender does not list.
+pub const TYPE_ROOM_SHARE_SIGNED: u8 = 0x0a;
 
 /// Why a bridged call did not connect (`Reject`) or ended (`Close`).
 ///
@@ -130,6 +133,14 @@ pub enum Control {
     RoomShare {
         handle: [u8; 32],
         members: Vec<crate::room::HomedMember>,
+    },
+    /// SIP-73: `RoomShare` with the local member whose word it stands on,
+    /// and the word -- signed for the room and the receiving exchange.
+    RoomShareSigned {
+        handle: [u8; 32],
+        members: Vec<crate::room::HomedMember>,
+        sharer: PubKey,
+        word: Box<crate::session::RoomWord>,
     },
 }
 
@@ -231,6 +242,25 @@ impl Control {
                 }
                 out
             }
+            Control::RoomShareSigned {
+                handle,
+                members,
+                sharer,
+                word,
+            } => {
+                let mut out = Vec::with_capacity(34 + members.len() * 96 + 32 + 74);
+                out.push(TYPE_ROOM_SHARE_SIGNED);
+                out.extend_from_slice(handle);
+                out.push(members.len() as u8);
+                for m in members {
+                    out.extend_from_slice(m.identity.as_bytes());
+                    out.extend_from_slice(&m.proof);
+                    out.extend_from_slice(m.home.as_bytes());
+                }
+                out.extend_from_slice(sharer.as_bytes());
+                word.encode_into(&mut out);
+                out
+            }
         }
     }
 
@@ -238,7 +268,7 @@ impl Control {
         let Some(&kind) = b.first() else {
             return Err(Error::Malformed("empty relay control frame".into()));
         };
-        if kind == TYPE_ROOM_SHARE {
+        if kind == TYPE_ROOM_SHARE || kind == TYPE_ROOM_SHARE_SIGNED {
             if b.len() < 34 {
                 return Err(Error::Malformed("room share cut short".into()));
             }
@@ -249,10 +279,14 @@ impl Control {
                     crate::room::MAX_MEMBERS
                 )));
             }
-            if b.len() != 34 + count * 96 {
+            let end = 34 + count * 96;
+            if kind == TYPE_ROOM_SHARE && b.len() != end {
                 return Err(Error::Malformed("room share cut short".into()));
             }
-            let members = (0..count)
+            if kind == TYPE_ROOM_SHARE_SIGNED && b.len() < end + 32 {
+                return Err(Error::Malformed("signed room share cut short".into()));
+            }
+            let members: Vec<crate::room::HomedMember> = (0..count)
                 .map(|i| {
                     let at = 34 + i * 96;
                     crate::room::HomedMember {
@@ -262,6 +296,21 @@ impl Control {
                     }
                 })
                 .collect();
+            if kind == TYPE_ROOM_SHARE_SIGNED {
+                let sharer = PubKey::new(b[end..end + 32].try_into().unwrap());
+                let (word, len) = crate::session::RoomWord::read(&b[end + 32..])?;
+                if end + 32 + len != b.len() {
+                    return Err(Error::Malformed(
+                        "trailing bytes after a signed room share".into(),
+                    ));
+                }
+                return Ok(Control::RoomShareSigned {
+                    handle: b[1..33].try_into().unwrap(),
+                    members,
+                    sharer,
+                    word: Box::new(word),
+                });
+            }
             return Ok(Control::RoomShare {
                 handle: b[1..33].try_into().unwrap(),
                 members,
@@ -426,6 +475,32 @@ mod tests {
 
     fn k(n: u8) -> PubKey {
         PubKey::new([n; 32])
+    }
+
+    /// SIP-73: a signed share round-trips and a plain one still does.
+    #[test]
+    fn a_signed_room_share_round_trips() {
+        let members = vec![crate::room::HomedMember {
+            identity: k(1),
+            proof: [2; 32],
+            home: PubKey::new([0; 32]),
+        }];
+        let word = crate::session::RoomWord::sign(&[7; 32], &[3; 32], &k(4), 99, None);
+        let c = Control::RoomShareSigned {
+            handle: [3; 32],
+            members: members.clone(),
+            sharer: k(1),
+            word: Box::new(word),
+        };
+        let b = c.encode();
+        assert!(b.len() <= MAX_CONTROL);
+        assert_eq!(Control::decode(&b).unwrap(), c);
+        assert!(Control::decode(&b[..b.len() - 1]).is_err());
+        let plain = Control::RoomShare {
+            handle: [3; 32],
+            members,
+        };
+        assert_eq!(Control::decode(&plain.encode()).unwrap(), plain);
     }
 
     #[test]

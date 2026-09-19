@@ -764,7 +764,7 @@ pub struct CallOpts {
     /// SIP-49: the relay peers to ask the exchange to share a room with --
     /// the channel's origin, for a call joined through a copy. Ignored on a
     /// two-party call.
-    pub share: Vec<PubKey>,
+    pub share: Vec<(PubKey, String)>,
 }
 
 impl Default for CallOpts {

@@ -213,7 +213,7 @@ enum Cmd {
         #[arg(long)]
         seconds: Option<u64>,
 
-        /// SIP-49: an exchange, by base58 key, to ask yours to share the
+        /// SIP-49, SIP-73: an exchange, by base58 key or `key@domain`, to ask yours to share the
         /// room with -- the channel's origin, when the call is in a channel
         /// you read through a copy. Members there see you, and you them.
         #[arg(long = "share")]
@@ -328,10 +328,17 @@ async fn run(cli: Cli) -> Result<(), String> {
         // rather than dials.
         let client = engine::connect(endpoint, &signer, &mut report).await?;
         let mut o = opts(&cli, source, sink, *jitter, *bitrate, *seconds, false);
+        // SIP-73: `key` or `key@domain` -- the domain is how our exchange
+        // finds an exchange it does not list.
         o.share = share
             .iter()
             .map(|k| {
-                k.parse::<sqnr_core::PubKey>()
+                let (key, domain) = match k.split_once('@') {
+                    Some((key, domain)) => (key, domain.to_string()),
+                    None => (k.as_str(), String::new()),
+                };
+                key.parse::<sqnr_core::PubKey>()
+                    .map(|key| (key, domain))
                     .map_err(|e| format!("--share {k}: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;

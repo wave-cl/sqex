@@ -432,20 +432,28 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     // (SIP-65) calls are open and the caller's own word can carry it --
     // judged below, once the callee's account is known.
     let listed = server.peers_with(&peer_key);
-    if !listed && !(server.open_calls() && word.is_some()) {
+    let account = match label.parse::<PubKey>() {
+        Ok(k) => k,
+        Err(_) if listed || (server.open_calls() && word.is_some()) => {
+            match resolve_name_at(peer_addr, &peer_key, &server.relay.seed, label).await {
+                Some(a) => a,
+                None => return CallAck::rejected(relay::REASON_NO_ACCOUNT, now),
+            }
+        }
+        Err(_) => return CallAck::rejected(relay::REASON_REFUSED, now),
+    };
+    // SIP-73: a device invite to an unlisted peer stands on the share that
+    // peer sent and this exchange admitted on a member's word -- the
+    // device among its members, the caller in the room here.
+    let room_vouched = by_key.is_some()
+        && server.open_calls()
+        && server.rooms.vouched_pair(&peer_key, &account, &caller);
+    if !listed && !room_vouched && !(server.open_calls() && word.is_some()) {
         return CallAck::rejected(relay::REASON_REFUSED, now);
     }
     if server.relay.at_capacity() {
         return CallAck::rejected(relay::REASON_REFUSED, now);
     }
-
-    let account = match label.parse::<PubKey>() {
-        Ok(k) => k,
-        Err(_) => match resolve_name_at(peer_addr, &peer_key, &server.relay.seed, label).await {
-            Some(a) => a,
-            None => return CallAck::rejected(relay::REASON_NO_ACCOUNT, now),
-        },
-    };
 
     // SIP-59: the account may live elsewhere now. Its exchange is asked
     // once, as it was asked for the name, and the call is placed at the
@@ -469,7 +477,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     // caller's account and the callee must already share a conversation
     // held here, and the caller is under the calls limit. A device invite
     // (SIP-49, by key) has no word to stand on and stays with the list.
-    if !listed {
+    if !listed && !room_vouched {
         let Some(word) = &word else {
             return CallAck::rejected(relay::REASON_REFUSED, now);
         };
@@ -900,10 +908,13 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             caller_eph,
             device,
         } => {
-            // SIP-65 §What stays listed: a device invite rests on a room
-            // roster the exchanges shared, not on a member's word, so it
-            // is served only over a link to a listed peer.
-            if server.relay.at_capacity() || !server.peers_with(&peer) {
+            // SIP-73: over a link to a listed peer as SIP-49 has it; over
+            // an unlisted one, only for a device in a room whose share
+            // from that peer was admitted on a member's word and names the
+            // caller among its members.
+            let vouched = server.peers_with(&peer)
+                || (server.open_calls() && server.rooms.vouched_pair(&peer, &caller, &device));
+            if server.relay.at_capacity() || !vouched {
                 let inner = server.relay.inner.lock().unwrap();
                 send_control(
                     &inner,
@@ -1015,22 +1026,40 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
         // SIP-49: a peer's view of a room. Reciprocal: the first share of a
         // room from a peer is answered with this exchange's view of it.
         Control::RoomShare { handle, members } => {
-            // SIP-65 §What stays listed.
+            // SIP-73: a plain share over an unlisted link is dropped; the
+            // signed form below is what such a link carries.
             if !server.peers_with(&peer) {
                 return;
             }
             let fresh = server.rooms.take_share(peer, handle, members);
             if fresh {
-                let view = server.rooms.view_for(&handle, &peer);
-                let inner = server.relay.inner.lock().unwrap();
-                send_control(
-                    &inner,
-                    &peer,
-                    Control::RoomShare {
-                        handle,
-                        members: view,
-                    },
-                );
+                share_back(server, &peer, handle);
+            }
+        }
+        // SIP-73: a share standing on a member's word. Verified whether or
+        // not the peer is listed -- a peer that can sign should not send a
+        // word that does not verify -- and kept only on the document's
+        // terms; dropped without answer otherwise, as any share is.
+        Control::RoomShareSigned {
+            handle,
+            members,
+            sharer,
+            word,
+        } => {
+            if !server.peers_with(&peer) && !server.open_calls() {
+                return;
+            }
+            if !word_shares(server, &peer, &handle, &members, &sharer, &word) {
+                tracing::debug!(peer = %peer, "a signed room share did not stand");
+                return;
+            }
+            let first = server.rooms.admitted_at(&handle, &peer).is_none();
+            if first {
+                server.rooms.admit(handle, peer);
+            }
+            let fresh = server.rooms.take_share(peer, handle, members);
+            if fresh || first {
+                share_back(server, &peer, handle);
             }
         }
     }
@@ -1041,7 +1070,11 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
 /// records for the key; a peer with no link and no domain is not told.
 pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
     for peer in server.rooms.peers_of(&handle) {
-        if !server.peers_with(&peer) {
+        let listed = server.peers_with(&peer);
+        // SIP-73: an unlisted peer is shared with on a member's word, and
+        // reached by the domain the member named it by.
+        let word = server.rooms.word_for(&handle, &peer);
+        if !listed && (!server.open_calls() || word.is_none()) {
             continue;
         }
         if link_to_key(server, peer).await.is_none() {
@@ -1050,15 +1083,87 @@ pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
         }
         let view = server.rooms.view_for(&handle, &peer);
         let inner = server.relay.inner.lock().unwrap();
-        send_control(
-            &inner,
-            &peer,
-            Control::RoomShare {
-                handle,
-                members: view,
-            },
-        );
+        send_control(&inner, &peer, share_control(handle, view, listed, word));
     }
+}
+
+/// SIP-49, SIP-73: the share to send `peer`: plain to a listed peer, on a
+/// member's word to one that is not.
+fn share_control(
+    handle: [u8; 32],
+    members: Vec<sqex_proto::room::HomedMember>,
+    listed: bool,
+    word: Option<(String, PubKey, sqex_proto::session::RoomWord)>,
+) -> Control {
+    match (listed, word) {
+        (false, Some((_, sharer, word))) => Control::RoomShareSigned {
+            handle,
+            members,
+            sharer,
+            word: Box::new(word),
+        },
+        _ => Control::RoomShare { handle, members },
+    }
+}
+
+/// SIP-49: answer a peer's first share of a room with this exchange's
+/// view -- SIP-73, over an unlisted link, only where a local member gave a
+/// word naming that peer, and with nothing otherwise.
+fn share_back(server: &Server, peer: &PubKey, handle: [u8; 32]) {
+    let listed = server.peers_with(peer);
+    let word = server.rooms.word_for(&handle, peer);
+    if !listed && word.is_none() {
+        return;
+    }
+    let view = server.rooms.view_for(&handle, peer);
+    let inner = server.relay.inner.lock().unwrap();
+    send_control(&inner, peer, share_control(handle, view, listed, word));
+}
+
+/// SIP-73 §Honouring a share: whether a signed share from `peer` stands.
+/// Rules 2 to 5 of the document, in order; rule 1 is the caller's.
+fn word_shares(
+    server: &Server,
+    peer: &PubKey,
+    handle: &[u8; 32],
+    members: &[sqex_proto::room::HomedMember],
+    sharer: &PubKey,
+    word: &sqex_proto::session::RoomWord,
+) -> bool {
+    let now = crate::state::now_unix();
+    if !members
+        .iter()
+        .any(|m| m.identity == *sharer && m.is_local())
+    {
+        return false;
+    }
+    if !word.verify(sharer, handle, &server.public_key) {
+        return false;
+    }
+    let Some(account) = server.account_behind_credential(sharer, word.credential.as_ref(), now)
+    else {
+        return false;
+    };
+    // Admitted already: later shares over this link stand on the first,
+    // whoever's word they now carry, for as long as it verifies.
+    if server.rooms.admitted_at(handle, peer).is_some() {
+        return true;
+    }
+    let vouched = server
+        .rooms
+        .local_members(handle)
+        .iter()
+        .map(|d| server.account_of(d))
+        .any(|local| server.channels().share_membership(&account, &local));
+    if !vouched {
+        return false;
+    }
+    if now.abs_diff(word.issued) > sqex_proto::session::ROOM_WORD_SECS {
+        return false;
+    }
+    server
+        .limit(crate::limits::Kind::Calls, &account, [0; 32])
+        .is_ok()
 }
 
 /// SIP-53: find an exchange by domain, as a call would -- SIP-33 discovery
@@ -1100,7 +1205,9 @@ pub(crate) async fn find_peer_moved(
 /// peer list records for it where there is none. `None` when the key is
 /// not a peer, has no domain on record, or cannot be reached.
 async fn link_to_key(server: &Arc<Server>, key: PubKey) -> Option<SocketAddr> {
-    if !server.peers_with(&key) {
+    // SIP-73: an unlisted exchange may be linked to when calls are open,
+    // by the domain a member named it by.
+    if !server.may_link(&key) {
         return None;
     }
     if let Some(addr) = server
@@ -1120,7 +1227,8 @@ async fn link_to_key(server: &Arc<Server>, key: PubKey) -> Option<SocketAddr> {
         .into_iter()
         .find(|p| p.key == key)
         .map(|p| p.domain)
-        .filter(|d| !d.is_empty())?;
+        .filter(|d| !d.is_empty())
+        .or_else(|| server.rooms.domain_named(&key))?;
     let (found, addr) = find_peer(server, &domain).await.ok()?;
     if found != key {
         return None;

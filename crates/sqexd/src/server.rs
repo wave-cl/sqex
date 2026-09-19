@@ -904,7 +904,19 @@ impl Server {
         word: &sqex_proto::session::CallWord,
         now: u64,
     ) -> Option<PubKey> {
-        match &word.credential {
+        self.account_behind_credential(caller, word.credential.as_ref(), now)
+    }
+
+    /// SIP-65 ringing rule 4, SIP-73 rule 3: the account a device speaks
+    /// for -- itself with no credential, or the one a verifying credential
+    /// naming it as delegate names.
+    pub(crate) fn account_behind_credential(
+        &self,
+        caller: &PubKey,
+        credential: Option<&sqex_proto::credential::Credential>,
+        now: u64,
+    ) -> Option<PubKey> {
+        match credential {
             None => Some(*caller),
             Some(c) => {
                 if c.delegate != *caller
@@ -4655,6 +4667,67 @@ async fn route(
             }
         },
 
+        // SIP-73: a shared join naming each exchange with a domain and the
+        // member's word for it. Listed peers as SIP-49; an unlisted one
+        // only where calls are open, and every word verified under the
+        // joining device for its room and the exchange it names.
+        ("POST", "/room/join")
+            if body.first() == Some(&sqex_proto::room::TYPE_JOIN_SHARED_WORD) =>
+        {
+            match (
+                peer.identity,
+                sqex_proto::room::JoinSharedWord::decode(body),
+            ) {
+                (None, _) => no_identity("joining a room"),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some(me), Ok(join)) => {
+                    if let Some((stranger, _, _)) = join
+                        .share
+                        .iter()
+                        .find(|(k, _, _)| !server.peers_with(k) && !server.open_calls())
+                    {
+                        return refuse(
+                            403,
+                            Code::NotYours,
+                            Some(&format!(
+                                "{stranger} is not an exchange this one federates with"
+                            )),
+                        );
+                    }
+                    if let Some((k, _, _)) = join
+                        .share
+                        .iter()
+                        .find(|(k, _, w)| !w.verify(&me, &join.handle, k))
+                    {
+                        return refuse(
+                            400,
+                            Code::Malformed,
+                            Some(&format!("the word for {k} does not verify under {me}")),
+                        );
+                    }
+                    let share: Vec<(PubKey, String, sqex_proto::session::RoomWord)> = join
+                        .share
+                        .iter()
+                        .map(|(k, d, w)| (*k, d.trim().to_ascii_lowercase(), w.clone()))
+                        .collect();
+                    match server
+                        .rooms
+                        .join_shared_word(join.handle, me, join.proof, &share)
+                    {
+                        Ok((homed, due)) => {
+                            if due {
+                                let server = Arc::clone(server);
+                                tokio::spawn(async move {
+                                    crate::relay::share_room(&server, join.handle).await;
+                                });
+                            }
+                            (200, "application/octet-stream", homed.encode())
+                        }
+                        Err(e) => refuse(507, e.code(), None),
+                    }
+                }
+            }
+        }
         // SIP-49: a join that names relay peers is answered with homes, and
         // the room is shared with those peers from then on. The plain join
         // is SIP-13's, answered as it always was.

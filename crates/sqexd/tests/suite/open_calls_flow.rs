@@ -69,7 +69,7 @@ async fn exchange_in(
     Some((addr, server_pub))
 }
 
-fn identity(b: u8) -> ([u8; 32], PubKey) {
+pub(crate) fn identity(b: u8) -> ([u8; 32], PubKey) {
     let sk = SigningKey::from_bytes(&[b; 32]);
     (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
 }
@@ -86,7 +86,7 @@ fn free_port() -> SocketAddr {
     s.local_addr().unwrap()
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -154,21 +154,21 @@ async fn ring_within(stream: &mut sqnr::Stream, secs: u64) -> Option<PubKey> {
 /// Two exchanges listing nobody. Bob lives at Y; Alice at X puts him in a
 /// group, which Y pulls for him (SIP-60/63). Returns the clients and Bob's
 /// ring stream at Y.
-struct Pair {
-    x_addr: SocketAddr,
-    x_pub: [u8; 32],
-    y_addr: SocketAddr,
-    y_pub: [u8; 32],
-    alice_seed: [u8; 32],
-    alice: PubKey,
-    bob_seed: [u8; 32],
-    bob: PubKey,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+pub(crate) struct Pair {
+    pub(crate) x_addr: SocketAddr,
+    pub(crate) x_pub: [u8; 32],
+    pub(crate) y_addr: SocketAddr,
+    pub(crate) y_pub: [u8; 32],
+    pub(crate) alice_seed: [u8; 32],
+    pub(crate) alice: PubKey,
+    pub(crate) bob_seed: [u8; 32],
+    pub(crate) bob: PubKey,
+    pub(crate) _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
 /// `x_lists_y`: X keeps Y on SIP-39's list, so X dials it as before and
 /// sends the plain invite first; Y lists nobody either way.
-async fn pair(y_open_calls: bool, x_lists_y: bool, a: u8, b: u8) -> Pair {
+pub(crate) async fn pair(y_open_calls: bool, x_lists_y: bool, a: u8, b: u8) -> Pair {
     let x_dir = tempfile::tempdir().unwrap();
     let y_dir = tempfile::tempdir().unwrap();
     let x_key = key_in(x_dir.path());

@@ -176,6 +176,85 @@ impl CallWord {
     }
 }
 
+/// SIP-73: the context a room word is signed under.
+pub const ROOM_CONTEXT: &[u8] = b"sqex-room-v1";
+/// SIP-73: how far from the receiving exchange's clock a room word may be
+/// issued, on the first share of a room over a link.
+pub const ROOM_WORD_SECS: u64 = 120;
+
+/// SIP-73: a member's word that its exchange may share a room with the
+/// exchange named -- `CallWord`'s shape over `ROOM_CONTEXT || handle ||
+/// peer || issued`, signed by the member's device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomWord {
+    pub issued: u64,
+    pub credential: Option<crate::credential::Credential>,
+    pub sig: [u8; 64],
+}
+
+impl RoomWord {
+    pub fn input(handle: &[u8; 32], peer: &PubKey, issued: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ROOM_CONTEXT.len() + 32 + 32 + 8);
+        out.extend_from_slice(ROOM_CONTEXT);
+        out.extend_from_slice(handle);
+        out.extend_from_slice(peer.as_bytes());
+        out.extend_from_slice(&issued.to_be_bytes());
+        out
+    }
+
+    pub fn sign(
+        seed: &[u8; 32],
+        handle: &[u8; 32],
+        peer: &PubKey,
+        issued: u64,
+        credential: Option<crate::credential::Credential>,
+    ) -> RoomWord {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(seed);
+        let sig = sk.sign(&Self::input(handle, peer, issued)).to_bytes();
+        RoomWord {
+            issued,
+            credential,
+            sig,
+        }
+    }
+
+    /// Whether `device` signed this word for `handle` and `peer`.
+    pub fn verify(&self, device: &PubKey, handle: &[u8; 32], peer: &PubKey) -> bool {
+        let Ok(vk) = device.verifying_key() else {
+            return false;
+        };
+        let sig = ed25519_dalek::Signature::from_bytes(&self.sig);
+        ed25519_dalek::Verifier::verify(&vk, &Self::input(handle, peer, self.issued), &sig).is_ok()
+    }
+
+    /// The same bytes as a `CallWord`'s.
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        CallWord {
+            issued: self.issued,
+            credential: self.credential.clone(),
+            sig: self.sig,
+        }
+        .encode_into(out)
+    }
+
+    /// Read a word from the front of `b`, saying how many bytes it took.
+    pub fn read(b: &[u8]) -> Result<(RoomWord, usize)> {
+        let short = || Error::Malformed("room word cut short".into());
+        let n = u16::from_be_bytes(b.get(8..10).ok_or_else(short)?.try_into().unwrap()) as usize;
+        let len = 10 + n + 64;
+        let w = CallWord::decode(b.get(..len).ok_or_else(short)?)?;
+        Ok((
+            RoomWord {
+                issued: w.issued,
+                credential: w.credential,
+                sig: w.sig,
+            },
+            len,
+        ))
+    }
+}
+
 /// Which end of the session a peer is, fixed by lexicographic order of the two
 /// identities so that both ends agree without negotiating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

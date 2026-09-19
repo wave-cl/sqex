@@ -72,6 +72,13 @@ struct Shared {
     peers: HashMap<PubKey, Option<Remote>>,
     last_shared: u64,
     changed: bool,
+    /// SIP-73: per peer named, where the member said it is found, and the
+    /// word the member gave for it -- the device that signed, and the
+    /// word. What a share over an unlisted link stands on.
+    words: HashMap<PubKey, Vec<(String, PubKey, sqex_proto::session::RoomWord)>>,
+    /// SIP-73: peers whose share of this room was admitted on a word,
+    /// with when. Later shares over that link stand on the first.
+    admitted: HashMap<PubKey, u64>,
 }
 
 /// Every room the exchange currently carries.
@@ -209,6 +216,132 @@ impl Rooms {
         Ok((Homed { now, members }, due))
     }
 
+    /// SIP-73: `join_shared`, with a domain and the member's word per
+    /// exchange named. The words are kept beside the room for the shares
+    /// to stand on; the caller has verified them.
+    pub fn join_shared_word(
+        &self,
+        handle: [u8; 32],
+        identity: PubKey,
+        proof: [u8; 32],
+        share: &[(PubKey, String, sqex_proto::session::RoomWord)],
+    ) -> Result<(Homed, bool), JoinError> {
+        let peers: Vec<PubKey> = share.iter().map(|(k, _, _)| *k).collect();
+        let out = self.join_shared(handle, identity, proof, &peers)?;
+        let mut shared = self.shared.lock().unwrap();
+        let s = shared.entry(handle).or_default();
+        for (peer, domain, word) in share {
+            let words = s.words.entry(*peer).or_default();
+            words.retain(|(_, who, _)| *who != identity);
+            words.push((domain.clone(), identity, word.clone()));
+        }
+        Ok(out)
+    }
+
+    /// SIP-73: the word this exchange holds for sharing `handle` with
+    /// `peer` -- the device that gave it and the word -- and the domain
+    /// the member named the peer by.
+    pub fn word_for(
+        &self,
+        handle: &[u8; 32],
+        peer: &PubKey,
+    ) -> Option<(String, PubKey, sqex_proto::session::RoomWord)> {
+        let now = now_unix();
+        let rooms = self.rooms.lock().unwrap();
+        let present = |device: &PubKey| {
+            rooms
+                .get(handle)
+                .and_then(|m| m.get(device))
+                .is_some_and(|p| now.saturating_sub(p.last_seen) < TTL_SECS)
+        };
+        self.shared
+            .lock()
+            .unwrap()
+            .get(handle)
+            .and_then(|s| s.words.get(peer))
+            .and_then(|words| {
+                // A word from a member still in the room, the newest first.
+                words.iter().rev().find(|(_, who, _)| present(who)).cloned()
+            })
+    }
+
+    /// SIP-73: the domain a member named `peer` by, for any room, where
+    /// the peer is not on the list and has to be found.
+    pub fn domain_named(&self, peer: &PubKey) -> Option<String> {
+        self.shared.lock().unwrap().values().find_map(|s| {
+            s.words.get(peer).and_then(|w| {
+                w.iter()
+                    .rev()
+                    .map(|(d, _, _)| d.clone())
+                    .find(|d| !d.is_empty())
+            })
+        })
+    }
+
+    /// SIP-73: the accounts-as-devices present in `handle` here -- what a
+    /// share over an unlisted link is checked against.
+    pub fn local_members(&self, handle: &[u8; 32]) -> Vec<PubKey> {
+        let now = now_unix();
+        self.rooms
+            .lock()
+            .unwrap()
+            .get(handle)
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|(_, p)| now.saturating_sub(p.last_seen) < TTL_SECS)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// SIP-73: whether `peer`'s share of `handle` was admitted on a word
+    /// already, and when.
+    pub fn admitted_at(&self, handle: &[u8; 32], peer: &PubKey) -> Option<u64> {
+        self.shared
+            .lock()
+            .unwrap()
+            .get(handle)
+            .and_then(|s| s.admitted.get(peer).copied())
+    }
+
+    /// SIP-73: note that `peer`'s share of `handle` stands on a verified
+    /// word from now on.
+    pub fn admit(&self, handle: [u8; 32], peer: PubKey) {
+        let now = now_unix();
+        self.shared
+            .lock()
+            .unwrap()
+            .entry(handle)
+            .or_default()
+            .admitted
+            .insert(peer, now);
+    }
+
+    /// SIP-73: whether `caller` is among the members `peer` shared, in a
+    /// room `device` is a present member of here, under a share that was
+    /// admitted -- what a device invite over an unlisted link rests on.
+    pub fn vouched_pair(&self, peer: &PubKey, caller: &PubKey, device: &PubKey) -> bool {
+        let now = now_unix();
+        let rooms = self.rooms.lock().unwrap();
+        let shared = self.shared.lock().unwrap();
+        shared.iter().any(|(handle, s)| {
+            s.admitted.contains_key(peer)
+                && rooms.get(handle).is_some_and(|members| {
+                    members
+                        .get(device)
+                        .is_some_and(|p| now.saturating_sub(p.last_seen) < TTL_SECS)
+                })
+                && s.peers.get(peer).is_some_and(|r| {
+                    r.as_ref().is_some_and(|r| {
+                        now.saturating_sub(r.at) < TTL_SECS
+                            && r.members.iter().any(|m| m.identity == *caller)
+                    })
+                })
+        })
+    }
+
     /// SIP-49: what `peer` said about `handle`. A member the peer sent as
     /// its own is homed at the peer. Returns whether this is the first the
     /// room has been shared with that peer -- which makes the sharing
@@ -303,6 +436,8 @@ impl Rooms {
             if let Some(r) = s.peers.get_mut(peer) {
                 *r = None;
             }
+            // SIP-73: a share stood on a word for as long as the link did.
+            s.admitted.remove(peer);
         }
     }
 
