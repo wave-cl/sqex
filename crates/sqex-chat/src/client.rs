@@ -5612,12 +5612,97 @@ impl Chat {
         timeline: &mut Timeline,
         wait_secs: u16,
     ) -> Result<Conversation> {
-        let got = self.ask(channel, wait_secs).await?;
+        let got = match self.ask(channel, wait_secs).await {
+            Ok(got) => got,
+            // SIP-71, SIP-75: a channel this client read that its exchange no
+            // longer serves may have been folded there -- the conversation
+            // lives at the lower key's home now, and this exchange may not
+            // hold a copy yet, or ever. What was read is kept as an earlier
+            // copy, the folded log read for the rest, and the reader told.
+            Err(e @ ChatError::Refused(_, _))
+                if matches!(&e, ChatError::Refused(_, r)
+                    if r.code == RefusalCode::NoSuchChannel || r.code == RefusalCode::NotFound)
+                    && self.folded_away(channel, timeline).await? =>
+            {
+                *timeline = Timeline::new();
+                return Ok(Conversation {
+                    timeline: Timeline::new(),
+                    unreadable: Vec::new(),
+                    gap: false,
+                    restarted: true,
+                    lost: 0,
+                    no_key: None,
+                    typing: false,
+                    accepted: None,
+                    last: 0,
+                    admins: Vec::new(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
         // SIP-57: what has run out goes, from the store and the timeline,
         // before the conversation is read out; what arrives already past
         // its time is not folded at all.
         let _ = self.expire(Some((channel, timeline)));
         self.absorb(timeline, got).await
+    }
+
+    /// SIP-71: whether a channel this exchange no longer serves was folded
+    /// here -- `/channel/folded` answers a log -- and, if so, keep what was
+    /// read as an earlier copy, once. `false` where nothing was held, or
+    /// the exchange holds no folded log.
+    async fn folded_away(&mut self, channel: &[u8; 32], timeline: &mut Timeline) -> Result<bool> {
+        let held = !self.store.messages(channel)?.is_empty();
+        if !held {
+            return Ok(false);
+        }
+        let Some(known) = self.store.incarnation(channel)? else {
+            return Ok(false);
+        };
+        let Ok(Some(_)) = self.folded_entries(channel).await else {
+            return Ok(false);
+        };
+        // The exchange no longer answers `info` for it; the last answer it
+        // gave, or the members as the messages held name them, is what the
+        // remainder is read under.
+        let info = match self.told_about.get(channel) {
+            Some((info, _)) => ChannelInfo {
+                instance: known,
+                ..info.clone()
+            },
+            None => {
+                let mut accounts: Vec<PubKey> =
+                    self.store.messages(channel)?.iter().map(|m| m.1).collect();
+                accounts.sort();
+                accounts.dedup();
+                ChannelInfo {
+                    visibility: Visibility::Private,
+                    epoch: 0,
+                    instance: known,
+                    retention_secs: 0,
+                    max_entries: 0,
+                    first: 0,
+                    last: 0,
+                    my_msg_seq: 0,
+                    my_chain_seq: 0,
+                    my_chain_head: [0; 32],
+                    now: now_secs(),
+                    members: accounts
+                        .into_iter()
+                        .map(|account| sqex_proto::channel::Member {
+                            account,
+                            role: Role::Member,
+                            joined: 0,
+                        })
+                        .collect(),
+                    name: String::new(),
+                    topic: String::new(),
+                }
+            }
+        };
+        self.read_folded(timeline, channel, &info, known, &[]).await;
+        self.store.reset_sequence_space(channel)?;
+        Ok(true)
     }
 
     /// A fetch for `channel` that can be parked off this client.
