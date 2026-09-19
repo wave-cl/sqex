@@ -2900,6 +2900,51 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
             t["mac2_verified"].as_u64().unwrap_or(0),
         );
     }
+    // SIP-78: the origins this exchange forwards to, and what each last
+    // said. A held origin is one whose last answer was a refusal this
+    // exchange is still honouring; nothing goes to it until the hold ends,
+    // so an operator watching a homed member's create fail with
+    // `origin_refused` finds the reason here rather than in the journal.
+    if let Some(origins) = v["origins"].as_array() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for o in origins {
+            let key = o["key"].as_str().unwrap_or("?");
+            let domain = o["domain"].as_str().unwrap_or("");
+            let reached = match o["reached"].as_u64() {
+                Some(ago) => format!("reached {ago}s ago"),
+                None => "never reached".to_string(),
+            };
+            let held = o["held_until"]
+                .as_u64()
+                .map(|until| format!(" · HELD {}s more", until.saturating_sub(now)))
+                .unwrap_or_default();
+            let refused = o["last_refused"]
+                .as_object()
+                .map(|r| {
+                    let wait = r["wait"]
+                        .as_u64()
+                        .map(|w| format!(", wait {w}s"))
+                        .unwrap_or_default();
+                    format!(
+                        " · last refused {} {}{} at {}",
+                        r["path"].as_str().unwrap_or("?"),
+                        r["code"].as_u64().unwrap_or(0),
+                        wait,
+                        r["at"].as_u64().unwrap_or(0),
+                    )
+                })
+                .unwrap_or_default();
+            let name = if domain.is_empty() {
+                key.to_string()
+            } else {
+                format!("{key} ({domain})")
+            };
+            println!("  origin {name}: {reached}{held}{refused}");
+        }
+    }
     Ok(())
 }
 
