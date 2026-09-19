@@ -683,3 +683,220 @@ async fn nobody_but_a_sibling_gets_past_hello() {
         assert!(!have_seen, "{what}: the phone said what it holds");
     }
 }
+
+/// SIP-72: the conversation is destroyed and rebuilt under the same
+/// identifier; the phone keeps what it read as a generation, and the
+/// laptop -- which never saw the first incarnation -- receives it as an
+/// earlier copy, verified, and nothing of it lands in the conversation
+/// that continues.
+#[tokio::test]
+async fn an_earlier_incarnation_reaches_a_sibling_as_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, mut phone, mut laptop, mut bob, channel) = phone_and_laptop(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    // Both leave; the last one out destroys it (SIP-16). Bob opens it
+    // again: the same identifier, a new incarnation, and one message.
+    phone.leave(&channel).await.unwrap();
+    bob.leave(&channel).await.unwrap();
+    assert_eq!(bob.open_dm(&alice_key).await.unwrap(), channel);
+    bob.send(&channel, "again").await.unwrap();
+    let mut t = Timeline::new();
+    let got = phone.poll(&channel, &mut t, 0).await.unwrap();
+    assert!(got.restarted, "the phone did not notice the rebuild");
+    let earlier = phone.earlier(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(said(&earlier[0]), vec!["one", "two", "three"]);
+    // The signed entries went with it: the live table holds only the new.
+    let generations = phone.store().generations().unwrap();
+    assert_eq!(generations.len(), 1, "{generations:?}");
+    assert!(
+        generations[0].last >= 3 && generations[0].epochs >= 1,
+        "{generations:?}"
+    );
+    let live = phone.history(&channel, &[alice_key, bob_key]).unwrap();
+    assert!(
+        said(&live).iter().all(|m| m == "again"),
+        "{:?}",
+        said(&live)
+    );
+
+    // The laptop reads the conversation as it is now, then trades.
+    let mut tl = Timeline::new();
+    let _ = laptop.poll(&channel, &mut tl, 0).await;
+    let (xp, xl) = run_both(&mut phone, &mut laptop).await;
+    assert_eq!(xp.phase(), Phase::Finished, "{:?}", xp.why);
+    assert_eq!(xl.phase(), Phase::Finished, "{:?}", xl.why);
+    assert!(xl.progress.entries_in >= 3, "{:?}", xl.progress);
+    assert!(xl.progress.keys_in >= 1, "{:?}", xl.progress);
+
+    let earlier = laptop.earlier(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(earlier.len(), 1, "the laptop holds no earlier copy");
+    assert_eq!(said(&earlier[0]), vec!["one", "two", "three"]);
+    // Not merged: the conversation that continues is Bob's one message.
+    let live = laptop.history(&channel, &[alice_key, bob_key]).unwrap();
+    assert!(
+        said(&live).iter().all(|m| m == "again"),
+        "{:?}",
+        said(&live)
+    );
+    assert_eq!(
+        laptop.store().generations().unwrap()[0].instance,
+        generations[0].instance
+    );
+
+    // A second trade has nothing to carry, either way.
+    let (xp, xl) = run_both(&mut phone, &mut laptop).await;
+    assert_eq!((xp.phase(), xl.phase()), (Phase::Finished, Phase::Finished));
+    assert_eq!(xl.progress.entries_in, 0, "{:?}", xl.progress);
+    assert_eq!(xp.progress.entries_in, 0, "{:?}", xp.progress);
+}
+
+/// SIP-72: a courier offering an earlier incarnation is held to the same
+/// checks -- an altered entry is refused and the rest kept -- and one
+/// naming an origin this device does not know is not asked for at all.
+#[tokio::test]
+async fn an_earlier_incarnation_is_verified_and_an_unknown_origin_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, server_pub, mut phone, mut laptop, mut bob, channel) =
+        phone_and_laptop(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    // The phone's first incarnation, as a generation it would offer.
+    phone.leave(&channel).await.unwrap();
+    bob.leave(&channel).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut t = Timeline::new();
+    let _ = phone.poll(&channel, &mut t, 0).await.unwrap();
+    let g = phone.store().generations().unwrap().remove(0);
+    let raw = phone
+        .store()
+        .history_entries_after(&channel, g.generation, 0, 256)
+        .unwrap();
+    let mut entries: Vec<Entry> = raw
+        .iter()
+        .map(|(_, b)| Entry::read_receipted(b, &mut 0).unwrap())
+        .collect();
+    let total = entries.len();
+    assert!(total >= 3);
+    let keys: Vec<(u32, [u8; 32])> = phone
+        .store()
+        .history_keys(&channel, g.generation)
+        .unwrap()
+        .into_iter()
+        .map(|(e, k)| (e, *k.as_bytes()))
+        .collect();
+    let victim = entries
+        .iter_mut()
+        .find(|e| e.kind == 1 && !e.body.is_empty())
+        .unwrap();
+    victim.body[0] ^= 0xff;
+
+    let mut tl = Timeline::new();
+    let _ = laptop.poll(&channel, &mut tl, 0).await;
+    let live_before = laptop.store().entry_count(&channel).unwrap();
+    let mut offered = sqex_chat::store::Generation {
+        origin: PubKey::new(server_pub),
+        ..g.clone()
+    };
+    // Named for an exchange the laptop has never met: not wanted.
+    offered.origin = PubKey::new([0x42; 32]);
+    let (s_phone, s_laptop) = sessions(1, 7);
+    let (mut pipe_laptop, pipe_phone) = Pipe::pair();
+    let mut courier = Courier {
+        session: s_phone,
+        pipe: pipe_phone,
+        seq: 0,
+        inbox: Vec::new(),
+    };
+    let mut x = Sync::new(s_laptop, alice_key);
+    let unknown = offered.clone();
+    drive(
+        &mut laptop,
+        &mut x,
+        &mut pipe_laptop,
+        &mut courier,
+        |c, heard| {
+            for m in heard {
+                match m {
+                    Message::Hello { .. } => {
+                        c.say(&Message::Hello {
+                            account: alice_key,
+                            credential: None,
+                        });
+                        c.say(&Message::Earlier(vec![unknown.clone()]));
+                        c.say(&Message::Have(vec![]));
+                    }
+                    Message::Have(_) => c.say(&Message::Want(vec![])),
+                    Message::WantEarlier(w) => panic!("asked for an unknown origin: {w:?}"),
+                    Message::Want(_) => c.say(&Message::Done),
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await;
+    assert_eq!(x.phase(), Phase::Finished, "{:?}", x.why);
+    assert!(laptop.store().generations().unwrap().is_empty());
+
+    // Named for the exchange it knows: wanted, verified, the altered one
+    // refused and the rest kept as an earlier copy.
+    offered.origin = PubKey::new(server_pub);
+    let (s_phone, s_laptop) = sessions(1, 7);
+    let (mut pipe_laptop, pipe_phone) = Pipe::pair();
+    let mut courier = Courier {
+        session: s_phone,
+        pipe: pipe_phone,
+        seq: 0,
+        inbox: Vec::new(),
+    };
+    let mut x = Sync::new(s_laptop, alice_key);
+    let known = offered.clone();
+    let instance = g.instance;
+    drive(
+        &mut laptop,
+        &mut x,
+        &mut pipe_laptop,
+        &mut courier,
+        |c, heard| {
+            for m in heard {
+                match m {
+                    Message::Hello { .. } => {
+                        c.say(&Message::Hello {
+                            account: alice_key,
+                            credential: None,
+                        });
+                        c.say(&Message::Earlier(vec![known.clone()]));
+                        c.say(&Message::Have(vec![]));
+                    }
+                    Message::Have(_) => c.say(&Message::Want(vec![])),
+                    Message::WantEarlier(w) => {
+                        assert_eq!(w, vec![(channel, instance, 0)], "the laptop wanted {w:?}");
+                        c.say(&Message::KeysOf {
+                            channel,
+                            instance,
+                            keys: keys.clone(),
+                        });
+                        c.say(&Message::Entries {
+                            channel,
+                            instance,
+                            entries: entries.clone(),
+                        });
+                    }
+                    Message::Want(_) => c.say(&Message::Done),
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await;
+    assert_eq!(x.phase(), Phase::Finished, "{:?}", x.why);
+    assert_eq!(x.progress.entries_in, total - 1, "{:?}", x.progress);
+    let earlier = laptop.earlier(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(said(&earlier[0]).len(), 2, "{:?}", said(&earlier[0]));
+    // Nothing of it in the live tables.
+    assert_eq!(laptop.store().entry_count(&channel).unwrap(), live_before);
+}

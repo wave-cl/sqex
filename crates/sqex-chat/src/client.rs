@@ -2673,6 +2673,10 @@ impl Chat {
             }
             out.push(timeline);
         }
+        // Oldest first, by the time of the first thing each holds: the
+        // numbering is local, and a generation a sibling handed over may
+        // have been numbered after one that came before it.
+        out.sort_by_key(|t| t.messages().next().map(|m| m.posted).unwrap_or(0));
         Ok(out)
     }
 
@@ -3060,6 +3064,129 @@ impl Chat {
             });
         }
         Ok(out)
+    }
+
+    /// SIP-72: the ended incarnations this device keeps, as a sibling is
+    /// offered them.
+    pub fn held_generations(&self) -> Result<Vec<crate::store::Generation>> {
+        Ok(self
+            .store
+            .generations()?
+            .into_iter()
+            // A generation with no signed entry has nothing a sibling can
+            // verify, and is not offered.
+            .filter(|g| g.last > 0)
+            .collect())
+    }
+
+    /// SIP-72: whether `key` is an exchange this device knows -- the one
+    /// it talks to, one a channel of its lives or lived at, or an earlier
+    /// key of one of those. A sibling's word for an origin it does not
+    /// know is not taken.
+    pub fn knows_exchange(&self, key: &PubKey) -> bool {
+        if *key == self.exchange {
+            return true;
+        }
+        if self.homes.values().any(|h| h.origin == *key) {
+            return true;
+        }
+        if self.former.values().any(|f| f.contains(key)) {
+            return true;
+        }
+        self.predecessors
+            .iter()
+            .any(|(k, older)| k == key || older.contains(key))
+    }
+
+    /// SIP-72: take a sibling's entries of an ended incarnation as a
+    /// generation. Verified as `import` verifies the live one -- each
+    /// entry's signature, its device's credential, the chain -- with the
+    /// receipts under `origin` and its earlier keys in place of the
+    /// exchange the channel lives at. What verifies is kept signed, opened
+    /// under the generation's keys, and shown as an earlier copy. Returns
+    /// how many entries were new.
+    pub async fn import_earlier(
+        &mut self,
+        channel: &[u8; 32],
+        instance: [u8; 32],
+        origin: &PubKey,
+        entries: &[Entry],
+    ) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let generation = match self.store.generation_of(channel, &instance)? {
+            Some(g) => g,
+            None => self
+                .store
+                .new_generation(channel, &instance, origin.as_bytes())?,
+        };
+        let mut keys = vec![*origin];
+        keys.extend(
+            self.predecessors
+                .entry(*origin)
+                .or_insert_with(|| predecessors_of(origin))
+                .iter()
+                .copied(),
+        );
+        let mut accounts: Vec<PubKey> = entries.iter().map(|e| e.account).collect();
+        accounts.sort();
+        accounts.dedup();
+        let bound = self.bindings(&accounts).await.unwrap_or_default();
+        let epoch_keys: HashMap<u32, ChannelKey> = self
+            .store
+            .history_keys(channel, generation)?
+            .into_iter()
+            .collect();
+        let mut chains: HashMap<PubKey, (u64, [u8; 32])> = HashMap::new();
+        let mut kept = 0;
+        for e in entries {
+            if self.store.has_history_entry(channel, generation, e.seq) {
+                continue;
+            }
+            // Only what the origin signed for: the sibling's word about
+            // where an entry sat counts for nothing.
+            if !matches!(
+                Self::standing_under(&keys, channel, instance, e, None),
+                Standing::Vouched | Standing::Unlinked
+            ) {
+                continue;
+            }
+            if Self::verdict_for(&keys, channel, instance, e, &mut chains, &bound)
+                == Verdict::Forged
+            {
+                continue;
+            }
+            let mut raw = Vec::with_capacity(e.wire_len());
+            e.write_receipted(&mut raw);
+            self.store
+                .put_history_entry(channel, generation, e.seq, &raw)?;
+            let tombstone = e.body.is_empty();
+            let plain = if e.epoch == 0 {
+                Some(e.body.clone())
+            } else {
+                epoch_keys
+                    .get(&e.epoch)
+                    .and_then(|k| k.open(channel, e.epoch, &e.device, e.msg_seq, &e.body).ok())
+            };
+            self.store.put_history_message(
+                channel,
+                generation,
+                Kept {
+                    seq: e.seq,
+                    account: e.account,
+                    posted: e.posted,
+                    kind: e.kind,
+                    plain: if tombstone {
+                        Some(&[][..])
+                    } else {
+                        plain.as_deref()
+                    },
+                },
+            )?;
+            kept += 1;
+        }
+        Ok(kept)
     }
 
     /// Take entries a sibling handed over (SIP-42): verified exactly as a

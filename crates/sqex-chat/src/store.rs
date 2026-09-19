@@ -142,6 +142,34 @@ CREATE TABLE IF NOT EXISTS message_history (
     sealed     BLOB,
     PRIMARY KEY (exchange, channel, generation, seq)
 );
+-- SIP-72: an ended incarnation, whole -- which one it was (SIP-31) and the
+-- exchange that ordered it, beside `message_history`'s plaintext: the
+-- signed entries a sibling can verify and the keys that open them. What a
+-- reset used to delete, kept so it can travel (SIP-42) and be shown.
+CREATE TABLE IF NOT EXISTS generation (
+    exchange   BLOB    NOT NULL,
+    channel    BLOB    NOT NULL,
+    generation INTEGER NOT NULL,
+    instance   BLOB    NOT NULL,
+    origin     BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, generation)
+);
+CREATE TABLE IF NOT EXISTS entry_history (
+    exchange   BLOB    NOT NULL,
+    channel    BLOB    NOT NULL,
+    generation INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    bytes      BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, generation, seq)
+);
+CREATE TABLE IF NOT EXISTS channel_key_history (
+    exchange   BLOB    NOT NULL,
+    channel    BLOB    NOT NULL,
+    generation INTEGER NOT NULL,
+    epoch      INTEGER NOT NULL,
+    sealed     BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, generation, epoch)
+);
 -- Note for whoever adds a column here next: this store is on people's
 -- machines, so `CREATE TABLE IF NOT EXISTS` is no longer enough. It creates
 -- tables and never alters one that already exists, so a new column needs an
@@ -687,6 +715,9 @@ const SCOPED: &[(&str, bool)] = &[
     ("channel_key", false),
     ("message", true),
     ("message_history", true),
+    ("generation", true),
+    ("entry_history", true),
+    ("channel_key_history", true),
     ("entry", true),
     ("timed", true),
     ("asset", true),
@@ -908,6 +939,19 @@ pub struct Kept<'a> {
     pub kind: u8,
     /// The opened body, or `None` for an entry we hold and could not open.
     pub plain: Option<&'a [u8]>,
+}
+
+/// SIP-72: an ended incarnation as this store keeps it, and as a sibling
+/// is offered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    pub channel: [u8; 32],
+    pub generation: u64,
+    pub instance: [u8; 32],
+    pub origin: PubKey,
+    pub first: u64,
+    pub last: u64,
+    pub epochs: u16,
 }
 
 /// One contact, and what we call them.
@@ -2393,42 +2437,286 @@ impl Store {
         Ok(false)
     }
 
-    /// SIP-71: move what this client read of the incarnation that just
-    /// ended into the channel's history, as its next generation. Called
-    /// before `reset_sequence_space`, which would otherwise delete it.
-    pub fn archive_messages(&self, channel: &[u8; 32]) -> Result<usize> {
+    /// SIP-71, SIP-72: keep the incarnation that just ended as the channel's
+    /// next generation -- what this client read, the signed entries under
+    /// it, the keys that open them, which incarnation it was and the
+    /// exchange that ordered it. Called by `reset_sequence_space`, which
+    /// would otherwise delete all of it. Nothing held, nothing kept.
+    pub fn archive_incarnation(&self, channel: &[u8; 32]) -> Result<Option<u64>> {
         let scope = self.scope()?;
         let held: i64 = self
             .db
             .query_row(
-                "SELECT COUNT(*) FROM message WHERE channel = ?1 AND exchange = ?2",
+                "SELECT (SELECT COUNT(*) FROM message WHERE channel = ?1 AND exchange = ?2)
+                      + (SELECT COUNT(*) FROM entry WHERE channel = ?1 AND exchange = ?2)
+                      + (SELECT COUNT(*) FROM channel_key WHERE channel = ?1 AND exchange = ?2)",
                 params![&channel[..], scope],
                 |r| r.get(0),
             )
-            .map_err(storage("count messages"))?;
+            .map_err(storage("count an incarnation"))?;
         if held == 0 {
-            return Ok(0);
+            return Ok(None);
         }
+        let instance = self.incarnation(channel)?.unwrap_or([0u8; 32]);
+        let origin = self.signing_scope(channel)?;
+        let generation = self.new_generation(channel, &instance, &origin)?;
+        for sql in [
+            "INSERT INTO message_history
+                (exchange, channel, generation, seq, account, posted, kind, sealed)
+             SELECT exchange, channel, ?3, seq, account, posted, kind, sealed
+             FROM message WHERE channel = ?1 AND exchange = ?2",
+            "INSERT INTO entry_history (exchange, channel, generation, seq, bytes)
+             SELECT exchange, channel, ?3, seq, bytes
+             FROM entry WHERE channel = ?1 AND exchange = ?2",
+            "INSERT INTO channel_key_history (exchange, channel, generation, epoch, sealed)
+             SELECT exchange, channel, ?3, epoch, sealed
+             FROM channel_key WHERE channel = ?1 AND exchange = ?2",
+        ] {
+            self.db
+                .execute(sql, params![&channel[..], scope, generation as i64])
+                .map_err(storage("archive an incarnation"))?;
+        }
+        Ok(Some(generation))
+    }
+
+    /// SIP-72: a fresh generation row for `channel`, numbered after the
+    /// ones held.
+    pub fn new_generation(
+        &self,
+        channel: &[u8; 32],
+        instance: &[u8; 32],
+        origin: &[u8],
+    ) -> Result<u64> {
+        let scope = self.scope()?;
         let generation: i64 = self
             .db
             .query_row(
-                "SELECT COALESCE(MAX(generation), 0) + 1 FROM message_history
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM generation
                  WHERE channel = ?1 AND exchange = ?2",
                 params![&channel[..], scope],
                 |r| r.get(0),
             )
             .map_err(storage("next generation"))?;
-        let moved = self
+        self.db
+            .execute(
+                "INSERT INTO generation (exchange, channel, generation, instance, origin)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![scope, &channel[..], generation, &instance[..], origin],
+            )
+            .map_err(storage("record a generation"))?;
+        Ok(generation as u64)
+    }
+
+    /// SIP-72: the generation holding `instance` of `channel`, if any.
+    pub fn generation_of(&self, channel: &[u8; 32], instance: &[u8; 32]) -> Result<Option<u64>> {
+        self.db
+            .query_row(
+                "SELECT generation FROM generation
+                 WHERE channel = ?1 AND exchange = ?2 AND instance = ?3",
+                params![&channel[..], self.scope()?, &instance[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|g| g.map(|g| g as u64))
+            .map_err(storage("find a generation"))
+    }
+
+    /// SIP-72: every generation held, with what a sibling is offered of it:
+    /// the incarnation, its origin, the range of signed entries and how
+    /// many keys.
+    pub fn generations(&self) -> Result<Vec<Generation>> {
+        let mut stmt = self
             .db
+            .prepare(
+                "SELECT g.channel, g.generation, g.instance, g.origin,
+                        (SELECT MIN(seq) FROM entry_history e
+                          WHERE e.exchange = g.exchange AND e.channel = g.channel
+                            AND e.generation = g.generation),
+                        (SELECT MAX(seq) FROM entry_history e
+                          WHERE e.exchange = g.exchange AND e.channel = g.channel
+                            AND e.generation = g.generation),
+                        (SELECT COUNT(*) FROM channel_key_history k
+                          WHERE k.exchange = g.exchange AND k.channel = g.channel
+                            AND k.generation = g.generation)
+                 FROM generation g WHERE g.exchange = ?1
+                 ORDER BY g.channel, g.generation",
+            )
+            .map_err(storage("prepare generations"))?;
+        let rows = stmt
+            .query_map(params![self.scope()?], |r| {
+                Ok(Generation {
+                    channel: r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
+                    generation: r.get::<_, i64>(1)? as u64,
+                    instance: r.get::<_, Vec<u8>>(2)?.try_into().unwrap_or([0; 32]),
+                    origin: PubKey::new(r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 32])),
+                    first: r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                    last: r.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                    epochs: r.get::<_, i64>(6)? as u16,
+                })
+            })
+            .map_err(storage("query generations"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read generations"))
+    }
+
+    /// SIP-72: a generation's signed entries above `since`, ascending, at
+    /// most `max`.
+    pub fn history_entries_after(
+        &self,
+        channel: &[u8; 32],
+        generation: u64,
+        since: u64,
+        max: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT seq, bytes FROM entry_history
+                 WHERE exchange = ?1 AND channel = ?2 AND generation = ?3 AND seq > ?4
+                 ORDER BY seq LIMIT ?5",
+            )
+            .map_err(storage("prepare history entries"))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    generation as i64,
+                    since as i64,
+                    max as i64
+                ],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(storage("query history entries"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read history entries"))
+    }
+
+    pub fn put_history_entry(
+        &self,
+        channel: &[u8; 32],
+        generation: u64,
+        seq: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO entry_history (exchange, channel, generation, seq, bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, channel, generation, seq) DO NOTHING",
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    generation as i64,
+                    seq as i64,
+                    bytes
+                ],
+            )
+            .map_err(storage("keep a history entry"))?;
+        Ok(())
+    }
+
+    pub fn has_history_entry(&self, channel: &[u8; 32], generation: u64, seq: u64) -> bool {
+        self.scope()
+            .ok()
+            .and_then(|scope| {
+                self.db
+                    .query_row(
+                        "SELECT 1 FROM entry_history
+                         WHERE exchange = ?1 AND channel = ?2 AND generation = ?3 AND seq = ?4",
+                        params![scope, &channel[..], generation as i64, seq as i64],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    }
+
+    /// SIP-72: a generation's keys.
+    pub fn history_keys(
+        &self,
+        channel: &[u8; 32],
+        generation: u64,
+    ) -> Result<Vec<(u32, ChannelKey)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT epoch, sealed FROM channel_key_history
+                 WHERE exchange = ?1 AND channel = ?2 AND generation = ?3 ORDER BY epoch",
+            )
+            .map_err(storage("prepare history keys"))?;
+        let rows = stmt
+            .query_map(
+                params![self.scope()?, &channel[..], generation as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u32, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(storage("query history keys"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (epoch, sealed) = row.map_err(storage("read history key"))?;
+            out.push((epoch, ChannelKey::new(self.unseal(&sealed)?)));
+        }
+        Ok(out)
+    }
+
+    pub fn put_history_key(
+        &self,
+        channel: &[u8; 32],
+        generation: u64,
+        epoch: u32,
+        key: &ChannelKey,
+    ) -> Result<()> {
+        let sealed = self.seal(key.as_bytes())?;
+        self.db
+            .execute(
+                "INSERT INTO channel_key_history (exchange, channel, generation, epoch, sealed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, channel, generation, epoch) DO NOTHING",
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    generation as i64,
+                    epoch as i64,
+                    sealed
+                ],
+            )
+            .map_err(storage("keep a history key"))?;
+        Ok(())
+    }
+
+    /// SIP-72: keep a message read out of a generation's entries.
+    pub fn put_history_message(
+        &self,
+        channel: &[u8; 32],
+        generation: u64,
+        m: Kept<'_>,
+    ) -> Result<()> {
+        let sealed = match m.plain {
+            Some(p) => Some(self.seal_bytes(p)?),
+            None => None,
+        };
+        self.db
             .execute(
                 "INSERT INTO message_history
                     (exchange, channel, generation, seq, account, posted, kind, sealed)
-                 SELECT exchange, channel, ?3, seq, account, posted, kind, sealed
-                 FROM message WHERE channel = ?1 AND exchange = ?2",
-                params![&channel[..], scope, generation],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (exchange, channel, generation, seq)
+                 DO UPDATE SET sealed = COALESCE(message_history.sealed, excluded.sealed)",
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    generation as i64,
+                    m.seq as i64,
+                    m.account.as_bytes(),
+                    m.posted as i64,
+                    m.kind as i64,
+                    sealed
+                ],
             )
-            .map_err(storage("archive messages"))?;
-        Ok(moved)
+            .map_err(storage("keep a history message"))?;
+        Ok(())
     }
 
     /// SIP-71: the archived incarnations of a channel, oldest first, each
@@ -2478,11 +2766,14 @@ impl Store {
     }
 
     pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
-        // SIP-71: what was read of the incarnation that ended is history,
-        // not waste. Archived here, at the one place every reset passes.
-        self.archive_messages(channel)?;
+        // SIP-71, SIP-72: the incarnation that ended is history, not waste.
+        // Kept here, at the one place every reset passes -- and the signed
+        // entries go with it, or they would be offered to a sibling as the
+        // conversation's (SIP-42).
+        self.archive_incarnation(channel)?;
         for sql in [
             "DELETE FROM message WHERE channel = ?1 AND exchange = ?2",
+            "DELETE FROM entry WHERE channel = ?1 AND exchange = ?2",
             "DELETE FROM seen WHERE channel = ?1 AND exchange = ?2",
             "DELETE FROM channel_key WHERE channel = ?1 AND exchange = ?2",
             "DELETE FROM cursor WHERE channel = ?1 AND exchange = ?2",
