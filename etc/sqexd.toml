@@ -179,6 +179,13 @@ seed_relay_peers = [
 # replication peer, or peer openly (SIP-63), for the pulls to be served.
 # home_secs = 30
 
+# SIP-71: on those same pulls, a direct message this exchange already holds
+# that an origin also orders is a stray there, and the origin is told to
+# fold it -- when the account pulled for is the lower of the two keys, whose
+# home the conversation lives at. Folded here, a direct message's log is
+# kept seven days for its two members (/channel/folded) and the identifier
+# points at the conversation for as long. Nothing to configure.
+
 # SIP-60: the domain this exchange is published under (SIP-33). Told to
 # another exchange as the hint to find this one by, when this exchange puts
 # one of its accounts in a channel here. Optional: a peer that already
