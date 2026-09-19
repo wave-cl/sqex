@@ -15,9 +15,22 @@ use sqex_proto::refusal::{Code, Refusal};
 use sqnr::Client;
 use sqnr_core::PubKey;
 
+use crate::blob_flow::{seal_file, upload};
 use crate::common;
 use crate::common::{Chain, Signer, instance_for};
 use crate::reaching_flow::{i_live_here, identity, now, pair, until};
+
+/// Whether `c` can fetch the first chunk of `blob` here.
+async fn can_fetch(c: &mut Client, blob: [u8; 32]) -> bool {
+    let (code, body) = c
+        .post(
+            "/blob/get",
+            sqex_proto::blob_store::GetChunk { blob, index: 0 }.encode(),
+        )
+        .await
+        .unwrap();
+    code == 200 && sqex_proto::blob_store::Chunk::decode(&body).unwrap().found
+}
 
 /// The folded log's member texts, as `/channel/folded` answers them.
 async fn folded_texts(c: &mut Client, channel: [u8; 32]) -> (u16, Vec<String>) {
@@ -161,6 +174,10 @@ async fn a_stray_direct_message_is_folded_into_the_conversation() {
         .await
         .unwrap();
     assert_eq!(code, 200);
+    // SIP-75: a file in the stray, attached to it.
+    let (_, sealed, blob) = seal_file(b"a photograph in the stray", 4096);
+    assert!(upload(&mut bob_at_b, dm, &sealed, blob, 25, 0).await);
+    assert!(can_fetch(&mut bob_at_b, blob).await);
     let (code, _) = a_at_b
         .post(
             "/peer/folded",
@@ -293,6 +310,20 @@ async fn a_stray_direct_message_is_folded_into_the_conversation() {
         folded_texts(&mut alice_at_a, dm).await.0,
         404,
         "A answered a folded log it never had"
+    );
+    // SIP-75: the stray's file is kept with its log, for the pair and
+    // nobody else.
+    assert!(
+        can_fetch(&mut bob_at_b, blob).await,
+        "the stray's file went with the channel"
+    );
+    assert!(
+        can_fetch(&mut alice_at_b, blob).await,
+        "the file is not served to the other member"
+    );
+    assert!(
+        !can_fetch(&mut carol_at_b, blob).await,
+        "the file is served to a third party"
     );
 
     // Bob says B is his home. The fold left A as an origin hint for him,

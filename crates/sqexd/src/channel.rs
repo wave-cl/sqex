@@ -644,6 +644,15 @@ CREATE TABLE IF NOT EXISTS folded (
     second   BLOB NOT NULL,
     at       INTEGER NOT NULL
 );
+-- SIP-75: the stray's attachments, kept with its folded log for the same
+-- window and the same two members. A blob lives while any attachment or
+-- folded attachment names it.
+CREATE TABLE IF NOT EXISTS folded_attachment (
+    channel BLOB    NOT NULL,
+    blob    BLOB    NOT NULL,
+    at      INTEGER NOT NULL,
+    PRIMARY KEY (channel, blob)
+);
 -- SIP-71: the folded log, the entry table's columns under the stray's
 -- incarnation. Never served as the conversation; served whole to the
 -- two members at `/channel/folded` for `FOLDED_SECS`.
@@ -2479,6 +2488,25 @@ impl Channels {
 
         let _ = expire_uploads(&tx, now);
         // SIP-71: a fold record and its log outlive their window by nothing.
+        // SIP-75: nor do its attachments; a blob nothing else names goes.
+        let expired_blobs: Vec<[u8; 32]> = tx
+            .prepare("SELECT blob FROM folded_attachment WHERE at + ?1 <= ?2")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![FOLDED_SECS as i64, now as i64], |r| {
+                    Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        let _ = tx.execute(
+            "DELETE FROM folded_attachment WHERE at + ?1 <= ?2",
+            params![FOLDED_SECS as i64, now as i64],
+        );
+        for blob in expired_blobs {
+            let _ = collect_blob(&tx, &blob);
+        }
         let _ = tx.execute(
             "DELETE FROM folded_entry WHERE channel IN
                 (SELECT channel FROM folded WHERE at + ?1 <= ?2)",
@@ -4188,6 +4216,19 @@ impl Channels {
             params![&channel[..], &own[..]],
         )
         .map_err(storage("retire folded instance"))?;
+        // SIP-75: the attachments are kept with the log, for the pair and the
+        // window; a blob is not collected while a folded attachment names it.
+        tx.execute(
+            "DELETE FROM folded_attachment WHERE channel = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("drop older folded attachments"))?;
+        tx.execute(
+            "INSERT INTO folded_attachment (channel, blob, at)
+             SELECT channel, blob, ?2 FROM attachment WHERE channel = ?1",
+            params![&channel[..], now as i64],
+        )
+        .map_err(storage("keep folded attachments"))?;
         destroy(&tx, channel)?;
         tx.commit().map_err(storage("commit fold"))?;
         Ok((first, second))
@@ -5697,6 +5738,30 @@ impl Channels {
                 member = true;
             }
         }
+        // SIP-75: a blob a folded attachment names, to the two members of
+        // the folded direct message, while the fold record stands. Counted
+        // as private: it is never what lets a blob be fetched publicly.
+        if !member {
+            let now = now_unix();
+            let mut stmt = db
+                .prepare(
+                    "SELECT f.first, f.second FROM folded_attachment a
+                     JOIN folded f ON f.channel = a.channel
+                     WHERE a.blob = ?1 AND f.at + ?2 > ?3",
+                )
+                .map_err(storage("prepare folded fetch check"))?;
+            let pairs = stmt
+                .query_map(params![&blob[..], FOLDED_SECS as i64, now as i64], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(storage("query folded fetch check"))?;
+            for pair in pairs.flatten() {
+                private = true;
+                if pair.0 == who.as_bytes() || pair.1 == who.as_bytes() {
+                    member = true;
+                }
+            }
+        }
         Ok(member || (public && !private))
     }
 
@@ -6648,9 +6713,11 @@ fn succeeded_by(db: &Connection, account: &[u8; 32]) -> Option<PubKey> {
 /// survives; that is SIP-18's rule and it is why closing one channel does not
 /// take a photograph out of another.
 fn collect_blob(db: &Connection, blob: &[u8; 32]) -> Result<(), ChannelError> {
+    // SIP-75: a folded attachment holds a blob alive as any attachment does.
     let remaining: i64 = db
         .query_row(
-            "SELECT COUNT(*) FROM attachment WHERE blob = ?1",
+            "SELECT (SELECT COUNT(*) FROM attachment WHERE blob = ?1)
+                  + (SELECT COUNT(*) FROM folded_attachment WHERE blob = ?1)",
             params![&blob[..]],
             |r| r.get(0),
         )

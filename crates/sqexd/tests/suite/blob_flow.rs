@@ -84,7 +84,7 @@ fn public(signer: &Signer, channel: [u8; 32], name: &str) -> Create {
 
 /// Seal a file the way a client must: one key, one nonce per chunk, and the
 /// name over the ciphertext.
-fn seal_file(plaintext: &[u8], chunk: usize) -> ([u8; 32], Vec<Vec<u8>>, [u8; 32]) {
+pub(crate) fn seal_file(plaintext: &[u8], chunk: usize) -> ([u8; 32], Vec<Vec<u8>>, [u8; 32]) {
     let key = [0x5a; 32];
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
     let sealed: Vec<Vec<u8>> = plaintext
@@ -114,7 +114,7 @@ fn open_file(key: &[u8; 32], sealed: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Upload a sealed file and commit it, returning whether the exchange accepted.
-async fn upload(
+pub(crate) async fn upload(
     c: &mut Client,
     channel: [u8; 32],
     sealed: &[Vec<u8>],

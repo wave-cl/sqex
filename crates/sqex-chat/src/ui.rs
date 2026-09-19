@@ -1750,7 +1750,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
         "messages",
         &[
             ("/file <path>", "send a file"),
-            ("/save <n> <path>", "keep one somebody sent"),
+            (
+                "/save <n> <path>",
+                "keep one somebody sent; e1.<n> for one in an earlier copy",
+            ),
             (
                 "/forward <n> <m>",
                 "send a file on to conversation m, without re-uploading",

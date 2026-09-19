@@ -2614,7 +2614,15 @@ async fn handle_key(
             let outcome = match cmd {
                 Command::Send(text) => chat.send(&channel, &text).await.map(|_| None),
                 Command::File(path) => send_file(chat, &channel, &path).await.map(Some),
-                Command::Save(seq, path) => save_file(chat, &open[i], seq, &path).await.map(Some),
+                Command::Save(seq, path) => save_file(chat, &open[i].timeline, seq, &path)
+                    .await
+                    .map(Some),
+                Command::SaveEarlier(g, seq, path) => match open[i].earlier.get(g - 1) {
+                    Some(t) => save_file(chat, t, seq, &path).await.map(Some),
+                    None => Err(ChatError::Protocol(format!(
+                        "this conversation has no earlier copy {g}"
+                    ))),
+                },
                 // Handled above: these need no conversation.
                 Command::New(_)
                 | Command::Public(_)
@@ -3171,6 +3179,9 @@ enum Command {
     Send(String),
     File(std::path::PathBuf),
     Save(u64, std::path::PathBuf),
+    /// SIP-75: a file of a message in an earlier copy (SIP-71), by copy
+    /// number (from 1, oldest first) and message number.
+    SaveEarlier(usize, u64, std::path::PathBuf),
     /// `/new <name>` — a private group, which you can then invite people into.
     New(String),
     /// `/public <name>` — a channel anybody may find and join.
@@ -3300,12 +3311,25 @@ impl Command {
             "/file" => Command::Unknown("/file needs a path".into()),
             "/save" => {
                 let path = rest[first.len()..].trim();
-                match (first.parse::<u64>(), path.is_empty()) {
-                    (Ok(seq), false) => Command::Save(seq, expand(path)),
-                    (Err(_), _) if !first.is_empty() => {
+                // SIP-75: `e<n>.<seq>` names a message in the n-th earlier
+                // copy of this conversation (SIP-71), whose files are kept.
+                let earlier = first
+                    .strip_prefix('e')
+                    .and_then(|r| r.split_once('.'))
+                    .and_then(|(g, s)| Some((g.parse::<usize>().ok()?, s.parse::<u64>().ok()?)));
+                match (first.parse::<u64>(), earlier, path.is_empty()) {
+                    (_, Some((g, seq)), false) if g > 0 => {
+                        Command::SaveEarlier(g, seq, expand(path))
+                    }
+                    (Ok(seq), _, false) => Command::Save(seq, expand(path)),
+                    (Err(_), None, _) if !first.is_empty() => {
                         Command::Unknown(format!("{first} is not a message number"))
                     }
-                    _ => Command::Unknown("/save needs a message number and a path".into()),
+                    _ => Command::Unknown(
+                        "/save needs a message number and a path (e1.4 for message 4 of the \
+                         first earlier copy)"
+                            .into(),
+                    ),
                 }
             }
             "/new" if !rest.is_empty() => Command::New(rest.to_string()),
@@ -3667,12 +3691,11 @@ async fn save_avatar(
 /// Fetch the attachment on message `seq` and write it out.
 async fn save_file(
     chat: &mut Chat,
-    conv: &Open,
+    timeline: &Timeline,
     seq: u64,
     path: &std::path::Path,
 ) -> std::result::Result<String, ChatError> {
-    let message = conv
-        .timeline
+    let message = timeline
         .get(seq)
         .ok_or_else(|| ChatError::Protocol(format!("no message {seq} here")))?;
     let attachment = message
