@@ -4311,12 +4311,18 @@ impl Chat {
         let Some(info) = asked else {
             return Ok(());
         };
-        // A replica tracked no chains (SIP-53): it reports nothing, and
-        // rebuilds from its entries before it orders. So does this client,
-        // from the entries it holds of what the replica holds -- what a
-        // client with a fresh store does (SIP-43).
+        // A replica tracked no chains (SIP-53). SIP-77 has it report the
+        // chain as its entries show it, and serve the heads by position;
+        // an exchange from before that reports zero, and this client
+        // rebuilds from the entries it holds itself (SIP-74).
         let (target_seq, target_head) = if info.my_chain_seq > 0 {
             (info.my_chain_seq, info.my_chain_head)
+        } else if let Ok(Some((seq, head))) = self
+            .chain_heads(channel, 0)
+            .await
+            .map(|h| h.last().copied())
+        {
+            (seq + 1, head)
         } else {
             self.chain_from_held(channel, info.last)?
                 .unwrap_or((0, sqex_proto::entry_sig::GENESIS))
@@ -4326,6 +4332,35 @@ impl Chat {
             self.store.reset_chain(channel, target_seq, &target_head)?;
         }
         Ok(())
+    }
+
+    /// SIP-77: this device's chain heads by position as the exchange holds
+    /// them, from `from` up. Empty where the exchange predates the route.
+    pub async fn chain_heads(
+        &mut self,
+        channel: &[u8; 32],
+        from: u64,
+    ) -> Result<Vec<(u64, [u8; 32])>> {
+        let body = match self
+            .post(
+                "/channel/chain",
+                sqex_proto::channel::ChainAsk {
+                    channel: *channel,
+                    from,
+                }
+                .encode(),
+            )
+            .await
+        {
+            Ok(body) => body,
+            Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(sqex_proto::channel::Heads::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .heads)
     }
 
     /// SIP-74: this device's chain as the entries held up to `upto` have

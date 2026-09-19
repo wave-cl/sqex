@@ -484,6 +484,27 @@ async fn a_replica_takes_a_channel_whose_origin_is_gone_and_the_origin_follows_w
             );
         }
     }
+    // SIP-77: Y, unable to ask X, reports the admin's chain as its own
+    // entries show it -- exactly what was rebuilt above by hand -- and
+    // serves the heads by position, the last of them the same.
+    let info = s.info(&mut at_y, channel).await;
+    assert_eq!(
+        (info.my_chain_seq, info.my_chain_head),
+        (chain_y.seq, chain_y.head),
+        "Y reported a chain other than its entries show"
+    );
+    let (code, body) = at_y
+        .post(
+            "/channel/chain",
+            sqex_proto::channel::ChainAsk { channel, from: 0 }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let heads = sqex_proto::channel::Heads::decode(&body).unwrap().heads;
+    assert!(!heads.is_empty(), "Y served no heads");
+    assert_eq!(heads.last().copied(), Some((chain_y.seq - 1, chain_y.head)));
+    assert!(heads.windows(2).all(|w| w[0].0 < w[1].0), "{heads:?}");
     // Now Y takes it: signed under X, receipted by Y, and Y is the origin.
     let (code, body) = rehome(&mut at_y, &s, &mut chain_y, channel, y_key, "y.test").await;
     assert_eq!(code, 200, "{}", common::said(&body));

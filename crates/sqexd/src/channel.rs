@@ -41,12 +41,12 @@ use sqex_proto::channel::{
     ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
     EVENT_DEMOTED, EVENT_JOINED, EVENT_LEFT, EVENT_MUTED, EVENT_PROMOTED, EVENT_REHOMED,
     EVENT_REMOVED, EVENT_RENAMED, EVENT_REPLICATE, EVENT_RETENTION, EVENT_ROTATED, EVENT_SUCCEEDED,
-    EVENT_UNMUTED, EVENT_UNREPLICATE, Entries, Entry, Invitee, KIND_MEMBER, KIND_SYSTEM, Listing,
-    MAX_BATCH, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY, MAX_DIRECTORY,
-    MAX_ENTRIES, MAX_MEMBERS, MAX_MINE, MAX_NAME, MAX_REPORTS, MAX_RETENTION, MAX_SIGNALS,
-    MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark, Marks, Member, Membership, Mines, Post, Posted,
-    Public, REPORT_TTL, Receipted, Reported, Reports, Retain, Role, SIGNAL_TTL, Signalled, System,
-    Tip, Visibility, constitution, direct_message_id,
+    EVENT_UNMUTED, EVENT_UNREPLICATE, Entries, Entry, Heads, Invitee, KIND_MEMBER, KIND_SYSTEM,
+    Listing, MAX_BATCH, MAX_BATCH_BYTES, MAX_CHANNEL_BYTES, MAX_CHANNELS_PER_IDENTITY,
+    MAX_DIRECTORY, MAX_ENTRIES, MAX_HEADS, MAX_MEMBERS, MAX_MINE, MAX_NAME, MAX_REPORTS,
+    MAX_RETENTION, MAX_SIGNALS, MAX_TOPIC, MAX_UNSPOKEN, MIN_RETENTION, Mark, Marks, Member,
+    Membership, Mines, Post, Posted, Public, REPORT_TTL, Receipted, Reported, Reports, Retain,
+    Role, SIGNAL_TTL, Signalled, System, Tip, Visibility, constitution, direct_message_id,
 };
 use sqex_proto::channel_key::{
     Absent, Envelope, Got, MAX_EPOCH, Put as KeyPut, PutAck, Stranded, verify_envelope,
@@ -4088,6 +4088,45 @@ impl Channels {
             .collect()
     }
 
+    /// SIP-77: a device's chain heads by position, from the entries held:
+    /// each member entry the device signed and each system entry recording
+    /// an action of its, at or above `from`, with the head after it -- the
+    /// entry's hash as receipted -- ascending; then the mark this exchange
+    /// keeps for the device, where that is higher. A copy answers from what
+    /// it holds.
+    pub fn heads_for(
+        &self,
+        caller: &PubKey,
+        device: &PubKey,
+        channel: &[u8; 32],
+        from: u64,
+    ) -> Result<Heads, ChannelError> {
+        let db = self.db.lock().unwrap();
+        visibility_of(&db, channel)?;
+        if !Self::readable_by(&db, channel, caller) {
+            return Err(Self::unreadable(&db, channel));
+        }
+        let mut heads = held_heads(&db, channel, device, from)?;
+        let (next, head) = chain_head(&db, channel, device)?;
+        if next > 0 && heads.last().is_none_or(|(s, _)| next - 1 > *s) && next > from {
+            heads.push((next - 1, head));
+        }
+        heads.truncate(MAX_HEADS);
+        Ok(Heads { heads })
+    }
+
+    /// SIP-77: a device's chain as this exchange's entries show it -- the
+    /// position after its highest held entry or action, and the head after
+    /// it -- for a copy whose origin cannot be asked. `(0, GENESIS)` where
+    /// it holds none.
+    pub fn chain_from_entries(&self, channel: &[u8; 32], device: &PubKey) -> (u64, [u8; 32]) {
+        let db = self.db.lock().unwrap();
+        held_heads(&db, channel, device, 0)
+            .ok()
+            .and_then(|h| h.last().map(|(s, head)| (s + 1, *head)))
+            .unwrap_or((0, GENESIS))
+    }
+
     /// SIP-71: the two accounts of a direct message this exchange orders,
     /// lesser first -- `None` for a channel it does not order, or one that is
     /// not a direct message by SIP-16's arithmetic.
@@ -5966,6 +6005,63 @@ impl Channels {
 ///
 /// Kept independently of the entries, so pruning cannot understate it — a
 /// device resuming from an understated mark would fork its own chain.
+/// SIP-77: the positions and heads of `device`'s held entries and actions
+/// in `channel` at or above `from`, ascending. A system entry's actor and
+/// step are inside its body (as `rebuild_standing` reads them); its
+/// `entry_hash` is the head after the action, kept because it cannot be
+/// recomputed here.
+fn held_heads(
+    db: &Connection,
+    channel: &[u8; 32],
+    device: &PubKey,
+    from: u64,
+) -> Result<Vec<(u64, [u8; 32])>, ChannelError> {
+    let mut stmt = db
+        .prepare(
+            "SELECT kind, device, chain_seq, body, entry_hash FROM entry
+             WHERE channel = ?1 ORDER BY seq",
+        )
+        .map_err(storage("prepare held heads"))?;
+    let rows = stmt
+        .query_map(params![&channel[..]], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .map_err(storage("query held heads"))?;
+    let mut out: Vec<(u64, [u8; 32])> = Vec::new();
+    for row in rows {
+        let (kind, dev, chain_seq, body, entry_hash) = row.map_err(storage("read held head"))?;
+        let (dev, chain_seq) = if kind == KIND_SYSTEM as i64 {
+            match System::decode(&body) {
+                Ok(Some(sys)) if sys.event != EVENT_SUCCEEDED => {
+                    (sys.actor_device.as_bytes().to_vec(), sys.chain_seq as i64)
+                }
+                _ => continue,
+            }
+        } else {
+            (dev, chain_seq)
+        };
+        if dev != device.as_bytes() || (chain_seq as u64) < from {
+            continue;
+        }
+        let Ok(head) = <[u8; 32]>::try_from(entry_hash) else {
+            continue;
+        };
+        if head == [0u8; 32] {
+            continue;
+        }
+        out.push((chain_seq as u64, head));
+    }
+    out.sort_by_key(|(s, _)| *s);
+    out.dedup_by_key(|(s, _)| *s);
+    Ok(out)
+}
+
 fn chain_head(
     db: &Connection,
     channel: &[u8; 32],

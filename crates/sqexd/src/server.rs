@@ -3239,6 +3239,23 @@ async fn route(
                 .encode(),
             ),
         },
+        // SIP-77: the calling device's chain heads by position, from the
+        // entries this exchange holds and the mark it keeps.
+        ("POST", "/channel/chain") => {
+            match (account, sqex_proto::channel::ChainAsk::decode(body)) {
+                (None, _) => no_identity("reading a chain"),
+                (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                (Some(me), Ok(req)) => match server.channels.heads_for(
+                    &me,
+                    &device.unwrap_or(me),
+                    &req.channel,
+                    req.from,
+                ) {
+                    Ok(heads) => (200, "application/octet-stream", heads.encode()),
+                    Err(e) => refused(e),
+                },
+            }
+        }
         // SIP-71: the folded log of a direct message this exchange ended,
         // to either of its members, as a fetch would have answered it.
         ("POST", "/channel/folded") => match (account, ByChannel::decode(body, CH_FOLDED)) {
@@ -3316,15 +3333,31 @@ async fn route(
                         // say. A replica tracks no chains, and a device that
                         // took this exchange's zero for an answer would sign
                         // from zero and be refused where it counts.
-                        if let Some(origin) = server.channels.origin_of(&req.channel)
-                            && let Some(forwarder) = server.forwarder(&origin)
-                            && let Some(standing) = forwarder
-                                .standing(&server.exchange_seed, &req.channel, &device)
-                                .await
-                        {
-                            info.my_chain_seq = standing.next_chain;
-                            info.my_chain_head = standing.head;
-                            info.my_msg_seq = standing.msg_seq;
+                        if let Some(origin) = server.channels.origin_of(&req.channel) {
+                            let asked = match server.forwarder(&origin) {
+                                Some(forwarder) => {
+                                    forwarder
+                                        .standing(&server.exchange_seed, &req.channel, &device)
+                                        .await
+                                }
+                                None => None,
+                            };
+                            match asked {
+                                Some(standing) => {
+                                    info.my_chain_seq = standing.next_chain;
+                                    info.my_chain_head = standing.head;
+                                    info.my_msg_seq = standing.msg_seq;
+                                }
+                                // SIP-77: the origin cannot be asked; the
+                                // chain as this copy's own entries show it,
+                                // which is what a rehome here would rebuild.
+                                None => {
+                                    let (next, head) =
+                                        server.channels.chain_from_entries(&req.channel, &device);
+                                    info.my_chain_seq = next;
+                                    info.my_chain_head = head;
+                                }
+                            }
                         }
                         (200, "application/octet-stream", info.encode())
                     }

@@ -117,6 +117,9 @@ pub const TYPE_CREATE_AT: u8 = 0x22;
 /// SIP-71: read the folded log of a direct message this exchange ended,
 /// a `ByChannel` answered with `Entries` to either member.
 pub const TYPE_FOLDED: u8 = 0x23;
+/// SIP-77: the calling device's chain heads by position, as the exchange
+/// holds them.
+pub const TYPE_CHAIN: u8 = 0x24;
 
 /// SIP-60: `POST /channel/create_at`: `| type = 0x22 | origin[32] | Create |`.
 /// The `Create` is signed under `origin`, as every act made through a copy
@@ -1497,6 +1500,75 @@ impl Stranded {
             at += len;
         }
         Ok(Stranded { entries })
+    }
+}
+
+/// SIP-77: `| type = 0x24 | channel[32] | from: u64 |` at `POST /channel/chain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainAsk {
+    pub channel: [u8; 32],
+    pub from: u64,
+}
+
+impl ChainAsk {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(TYPE_CHAIN);
+        out.extend_from_slice(&self.channel);
+        out.extend_from_slice(&self.from.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ChainAsk> {
+        if b.len() != 41 || b[0] != TYPE_CHAIN {
+            return Err(Error::Malformed("not a chain ask".into()));
+        }
+        Ok(ChainAsk {
+            channel: b[1..33].try_into().unwrap(),
+            from: u64::from_be_bytes(b[33..41].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-77: `| count: u16 | count × (chain_seq: u64 | head[32]) |` -- the
+/// head after each position, ascending.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Heads {
+    pub heads: Vec<(u64, [u8; 32])>,
+}
+
+/// SIP-77: heads per answer.
+pub const MAX_HEADS: usize = 256;
+
+impl Heads {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.heads.len() * 40);
+        out.extend_from_slice(&(self.heads.len() as u16).to_be_bytes());
+        for (seq, head) in &self.heads {
+            out.extend_from_slice(&seq.to_be_bytes());
+            out.extend_from_slice(head);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Heads> {
+        if b.len() < 2 {
+            return Err(Error::Malformed("heads cut short".into()));
+        }
+        let count = u16::from_be_bytes([b[0], b[1]]) as usize;
+        if b.len() != 2 + count * 40 {
+            return Err(Error::Malformed("heads cut short".into()));
+        }
+        let heads = (0..count)
+            .map(|i| {
+                let at = 2 + i * 40;
+                (
+                    u64::from_be_bytes(b[at..at + 8].try_into().unwrap()),
+                    b[at + 8..at + 40].try_into().unwrap(),
+                )
+            })
+            .collect();
+        Ok(Heads { heads })
     }
 }
 

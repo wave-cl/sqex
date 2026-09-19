@@ -476,6 +476,8 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Chat("Chat::stranded_entries"),
         SelfOnly,
     ),
+    // SIP-77: the calling device's chain heads by position.
+    ("POST", "/channel/chain", Chat("Chat::chain_heads"), Member),
     // SIP-71: the folded log of a direct message this exchange ended, to
     // either of its two members.
     (
