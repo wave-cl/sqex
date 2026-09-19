@@ -43,7 +43,7 @@ use sqex_proto::timeline::{Received, Timeline};
 use sqex_proto::timeline::{Standing, Verdict};
 use sqnr::Client;
 use sqnr_core::PubKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -754,6 +754,16 @@ pub struct Chat {
     /// origin, newest first. What they signed and receipted verifies under
     /// them, as a key's predecessors do (SIP-40).
     former: HashMap<[u8; 32], Vec<PubKey>>,
+    /// SIP-74: forks already dealt with, `(channel, fork)`, so a `Home`
+    /// answer read again does not strand again.
+    forks_seen: HashSet<([u8; 32], u64)>,
+    /// SIP-74: forks met while folding a batch -- a rehome entry read --
+    /// dealt with once the batch is done, where a network call is possible.
+    pending_forks: Vec<([u8; 32], PubKey, u64)>,
+    /// SIP-74: channels whose entries carried a receipt under no origin
+    /// this client knows -- the first sign, for a client whose cursor is
+    /// above a fork, that the origin changed. Its home is asked again.
+    reask_home: HashSet<[u8; 32]>,
     /// SIP-40: the keys each exchange held before its current one, as the
     /// pin store remembers them, newest first. What was signed under them
     /// still verifies under them and under nothing else.
@@ -845,6 +855,9 @@ impl Chat {
             mail_opened: std::collections::HashSet::new(),
             gap_asked: std::collections::HashSet::new(),
             former: HashMap::new(),
+            forks_seen: HashSet::new(),
+            pending_forks: Vec::new(),
+            reask_home: HashSet::new(),
             timers: HashMap::new(),
             bound_in: HashMap::new(),
             domain: None,
@@ -4131,7 +4144,278 @@ impl Chat {
             .entry(home.origin)
             .or_insert_with(|| predecessors_of(&home.origin));
         self.homes.insert(*channel, home.clone());
+        // SIP-74: a former origin whose regime ended below what this client
+        // holds is a fork this client was on the losing side of.
+        let forks: Vec<(u64, PubKey)> = home
+            .former
+            .iter()
+            .filter(|(_, f)| *f != home.origin)
+            .copied()
+            .collect();
+        for (ended, f) in forks {
+            // `ended` is the position of the rehome that ended the regime:
+            // the first of the new one. The fork is the position before it.
+            let _ = self.fork_check(channel, &f, ended.saturating_sub(1)).await;
+        }
         Ok(home)
+    }
+
+    /// SIP-74: deal with a fork at `fork` that `former` lost. What this
+    /// client holds above it under the former origin's receipts is of the
+    /// losing regime: its own posts are kept aside as stranded, the rest
+    /// dropped, the cursor put back to the fork, and the chain continued
+    /// from what the winning origin holds. Returns how many posts were
+    /// stranded; nothing where the fork is above what is held, or was dealt
+    /// with already.
+    pub async fn fork_check(
+        &mut self,
+        channel: &[u8; 32],
+        former: &PubKey,
+        fork: u64,
+    ) -> Result<usize> {
+        self.fork_found(channel, former, fork, false).await
+    }
+
+    /// `fork_check`, with `own_act` where this client is making the fork
+    /// itself by rehoming at a replica: then the chain is put back to what
+    /// the replica holds whether or not this connection's view held
+    /// anything above it -- the other connection's view may, and the
+    /// rehome must chain from what the replica has seen.
+    async fn fork_found(
+        &mut self,
+        channel: &[u8; 32],
+        former: &PubKey,
+        fork: u64,
+        own_act: bool,
+    ) -> Result<usize> {
+        let seen = !self.forks_seen.insert((*channel, fork));
+        let highest = self.store.highest_entry(channel)?.max(
+            self.store
+                .messages(channel)?
+                .last()
+                .map(|m| m.0)
+                .unwrap_or(0),
+        );
+        let nothing_held = highest <= fork;
+        if (seen || nothing_held) && !own_act {
+            return Ok(0);
+        }
+        if seen || nothing_held {
+            self.chain_back_to_origin(channel).await?;
+            return Ok(0);
+        }
+        let current = self.exchange_of(channel);
+        let instance = self.store.incarnation(channel)?.unwrap_or([0; 32]);
+        let mut under_former = vec![*former];
+        under_former.extend(
+            self.predecessors
+                .entry(*former)
+                .or_insert_with(|| predecessors_of(former))
+                .iter()
+                .copied(),
+        );
+        let under_current = vec![current];
+        // Which of the held entries above the fork the former origin
+        // receipted: those are the losing regime. One held without a receipt
+        // was fetched before the fork was known, and is taken as losing too.
+        let mut losing: HashSet<u64> = HashSet::new();
+        for (seq, bytes) in self.store.entries_after(channel, fork, usize::MAX)? {
+            let Ok(e) = Entry::read_receipted(&bytes, &mut 0) else {
+                continue;
+            };
+            let old = matches!(
+                Self::standing_under(&under_former, channel, instance, &e, None),
+                Standing::Vouched | Standing::Unlinked
+            );
+            let new = current != *former
+                && matches!(
+                    Self::standing_under(&under_current, channel, instance, &e, None),
+                    Standing::Vouched | Standing::Unlinked
+                );
+            if (old && !new) || e.stamp.is_none() {
+                losing.insert(seq);
+            }
+        }
+        let plain: HashMap<u64, (PubKey, u64, Option<Vec<u8>>)> = self
+            .store
+            .messages(channel)?
+            .into_iter()
+            .filter(|m| m.0 > fork)
+            .map(|(seq, account, posted, kind, plain)| {
+                (
+                    seq,
+                    (
+                        account,
+                        posted,
+                        (kind == KIND_MEMBER).then_some(plain).flatten(),
+                    ),
+                )
+            })
+            .collect();
+        // A message held with no signed entry beside it was read before this
+        // client kept entries; above a fork it can only be the losing side.
+        let mut stranded = 0;
+        for (seq, (account, posted, body)) in &plain {
+            let held_signed = self.has_entry(channel, *seq);
+            if held_signed && !losing.contains(seq) {
+                continue;
+            }
+            if *account != self.me {
+                continue;
+            }
+            if let Some(body) = body
+                && matches!(Body::decode(body), Ok(Some(Body::Post(_))))
+            {
+                self.store
+                    .put_stranded(channel, *seq, *posted, fork, body)?;
+                stranded += 1;
+            }
+        }
+        self.store.truncate_above(channel, fork)?;
+        if !losing.is_empty() || own_act {
+            self.chain_back_to_origin(channel).await?;
+        }
+        Ok(stranded)
+    }
+
+    /// SIP-74: the chain continues from the last entry the winning origin
+    /// holds. Asked plainly: `info` asks `home`, which may have asked here.
+    async fn chain_back_to_origin(&mut self, channel: &[u8; 32]) -> Result<()> {
+        let asked = self
+            .post(
+                "/channel/info",
+                ByChannel { channel: *channel }.encode(TYPE_INFO),
+            )
+            .await
+            .ok()
+            .and_then(|b| ChannelInfo::decode(&b).ok());
+        let Some(info) = asked else {
+            return Ok(());
+        };
+        // A replica tracked no chains (SIP-53): it reports nothing, and
+        // rebuilds from its entries before it orders. So does this client,
+        // from the entries it holds of what the replica holds -- what a
+        // client with a fresh store does (SIP-43).
+        let (target_seq, target_head) = if info.my_chain_seq > 0 {
+            (info.my_chain_seq, info.my_chain_head)
+        } else {
+            self.chain_from_held(channel, info.last)?
+                .unwrap_or((0, sqex_proto::entry_sig::GENESIS))
+        };
+        let (mine, _) = self.store.chain(channel)?;
+        if mine > target_seq {
+            self.store.reset_chain(channel, target_seq, &target_head)?;
+        }
+        Ok(())
+    }
+
+    /// SIP-74: this device's chain as the entries held up to `upto` have
+    /// it -- the next position and the link -- or `None` where it signed
+    /// nothing held. A post of this device's links over its entry terms;
+    /// an action of this device's (a system entry naming it) links over an
+    /// input the exchange never transmits, so the head this device logged
+    /// when it signed is what stands there.
+    fn chain_from_held(&self, channel: &[u8; 32], upto: u64) -> Result<Option<(u64, [u8; 32])>> {
+        let instance = self.store.incarnation(channel)?.unwrap_or([0; 32]);
+        let keys = self.keys_of(channel);
+        let mut last: Option<(u64, [u8; 32])> = None;
+        let mut take = |next: u64, head: [u8; 32]| {
+            if last.is_none_or(|(n, _)| next > n) {
+                last = Some((next, head));
+            }
+        };
+        for (seq, bytes) in self.store.entries_after(channel, 0, usize::MAX)? {
+            if seq > upto {
+                break;
+            }
+            let Ok(e) = Entry::read_receipted(&bytes, &mut 0) else {
+                continue;
+            };
+            if e.kind == KIND_SYSTEM {
+                if let Ok(Some(sys)) = System::decode(&e.body)
+                    && sys.actor_device == self.device
+                    && let Some(head) = self.store.head_after(channel, sys.chain_seq)?
+                {
+                    take(sys.chain_seq + 1, head);
+                }
+                continue;
+            }
+            if e.device != self.device {
+                continue;
+            }
+            for key in &keys {
+                let terms = EntryTerms {
+                    place: Place {
+                        exchange: *key,
+                        instance,
+                        channel: *channel,
+                    },
+                    account: e.account,
+                    device: e.device,
+                    epoch: e.epoch,
+                    msg_seq: e.msg_seq,
+                    expires_after: e.expires_after,
+                    chain_seq: e.chain_seq,
+                    prev: e.prev,
+                    body: &e.body,
+                };
+                let signed = if e.body.is_empty()
+                    && e.body_hash != Sha256::digest(&[] as &[u8]).as_slice()
+                {
+                    verify_entry_hashed(&terms, &e.body_hash, &e.sig)
+                } else {
+                    verify_entry(&terms, &e.sig)
+                };
+                if signed {
+                    take(e.chain_seq + 1, link(&terms.input_hashed(&e.body_hash)));
+                    break;
+                }
+            }
+        }
+        Ok(last)
+    }
+
+    /// SIP-74: this client's own posts a move stranded, oldest first:
+    /// `(seq, posted, post)`.
+    pub fn stranded_posts(&self, channel: &[u8; 32]) -> Result<Vec<(u64, u64, SipPost)>> {
+        let mut out = Vec::new();
+        for (seq, posted, _, plain) in self.store.stranded(channel)? {
+            if let Ok(Some(Body::Post(p))) = Body::decode(&plain) {
+                out.push((seq, posted, p));
+            }
+        }
+        Ok(out)
+    }
+
+    /// SIP-74: post a stranded post again, as a fresh entry saying when it
+    /// was first said. A reply to something above the fork loses its
+    /// reply: what it answered was stranded too.
+    pub async fn post_again(&mut self, channel: &[u8; 32], seq: u64) -> Result<Posted> {
+        let (posted, fork, plain) = self
+            .store
+            .stranded(channel)?
+            .into_iter()
+            .find(|(s, _, _, _)| *s == seq)
+            .map(|(_, posted, fork, plain)| (posted, fork, plain))
+            .ok_or_else(|| ChatError::Protocol("no such stranded post".into()))?;
+        let Ok(Some(Body::Post(mut post))) = Body::decode(&plain) else {
+            return Err(ChatError::Protocol(
+                "the stranded body is not a post".into(),
+            ));
+        };
+        post.parts
+            .retain(|p| !matches!(p, Part::Said(_) | Part::Via(_)));
+        post.parts
+            .retain(|p| !matches!(p, Part::Reply(t) if *t > fork));
+        post.parts.push(Part::Said(posted));
+        let sent = self.send_body(channel, Body::Post(post)).await?;
+        self.store.drop_stranded(channel, seq)?;
+        Ok(sent)
+    }
+
+    /// SIP-74: let a stranded post go unsent.
+    pub fn forget_stranded(&mut self, channel: &[u8; 32], seq: u64) -> Result<()> {
+        Ok(self.store.drop_stranded(channel, seq)?)
     }
 
     /// The exchange a channel's signatures name and its receipts verify
@@ -4240,6 +4524,16 @@ impl Chat {
         domain: &str,
     ) -> Result<()> {
         let info = self.info(channel).await?;
+        // SIP-74: rehoming at a replica whose origin is gone strands, by that
+        // act, everything above the replica's last position -- this client's
+        // own included -- and the rehome must chain from what the replica
+        // holds, or it links to a hash the replica has never seen.
+        if *subject == self.exchange {
+            let was = self.exchange_of(channel);
+            if was != *subject {
+                let _ = self.fork_found(channel, &was, info.last, true).await;
+            }
+        }
         let (action, head) = self.sign_action_at(channel, &info, EVENT_REHOMED, subject, &[])?;
         self.post(
             "/channel/rehome",
@@ -4282,13 +4576,20 @@ impl Chat {
             .encode(),
         )
         .await?;
+        // The exchange just learned the channel moved; what it answers for
+        // the channel's home has changed, and so may what this client holds
+        // above the fork (SIP-74).
+        self.homes.remove(channel);
+        let _ = self.home(channel).await;
         Ok(true)
     }
 
     /// SIP-53: the latest rehome entry this client holds for a channel,
     /// receipted, if any.
     fn rehome_entry(&self, channel: &[u8; 32]) -> Result<Option<Entry>> {
-        let raw = self.store.entries_after(channel, 0, usize::MAX)?;
+        // Under any connection: the entry was read at the new origin, and is
+        // carried from a connection to the old one (SIP-74 found this).
+        let raw = self.store.entries_anywhere(channel)?;
         let mut found = None;
         for (_, b) in &raw {
             let mut at = 0;
@@ -5489,6 +5790,11 @@ impl Chat {
             if let Some(stamp) = &e.stamp {
                 last_head = Some((e.seq, stamp.head));
             }
+            // SIP-74: a receipt under no origin this client knows is how a
+            // client with its cursor above a fork first meets the new origin.
+            if standing == Standing::Repudiated {
+                self.reask_home.insert(*channel);
+            }
             if verdict == Verdict::Forged {
                 // Not stored, not folded, and not counted as read. `history`
                 // rebuilds from this store without the signatures — they are
@@ -5573,7 +5879,14 @@ impl Chat {
             if let Some(sys) = &system
                 && sys.event == EVENT_REHOMED
             {
+                let was = self.exchange_of(channel);
                 self.moved_origin(channel, &sys.subject);
+                // SIP-74: everything held above the position before this
+                // entry, under the old origin, is the losing side of a fork.
+                if was != sys.subject {
+                    self.pending_forks
+                        .push((*channel, was, e.seq.saturating_sub(1)));
+                }
             }
             let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
             let redacts = match &body {
@@ -5822,6 +6135,19 @@ impl Chat {
         )?;
         if last > since {
             self.store.set_since(channel, last)?;
+        }
+        // SIP-74: a rehome read in this batch is a fork; what was held above
+        // it under the old origin is dealt with now, and the next poll reads
+        // the winning history from there. A receipt under a key this client
+        // does not know has the home asked again, which finds the fork the
+        // same way.
+        let forks = std::mem::take(&mut self.pending_forks);
+        for (c, was, fork) in forks {
+            let _ = self.fork_check(&c, &was, fork).await;
+        }
+        if self.reask_home.remove(channel) {
+            self.homes.remove(channel);
+            let _ = self.home(channel).await;
         }
 
         let typing = entries.signals.iter().any(|s| {

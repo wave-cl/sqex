@@ -137,6 +137,9 @@ pub struct Said {
     pub has_file: bool,
     pub at: u64,
     pub edited: bool,
+    /// SIP-74: posted again after being stranded; `at` is when it was
+    /// first said, by the poster's own word.
+    pub again: bool,
     /// SIP-43: the exchange the sender says they posted this through, when
     /// that was not where the conversation lives. Shortened for display
     /// where it is a key rather than a domain.
@@ -229,6 +232,9 @@ pub struct Trouble {
     /// key signed and says nothing about whose it is, so the attribution is
     /// withheld rather than assumed.
     pub unattributed: usize,
+    /// SIP-74: posts of yours a move stranded, waiting to be sent again
+    /// or let go.
+    pub stranded: usize,
     /// Anything else — a refusal, a dropped connection.
     pub message: Option<String>,
 }
@@ -293,6 +299,16 @@ impl Trouble {
                 "{} message{} cannot be opened yet",
                 self.unreadable,
                 if self.unreadable == 1 { "" } else { "s" }
+            ));
+        }
+        if self.stranded > 0 {
+            parts.push(format!(
+                "{} message{} of yours {} stranded by a move — /repost sends {} again, /unstrand lets {} go",
+                self.stranded,
+                if self.stranded == 1 { "" } else { "s" },
+                if self.stranded == 1 { "was" } else { "were" },
+                if self.stranded == 1 { "it" } else { "them" },
+                if self.stranded == 1 { "it" } else { "them" }
             ));
         }
         if let Some(m) = &self.message {
@@ -1168,6 +1184,10 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
     if s.has_file && !s.redacted {
         tail += &format!("  /save {}", s.seq);
     }
+    // SIP-74: shown at when it was first said, and said so.
+    if s.again && !s.redacted {
+        tail += "  (posted again)";
+    }
     if s.edited && !s.redacted {
         tail += "  (edited)";
     }
@@ -1777,6 +1797,10 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
                 "who is here and their keys in full; how far each has read",
             ),
             ("/rotate", "mint a new key for everyone currently here"),
+            (
+                "/repost  /unstrand",
+                "send again what a move stranded, or let it go",
+            ),
         ],
     ),
     (
@@ -2301,6 +2325,7 @@ mod tests {
             restarted: false,
             forked: Vec::new(),
             unattributed: 0,
+            stranded: 0,
             message: None,
         };
         let line = t.line();

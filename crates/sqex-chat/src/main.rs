@@ -1761,6 +1761,10 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
             conv.trouble.no_key = got.no_key;
             conv.trouble.gap = got.gap;
             conv.trouble.restarted = got.restarted;
+            conv.trouble.stranded = chat
+                .stranded_posts(&conv.channel)
+                .map(|s| s.len())
+                .unwrap_or(0);
             if got.restarted {
                 // SIP-71: what was read of the copy that ended is history
                 // now, and is shown as such.
@@ -2770,6 +2774,47 @@ async fn handle_key(
                     }),
                     Err(e) => Err(ChatError::Protocol(format!("bad key: {e}"))),
                 },
+                Command::Repost => {
+                    let mut sent = 0;
+                    let outcome = async {
+                        for (seq, _, _) in chat.stranded_posts(&channel)? {
+                            chat.post_again(&channel, seq).await?;
+                            sent += 1;
+                        }
+                        Ok::<_, ChatError>(())
+                    }
+                    .await;
+                    outcome.map(|()| {
+                        Some(if sent == 0 {
+                            "nothing of yours is stranded here".to_string()
+                        } else {
+                            format!(
+                                "sent {sent} message{} again, each saying when it was first said",
+                                if sent == 1 { "" } else { "s" }
+                            )
+                        })
+                    })
+                }
+                Command::Unstrand => {
+                    let outcome = (|| {
+                        let stranded = chat.stranded_posts(&channel)?;
+                        let n = stranded.len();
+                        for (seq, _, _) in &stranded {
+                            chat.forget_stranded(&channel, *seq)?;
+                        }
+                        Ok::<_, ChatError>(n)
+                    })();
+                    outcome.map(|n| {
+                        Some(if n == 0 {
+                            "nothing of yours is stranded here".to_string()
+                        } else {
+                            format!(
+                                "let {n} stranded message{} go",
+                                if n == 1 { "" } else { "s" }
+                            )
+                        })
+                    })
+                }
                 Command::Rotate => chat.rotate(&channel).await.map(|epoch| {
                     Some(format!(
                         "rotated to epoch {epoch} — everyone here has the new key, \
@@ -3156,6 +3201,9 @@ enum Command {
     /// is ordered: to a replica, from its origin; or to the exchange this
     /// client is at, when the origin is gone.
     Rehome(String, String),
+    /// SIP-74: send again what a move stranded.
+    Repost,
+    Unstrand,
     /// `/name <name>` — rename, as a sealed entry the exchange cannot read.
     Name(String),
     /// `/topic <text>` — set what this channel is for, likewise sealed.
@@ -3351,6 +3399,8 @@ impl Command {
                 Command::Unknown("/unreplicate needs an exchange's public key".into())
             }
             "/rotate" => Command::Rotate,
+            "/repost" => Command::Repost,
+            "/unstrand" => Command::Unstrand,
             // SIP-36 calls. Signalling only; the audio is a room joined with
             // sqex-voice, and these say so rather than pretending otherwise.
             "/call" => Command::Call,
@@ -3982,7 +4032,9 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 text,
                 seq: m.seq,
                 has_file,
-                at: m.posted,
+                // SIP-74: shown at when it was first said, marked.
+                at: m.post.said().filter(|s| *s <= m.posted).unwrap_or(m.posted),
+                again: m.post.said().is_some_and(|s| s <= m.posted),
                 edited: m.edited.is_some(),
                 via: m.post.via().map(|k| Chat::via_name(&k)),
                 redacted: m.redacted,
@@ -4116,6 +4168,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 has_file: false,
                 at: c.posted,
                 edited: false,
+                again: false,
                 via: None,
                 redacted: false,
                 receipt: None,
@@ -4162,6 +4215,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
         restarted: conv.trouble.restarted,
         forked: conv.trouble.forked.clone(),
         unattributed: conv.trouble.unattributed,
+        stranded: conv.trouble.stranded,
         message: note.or_else(|| conv.trouble.message.clone()).or_else(|| {
             conv.waiting.then(|| match conv.peer {
                 Some(_) => format!(

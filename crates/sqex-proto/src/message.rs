@@ -82,6 +82,9 @@ pub const PART_MENTION: u8 = 0x05;
 /// SIP-43: the exchange the poster sent this through, where that is not the
 /// channel's origin -- the poster's own word about the poster's own act.
 pub const PART_VIA: u8 = 0x06;
+/// SIP-74: when the poster first said this -- a post sent again after the
+/// entry that carried it was stranded by a move (SIP-53).
+pub const PART_SAID: u8 = 0x07;
 
 pub const REACT_ADD: u8 = 0x01;
 pub const REACT_REMOVE: u8 = 0x02;
@@ -151,6 +154,11 @@ pub enum Part {
     /// by the key -- and concludes nothing else from it: no exchange said
     /// it, and nothing says who carried a message the poster did not label.
     Via(PubKey),
+    /// SIP-74: when the poster first posted this, where the entry that
+    /// carried it was stranded and this is it posted again. The poster's
+    /// own word; a reader shows the message at this time, marked, and the
+    /// entry's `posted` still orders the log.
+    Said(u64),
 }
 
 /// A message, an edit to one, a reaction, a redaction, or channel metadata.
@@ -239,6 +247,7 @@ impl Post {
         let mut links = 0usize;
         let mut mentions = 0usize;
         let mut via = 0usize;
+        let mut said = 0usize;
         for p in &self.parts {
             match p {
                 Part::Text(_) => text += 1,
@@ -247,6 +256,7 @@ impl Post {
                 Part::Link(_) => links += 1,
                 Part::Mention(_) => mentions += 1,
                 Part::Via(_) => via += 1,
+                Part::Said(_) => said += 1,
             }
         }
         // The "at most one" kinds are the ones whose excess has no sensible
@@ -255,6 +265,7 @@ impl Post {
         cap(text, 1, "text parts")?;
         cap(reply, 1, "reply parts")?;
         cap(via, 1, "via parts")?;
+        cap(said, 1, "said parts")?;
         cap(attachments, MAX_ATTACHMENTS, "attachments")?;
         cap(links, MAX_LINKS, "link previews")?;
         cap(mentions, MAX_MENTIONS, "mentions")?;
@@ -280,6 +291,15 @@ impl Post {
     pub fn via(&self) -> Option<PubKey> {
         self.parts.iter().find_map(|p| match p {
             Part::Via(v) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// SIP-74: when the poster says this was first said, where it was
+    /// posted again after being stranded.
+    pub fn said(&self) -> Option<u64> {
+        self.parts.iter().find_map(|p| match p {
+            Part::Said(at) => Some(*at),
             _ => None,
         })
     }
@@ -323,6 +343,7 @@ fn write_part(part: &Part, out: &mut Vec<u8>) {
         Part::Reply(t) => (PART_REPLY, t.to_be_bytes().to_vec()),
         Part::Mention(m) => (PART_MENTION, m.as_bytes().to_vec()),
         Part::Via(v) => (PART_VIA, v.as_bytes().to_vec()),
+        Part::Said(at) => (PART_SAID, at.to_be_bytes().to_vec()),
         Part::Link(l) => {
             let mut b = Vec::new();
             b.extend_from_slice(&(l.url.len() as u16).to_be_bytes());
@@ -358,6 +379,15 @@ fn read_part(kind: u8, b: &[u8]) -> Result<Option<Part>> {
                 )));
             }
             Ok(Some(Part::Text(utf8(b, "text")?)))
+        }
+        PART_SAID => {
+            if b.len() != 8 {
+                return Err(Error::Malformed(format!(
+                    "said is {} bytes, want 8",
+                    b.len()
+                )));
+            }
+            Ok(Some(Part::Said(u64::from_be_bytes(b.try_into().unwrap()))))
         }
         PART_VIA => {
             if b.len() != 32 {
@@ -877,6 +907,22 @@ mod tests {
             topic: String::new(),
             avatar: None,
         });
+    }
+
+    /// SIP-74: a post sent again says when it was first said, once.
+    #[test]
+    fn a_said_part_round_trips_and_is_at_most_one() {
+        let mut post = Post::text("still true");
+        post.parts.push(Part::Said(1_700_000_000));
+        let body = Body::Post(post.clone());
+        let back = Body::decode(&body.encode()).unwrap().unwrap();
+        assert_eq!(back, body);
+        match back {
+            Body::Post(p) => assert_eq!(p.said(), Some(1_700_000_000)),
+            _ => panic!("not a post"),
+        }
+        post.parts.push(Part::Said(5));
+        assert!(post.validate().is_err(), "two said parts were allowed");
     }
 
     #[test]

@@ -170,6 +170,22 @@ CREATE TABLE IF NOT EXISTS channel_key_history (
     sealed     BLOB    NOT NULL,
     PRIMARY KEY (exchange, channel, generation, epoch)
 );
+-- SIP-74: this device's own posts that a move stranded (SIP-53): kept
+-- aside with when each was first posted and the fork it fell past, to be
+-- offered to the person and posted again. Sealed at rest: plaintext. A
+-- fact about this device's own words, not about an exchange: found where
+-- the fork was met -- the connection that held the losing side -- and
+-- posted again from whichever connection can, so the exchange column is
+-- where it was learned and is not a key on read (as `dm_alias`).
+CREATE TABLE IF NOT EXISTS stranded (
+    exchange BLOB    NOT NULL,
+    channel  BLOB    NOT NULL,
+    seq      INTEGER NOT NULL,
+    posted   INTEGER NOT NULL,
+    fork     INTEGER NOT NULL,
+    sealed   BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, seq)
+);
 -- Note for whoever adds a column here next: this store is on people's
 -- machines, so `CREATE TABLE IF NOT EXISTS` is no longer enough. It creates
 -- tables and never alters one that already exists, so a new column needs an
@@ -224,6 +240,17 @@ CREATE TABLE IF NOT EXISTS chain (
     chain_seq INTEGER NOT NULL,
     head      BLOB    NOT NULL,
     PRIMARY KEY (exchange, channel)
+);
+-- SIP-74: every chain head this device computed, by the position it is
+-- the link into. `chain` holds only the latest; putting the chain back to
+-- an earlier position after a fork needs the head that stood there, and a
+-- system entry's action cannot be re-linked from what the exchange serves.
+CREATE TABLE IF NOT EXISTS chain_log (
+    exchange  BLOB    NOT NULL,
+    channel   BLOB    NOT NULL,
+    chain_seq INTEGER NOT NULL,
+    head      BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, chain_seq)
 );
 -- SIP-32: which incarnation of a channel our state belongs to.
 --
@@ -723,6 +750,7 @@ const SCOPED: &[(&str, bool)] = &[
     ("asset", true),
     ("cursor", true),
     ("chain", false),
+    ("chain_log", false),
     ("incarnation", false),
     ("seen", true),
     ("channel_meta", true),
@@ -739,7 +767,7 @@ const SCOPED: &[(&str, bool)] = &[
 fn moving_tables() -> impl Iterator<Item = &'static (&'static str, bool)> {
     SCOPED
         .iter()
-        .filter(|(t, _)| *t != "chain" && *t != "incarnation")
+        .filter(|(t, _)| *t != "chain" && *t != "chain_log" && *t != "incarnation")
 }
 
 /// SIP-40 §Consumers other than pins. A store that scopes every row by the
@@ -1457,6 +1485,24 @@ impl Store {
             .map_err(storage("query entries"))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage("read entries"))
+    }
+
+    /// The signed entries held for a channel under **every** connection this
+    /// store has read it through, ascending by position. A rehome entry
+    /// (SIP-53) read at the new origin is carried to the old one from a
+    /// connection to the old one, whose own view never held it.
+    pub fn entries_anywhere(&self, channel: &[u8; 32]) -> Result<Vec<(u64, Vec<u8>)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT seq, bytes FROM entry WHERE channel = ?1 ORDER BY seq")
+            .map_err(storage("prepare entries anywhere"))?;
+        let rows = stmt
+            .query_map(params![&channel[..]], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(storage("query entries anywhere"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read entries anywhere"))
     }
 
     /// The range of signed entries held per channel: `(channel, first,
@@ -2894,7 +2940,159 @@ impl Store {
     /// which is recorded first because a burnt nonce costs nothing and a reused
     /// one costs two plaintexts. A position is only spent once something is in
     /// the log at it, so a refused request leaves the chain where it was.
+    /// SIP-74: the head this device computed after taking position
+    /// `chain_seq` -- the link into the next -- where it logged one.
+    pub fn head_after(&self, channel: &[u8; 32], chain_seq: u64) -> Result<Option<[u8; 32]>> {
+        self.db
+            .query_row(
+                "SELECT head FROM chain_log WHERE exchange = ?1 AND channel = ?2 AND chain_seq = ?3",
+                params![self.signing_scope(channel)?, &channel[..], chain_seq as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map(|h| h.and_then(|h| h.try_into().ok()))
+            .map_err(storage("read a logged head"))
+    }
+
+    /// SIP-74: put the chain **back** so that `next` is the next position
+    /// to sign at, with `head` the link into it -- the one case a lower
+    /// position is taken, on this client's own evidence that the entries
+    /// between were stranded. `next == 0` is a chain that starts over.
+    pub fn reset_chain(&self, channel: &[u8; 32], next: u64, head: &[u8; 32]) -> Result<()> {
+        let scope = self.signing_scope(channel)?;
+        if next == 0 {
+            self.db
+                .execute(
+                    "DELETE FROM chain WHERE channel = ?1 AND exchange = ?2",
+                    params![&channel[..], scope],
+                )
+                .map_err(storage("reset chain"))?;
+            return Ok(());
+        }
+        self.db
+            .execute(
+                "INSERT INTO chain (channel, chain_seq, head, exchange)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel) DO UPDATE SET chain_seq = ?2, head = ?3",
+                params![&channel[..], (next - 1) as i64, &head[..], scope],
+            )
+            .map_err(storage("reset chain"))?;
+        Ok(())
+    }
+
+    /// SIP-74: keep one of this device's own posts that a move stranded.
+    pub fn put_stranded(
+        &self,
+        channel: &[u8; 32],
+        seq: u64,
+        posted: u64,
+        fork: u64,
+        plain: &[u8],
+    ) -> Result<()> {
+        let sealed = self.seal_bytes(plain)?;
+        self.db
+            .execute(
+                "INSERT INTO stranded (exchange, channel, seq, posted, fork, sealed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (exchange, channel, seq) DO NOTHING",
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    seq as i64,
+                    posted as i64,
+                    fork as i64,
+                    sealed
+                ],
+            )
+            .map_err(storage("keep a stranded post"))?;
+        // Bounded: the oldest go past the limit.
+        self.db
+            .execute(
+                "DELETE FROM stranded WHERE channel = ?1 AND seq NOT IN
+                    (SELECT seq FROM stranded WHERE channel = ?1
+                     ORDER BY seq DESC LIMIT 256)",
+                params![&channel[..]],
+            )
+            .map_err(storage("bound stranded posts"))?;
+        Ok(())
+    }
+
+    /// SIP-74: the stranded posts held for a channel: `(seq, posted, fork,
+    /// plain body)`, in the order they were first posted.
+    #[allow(clippy::type_complexity)]
+    pub fn stranded(&self, channel: &[u8; 32]) -> Result<Vec<(u64, u64, u64, Vec<u8>)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT seq, posted, fork, sealed FROM stranded
+                 WHERE channel = ?1 ORDER BY seq",
+            )
+            .map_err(storage("prepare stranded"))?;
+        let rows = stmt
+            .query_map(params![&channel[..]], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(storage("query stranded"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, posted, fork, sealed) = row.map_err(storage("read stranded"))?;
+            out.push((seq, posted, fork, self.unseal_bytes(&sealed)?));
+        }
+        Ok(out)
+    }
+
+    pub fn drop_stranded(&self, channel: &[u8; 32], seq: u64) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM stranded WHERE channel = ?1 AND seq = ?2",
+                params![&channel[..], seq as i64],
+            )
+            .map_err(storage("drop a stranded post"))?;
+        Ok(())
+    }
+
+    /// SIP-74: forget everything held above the fork -- messages, signed
+    /// entries, timers -- and put the cursor back to it. The losing side
+    /// of a fork is not the conversation, and its numbers are the winning
+    /// history's now.
+    pub fn truncate_above(&self, channel: &[u8; 32], fork: u64) -> Result<()> {
+        let scope = self.scope()?;
+        for sql in [
+            "DELETE FROM message WHERE channel = ?1 AND exchange = ?2 AND seq > ?3",
+            "DELETE FROM entry WHERE channel = ?1 AND exchange = ?2 AND seq > ?3",
+            "DELETE FROM timed WHERE channel = ?1 AND exchange = ?2 AND seq > ?3",
+        ] {
+            self.db
+                .execute(sql, params![&channel[..], scope, fork as i64])
+                .map_err(storage("truncate above a fork"))?;
+        }
+        self.db
+            .execute(
+                "UPDATE cursor SET since = MIN(since, ?3) WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], scope, fork as i64],
+            )
+            .map_err(storage("cursor back to a fork"))?;
+        Ok(())
+    }
+
     pub fn set_chain(&self, channel: &[u8; 32], chain_seq: u64, head: &[u8; 32]) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO chain_log (exchange, channel, chain_seq, head) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel, chain_seq) DO UPDATE SET head = ?4",
+                params![
+                    self.signing_scope(channel)?,
+                    &channel[..],
+                    chain_seq as i64,
+                    &head[..]
+                ],
+            )
+            .map_err(storage("log chain head"))?;
         self.db
             .execute(
                 "INSERT INTO chain (channel, chain_seq, head, exchange)
