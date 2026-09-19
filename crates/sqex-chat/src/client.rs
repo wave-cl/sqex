@@ -2570,17 +2570,19 @@ impl Chat {
             // signature is checked against *us*, which is who the exchange
             // served it to. Verifying the zeroes it arrived with would fail on
             // every honest envelope.
+            // Under any key the channel's receipts verify under: the
+            // exchange that orders it, its earlier keys (SIP-40, SIP-64)
+            // and the exchanges that ordered it before (SIP-53) -- the
+            // envelope names the place as it was when published.
             let addressed = Envelope {
                 recipient: self.device,
                 ..env.clone()
             };
-            if !verify_envelope(
-                &self.exchange_of(channel),
-                instance,
-                channel,
-                env.from_epoch,
-                &addressed,
-            ) {
+            if !self
+                .keys_of(channel)
+                .iter()
+                .any(|key| verify_envelope(key, instance, channel, env.from_epoch, &addressed))
+            {
                 unattested += 1;
                 continue;
             }

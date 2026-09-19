@@ -10,6 +10,9 @@ use std::path::Path;
 use ed25519_dalek::{Signer as _, SigningKey};
 use sqex_discovery::Handover;
 use sqex_proto::channel::{ByChannel, Entries, Fetch, Invitee, Role, TYPE_INFO, Visibility};
+use sqex_proto::channel_key::{
+    ChannelKey, Get as KeyGet, Got, Put as KeyPut, seal_envelope, sign_envelope,
+};
 use sqex_proto::home::{Move, Moving};
 use sqex_proto::lineage::Lineage;
 use sqexd::config::FileConfig;
@@ -190,7 +193,7 @@ async fn a_home_learned_by_hint_reads_what_the_origin_receipted_under_an_earlier
             &mut ca,
             channel,
             instance_for(channel, 0),
-            Visibility::Public,
+            Visibility::Private,
             3600,
             "lineage",
             vec![Invitee {
@@ -201,7 +204,41 @@ async fn a_home_learned_by_hint_reads_what_the_origin_receipted_under_an_earlier
         let (code, body) = al.post("/channel/create", req.encode()).await.unwrap();
         assert_eq!(code, 200, "{}", common::said(&body));
         let info = sa.info(&mut al, channel).await;
-        let post = sa.post_chained(&mut ca, channel, info.instance, 0, 0, b"under a".to_vec());
+        // A key envelope for Bob (a private channel posts under epoch 1), signed -- as SIP-32 has it -- over the
+        // place it was published to, which names A.
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let prekey_public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let envelope = sign_envelope(
+            &alice_seed,
+            &a_key,
+            &info.instance,
+            &channel,
+            1,
+            seal_envelope(&bob, 7, &prekey_public, 1, &[ChannelKey::generate()]).unwrap(),
+        );
+        let rot = sa.action_chained(
+            &mut ca,
+            channel,
+            info.instance,
+            sqex_proto::channel::EVENT_ROTATED,
+            &alice,
+            &1u32.to_be_bytes(),
+        );
+        let (code, body) = al
+            .post(
+                "/channel/key/put",
+                KeyPut {
+                    channel,
+                    epoch: 1,
+                    envelopes: vec![envelope],
+                    action: Some(rot),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "{}", common::said(&body));
+        let post = sa.post_chained(&mut ca, channel, info.instance, 1, 0, b"under a".to_vec());
         assert_eq!(
             al.post("/channel/post", post.encode()).await.unwrap().0,
             200
@@ -216,7 +253,7 @@ async fn a_home_learned_by_hint_reads_what_the_origin_receipted_under_an_earlier
             &mut cb,
             channel,
             info.instance,
-            0,
+            1,
             0,
             b"also under a".to_vec(),
         );
@@ -328,6 +365,39 @@ async fn a_home_learned_by_hint_reads_what_the_origin_receipted_under_an_earlier
         watch(&mut at_g, channel, 80, |t| t.len() == 2).await,
         ["under a", "also under a"]
     );
+    // The key envelope Alice published under A verifies at G under A as
+    // the entries do: Bob asks G for his key and is given it. Live, a copy
+    // that checked envelopes under the current key alone refused every
+    // envelope from before its origin's rotation, on every pull, forever.
+    let mut got = Got {
+        now: 0,
+        envelopes: vec![],
+    };
+    for _ in 0..40 {
+        let (code, body) = at_g
+            .post(
+                "/channel/key/get",
+                KeyGet {
+                    channel,
+                    since_epoch: 0,
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200, "{}", common::said(&body));
+        got = Got::decode(&body).unwrap();
+        if !got.envelopes.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        got.envelopes.len(),
+        1,
+        "the envelope published under A did not verify at a home holding B"
+    );
+    assert_eq!(got.envelopes[0].publisher, alice);
 }
 
 /// A lineage file whose chain does not end at the daemon's own key is

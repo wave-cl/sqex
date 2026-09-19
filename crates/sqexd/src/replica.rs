@@ -611,7 +611,15 @@ pub async fn pull_once_from(
         // there is no point accumulating more from a party already refused.
         if !took.equivocated {
             pull_shape(client, store, channel).await;
-            pull_envelopes(client, store, origin, channel, &pulled.instance).await;
+            pull_envelopes(
+                client,
+                store,
+                origin,
+                &predecessors,
+                channel,
+                &pulled.instance,
+            )
+            .await;
             pull_blobs(client, store, channel).await;
             pull_profiles(client, server, store, channel).await;
         }
@@ -878,6 +886,7 @@ async fn pull_envelopes(
     client: &mut H3Client,
     store: &Channels,
     origin: &Origin,
+    predecessors: &[PubKey],
     channel: &[u8; 32],
     instance: &[u8; 32],
 ) {
@@ -898,7 +907,17 @@ async fn pull_envelopes(
         return;
     };
     for (epoch, e) in &got.envelopes {
-        if acceptable_envelope(&origin.key, instance, channel, *epoch, e) {
+        // Under the origin's key, then each key it held before (SIP-40,
+        // SIP-64) and each exchange that ordered the channel before
+        // (SIP-53): an envelope names the place it was published to, and
+        // the place was under whichever of these was current then. A copy
+        // that checked the current key alone refused every envelope from
+        // before its origin's rotation, on every pull, for as long as it
+        // held the channel -- trunk.exchange's, at ex, 2026-09-19.
+        let under_any = std::iter::once(&origin.key)
+            .chain(predecessors.iter())
+            .any(|key| acceptable_envelope(key, instance, channel, *epoch, e));
+        if under_any {
             let _ = store.store_envelope(channel, *epoch, e);
         } else {
             tracing::warn!(
