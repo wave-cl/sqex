@@ -5732,6 +5732,188 @@ impl Channels {
         Ok(())
     }
 
+    /// SIP-79: one chunk of a blob `account` holds as its backup (attached
+    /// to the account itself, SIP-48), for the account's home to collect.
+    /// `BLOB_LIST` answers the one blob's `(id, size, chunks)` row, so the
+    /// home knows how many chunks to ask for; the manifest is the list.
+    pub fn pull_backup_blob(
+        &self,
+        account: &PubKey,
+        blob: &[u8; 32],
+        chunk: u32,
+    ) -> Result<PulledBlob, ChannelError> {
+        let db = self.db.lock().unwrap();
+        let row: Option<(u64, u32)> = db
+            .query_row(
+                "SELECT b.size, b.chunks FROM attachment a JOIN blob b ON b.id = a.blob
+                 WHERE a.channel = ?1 AND a.blob = ?2",
+                params![account.as_bytes(), &blob[..]],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u32)),
+            )
+            .optional()
+            .map_err(storage("check held blob"))?;
+        let Some((size, chunks)) = row else {
+            return Err(ChannelError::NoSuchBlob);
+        };
+        if chunk == BLOB_LIST {
+            return Ok(PulledBlob {
+                blobs: vec![(*blob, size, chunks)],
+                sealed: Vec::new(),
+            });
+        }
+        let sealed: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT sealed FROM blob_chunk WHERE blob = ?1 AND idx = ?2",
+                params![&blob[..], chunk as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read held chunk"))?;
+        Ok(PulledBlob {
+            blobs: Vec::new(),
+            sealed: sealed.ok_or(ChannelError::NoSuchBlob)?,
+        })
+    }
+
+    /// SIP-79: whether `account` holds `blob` here, so a collection that was
+    /// interrupted does not fetch twice.
+    pub fn holds_backup_blob(&self, account: &PubKey, blob: &[u8; 32]) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT 1 FROM attachment WHERE channel = ?1 AND blob = ?2",
+            params![account.as_bytes(), &blob[..]],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+
+    /// SIP-79: store a blob collected for `account`'s backup, held by the
+    /// account as a device's upload would be and counted against the same
+    /// quota. The chunks have been checked against the id by the caller.
+    pub fn store_backup_blob(
+        &self,
+        account: &PubKey,
+        blob: &[u8; 32],
+        size: u64,
+        chunks: &[Vec<u8>],
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin store held blob"))?;
+        if channel_blob_bytes(&tx, account.as_bytes())? + size > self.backup_quota {
+            return Err(ChannelError::BlobQuota);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO blob (id, size, chunks) VALUES (?1, ?2, ?3)",
+            params![&blob[..], size as i64, chunks.len() as i64],
+        )
+        .map_err(storage("store held blob"))?;
+        for (i, sealed) in chunks.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO blob_chunk (blob, idx, sealed) VALUES (?1, ?2, ?3)",
+                params![&blob[..], i as i64, sealed],
+            )
+            .map_err(storage("store held chunk"))?;
+        }
+        attach(
+            &tx,
+            account.as_bytes(),
+            blob,
+            &PubKey::new([0; 32]),
+            0,
+            now_unix(),
+        )?;
+        tx.commit().map_err(storage("commit store held blob"))?;
+        Ok(())
+    }
+
+    /// SIP-79: store a manifest the account's former home served, as the
+    /// device wrote it, once every blob it names is held here. `false` when
+    /// the account already holds a backup here, of any generation: written
+    /// after the Move, by the account's own act, and the newer for it.
+    pub fn import_backup(
+        &self,
+        account: &PubKey,
+        held: &sqex_proto::backup::Held,
+    ) -> Result<bool, ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin backup import"))?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM backup WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read backup generation"))?;
+        if current.is_some() {
+            return Ok(false);
+        }
+        for blob in &held.blobs {
+            let attached: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM attachment WHERE channel = ?1 AND blob = ?2",
+                    params![account.as_bytes(), &blob[..]],
+                    |r| r.get(0),
+                )
+                .map_err(storage("check held"))?;
+            if attached == 0 {
+                return Err(ChannelError::NotHeld);
+            }
+        }
+        let mut blobs = Vec::with_capacity(held.blobs.len() * 32);
+        for b in &held.blobs {
+            blobs.extend_from_slice(b);
+        }
+        tx.execute(
+            "INSERT INTO backup (account, generation, device, written, blobs, sealed, sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                account.as_bytes(),
+                held.generation as i64,
+                held.device.as_bytes(),
+                held.written as i64,
+                blobs,
+                &held.sealed,
+                &held.sig[..],
+            ],
+        )
+        .map_err(storage("import backup"))?;
+        tx.commit().map_err(storage("commit backup import"))?;
+        Ok(true)
+    }
+
+    /// SIP-79: the generation of the backup `account` holds here, 0 for none.
+    pub fn backup_generation(&self, account: &PubKey) -> u64 {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT generation FROM backup WHERE account = ?1",
+            params![account.as_bytes()],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(0) as u64
+    }
+
+    /// SIP-79: release what `account` holds, as `Drop` would, if the manifest
+    /// here is of `generation` -- the one the account's home says it stored.
+    /// Any other generation releases nothing: `false`.
+    pub fn release_backup_if(
+        &self,
+        account: &PubKey,
+        generation: u64,
+    ) -> Result<bool, ChannelError> {
+        if generation == 0 || self.backup_generation(account) != generation {
+            return Ok(false);
+        }
+        self.drop_backup(account)?;
+        Ok(true)
+    }
+
     /// Whether the caller may fetch a blob: a member of any channel it is
     /// attached to, or anybody at all if one of those channels is public.
     fn may_fetch(db: &Connection, who: &PubKey, blob: &[u8; 32]) -> Result<bool, ChannelError> {

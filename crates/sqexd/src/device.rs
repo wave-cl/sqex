@@ -237,6 +237,13 @@ impl Registry {
             "mail_collected",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // SIP-79: whether the account's backup at this origin was collected.
+        add_column(
+            &db,
+            "home_origin",
+            "backup_collected",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Registry { db: Mutex::new(db) })
     }
 
@@ -1158,6 +1165,45 @@ impl Registry {
         let db = self.db.lock().unwrap();
         let _ = db.execute(
             "UPDATE home_origin SET mail_collected = 1 WHERE account = ?1 AND origin = ?2",
+            params![account.as_bytes(), origin.as_bytes()],
+        );
+    }
+
+    /// SIP-79: the (account, origin) hints of accounts homed here whose
+    /// backup at that origin has not been collected yet.
+    pub fn backup_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey)> {
+        let db = self.db.lock().unwrap();
+        db.prepare(
+            "SELECT o.account, o.origin FROM home_origin o
+             JOIN home h ON h.account = o.account
+             WHERE h.home = ?1 AND o.backup_collected = 0",
+        )
+        .ok()
+        .and_then(|mut st| {
+            st.query_map(params![me.as_bytes()], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .ok()
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .filter_map(|(a, o)| {
+                        Some((
+                            PubKey::new(a.try_into().ok()?),
+                            PubKey::new(o.try_into().ok()?),
+                        ))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+    }
+
+    /// SIP-79: the account's backup at `origin` has been collected, or the
+    /// origin holds none, or the home gave up on it (over quota).
+    pub fn mark_backup_collected(&self, account: &PubKey, origin: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE home_origin SET backup_collected = 1 WHERE account = ?1 AND origin = ?2",
             params![account.as_bytes(), origin.as_bytes()],
         );
     }

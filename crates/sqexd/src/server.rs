@@ -67,8 +67,9 @@ use sqex_proto::message::{RING_RINGING, Signal};
 use sqex_proto::name;
 use sqex_proto::peer::{
     Carried, Changed, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi,
-    Mine, PEER_VERSION, PeerFolded, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBlob,
-    PullEnvelopes, PullMail, PullMine, PullRecord, PullShape, PullStanding, TookMail,
+    Mine, PEER_VERSION, PeerFolded, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBackup,
+    PullBackupBlob, PullBlob, PullEnvelopes, PullMail, PullMine, PullRecord, PullShape,
+    PullStanding, TookBackup, TookMail,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -4191,6 +4192,71 @@ async fn route(
             {
                 for id in &req.ids {
                     server.mailbox.delete(&req.account, *id);
+                }
+                (
+                    200,
+                    "application/octet-stream",
+                    ChannelAck { now: now_unix() }.encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
+        // SIP-79: the account's home collects its backup here, gated as the
+        // mailbox is: the home by the account's own Move, and nobody else.
+        // `Held` is what `/backup/read` would answer the account; nothing
+        // is removed by asking, and `/peer/backup/took` names the
+        // generation the home stored, which releases it here.
+        ("POST", "/peer/backup") => match (peer.identity, PullBackup::decode(body)) {
+            (Some(who), Ok(req))
+                if server.peering(&who).is_some()
+                    && server
+                        .devices
+                        .home_of(&req.account)
+                        .is_some_and(|(h, _, _)| h == who) =>
+            {
+                match server.channels.read_backup(&req.account) {
+                    Ok(h) => (200, "application/octet-stream", h.encode()),
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+        ("POST", "/peer/backup/blob") => match (peer.identity, PullBackupBlob::decode(body)) {
+            (Some(who), Ok(req))
+                if server.peering(&who).is_some()
+                    && server
+                        .devices
+                        .home_of(&req.account)
+                        .is_some_and(|(h, _, _)| h == who) =>
+            {
+                match server
+                    .channels
+                    .pull_backup_blob(&req.account, &req.blob, req.chunk)
+                {
+                    Ok(got) => (200, "application/octet-stream", got.encode()),
+                    Err(_) => peering_refused(),
+                }
+            }
+            _ => peering_refused(),
+        },
+        ("POST", "/peer/backup/took") => match (peer.identity, TookBackup::decode(body)) {
+            (Some(who), Ok(req))
+                if server.peering(&who).is_some()
+                    && server
+                        .devices
+                        .home_of(&req.account)
+                        .is_some_and(|(h, _, _)| h == who) =>
+            {
+                match server
+                    .channels
+                    .release_backup_if(&req.account, req.generation)
+                {
+                    Ok(true) => tracing::info!(
+                        account = %req.account, home = %who, generation = req.generation,
+                        "released an account's backup to its home (SIP-79)"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => return refused(e),
                 }
                 (
                     200,

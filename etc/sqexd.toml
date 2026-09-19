@@ -164,7 +164,9 @@ seed_relay_peers = [
 
 # SIP-48: bytes one account may hold at this exchange as its sealed backup
 # (history and keys the exchange cannot read, kept past its own retention).
-# Omit for the reference default of 512 MiB.
+# Omit for the reference default of 512 MiB. SIP-79: a backup collected
+# from an account's former home on its Move counts against the same
+# quota; one that would not fit is left where it was and said in the log.
 # backup_quota = 536870912
 
 # SIP-61: a replica waits on each origin for its channels to change rather

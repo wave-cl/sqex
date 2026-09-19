@@ -428,6 +428,25 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_mail"),
         ReplicationPeer,
     ),
+    // SIP-79: the account's home collects its backup here, on the Move.
+    (
+        "POST",
+        "/peer/backup",
+        Peer("replica::collect_backup"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/backup/blob",
+        Peer("replica::collect_backup"),
+        ReplicationPeer,
+    ),
+    (
+        "POST",
+        "/peer/backup/took",
+        Peer("replica::collect_backup"),
+        ReplicationPeer,
+    ),
     // SIP-71: the lower key's home tells an origin its copy of a direct
     // message is a stray.
     (

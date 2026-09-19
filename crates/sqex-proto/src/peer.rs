@@ -307,6 +307,12 @@ pub const TYPE_TOOK_MAIL: u8 = 0x13;
 /// SIP-71: the home of a direct message's lower key tells an exchange that
 /// the channel of that identifier it orders is a stray, to be folded.
 pub const TYPE_FOLDED: u8 = 0x14;
+/// SIP-79: the home collects an account's backup at its former home.
+pub const TYPE_PULL_BACKUP: u8 = 0x15;
+/// SIP-79: one chunk of a blob the account holds at its former home.
+pub const TYPE_PULL_BACKUP_BLOB: u8 = 0x16;
+/// SIP-79: the generation the home stored, for the former home to release.
+pub const TYPE_TOOK_BACKUP: u8 = 0x17;
 
 /// `POST /peer/mailbox`: `| type=0x12 | account[32] |`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +467,91 @@ impl TookMail {
             .map(|i| u64::from_be_bytes(b[34 + i * 8..42 + i * 8].try_into().unwrap()))
             .collect();
         Ok(TookMail { account, ids })
+    }
+}
+
+/// `POST /peer/backup`: `| type=0x15 | account[32] |`. Answered with
+/// SIP-48's `Held`, generation 0 for nothing held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullBackup {
+    pub account: PubKey,
+}
+
+impl PullBackup {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_PULL_BACKUP);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullBackup> {
+        if b.len() != 33 || b[0] != TYPE_PULL_BACKUP {
+            return Err(Error::Malformed("not a backup pull".into()));
+        }
+        Ok(PullBackup {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// `POST /peer/backup/blob`: `| type=0x16 | account[32] | blob[32] | chunk: u32 |`.
+/// Answered with SIP-43's `PulledBlob` carrying the chunk's sealed bytes;
+/// `BLOB_LIST` is not served, since the manifest is the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullBackupBlob {
+    pub account: PubKey,
+    pub blob: [u8; 32],
+    pub chunk: u32,
+}
+
+impl PullBackupBlob {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(69);
+        out.push(TYPE_PULL_BACKUP_BLOB);
+        out.extend_from_slice(self.account.as_bytes());
+        out.extend_from_slice(&self.blob);
+        out.extend_from_slice(&self.chunk.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullBackupBlob> {
+        if b.len() != 69 || b[0] != TYPE_PULL_BACKUP_BLOB {
+            return Err(Error::Malformed("not a backup blob pull".into()));
+        }
+        Ok(PullBackupBlob {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+            blob: b[33..65].try_into().unwrap(),
+            chunk: u32::from_be_bytes(b[65..69].try_into().unwrap()),
+        })
+    }
+}
+
+/// `POST /peer/backup/took`: `| type=0x17 | account[32] | generation: u64 |`.
+/// The former home releases the backup if `generation` is the one it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TookBackup {
+    pub account: PubKey,
+    pub generation: u64,
+}
+
+impl TookBackup {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(TYPE_TOOK_BACKUP);
+        out.extend_from_slice(self.account.as_bytes());
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<TookBackup> {
+        if b.len() != 41 || b[0] != TYPE_TOOK_BACKUP {
+            return Err(Error::Malformed("not a took backup".into()));
+        }
+        Ok(TookBackup {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+            generation: u64::from_be_bytes(b[33..41].try_into().unwrap()),
+        })
     }
 }
 
@@ -1858,5 +1949,29 @@ mod wait_tests {
         let mut cut = m.encode();
         cut.truncate(cut.len() - 1);
         assert!(Mail::decode(&cut).is_err());
+    }
+
+    #[test]
+    fn backup_collection_round_trips() {
+        let account = PubKey::new([5u8; 32]);
+        let p = PullBackup { account };
+        assert_eq!(PullBackup::decode(&p.encode()).unwrap(), p);
+        let b = PullBackupBlob {
+            account,
+            blob: [7; 32],
+            chunk: 3,
+        };
+        assert_eq!(PullBackupBlob::decode(&b.encode()).unwrap(), b);
+        let t = TookBackup {
+            account,
+            generation: 37,
+        };
+        assert_eq!(TookBackup::decode(&t.encode()).unwrap(), t);
+        // One type byte does not read as another.
+        assert!(PullBackup::decode(&PullMail { account }.encode()).is_err());
+        assert!(TookBackup::decode(&b.encode()).is_err());
+        let mut cut = b.encode();
+        cut.truncate(cut.len() - 1);
+        assert!(PullBackupBlob::decode(&cut).is_err());
     }
 }

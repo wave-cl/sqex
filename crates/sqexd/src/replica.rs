@@ -679,6 +679,128 @@ async fn collect_mail(
     }
 }
 
+/// SIP-79: collect `account`'s backup at `origin` -- its former home --
+/// into this exchange's store, as the device wrote it, and tell the origin
+/// the generation stored so it releases its copy. A backup the account
+/// already holds here, of any generation, was written after the Move and
+/// stands; the origin's is released unread. The hint is marked on an
+/// answer (nothing held, stored, superseded, or given up over quota) and
+/// left for the next cycle on a failure, with the blobs already held kept.
+async fn collect_backup(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    origin: &PubKey,
+    account: &PubKey,
+) {
+    use sqex_proto::peer::{PullBackup, PullBackupBlob, TookBackup};
+    let held = match client
+        .post("/peer/backup", PullBackup { account: *account }.encode())
+        .await
+    {
+        Ok((200, body)) => match sqex_proto::backup::Held::decode(&body) {
+            Ok(h) => h,
+            Err(_) => return,
+        },
+        Ok((code, _)) => {
+            tracing::debug!(%origin, %account, code, "the origin did not answer a backup pull");
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(%origin, %account, error = %e, "a backup pull failed");
+            return;
+        }
+    };
+    if !held.is_some() {
+        server.devices.mark_backup_collected(account, origin);
+        return;
+    }
+    let took = TookBackup {
+        account: *account,
+        generation: held.generation,
+    };
+    let store = server.channels();
+    if store.backup_generation(account) != 0 {
+        // Written here after the Move: the newer state by the account's
+        // own act. The former home's copy is released without being read.
+        let _ = client.post("/peer/backup/took", took.encode()).await;
+        server.devices.mark_backup_collected(account, origin);
+        tracing::info!(%origin, %account, generation = held.generation,
+            "an account's backup at its former home was superseded by one written here (SIP-79)");
+        return;
+    }
+    for id in &held.blobs {
+        if store.holds_backup_blob(account, id) {
+            continue;
+        }
+        let ask = |chunk: u32| PullBackupBlob {
+            account: *account,
+            blob: *id,
+            chunk,
+        };
+        let Ok((200, body)) = client
+            .post("/peer/backup/blob", ask(BLOB_LIST).encode())
+            .await
+        else {
+            return;
+        };
+        let Some((_, size, chunks)) = PulledBlob::decode(&body)
+            .ok()
+            .and_then(|l| l.blobs.first().copied())
+        else {
+            return;
+        };
+        let mut sealed = Vec::with_capacity(chunks as usize);
+        for idx in 0..chunks {
+            let Ok((200, body)) = client.post("/peer/backup/blob", ask(idx).encode()).await else {
+                return;
+            };
+            match PulledBlob::decode(&body) {
+                Ok(chunk) => sealed.push(chunk.sealed),
+                Err(_) => return,
+            }
+        }
+        if !acceptable_blob(id, &sealed) {
+            tracing::warn!(%origin, %account, blob = %bs58::encode(id).into_string(),
+                "a collected backup blob did not hash to its own name and was not stored");
+            return;
+        }
+        match store.store_backup_blob(account, id, size, &sealed) {
+            Ok(()) => {}
+            Err(crate::channel::ChannelError::BlobQuota) => {
+                // A quota does not change on its own: give up, release what
+                // was fetched, and leave the backup where it was, readable
+                // there as before. Said once, where the operator looks.
+                let _ = store.drop_backup(account);
+                server.devices.mark_backup_collected(account, origin);
+                tracing::warn!(%origin, %account, generation = held.generation,
+                    "an account's backup at its former home exceeds the backup quota here and was not collected (SIP-79)");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(%origin, %account, error = ?e, "could not store a collected backup blob");
+                return;
+            }
+        }
+    }
+    match store.import_backup(account, &held) {
+        Ok(true) => {
+            let _ = client.post("/peer/backup/took", took.encode()).await;
+            server.devices.mark_backup_collected(account, origin);
+            tracing::info!(%origin, %account, generation = held.generation, blobs = held.blobs.len(),
+                "collected an account's backup from its former home (SIP-79)");
+        }
+        // Written here while the blobs were coming: the account's own act
+        // stands, as above.
+        Ok(false) => {
+            let _ = client.post("/peer/backup/took", took.encode()).await;
+            server.devices.mark_backup_collected(account, origin);
+        }
+        Err(e) => {
+            tracing::debug!(%origin, %account, error = ?e, "could not store a collected backup");
+        }
+    }
+}
+
 /// SIP-64: ask the origin for its lineage, verify it back from the key
 /// this replica holds (and the domain, where it holds one), and keep the
 /// predecessors with the origin. An origin from before SIP-64 answers
@@ -1488,6 +1610,9 @@ pub async fn run_homed(
             .into_iter()
             .map(|(a, o, _)| (a, o))
             .collect();
+        // SIP-79: likewise the account's backup, once per hinted origin.
+        let pending_backup: std::collections::HashSet<(PubKey, PubKey)> =
+            server.devices.backup_pending(&me).into_iter().collect();
         // SIP-71: a fold record points a member homed here at the
         // conversation, beside the hints the accounts gave themselves.
         let mut by_origin = server.devices.homed_here(&me);
@@ -1631,6 +1756,10 @@ pub async fn run_homed(
                 // SIP-68: the account's mail waiting at this origin, once.
                 if pending_mail.contains(&(*account, origin)) {
                     collect_mail(&mut client, &server, &origin, account).await;
+                }
+                // SIP-79: and its backup, once.
+                if pending_backup.contains(&(*account, origin)) {
+                    collect_backup(&mut client, &server, &origin, account).await;
                 }
             }
             if channels.is_empty() {
