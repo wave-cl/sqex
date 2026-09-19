@@ -1428,6 +1428,10 @@ pub async fn run_homed(
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = HashMap::new();
     let mut seeded: std::collections::HashSet<PubKey> = std::collections::HashSet::new();
+    let mut carried_moves: std::collections::HashSet<(PubKey, PubKey, u64)> =
+        std::collections::HashSet::new();
+    let mut told_folds: std::collections::HashSet<(PubKey, [u8; 32])> =
+        std::collections::HashSet::new();
     loop {
         // SIP-61: wait on every origin pulled last cycle; a move here or a
         // forward through here comes back early either way.
@@ -1499,13 +1503,25 @@ pub async fn run_homed(
                 .collect();
             let mut channels: Vec<[u8; 32]> = Vec::new();
             for account in &accounts {
-                if let Some((mv, home_domain)) = server.devices.move_of(account) {
+                // Carried once per Move per origin, not once per cycle: the
+                // origin's peering-write limit (SIP-63, 60 an hour per
+                // caller) is shared with every forward this home makes
+                // there, and a home carrying every account's Move every
+                // `home_secs` spent it all on saying what the origin had
+                // already recorded -- found live, as a forwarded create
+                // refused because the Move before it had been refused.
+                if let Some((mv, home_domain)) = server.devices.move_of(account)
+                    && !carried_moves.contains(&(*account, origin, mv.issued))
+                {
+                    let issued = mv.issued;
                     let carried = sqex_proto::peer::PeerMoved {
                         mv,
                         domain: home_domain,
                     };
                     match client.post("/peer/moved", carried.encode()).await {
-                        Ok((200, _)) | Ok((409, _)) => {}
+                        Ok((200, _)) | Ok((409, _)) => {
+                            carried_moves.insert((*account, origin, issued));
+                        }
                         Ok((code, _)) => {
                             tracing::debug!(origin = %origin, account = %account, code, "the origin did not take the move")
                         }
@@ -1537,8 +1553,8 @@ pub async fn run_homed(
                                     if let Some((first, _)) = server.channels().held_direct_pair(&c)
                                         && first == *account
                                         && let Some(instance) = server.channels().instance_of(&c)
-                                    {
-                                        tell_folded(
+                                        && !told_folds.contains(&(origin, c))
+                                        && tell_folded(
                                             &mut client,
                                             &server,
                                             &origin,
@@ -1546,7 +1562,14 @@ pub async fn run_homed(
                                             account,
                                             &instance,
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        // Said once: the origin folded, or holds
+                                        // nothing under the identifier; either
+                                        // way the telling is done, and the
+                                        // origin's write limit is not spent on
+                                        // repeating it.
+                                        told_folds.insert((origin, c));
                                     }
                                     continue;
                                 }
@@ -1678,7 +1701,7 @@ async fn tell_folded(
     channel: &[u8; 32],
     first: &PubKey,
     instance: &[u8; 32],
-) {
+) -> bool {
     let req = sqex_proto::peer::PeerFolded {
         channel: *channel,
         first: *first,
@@ -1688,14 +1711,20 @@ async fn tell_folded(
     let channel = bs58::encode(channel).into_string();
     match client.post("/peer/folded", req.encode()).await {
         Ok((200, _)) => {
-            tracing::info!(%origin, %channel, account = %first, "an origin folded a stray direct message")
+            tracing::info!(%origin, %channel, account = %first, "an origin folded a stray direct message");
+            true
         }
-        Ok((409, _)) => tracing::debug!(%origin, %channel, "the origin no longer holds the stray"),
+        Ok((409, _)) => {
+            tracing::debug!(%origin, %channel, "the origin no longer holds the stray");
+            true
+        }
         Ok((code, _)) => {
-            tracing::debug!(%origin, %channel, code, "the origin did not fold the stray")
+            tracing::debug!(%origin, %channel, code, "the origin did not fold the stray");
+            false
         }
         Err(e) => {
-            tracing::debug!(%origin, %channel, error = %e, "telling an origin of a stray failed")
+            tracing::debug!(%origin, %channel, error = %e, "telling an origin of a stray failed");
+            false
         }
     }
 }
