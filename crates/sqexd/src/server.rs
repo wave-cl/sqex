@@ -293,6 +293,9 @@ impl UnfoundWhy {
 
 /// SIP-80: the longest a home holds off from an origin it cannot find.
 pub const MAX_UNFOUND_SECS: u64 = MAX_HOLD_SECS;
+/// SIP-81: how long the home's device list for an away account is served
+/// again before it is asked for afresh.
+pub const DEVICES_TTL: u64 = 60;
 
 pub struct Server {
     pub public_key: PubKey,
@@ -412,6 +415,9 @@ pub struct Server {
     origin_refusals: Mutex<HashMap<PubKey, OriginRefusal>>,
     /// SIP-80: origins the home task could not find or reach.
     origin_unfound: Mutex<HashMap<PubKey, Unfound>>,
+    /// SIP-81: the home's device list for an account that lives elsewhere,
+    /// kept `DEVICES_TTL` so a poll's sixty asks are one round trip each.
+    devices_elsewhere: Mutex<HashMap<PubKey, (u64, sqex_proto::device::Devices)>>,
     /// SIP-59: poked when an account moves here, so the home task pulls
     /// its channels at once rather than at its next interval.
     pub(crate) homed: tokio::sync::Notify,
@@ -986,6 +992,29 @@ impl Server {
             "cannot find an account's origin; holding off (SIP-80)"
         );
         hold
+    }
+
+    /// SIP-81: `account`'s devices as its home `home` lists them -- the
+    /// answer kept within `DEVICES_TTL`, or a fresh ask. `None` where the
+    /// home could not be asked; a failed ask is not kept.
+    pub(crate) async fn devices_at_home(
+        self: &Arc<Self>,
+        home: &PubKey,
+        account: &PubKey,
+    ) -> Option<sqex_proto::device::Devices> {
+        let now = now_unix();
+        if let Some((at, kept)) = self.devices_elsewhere.lock().unwrap().get(account)
+            && now.saturating_sub(*at) < DEVICES_TTL
+        {
+            return Some(kept.clone());
+        }
+        let (addr, _) = self.reach(home).await?;
+        let theirs = crate::relay::devices_at(addr, home, &self.exchange_seed, account).await?;
+        self.devices_elsewhere
+            .lock()
+            .unwrap()
+            .insert(*account, (now, theirs.clone()));
+        Some(theirs)
     }
 
     /// SIP-80: forget unfound origins not in `keep` -- the ones no account
@@ -1612,6 +1641,7 @@ pub async fn bind_with(
         contacts: Mutex::new(HashMap::new()),
         origin_refusals: Mutex::new(HashMap::new()),
         origin_unfound: Mutex::new(HashMap::new()),
+        devices_elsewhere: Mutex::new(HashMap::new()),
         homed: tokio::sync::Notify::new(),
         rehome_away_secs: config.rehome_away_secs,
         limiter: crate::limits::Limiter::new(config.limits),
@@ -3008,28 +3038,24 @@ async fn route(
         },
         ("POST", "/device/list") => match ListDevices::decode(body) {
             Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            Ok(req) => match server.devices.list(&req.account) {
-                // SIP-60: an account with no devices here whose home is
-                // elsewhere is listed as its home lists it.
-                Ok(list) if list.devices.is_empty() => {
-                    if let Some((home, _)) =
-                        server.devices.where_is(&req.account, &server.public_key)
-                        && let Some((addr, _)) = server.reach(&home).await
-                        && let Some(theirs) = crate::relay::devices_at(
-                            addr,
-                            &home,
-                            &server.exchange_seed,
-                            &req.account,
-                        )
-                        .await
-                    {
-                        return (200, "application/octet-stream", theirs.encode());
-                    }
-                    (200, "application/octet-stream", list.encode())
+            // SIP-60 asked the home for an account with no devices here;
+            // SIP-81 asks it for every account that lives elsewhere. A
+            // former home's own registry is the devices the account had
+            // when it left -- one revoked since still listed, one linked
+            // since not, and after a handover the new key's nowhere -- and
+            // every key sealed from it went to a device in a drawer. Its
+            // own list is answered only where the home cannot be asked.
+            Ok(req) => {
+                if let Some((home, _)) = server.devices.where_is(&req.account, &server.public_key)
+                    && let Some(theirs) = server.devices_at_home(&home, &req.account).await
+                {
+                    return (200, "application/octet-stream", theirs.encode());
                 }
-                Ok(list) => (200, "application/octet-stream", list.encode()),
-                Err(e) => refuse(e.status(), e.code(), None),
-            },
+                match server.devices.list(&req.account) {
+                    Ok(list) => (200, "application/octet-stream", list.encode()),
+                    Err(e) => refuse(e.status(), e.code(), None),
+                }
+            }
         },
 
         // SIP-38 names. A name binds to an **account**, so the account's devices
