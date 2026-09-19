@@ -123,6 +123,11 @@ pub struct Membership {
     /// Identities we are still trying to reach, and the ephemeral we offered
     /// them. Re-offering the same one every tick is what SIP-12 expects.
     pending: HashMap<PubKey, x25519_dalek::StaticSecret>,
+    /// Peers in `pending` only because the session we had with them went
+    /// stale, as against ones we have never reached at all.
+    ///
+    /// These are **not** counted as connecting. See [`Membership::connecting`].
+    rebuilding: std::collections::HashSet<PubKey>,
     /// Names we have already complained about, so a forged member produces one
     /// line rather than one every two seconds.
     rejected: std::collections::HashSet<PubKey>,
@@ -168,6 +173,7 @@ impl Membership {
             peers: HashMap::new(),
             by_identity: HashMap::new(),
             pending: HashMap::new(),
+            rebuilding: std::collections::HashSet::new(),
             rejected: std::collections::HashSet::new(),
             share: Vec::new(),
             homes: HashMap::new(),
@@ -197,8 +203,26 @@ impl Membership {
     }
 
     /// How many peers we are still working on connecting to.
+    ///
+    /// **A peer whose session went stale is not one of them.** A call ends
+    /// when somebody was seen, nobody is present and nobody is connecting;
+    /// counting a stale peer here kept that third condition false forever,
+    /// so a relayed call whose only other party hung up never ended. It sat
+    /// saying "connecting to 1…" -- to somebody who had left -- until the
+    /// person gave up and pressed the button themselves.
+    ///
+    /// Excluding them does not cost the recovery this was built for. A peer
+    /// that really is rebuilding re-establishes **in the same poll** that
+    /// discarded the old session: the sweep and the re-offer are steps 3 and
+    /// 4 of one pass, and a live run shows the `Restarted` and `Joined`
+    /// events sixteen microseconds apart. Lingering in `pending` is what a
+    /// peer who has gone looks like, and the whole point of this count is to
+    /// tell those apart.
     pub fn connecting(&self) -> usize {
-        self.pending.len()
+        self.pending
+            .keys()
+            .filter(|id| !self.rebuilding.contains(id))
+            .count()
     }
 
     /// Heartbeat, fetch the roster, and reconcile it with what we have.
@@ -289,6 +313,7 @@ impl Membership {
             events.push(Event::Left(id));
         }
         self.pending.retain(|id, _| still_here(id));
+        self.rebuilding.retain(|id| still_here(id));
         self.rejected
             .retain(|id| roster.members.iter().any(|m| m.identity == *id));
 
@@ -303,6 +328,10 @@ impl Membership {
         for (sid, id) in stale {
             self.peers.remove(&sid);
             self.by_identity.remove(&id);
+            // Step 4 will re-offer; until that succeeds this peer is being
+            // rebuilt, not reached for the first time, and must not read as
+            // a connection in progress.
+            self.rebuilding.insert(id);
             events.push(Event::Restarted(id));
         }
 
@@ -352,6 +381,8 @@ impl Membership {
             };
             {
                 self.unreachable.remove(&id);
+                // Reached: whatever it was before, it is a peer now.
+                self.rebuilding.remove(&id);
                 events.push(Event::Joined(peer.identity));
                 self.by_identity.insert(peer.identity, peer.session_id);
                 self.peers.insert(peer.session_id, peer);
@@ -582,4 +613,62 @@ impl Membership {
 /// several of them.
 pub fn short(key: &PubKey) -> String {
     key.to_string().chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod connecting_tests {
+    use super::*;
+
+    fn a_room() -> Membership {
+        Membership::new(
+            RoomId::new([1u8; 32]),
+            PubKey::new([2u8; 32]),
+            [3u8; 32],
+            4,
+            crate::audio::Rate::DEFAULT,
+        )
+    }
+
+    fn an_ephemeral() -> x25519_dalek::StaticSecret {
+        x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng)
+    }
+
+    /// A peer we have never reached is one we are connecting to. A peer whose
+    /// session went stale is not.
+    ///
+    /// **This is what left a relayed call running after the other side hung
+    /// up.** A call is over when somebody was seen, nobody is present and
+    /// nobody is connecting. A departed peer stayed in `pending` -- the
+    /// exchange lists a member for three times as long as a session is
+    /// allowed to be silent -- so the third condition never held and the
+    /// call sat saying "connecting to 1…" to somebody who had left, until
+    /// the person pressed the button themselves.
+    #[test]
+    fn a_peer_being_rebuilt_is_not_a_peer_being_reached() {
+        let mut m = a_room();
+        let never_reached = PubKey::new([7u8; 32]);
+        let went_stale = PubKey::new([8u8; 32]);
+
+        m.pending.insert(never_reached, an_ephemeral());
+        m.pending.insert(went_stale, an_ephemeral());
+        assert_eq!(m.connecting(), 2, "both are new arrivals so far");
+
+        // The second one is only here because its session went quiet.
+        m.rebuilding.insert(went_stale);
+        assert_eq!(
+            m.connecting(),
+            1,
+            "a stale peer is being rebuilt, not reached"
+        );
+
+        // And with nobody left but the stale one, nothing is connecting --
+        // which is what lets the call end.
+        m.pending.remove(&never_reached);
+        assert_eq!(
+            m.connecting(),
+            0,
+            "a call with only a departed peer is over"
+        );
+        assert!(m.present().is_empty(), "and nobody is present");
+    }
 }
