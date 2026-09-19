@@ -179,6 +179,12 @@ seed_relay_peers = [
 # replication peer, or peer openly (SIP-63), for the pulls to be served.
 # home_secs = 30
 
+# SIP-73: with calls open, a room is shared with an exchange this one does
+# not list on a member's word -- the member names the exchange (and its
+# domain) in the join and signs for it -- and a share from such an exchange
+# is kept when its signer already shares a private channel with a member of
+# the room here. Nothing to configure beyond open_calls.
+
 # SIP-71: on those same pulls, a direct message this exchange already holds
 # that an origin also orders is a stray there, and the origin is told to
 # fold it -- when the account pulled for is the lower of the two keys, whose
