@@ -179,6 +179,11 @@ seed_relay_peers = [
 # replication peer, or peer openly (SIP-63), for the pulls to be served.
 # home_secs = 30
 
+# SIP-76: a device may tell this exchange, as its home, which origin to
+# pull its account's channels from (/account/hint) -- and a create this
+# exchange carries elsewhere for an account homed here records the origin
+# by itself. Hints are kept 32 per account. Nothing to configure.
+
 # SIP-73: with calls open, a room is shared with an exchange this one does
 # not list on a member's word -- the member names the exchange (and its
 # domain) in the join and signs for it -- and a share from such an exchange
