@@ -797,10 +797,25 @@ impl Sync {
                 }
             }
             Message::Keys { channel, keys } => {
+                let mut fresh = false;
                 for (epoch, key) in keys {
+                    if chat.store().key(&channel, epoch)?.is_none() {
+                        fresh = true;
+                    }
                     chat.store()
                         .put_key(&channel, epoch, &ChannelKey::new(key))?;
                     self.progress.keys_in += 1;
+                }
+                // A key this device lacked may open entries it fetched and
+                // could not read -- and nothing else would ever revisit
+                // them, as `collect_keys` says of a key it opened itself.
+                // Found live: a device whose envelope never came read
+                // nothing of a conversation even after its sibling handed
+                // it the key. Only where something is unread: SIP-42 keeps
+                // the cursor the exchange's, and going back over entries
+                // already read would be moving it for nothing.
+                if fresh && chat.store().has_unread(&channel)? {
+                    chat.store().rewind(&channel)?;
                 }
                 self.progress.channels_in.insert(channel);
             }

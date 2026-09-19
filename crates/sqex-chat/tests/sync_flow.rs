@@ -900,3 +900,90 @@ async fn an_earlier_incarnation_is_verified_and_an_unknown_origin_refused() {
     // Nothing of it in the live tables.
     assert_eq!(laptop.store().entry_count(&channel).unwrap(), live_before);
 }
+
+/// A device that fetched a conversation it could not open -- its envelope
+/// never came -- reads it once a sibling hands it the key: the key alone,
+/// no entries, and the cursor goes back over what it could not read.
+#[tokio::test]
+async fn a_key_from_a_sibling_reopens_what_was_fetched_unread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, _, phone, mut laptop, _bob, channel) = phone_and_laptop(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    // The laptop reads the channel with no key: entries fetched, none opened.
+    let mut t = Timeline::new();
+    let got = laptop.poll(&channel, &mut t, 0).await.unwrap();
+    assert!(said(&got.timeline).is_empty(), "{:?}", said(&got.timeline));
+    assert!(
+        !got.unreadable.is_empty(),
+        "the laptop could read without a key"
+    );
+    assert!(laptop.store().keys_of(&channel).unwrap().is_empty());
+
+    // A courier with the phone's key and nothing else to say.
+    let instance = phone.store().incarnation(&channel).unwrap().unwrap();
+    let keys: Vec<(u32, [u8; 32])> = phone
+        .store()
+        .keys_of(&channel)
+        .unwrap()
+        .into_iter()
+        .map(|(e, k)| (e, *k.as_bytes()))
+        .collect();
+    assert!(!keys.is_empty());
+    let (s_phone, s_laptop) = sessions(1, 7);
+    let (mut pipe_laptop, pipe_phone) = Pipe::pair();
+    let mut courier = Courier {
+        session: s_phone,
+        pipe: pipe_phone,
+        seq: 0,
+        inbox: Vec::new(),
+    };
+    let mut x = Sync::new(s_laptop, alice_key);
+    drive(
+        &mut laptop,
+        &mut x,
+        &mut pipe_laptop,
+        &mut courier,
+        |c, heard| {
+            for m in heard {
+                match m {
+                    Message::Hello { .. } => {
+                        c.say(&Message::Hello {
+                            account: alice_key,
+                            credential: None,
+                        });
+                        c.say(&Message::Have(vec![sqex_chat::sync::Held {
+                            channel,
+                            instance,
+                            first: 1,
+                            last: 1,
+                            epochs: keys.len() as u16,
+                        }]));
+                    }
+                    Message::Have(_) => c.say(&Message::Want(vec![])),
+                    Message::Want(w) => {
+                        assert_eq!(w.len(), 1, "the laptop did not want the key: {w:?}");
+                        c.say(&Message::Keys {
+                            channel,
+                            keys: keys.clone(),
+                        });
+                        c.say(&Message::Done);
+                    }
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await;
+    assert_eq!(x.phase(), Phase::Finished, "{:?}", x.why);
+    assert!(x.progress.keys_in >= 1);
+
+    // The next poll goes back over what it could not read, and reads it.
+    let mut t = Timeline::new();
+    let got = laptop.poll(&channel, &mut t, 0).await.unwrap();
+    assert_eq!(said(&got.timeline), vec!["one", "two", "three"]);
+    assert!(got.unreadable.is_empty(), "{:?}", got.unreadable);
+    let held = laptop.history(&channel, &[alice_key, bob_key]).unwrap();
+    assert_eq!(said(&held), vec!["one", "two", "three"]);
+}

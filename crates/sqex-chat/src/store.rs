@@ -2834,6 +2834,21 @@ impl Store {
     ///
     /// For when a key arrives after the entries it opens: those were held and
     /// could not be read, and nothing else would ever look at them again.
+    /// Whether this channel holds an entry that was fetched and could not
+    /// be opened -- what a key arriving later is for.
+    pub fn has_unread(&self, channel: &[u8; 32]) -> Result<bool> {
+        let n: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM message
+                 WHERE channel = ?1 AND exchange = ?2 AND sealed IS NULL",
+                params![&channel[..], self.scope()?],
+                |r| r.get(0),
+            )
+            .map_err(storage("count unread"))?;
+        Ok(n > 0)
+    }
+
     pub fn rewind(&self, channel: &[u8; 32]) -> Result<()> {
         self.db
             .execute(
