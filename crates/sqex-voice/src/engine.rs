@@ -1020,6 +1020,22 @@ pub async fn room_call(
 
     let mut hangup: Option<Instant> = None;
     let mut outgoing = media::Sender::new(KEEPALIVE_FRAMES, opts.dtx);
+    // **Frames that go nowhere, counted by the session they claimed.**
+    //
+    // Both ways of losing one are silent by design: a frame for a session we
+    // do not hold is dropped because in a room anything may arrive, and a
+    // frame we cannot open is dropped because saying so once per frame would
+    // drown the roster at fifty frames a second. Silent is right, and it also
+    // means the one thing that would explain a peer going stale -- `Restarted`
+    // after ten seconds of nothing opening -- leaves no trace at all.
+    //
+    // So: counted always, and said once per session id, with the ids we do
+    // hold beside it. That comparison is the whole diagnostic. A summary goes
+    // out when the call ends, because a count of zero is as informative as a
+    // large one and only the end knows it.
+    let mut stray: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut unopened: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut undecodable: u64 = 0;
     let result = loop {
         tokio::select! {
             // Roster, heartbeat and session establishment are the same tick.
@@ -1085,16 +1101,25 @@ pub async fn room_call(
                 };
                 // The session id says who this is. A frame for a session we do
                 // not hold is one from a peer who has since left.
-                if let Some(peer) = members.peers.get_mut(&frame.session_id) {
-                    // A frame we cannot open is one we do not play. On this
-                    // path anything may arrive, and in a room saying so once
-                    // per frame would drown the roster.
-                    if let Ok(plaintext) = peer.session.open(frame.seq, &frame.ciphertext)
-                        && let Ok(Some(m)) = media::Frame::decode(&plaintext)
-                    {
-                        peer.heard();
-                        peer.jitter.push(frame.seq, m.timestamp, m.body);
+                match members.peers.get_mut(&frame.session_id) {
+                    Some(peer) => {
+                        // A frame we cannot open is one we do not play. On
+                        // this path anything may arrive, and in a room saying
+                        // so once per frame would drown the roster.
+                        match peer.session.open(frame.seq, &frame.ciphertext) {
+                            Ok(plaintext) => match media::Frame::decode(&plaintext) {
+                                Ok(Some(m)) => {
+                                    peer.heard();
+                                    peer.jitter.push(frame.seq, m.timestamp, m.body);
+                                }
+                                // A reserved type (SIP-15 keeps the space) or
+                                // a malformed body. Neither counts as heard.
+                                Ok(None) | Err(_) => undecodable += 1,
+                            },
+                            Err(_) => *unopened.entry(frame.session_id).or_default() += 1,
+                        }
                     }
+                    None => *stray.entry(frame.session_id).or_default() += 1,
                 }
             }
 
@@ -1147,15 +1172,62 @@ pub async fn room_call(
 
             _ = tick.tick() => {
                 report.event(present_of(&members));
-                report.event(Event::Stats(room_summary(&members)));
+                report.event(Event::Stats(format!(
+                    "{}{}",
+                    room_summary(&members),
+                    lost_note(&stray, &unopened, undecodable, &members)
+                )));
             }
         }
     };
 
-    report.event(Event::FinalStats(room_summary(&members)));
+    report.event(Event::FinalStats(format!(
+        "{}{}",
+        room_summary(&members),
+        lost_note(&stray, &unopened, undecodable, &members)
+    )));
     out.finish()?;
     members.leave(&mut client).await;
     result
+}
+
+/// Frames that arrived and went nowhere, for the end of a stats line.
+///
+/// **Both ways of losing one are silent by design**, and rightly so: in a room
+/// anything may arrive, and complaining once per frame would drown the roster
+/// at fifty a second. But silence here is also why a peer going stale --
+/// [`room::Event::Restarted`], after ten seconds of nothing opening -- leaves
+/// no trace of *why*. The two causes want telling apart:
+///
+/// - **unheld**: a frame for a session id we do not have. The sender thinks a
+///   session exists that we discarded, or never learned about.
+/// - **unopened**: a session we do hold, whose frames will not decrypt. The
+///   two ends derived different keys and neither can tell.
+///
+/// The session ids come with the counts, beside the ones we hold, because that
+/// comparison is the whole diagnostic. Empty when nothing was lost, so an
+/// ordinary call's stats line is unchanged.
+fn lost_note(
+    stray: &std::collections::HashMap<u64, u64>,
+    unopened: &std::collections::HashMap<u64, u64>,
+    undecodable: u64,
+    members: &Membership,
+) -> String {
+    let strayed: u64 = stray.values().sum();
+    let refused: u64 = unopened.values().sum();
+    if strayed + refused + undecodable == 0 {
+        return String::new();
+    }
+    let mut held: Vec<u64> = members.peers.keys().copied().collect();
+    held.sort_unstable();
+    let mut unheld: Vec<u64> = stray.keys().copied().collect();
+    unheld.sort_unstable();
+    let mut shut: Vec<u64> = unopened.keys().copied().collect();
+    shut.sort_unstable();
+    format!(
+        " · lost {strayed} to sessions {unheld:?} we do not hold, {refused} to sessions {shut:?} \
+         that would not open, {undecodable} undecodable; holding {held:?}"
+    )
 }
 
 /// The roster as structured data, for something that draws rather than prints.
@@ -1283,5 +1355,56 @@ pub async fn echo(
             .post("/session/close", BySession::close(id).encode())
             .await;
         report.event(Event::CallerGone { after: CALLER_GONE });
+    }
+}
+
+#[cfg(test)]
+mod lost_note_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn empty_room() -> Membership {
+        Membership::new(
+            RoomId::new([1u8; 32]),
+            PubKey::new([2u8; 32]),
+            [3u8; 32],
+            4,
+            Rate::DEFAULT,
+        )
+    }
+
+    /// A call that loses nothing says nothing, so an ordinary stats line is
+    /// unchanged and a line that does carry this is worth reading.
+    #[test]
+    fn a_call_that_loses_nothing_adds_nothing_to_its_stats() {
+        let note = lost_note(&HashMap::new(), &HashMap::new(), 0, &empty_room());
+        assert!(note.is_empty(), "{note}");
+    }
+
+    /// The two ways of losing a frame are named apart, with the session ids,
+    /// because which one happened is the whole question behind a peer being
+    /// restarted after ten seconds of nothing opening.
+    #[test]
+    fn frames_lost_to_an_unheld_session_and_to_one_that_will_not_open_are_told_apart() {
+        let stray = HashMap::from([(7u64, 120u64)]);
+        let unopened = HashMap::from([(5u64, 3u64)]);
+        let note = lost_note(&stray, &unopened, 1, &empty_room());
+
+        assert!(note.contains("120"), "the strayed count is missing: {note}");
+        assert!(
+            note.contains("[7]"),
+            "the unheld session is not named: {note}"
+        );
+        assert!(note.contains('3'), "the refused count is missing: {note}");
+        assert!(
+            note.contains("[5]"),
+            "the unopened session is not named: {note}"
+        );
+        assert!(note.contains("undecodable"), "{note}");
+        // And what we do hold, which is the half that makes it a comparison.
+        assert!(note.contains("holding []"), "{note}");
+        // The two causes must not read as one.
+        assert!(note.contains("do not hold"), "{note}");
+        assert!(note.contains("would not open"), "{note}");
     }
 }
