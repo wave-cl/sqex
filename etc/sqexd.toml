@@ -179,6 +179,12 @@ seed_relay_peers = [
 # replication peer, or peer openly (SIP-63), for the pulls to be served.
 # home_secs = 30
 
+# SIP-78: an origin that answers a peering write with its limit holds this
+# exchange's writes to it for the seconds it gave; a member whose act was
+# carried there is answered the origin's limit, or origin_refused where it
+# said no, and origin_away only where it did not answer. What each origin
+# last refused is under `origins` in GET /status. Nothing to configure.
+
 # SIP-76: a device may tell this exchange, as its home, which origin to
 # pull its account's channels from (/account/hint) -- and a create this
 # exchange carries elsewhere for an account homed here records the origin
