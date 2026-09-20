@@ -24,6 +24,7 @@ pub mod room;
 pub mod server;
 pub mod session;
 pub mod state;
+pub mod tunnel;
 pub mod wake;
 
 pub use config::Config;

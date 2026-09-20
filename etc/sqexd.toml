@@ -113,6 +113,23 @@ challenge_ttl_secs = 30
 # open_calls = false
 
 # ---------------------------------------------------------------------------
+# SIP-85: connections carried for members.
+#
+# A member -- on the whitelist while there is one, a registered device of an
+# admitted account (SIP-47), or an account homed here by its Move (SIP-59)
+# -- may ask this exchange to carry a transport connection to another
+# exchange it names. This exchange resolves the name (SIP-33), refuses unless
+# the key it finds is the key the member named, opens a UDP socket towards
+# it and copies packets both ways, reading none: the member's own handshake
+# with the far exchange runs end to end, and the far exchange sees this
+# exchange's address, never the member's. With no whitelist, only the
+# accounts homed here are carried for. Off by default; the startup line says
+# "tunnel = on (...)" when it is on.
+# tunnel = false
+# tunnels_per_member = 4          # open at once, per member
+# tunnel_bytes_per_sec = 2097152  # each direction, per tunnel; over it, packets drop
+
+# ---------------------------------------------------------------------------
 # SIP-39: cross-exchange calls.
 # ---------------------------------------------------------------------------
 
@@ -242,3 +259,4 @@ seed_relay_peers = [
 # reports = [20, 3600]
 # peering = [60, 3600]    # SIP-35 §What a stranger can cost: per caller key, the writes a peer causes
 # calls = [20, 3600]      # SIP-65: per caller account, cross-exchange calls
+# tunnels = [10, 3600]    # SIP-85: per member, tunnels opened (burst 4)

@@ -44,6 +44,7 @@ use sqex_proto::receipt::{self, Equivocation, ReceiptTerms};
 use sqex_proto::refusal::{Code as RefusalCode, Refusal};
 use sqex_proto::timeline::{Received, Timeline};
 use sqex_proto::timeline::{Standing, Verdict};
+use sqex_proto::tunnel::Carrier;
 use sqnr::Client;
 use sqnr_core::PubKey;
 use std::collections::{HashMap, HashSet};
@@ -160,7 +161,19 @@ const DIAL_SLICE: Duration = Duration::from_millis(50);
 /// driven by whoever built it, and a program that also wants to draw a window
 /// or carry a call has nowhere to put it. Permitting a task costs nothing; the
 /// reconnect still does not use one.
-type Dialing = Pin<Box<dyn Future<Output = std::result::Result<Client, String>> + Send>>;
+type Dialing =
+    Pin<Box<dyn Future<Output = std::result::Result<(Client, Option<Carrier>), String>> + Send>>;
+
+/// SIP-85: the home this client reaches its exchange through, and the
+/// tunnel it holds there now. Reconnecting re-opens the tunnel first when
+/// the old one is gone -- a dial to the old carrier's loopback socket
+/// reaches nothing.
+pub struct Via {
+    pub home: (SocketAddr, [u8; 32]),
+    pub target_key: [u8; 32],
+    pub target_domain: String,
+    carrier: Option<Carrier>,
+}
 
 /// A wait with up to a fifth taken off it or added to it.
 ///
@@ -778,6 +791,8 @@ pub struct Chat {
     /// short-circuit its own requests either, so it keeps the behaviour it had
     /// before any of this existed: every call tries.
     endpoint: Option<(SocketAddr, [u8; 32])>,
+    /// SIP-85: set when the connection is carried by a home.
+    via: Option<Via>,
     link: Link,
     /// How many redials have failed since the link was last up. Indexes
     /// `BACKOFF_MS`, and reaching the end of it is what makes the link `Gone`.
@@ -950,6 +965,7 @@ impl Chat {
             domain: None,
             followed,
             endpoint: None,
+            via: None,
             link: Link::Up,
             attempts: 0,
             next_dial: Instant::now(),
@@ -1507,6 +1523,28 @@ impl Chat {
         self.endpoint = Some((addr, server_pub));
     }
 
+    /// SIP-85: this connection is carried by `home`; keep the carrier, and
+    /// open another there when reconnecting finds it closed.
+    pub fn via(
+        &mut self,
+        home: (SocketAddr, [u8; 32]),
+        target_key: [u8; 32],
+        target_domain: String,
+        carrier: Carrier,
+    ) {
+        self.via = Some(Via {
+            home,
+            target_key,
+            target_domain,
+            carrier: Some(carrier),
+        });
+    }
+
+    /// SIP-85: the home this connection goes through, if any.
+    pub fn via_home(&self) -> Option<SocketAddr> {
+        self.via.as_ref().map(|v| v.home.0)
+    }
+
     /// The domain this exchange was discovered under, so a SIP-38 handle can be
     /// shown as `name@domain`. Set once, after connecting.
     /// SIP-40: what opening the store re-filed from a predecessor key, if
@@ -1677,6 +1715,11 @@ impl Chat {
         self.dialing = None;
         self.attempts = 0;
         self.next_dial = Instant::now();
+        // SIP-85: through a home, starting over means a fresh tunnel too --
+        // the one held may be the thing that went wrong.
+        if let Some(carrier) = self.via.as_ref().and_then(|v| v.carrier.as_ref()) {
+            carrier.close();
+        }
         if self.link == Link::Up {
             self.link = Link::Retrying;
         }
@@ -1704,8 +1747,24 @@ impl Chat {
                 return;
             }
             let seed = self.seed;
+            // SIP-85: through a home, a tunnel that is gone is re-opened
+            // first and the dial goes to the new carrier's socket; one that
+            // still stands is dialled again as it is.
+            let reopen = self.via.as_ref().and_then(|v| {
+                let gone = v.carrier.as_ref().is_none_or(|c| c.closed());
+                gone.then(|| (v.home, v.target_key, v.target_domain.clone()))
+            });
             self.dialing = Some(Box::pin(async move {
-                Client::connect_as(addr, &server_pub, &seed).await
+                match reopen {
+                    Some((home, target_key, domain)) => {
+                        let carrier =
+                            Carrier::open(home.0, &home.1, &seed, &target_key, &domain).await?;
+                        let client =
+                            Client::connect_as(carrier.local_addr(), &server_pub, &seed).await?;
+                        Ok((client, Some(carrier)))
+                    }
+                    None => Ok((Client::connect_as(addr, &server_pub, &seed).await?, None)),
+                }
             }));
         }
         let dial = self.dialing.as_mut().expect("just set");
@@ -1713,9 +1772,13 @@ impl Chat {
             // Still handshaking. The future is kept, so the next tick carries
             // on rather than starting over.
             Err(_) => {}
-            Ok(Ok(client)) => {
+            Ok(Ok((client, carrier))) => {
                 self.dialing = None;
                 self.client = client;
+                if let (Some(via), Some(carrier)) = (self.via.as_mut(), carrier) {
+                    self.endpoint = Some((carrier.local_addr(), via.target_key));
+                    via.carrier = Some(carrier);
+                }
                 // The old subscription belonged to the old connection. Dropping
                 // it here rather than letting it error out is what makes
                 // `subscribed()` mean "there is a stream on *this* connection".

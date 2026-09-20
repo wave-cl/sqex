@@ -199,6 +199,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Reach an exchange through your home (SIP-85): the home carries the
+    /// connection, and the target sees the home's address, not yours.
+    /// Discovers both by name, opens the tunnel as this identity, dials the
+    /// target through it and prints its status.
+    Tunnel {
+        /// The home: a domain whose exchange carries connections for you --
+        /// you are whitelisted there, or your account lives there.
+        home: String,
+        /// The exchange to reach, by the domain it publishes under.
+        target: String,
+    },
     /// Find the exchange a domain publishes (SIP-33), and inspect what is
     /// pinned. Talks to DNS only — no exchange is contacted.
     Discover {
@@ -649,6 +660,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Attest { cmd } => attest(&cli, &cfg, cmd).await,
         Cmd::Verify { peer, attest } => verify(&cli, &cfg, peer, *attest).await,
         Cmd::Peers => peers(&cli, &cfg).await,
+        Cmd::Tunnel { home, target } => tunnel(&cli, &cfg, home, target).await,
         Cmd::Lineage => lineage(&cli, &cfg).await,
         Cmd::Succession { cmd } => succession(&cli, &cfg, cmd).await,
         Cmd::Home { cmd } => home(&cli, &cfg, cmd).await,
@@ -2800,6 +2812,70 @@ async fn peers(cli: &Cli, cfg: &Config) -> Result<(), String> {
         "A hint, not an introduction: discover a domain (sqex discover) and refuse it if \
          the key differs."
     );
+    Ok(())
+}
+
+/// SIP-85: the live probe. Discover the home and the target, open a tunnel
+/// at the home naming the target's key and domain, dial the target through
+/// it as this identity, and read its status -- the target's own log then
+/// names the home's address for this connection, which is the point.
+async fn tunnel(cli: &Cli, cfg: &Config, home: &str, target: &str) -> Result<(), String> {
+    let signer = load_software_identity(cli, cfg)?;
+    if cli.yubikey {
+        return Err("a tunnel is opened as a transport identity; a YubiKey cannot be one".into());
+    }
+    let seed = signer.seed();
+    let home_found = sqex_discovery::discover(home)
+        .await
+        .map_err(|e| format!("discovering {home}: {e}"))?;
+    if let Some(notice) = home_found.notice(home) {
+        eprintln!("{notice}");
+    }
+    let target_found = sqex_discovery::discover(target)
+        .await
+        .map_err(|e| format!("discovering {target}: {e}"))?;
+    if let Some(notice) = target_found.notice(target) {
+        eprintln!("{notice}");
+    }
+    let home_addr = resolve(&home_found.address)?;
+    let started = std::time::Instant::now();
+    let carrier = sqex_proto::tunnel::Carrier::open(
+        home_addr,
+        home_found.key.as_bytes(),
+        &seed,
+        target_found.key.as_bytes(),
+        target,
+    )
+    .await?;
+    println!(
+        "tunnel open at {home} ({home_addr}) towards {target} ({}), IPv{}, {}ms",
+        target_found.key,
+        carrier.family(),
+        started.elapsed().as_millis()
+    );
+    let dialled = std::time::Instant::now();
+    let mut through = Client::connect_as(carrier.local_addr(), target_found.key.as_bytes(), &seed)
+        .await
+        .map_err(|e| format!("dialling {target} through the tunnel: {e}"))?;
+    println!(
+        "connected to {target} through it in {}ms, as {}",
+        dialled.elapsed().as_millis(),
+        PubKey::new(sqnr_core::Signer::public(&signer))
+    );
+    let (code, body) = through.get("/status").await?;
+    if code != 200 {
+        return Err(format!("status failed ({code}): {}", said(&body)));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    println!(
+        "{target}: server {} · up {}s · {} connection(s) · carrying {} tunnel(s) itself",
+        v["version"].as_str().unwrap_or("?"),
+        v["uptime_secs"].as_u64().unwrap_or(0),
+        v["connections"].as_u64().unwrap_or(0),
+        v["tunnels"].as_u64().unwrap_or(0),
+    );
+    let (up, down) = carrier.bytes();
+    println!("tunnel carried {up} bytes up, {down} bytes down");
     Ok(())
 }
 

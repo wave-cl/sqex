@@ -86,6 +86,12 @@ struct Cli {
     /// Identity file (default ~/.sqnr/identity).
     #[arg(short = 'i', long, global = true)]
     identity: Option<PathBuf>,
+    /// Reach the exchange through your home (SIP-85): a domain whose
+    /// exchange carries connections for you. The exchange named by --server
+    /// then sees the home's address, never yours. Needs --server <domain>;
+    /// the home resolves the target by name.
+    #[arg(long, value_name = "DOMAIN")]
+    via: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -330,17 +336,27 @@ async fn run(cli: Cli) -> Result<(), String> {
         _ => {}
     }
 
-    let (client, addr, server, pinned_notice, domain) = connect(&cli, &cfg, &seed).await?;
+    let (client, addr, server, pinned_notice, domain, carried) = connect(&cli, &cfg, &seed).await?;
     // The exchange we are talking to is bound into every SIP-31 signature, so
     // an entry signed here cannot be lifted into another exchange's copy of the
     // same conversation — which for a direct message is byte-identical.
     let mut chat = Chat::new(client, seed, me, server, store);
     // The exchange's domain, for showing SIP-38 handles as name@domain.
-    chat.set_domain(domain);
+    chat.set_domain(domain.clone());
     // Where to dial when this connection is lost — which, until now, was
     // nowhere: the client connected once here and a dropped connection meant
     // every request afterwards failed for as long as it stayed open.
     chat.dials(addr, *server.as_bytes());
+    // SIP-85: carried by a home. The address dialled is the carrier's own
+    // loopback socket; a reconnect re-opens the tunnel when it is gone.
+    if let Some((home, carrier)) = carried {
+        chat.via(
+            home,
+            *server.as_bytes(),
+            domain.clone().unwrap_or_default(),
+            carrier,
+        );
+    }
     chat.top_up_prekeys()
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
@@ -4486,6 +4502,13 @@ const CACHED_ATTEMPT: Duration = Duration::from_millis(1500);
 /// know, then a fresh DNSSEC lookup.
 ///
 /// Whichever rung answers is written back, so the next start begins there.
+/// SIP-85: what a carried connection came with -- the home it goes through
+/// and the carrier holding the tunnel, for the reconnect path.
+type Carried = Option<(
+    (std::net::SocketAddr, [u8; 32]),
+    sqex_proto::tunnel::Carrier,
+)>;
+
 async fn connect(
     cli: &Cli,
     cfg: &Config,
@@ -4497,6 +4520,7 @@ async fn connect(
         PubKey,
         Option<String>,
         Option<String>,
+        Carried,
     ),
     String,
 > {
@@ -4504,14 +4528,24 @@ async fn connect(
 
     let addr = match target {
         sqex_discovery::Target::Direct { address, key } => {
+            if cli.via.is_some() {
+                return Err(
+                    "--via needs --server <domain>: the home finds the exchange by its name, \
+                     not by an address you hold"
+                        .into(),
+                );
+            }
             let socket = resolve_one_sync(&address)?;
             let client = Client::connect_as(socket, key.as_bytes(), seed)
                 .await
                 .map_err(|e| format!("could not reach {socket}: {e}"))?;
-            return Ok((client, socket, key, None, None));
+            return Ok((client, socket, key, None, None, None));
         }
         sqex_discovery::Target::Discover(d) => d,
     };
+    if let Some(home) = &cli.via {
+        return connect_via(home, &addr, seed).await;
+    }
 
     let (domain, _) = split_port(&addr);
     if domain.parse::<std::net::IpAddr>().is_ok() {
@@ -4570,6 +4604,7 @@ async fn connect(
                     server,
                     pinned_notice,
                     Some(domain.to_string()),
+                    None,
                 ));
             }
             Err(e) => {
@@ -4583,6 +4618,87 @@ async fn connect(
     Err(format!(
         "could not reach {domain} at any of its {} address(es) — last was {last}",
         candidates.len()
+    ))
+}
+
+/// SIP-85: reach `target` through `home`. Both are discovered by name and
+/// pinned; the home is dialled, asked to carry a connection to the target's
+/// key and domain, and the ordinary dial then goes to the carrier's loopback
+/// socket with the target's key pinned -- the target authenticates this
+/// identity and sees the home's address.
+async fn connect_via(
+    home: &str,
+    target: &str,
+    seed: &[u8; 32],
+) -> Result<
+    (
+        Client,
+        std::net::SocketAddr,
+        PubKey,
+        Option<String>,
+        Option<String>,
+        Carried,
+    ),
+    String,
+> {
+    let (target_domain, _) = split_port(target);
+    let (home_domain, _) = split_port(home);
+    if home_domain.eq_ignore_ascii_case(target_domain) {
+        return Err(format!(
+            "--via {home_domain} names the exchange itself; a home carries connections to \
+             other exchanges"
+        ));
+    }
+    let (target_key, _, target_pin) = sqex_discovery::candidates(target_domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (home_key, home_candidates, _) = sqex_discovery::candidates(home_domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    let pinned_notice = match target_pin {
+        sqex_discovery::Pin::Held => None,
+        sqex_discovery::Pin::First => Some(format!(
+            "discovered {target_key} for {target_domain} over DNSSEC and pinned it — it \
+             will not change without telling you."
+        )),
+        sqex_discovery::Pin::Moved { from } => Some(format!(
+            "{target_domain}'s key changed hands: {from} was withdrawn and had signed a \
+             handover to {target_key}, so the pin followed it (SIP-40)."
+        )),
+    };
+    let mut last = String::new();
+    for c in &home_candidates {
+        match sqex_proto::tunnel::Carrier::open(
+            c.addr,
+            home_key.as_bytes(),
+            seed,
+            target_key.as_bytes(),
+            target_domain,
+        )
+        .await
+        {
+            Ok(carrier) => {
+                let local = carrier.local_addr();
+                let client = Client::connect_as(local, target_key.as_bytes(), seed)
+                    .await
+                    .map_err(|e| {
+                        format!("could not reach {target_domain} through {home_domain}: {e}")
+                    })?;
+                return Ok((
+                    client,
+                    local,
+                    target_key,
+                    pinned_notice,
+                    Some(target_domain.to_string()),
+                    Some(((c.addr, *home_key.as_bytes()), carrier)),
+                ));
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(format!(
+        "could not open a tunnel at {home_domain} ({} address(es)) — last was {last}",
+        home_candidates.len()
     ))
 }
 

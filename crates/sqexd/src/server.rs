@@ -389,6 +389,17 @@ pub struct Server {
     lineage_file: PathBuf,
     /// SIP-65: calls are carried for an exchange nobody listed.
     open_calls: bool,
+    /// SIP-85: connections are carried for members, and how many each may
+    /// hold; the tunnels open now, by member; and what a tunnel may carry
+    /// per second in each direction.
+    pub(crate) tunnel: bool,
+    pub(crate) tunnels_per_member: usize,
+    pub(crate) tunnel_bytes_per_sec: u64,
+    pub(crate) tunnels: Mutex<HashMap<PubKey, Vec<crate::tunnel::Open>>>,
+    /// The address the last accepted connection came from -- what the
+    /// "connection ended" line prints -- so a test can read what a target
+    /// exchange observed of a tunnelled client without parsing a log.
+    last_peer: Mutex<Option<std::net::SocketAddr>>,
     /// SIP-65: the `(caller, eph)` pairs rung on lately, so a word is
     /// honoured once within `CALL_WORD_SECS`. Value: when it was seen.
     call_words: Mutex<HashMap<(PubKey, [u8; 32]), u64>>,
@@ -502,6 +513,44 @@ impl Server {
             return true;
         }
         key.is_some_and(|k| self.transport.has_key(&k))
+    }
+
+    /// SIP-85 §Opening a tunnel: whether this exchange carries connections
+    /// for the identity on `key` -- on the whitelist while there is one
+    /// (which includes SIP-47's registered devices and the administrators),
+    /// or homed here by a SIP-59 Move. With no whitelist the door is open
+    /// to everyone and the tunnel is not: an open exchange carries for the
+    /// accounts that live here and for nobody else.
+    pub(crate) fn tunnels_for(&self, key: Option<[u8; 32]>, identity: &PubKey) -> bool {
+        let listed =
+            self.state.lock().unwrap().enabled() && key.is_some_and(|k| self.transport.has_key(&k));
+        listed
+            || self
+                .devices
+                .home_of(&self.devices.account_for(identity))
+                .is_some_and(|(home, _, _)| home == self.public_key)
+    }
+
+    /// SIP-85: tunnels carried right now.
+    pub fn tunnels_open(&self) -> usize {
+        self.tunnels.lock().unwrap().values().map(Vec::len).sum()
+    }
+
+    /// SIP-85: the local socket of every tunnel carried right now -- the
+    /// address a target sees this exchange's members arrive from.
+    pub fn tunnel_sockets(&self) -> Vec<std::net::SocketAddr> {
+        self.tunnels
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .map(|t| t.local)
+            .collect()
+    }
+
+    /// Where the last accepted connection came from.
+    pub fn last_peer_addr(&self) -> Option<std::net::SocketAddr> {
+        *self.last_peer.lock().unwrap()
     }
 
     fn sync_transport(&self, state: &State) {
@@ -1588,10 +1637,17 @@ pub async fn bind_with(
     // set is the managed state's, read after the listener exists and kept in
     // step with every change; `allowed_keys` at construction would be a
     // second copy that stopped being true at the first admin op.
+    // `h3` for clients; `sqex-relay` (SIP-39) for a peering exchange's link;
+    // `sqex-tunnel` (SIP-85) for a member's carried connection, offered only
+    // when the operator turned carriage on -- a home that does not carry
+    // refuses at the handshake, which is how a client tells. The accept loop
+    // tells them apart by the negotiated ALPN.
+    let mut alpns = vec![ALPN.to_vec(), sqex_proto::relay::ALPN.to_vec()];
+    if config.tunnel {
+        alpns.push(sqex_proto::tunnel::ALPN.to_vec());
+    }
     let squic_config = SquicConfig {
-        // `h3` for clients; `sqex-relay` (SIP-39) for a peering exchange's link,
-        // which the accept loop tells apart by the negotiated ALPN.
-        alpn_protocols: vec![ALPN.to_vec(), sqex_proto::relay::ALPN.to_vec()],
+        alpn_protocols: alpns,
         max_idle_timeout: std::time::Duration::from_secs(60),
         // Sessions may carry real-time media over datagrams (SIP-12). Costs
         // nothing for the connections that never send one.
@@ -1639,6 +1695,11 @@ pub async fn bind_with(
         lineage_asked: Mutex::new(HashMap::new()),
         lineage_retry: config.lineage_retry,
         open_calls: config.open_calls,
+        tunnel: config.tunnel,
+        tunnels_per_member: config.tunnels_per_member,
+        tunnel_bytes_per_sec: config.tunnel_bytes_per_sec,
+        tunnels: Mutex::new(HashMap::new()),
+        last_peer: Mutex::new(None),
         call_words: Mutex::new(HashMap::new()),
         replicate: config.replicate.clone(),
         exchange_seed: signing_key.to_bytes(),
@@ -1839,6 +1900,14 @@ pub async fn serve(bound: Bound) -> Result<()> {
         replication_peers = server.replication_peers.len(),
         peering = if server.open_peering { "open" } else { "listed" },
         calls = if server.open_calls { "open" } else { "listed" },
+        tunnel = %if server.tunnel {
+            format!(
+                "on ({} per member, {} bytes/s)",
+                server.tunnels_per_member, server.tunnel_bytes_per_sec
+            )
+        } else {
+            "off".to_string()
+        },
         lineage = server.lineage.read().unwrap().0.links.len(),
         lineage_file = %server.lineage_file.display(),
         "sqexd {} listening (HTTP/3)", VERSION
@@ -1929,16 +1998,20 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 addr: incoming.remote_address(),
             };
             let server = Arc::clone(&server);
+            *server.last_peer.lock().unwrap() = Some(peer.addr);
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
                         server.connections.fetch_add(1, Ordering::Relaxed);
                         // SIP-39: a peering exchange's link negotiates the
                         // `sqex-relay` ALPN and is driven by the relay protocol,
-                        // not HTTP/3.
-                        if crate::relay::alpn_of(&conn).as_deref() == Some(sqex_proto::relay::ALPN)
-                        {
+                        // not HTTP/3. SIP-85: a member's tunnel connection
+                        // negotiates `sqex-tunnel` and carries packets.
+                        let alpn = crate::relay::alpn_of(&conn);
+                        if alpn.as_deref() == Some(sqex_proto::relay::ALPN) {
                             crate::relay::serve_relay(&server, conn, peer.identity).await;
+                        } else if alpn.as_deref() == Some(sqex_proto::tunnel::ALPN) {
+                            crate::tunnel::serve(&server, conn, peer).await;
                         } else {
                             let ended = serve_h3(server, conn.clone(), peer).await;
                             // **The transport, in numbers, once per
@@ -1947,8 +2020,12 @@ pub async fn serve(bound: Bound) -> Result<()> {
                             // window never grew, or the client was slow to
                             // read, and this is the only place the server's
                             // own window and loss count are visible.
+                            // With the peer's address: what a tunnelled client
+                            // (SIP-85) looks like from here is the one question
+                            // the far exchange's operator will ask of this line.
                             let s = conn.stats();
                             tracing::info!(
+                                peer = %conn.remote_address(),
                                 rtt_ms = s.path.rtt.as_millis() as u64,
                                 cwnd = s.path.cwnd,
                                 mtu = s.path.current_mtu,
@@ -5487,6 +5564,8 @@ impl Server {
             "origins": self.origins_value(),
             "sessions": self.sessions.len(),
             "rooms": self.rooms.len(),
+            // SIP-85: connections carried for members right now.
+            "tunnels": self.tunnels_open(),
             "admins": self.admins.read().unwrap().len(),
             "transport": self.transport_value(),
         })

@@ -22,6 +22,8 @@ pub enum Kind {
     Peering,
     /// SIP-65: cross-exchange calls dialled or rung, per caller account.
     Calls,
+    /// SIP-85: tunnels opened, per member identity.
+    Tunnels,
 }
 
 /// A limit: `burst` tokens, refilled at `per_sec`. Zero burst is unlimited.
@@ -59,6 +61,7 @@ pub struct Limits {
     pub reports: Limit,
     pub peering: Limit,
     pub calls: Limit,
+    pub tunnels: Limit,
 }
 
 impl Default for Limits {
@@ -73,6 +76,11 @@ impl Default for Limits {
             reports: Limit::per(20, 3600),
             peering: Limit::per(60, 3600),
             calls: Limit::per(20, 3600),
+            // SIP-85 §Limits: burst 4, ten an hour.
+            tunnels: Limit {
+                burst: 4.0,
+                per_sec: 10.0 / 3600.0,
+            },
         }
     }
 }
@@ -88,6 +96,7 @@ impl Limits {
             Kind::Reports => self.reports,
             Kind::Peering => self.peering,
             Kind::Calls => self.calls,
+            Kind::Tunnels => self.tunnels,
         }
     }
 }

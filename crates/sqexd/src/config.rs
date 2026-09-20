@@ -260,6 +260,19 @@ pub struct FileConfig {
     /// as written: only the relay peer list. Independent of `open_peering`.
     #[serde(default)]
     pub open_calls: bool,
+    /// SIP-85: carry transport connections to other exchanges for members
+    /// -- the whitelisted, SIP-47's registered devices, and the accounts
+    /// homed here by a SIP-59 Move. The far exchange then sees this
+    /// exchange's address and never the member's. Off by default.
+    #[serde(default)]
+    pub tunnel: bool,
+    /// SIP-85 §Limits: tunnels one member may hold open at once. Default 4.
+    #[serde(default)]
+    pub tunnels_per_member: Option<u32>,
+    /// SIP-85 §Limits: bytes per second each tunnel may carry in each
+    /// direction; a packet over budget is dropped. Default 2 MiB.
+    #[serde(default)]
+    pub tunnel_bytes_per_sec: Option<u64>,
     /// SIP-56: rate limits, per account. Each is `[n, seconds]`: n in any
     /// window of that many seconds, refilling steadily; `[0, 0]` is
     /// unlimited. Omitted ones take SIP-56's defaults.
@@ -288,6 +301,9 @@ pub struct FileLimits {
     /// SIP-65: cross-exchange calls, per caller account.
     #[serde(default)]
     pub calls: Option<[u32; 2]>,
+    /// SIP-85: tunnels opened, per member.
+    #[serde(default)]
+    pub tunnels: Option<[u32; 2]>,
 }
 
 impl FileLimits {
@@ -308,6 +324,7 @@ impl FileLimits {
             reports: pick(self.reports, d.reports),
             peering: pick(self.peering, d.peering),
             calls: pick(self.calls, d.calls),
+            tunnels: pick(self.tunnels, d.tunnels),
         }
     }
 }
@@ -421,6 +438,12 @@ pub struct Config {
     /// SIP-65: calls are carried for an exchange nobody listed, on the
     /// caller's word and a shared conversation.
     pub open_calls: bool,
+    /// SIP-85: connections are carried for members.
+    pub tunnel: bool,
+    /// SIP-85 §Limits: tunnels one member may hold open.
+    pub tunnels_per_member: usize,
+    /// SIP-85 §Limits: bytes per second per tunnel, each direction.
+    pub tunnel_bytes_per_sec: u64,
     /// SIP-56: the rate limits.
     pub limits: crate::limits::Limits,
 }
@@ -638,6 +661,9 @@ impl FileConfig {
                 .filter(|d| !d.is_empty()),
             open_peering: self.open_peering,
             open_calls: self.open_calls,
+            tunnel: self.tunnel,
+            tunnels_per_member: self.tunnels_per_member.unwrap_or(4).max(1) as usize,
+            tunnel_bytes_per_sec: self.tunnel_bytes_per_sec.unwrap_or(2 << 20).max(1),
             limits: self.limits.resolve(),
         })
     }
