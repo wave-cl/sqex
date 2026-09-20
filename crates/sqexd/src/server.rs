@@ -2327,7 +2327,15 @@ async fn route(
     if let Some(me) = account
         && matches!(
             path,
-            "/prekey/publish" | "/wake/register" | "/backup/write" | "/resolve/publish"
+            "/prekey/publish"
+                | "/wake/register"
+                | "/backup/write"
+                | "/resolve/publish"
+                // SIP-81: a device registering or revoking at a former home
+                // would be seen by nobody, since the former home answers the
+                // home's list; it is told where to go instead.
+                | "/device/register"
+                | "/device/revoke"
         )
         && let Some(moved) = server.moved_away(&me)
     {

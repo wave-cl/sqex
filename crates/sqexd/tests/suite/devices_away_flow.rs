@@ -194,6 +194,20 @@ async fn a_former_home_lists_the_devices_the_home_lists() {
         listed_from(&mut alice_at_h, &alice).await,
         (FROM_HERE, sorted(vec![laptop, tablet]))
     );
+    // A device registering at the former home after the Move is told
+    // where to go: nobody would see it here.
+    let (_, late) = identity(98);
+    let n = now();
+    let cred = Credential::issue(&alice_seed, &late, SCOPE_CHAT, n - 1, n + 3600).unwrap();
+    let (code, body) = alice_at_x
+        .post("/device/register", Register { credential: cred }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 403, "{}", common::said(&body));
+    assert_eq!(
+        sqex_proto::refusal::Refusal::decode(&body).unwrap().code,
+        sqex_proto::refusal::Code::Moved
+    );
     // A 0x05 body of the wrong length is malformed, not a 0x03 body.
     let mut bad = ListDevicesFrom { account: alice }.encode();
     bad.push(0);
