@@ -25,15 +25,15 @@ jobs:
           # YubiKey. Native x86_64 Linux installs it; aarch64 Linux via cross
           # would need it inside the cross image, so it is omitted (build from
           # source there). macOS has PCSC built in. The GUI is not packaged.
+          # The Intel macOS build was dropped 2026-09-20 (v0.101.4): the
+          # slowest runner and the longest queue, for a machine nobody here
+          # runs the CLIs on; the exchanges are Linux x86_64.
           - target: x86_64-unknown-linux-gnu
             archive_target: x86_64-linux-gnu
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             archive_target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-apple-darwin
-            archive_target: x86_64-apple-darwin
-            os: macos-15-intel
 
     runs-on: ${{ matrix.os }}
 
@@ -64,6 +64,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # **Read from main, never saved here.** A cache saved by a tag's run is
+      # visible only to that tag, so every release built cold. ci.yml's
+      # `warm` job builds this same profile and target on these runners on
+      # every push to main under this key; `save-if: false` keeps tag runs
+      # from filling the quota with caches nothing can read.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.os }}
+          save-if: false
 
       - name: Build
         run: cargo build --release -p sqexd -p sqex-cli -p sqex-chat -p sqex-voice --target ${{ matrix.target }}

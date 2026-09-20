@@ -50,8 +50,12 @@ tempfile = "3"
 hickory-resolver = { version = "0.26", default-features = false, features = ["dnssec-ring", "system-config", "tokio"] }
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Thin, with the default codegen units. Fat LTO and one unit relinked the four
+# binaries in 63 s against 39 s here (2026-09-20, M-series), for 30 MB against
+# 43 in total; the link is the one step no cache carries, and nothing in an
+# exchange's hot path -- quinn, the ciphers -- crosses a crate boundary that
+# fat LTO would inline.
+lto = "thin"
 strip = true
 
 # Debug info is the bulk of what a test binary carries, and every test target
