@@ -198,6 +198,12 @@ seed_relay_peers = [
 # what its home lists -- whether or not devices of it registered here before
 # it moved -- kept a minute; this exchange's own registry only where the
 # home cannot be asked. Nothing to configure.
+#
+# SIP-84: on an account's Move here, its wake registrations (SIP-45) at each
+# hinted origin are copied and held for the account, so what arrives here
+# wakes its devices before they next connect; an endpoint this exchange's
+# own policy (wake_loopback) would refuse is not held. The former home
+# keeps its own and goes on waking for the channels it orders.
 
 # SIP-76: a device may tell this exchange, as its home, which origin to
 # pull its account's channels from (/account/hint) -- and a create this

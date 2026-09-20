@@ -313,6 +313,9 @@ pub const TYPE_PULL_BACKUP: u8 = 0x15;
 pub const TYPE_PULL_BACKUP_BLOB: u8 = 0x16;
 /// SIP-79: the generation the home stored, for the former home to release.
 pub const TYPE_TOOK_BACKUP: u8 = 0x17;
+/// SIP-84: the home copies an account's wake registrations from its
+/// former home.
+pub const TYPE_PULL_WAKES: u8 = 0x18;
 
 /// `POST /peer/mailbox`: `| type=0x12 | account[32] |`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,6 +555,104 @@ impl TookBackup {
             account: PubKey::new(b[1..33].try_into().unwrap()),
             generation: u64::from_be_bytes(b[33..41].try_into().unwrap()),
         })
+    }
+}
+
+/// `POST /peer/wakes`: `| type=0x18 | account[32] |`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullWakes {
+    pub account: PubKey,
+}
+
+impl PullWakes {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_PULL_WAKES);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<PullWakes> {
+        if b.len() != 33 || b[0] != TYPE_PULL_WAKES {
+            return Err(Error::Malformed("not a wakes pull".into()));
+        }
+        Ok(PullWakes {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// One live registration as the former home holds it: the device, when it
+/// expires, and the endpoint the device gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeRow {
+    pub device: PubKey,
+    pub until: u64,
+    pub endpoint: String,
+}
+
+/// The answer to a wakes pull: `| now: u64 | count: u8 | count × ( device[32]
+/// | until: u64 | ep_len: u16 | endpoint ) |`. At most `MAX_DEVICES + 1`
+/// rows of at most `MAX_ENDPOINT` bytes each; no trailing bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wakes {
+    pub now: u64,
+    pub rows: Vec<WakeRow>,
+}
+
+/// SIP-84: the most registrations one account can have -- its devices and
+/// its own key.
+pub const MAX_WAKE_ROWS: usize = crate::device::MAX_DEVICES + 1;
+
+impl Wakes {
+    pub fn encode(&self) -> Vec<u8> {
+        let n = self.rows.len().min(MAX_WAKE_ROWS);
+        let mut out = Vec::with_capacity(9 + n * 64);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.push(n as u8);
+        for r in &self.rows[..n] {
+            let ep = &r.endpoint.as_bytes()[..r.endpoint.len().min(crate::wake::MAX_ENDPOINT)];
+            out.extend_from_slice(r.device.as_bytes());
+            out.extend_from_slice(&r.until.to_be_bytes());
+            out.extend_from_slice(&(ep.len() as u16).to_be_bytes());
+            out.extend_from_slice(ep);
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Wakes> {
+        let short = || Error::Malformed("wakes cut short".into());
+        let now = u64::from_be_bytes(b.get(0..8).ok_or_else(short)?.try_into().unwrap());
+        let n = *b.get(8).ok_or_else(short)? as usize;
+        if n > MAX_WAKE_ROWS {
+            return Err(Error::Malformed(format!("wakes lists {n} rows")));
+        }
+        let mut o = 9;
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let head = b.get(o..o + 42).ok_or_else(short)?;
+            let device = PubKey::new(head[0..32].try_into().unwrap());
+            let until = u64::from_be_bytes(head[32..40].try_into().unwrap());
+            let len = u16::from_be_bytes(head[40..42].try_into().unwrap()) as usize;
+            if len > crate::wake::MAX_ENDPOINT {
+                return Err(Error::Malformed("a wake endpoint is too long".into()));
+            }
+            o += 42;
+            let ep = b.get(o..o + len).ok_or_else(short)?;
+            let endpoint = std::str::from_utf8(ep)
+                .map_err(|_| Error::Malformed("a wake endpoint is not text".into()))?
+                .to_string();
+            o += len;
+            rows.push(WakeRow {
+                device,
+                until,
+                endpoint,
+            });
+        }
+        if o != b.len() {
+            return Err(Error::Malformed("wakes has trailing bytes".into()));
+        }
+        Ok(Wakes { now, rows })
     }
 }
 
@@ -1949,6 +2050,47 @@ mod wait_tests {
         let mut cut = m.encode();
         cut.truncate(cut.len() - 1);
         assert!(Mail::decode(&cut).is_err());
+    }
+
+    #[test]
+    fn wakes_round_trip() {
+        let account = PubKey::new([5u8; 32]);
+        let p = PullWakes { account };
+        assert_eq!(PullWakes::decode(&p.encode()).unwrap(), p);
+        assert!(PullWakes::decode(&PullBackup { account }.encode()).is_err());
+        let w = Wakes {
+            now: 7,
+            rows: vec![
+                WakeRow {
+                    device: PubKey::new([1u8; 32]),
+                    until: 99,
+                    endpoint: "https://push.example/a".into(),
+                },
+                WakeRow {
+                    device: account,
+                    until: 100,
+                    endpoint: "http://127.0.0.1:9/b".into(),
+                },
+            ],
+        };
+        assert_eq!(Wakes::decode(&w.encode()).unwrap(), w);
+        let empty = Wakes {
+            now: 7,
+            rows: vec![],
+        };
+        assert_eq!(Wakes::decode(&empty.encode()).unwrap(), empty);
+        let mut cut = w.encode();
+        cut.truncate(cut.len() - 1);
+        assert!(Wakes::decode(&cut).is_err());
+        let mut long = w.encode();
+        long.push(0);
+        assert!(
+            Wakes::decode(&long).is_err(),
+            "trailing bytes were admitted"
+        );
+        let mut many = empty.encode();
+        many[8] = (MAX_WAKE_ROWS + 1) as u8;
+        assert!(Wakes::decode(&many).is_err());
     }
 
     #[test]

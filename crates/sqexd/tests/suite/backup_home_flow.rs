@@ -25,7 +25,7 @@ use crate::common;
 
 /// An exchange peering openly, finding `found` without DNS, with `peers`
 /// listed, a home cycle of `home_secs`, and `extra` config appended.
-async fn exchange_in(
+pub(crate) async fn exchange_in(
     dir: &Path,
     listen: SocketAddr,
     domain: &str,
@@ -65,12 +65,12 @@ async fn exchange_in(
     (addr, server_pub)
 }
 
-fn identity(b: u8) -> ([u8; 32], PubKey) {
+pub(crate) fn identity(b: u8) -> ([u8; 32], PubKey) {
     let sk = SigningKey::from_bytes(&[b; 32]);
     (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
 }
 
-fn key_in(dir: &Path) -> (PubKey, [u8; 32]) {
+pub(crate) fn key_in(dir: &Path) -> (PubKey, [u8; 32]) {
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(dir.join("host_key"), hex::encode(server_sk.to_bytes())).unwrap();
     let seed = server_sk.to_bytes();
@@ -78,13 +78,13 @@ fn key_in(dir: &Path) -> (PubKey, [u8; 32]) {
     (PubKey::new(vk.to_bytes()), seed)
 }
 
-fn seed_in(dir: &Path) -> [u8; 32] {
+pub(crate) fn seed_in(dir: &Path) -> [u8; 32] {
     let bytes = std::fs::read_to_string(dir.join("host_key")).unwrap();
     let (sk, _) = squic::load_keypair(&bytes).unwrap();
     sk.to_bytes()
 }
 
-fn free_port() -> SocketAddr {
+pub(crate) fn free_port() -> SocketAddr {
     let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     s.local_addr().unwrap()
 }

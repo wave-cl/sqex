@@ -809,6 +809,69 @@ async fn collect_backup(
     }
 }
 
+/// SIP-84: copy `account`'s wake registrations from `origin` -- its former
+/// home -- so that what arrives here wakes its devices. Held for the
+/// account, since a device that registered there may never have connected
+/// here; a registration the device has made here since stands. Nothing is
+/// taken: the former home goes on waking for the channels it orders. The
+/// hint is marked on any decoded answer, and left for the next cycle on a
+/// failure.
+async fn collect_wakes(
+    client: &mut H3Client,
+    server: &crate::server::Server,
+    origin: &PubKey,
+    account: &PubKey,
+) {
+    use sqex_proto::peer::{PullWakes, Wakes};
+    let wakes = match client
+        .post("/peer/wakes", PullWakes { account: *account }.encode())
+        .await
+    {
+        Ok((200, body)) => match Wakes::decode(&body) {
+            Ok(w) => w,
+            Err(_) => return,
+        },
+        Ok((code, _)) => {
+            tracing::debug!(%origin, %account, code, "the origin did not answer a wakes pull");
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(%origin, %account, error = %e, "a wakes pull failed");
+            return;
+        }
+    };
+    let now = crate::state::now_unix();
+    let mut stored = 0usize;
+    for row in &wakes.rows {
+        if row.until <= now {
+            continue;
+        }
+        let until = row.until.min(now + u64::from(sqex_proto::wake::MAX_TTL));
+        // This home's own policy: the endpoint is where *this* exchange
+        // will post, whatever the former home admitted.
+        if !server.wake_endpoint_ok(&row.endpoint) {
+            tracing::debug!(%origin, %account, device = %row.device,
+                "a collected wake endpoint is not one this exchange posts to");
+            continue;
+        }
+        match server
+            .devices
+            .import_wake(&row.device, account, &row.endpoint, until)
+        {
+            Ok(true) => stored += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!(%origin, %account, error = ?e, "could not hold a collected wake");
+                return;
+            }
+        }
+    }
+    server.devices.mark_wakes_collected(account, origin);
+    if stored > 0 {
+        tracing::info!(%origin, %account, stored, "collected an account's wake registrations from its former home (SIP-84)");
+    }
+}
+
 /// SIP-64: ask the origin for its lineage, verify it back from the key
 /// this replica holds (and the domain, where it holds one), and keep the
 /// predecessors with the origin. An origin from before SIP-64 answers
@@ -1632,6 +1695,9 @@ pub async fn run_homed(
         // SIP-79: likewise the account's backup, once per hinted origin.
         let pending_backup: std::collections::HashSet<(PubKey, PubKey)> =
             server.devices.backup_pending(&me).into_iter().collect();
+        // SIP-84: and its wake registrations, copied once per hinted origin.
+        let pending_wakes: std::collections::HashSet<(PubKey, PubKey)> =
+            server.devices.wakes_pending(&me).into_iter().collect();
         // SIP-71: a fold record points a member homed here at the
         // conversation, beside the hints the accounts gave themselves.
         let mut by_origin = server.devices.homed_here(&me);
@@ -1804,6 +1870,10 @@ pub async fn run_homed(
                 // SIP-79: and its backup, once.
                 if pending_backup.contains(&(*account, origin)) {
                     collect_backup(&mut client, &server, &origin, account).await;
+                }
+                // SIP-84: and where its devices asked to be woken, once.
+                if pending_wakes.contains(&(*account, origin)) {
+                    collect_wakes(&mut client, &server, &origin, account).await;
                 }
             }
             if channels.is_empty() {

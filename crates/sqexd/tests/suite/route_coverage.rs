@@ -447,6 +447,13 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_backup"),
         ReplicationPeer,
     ),
+    // SIP-84: the account's home copies its wake registrations, on the Move.
+    (
+        "POST",
+        "/peer/wakes",
+        Peer("replica::collect_wakes"),
+        ReplicationPeer,
+    ),
     // SIP-71: the lower key's home tells an origin its copy of a direct
     // message is a stray.
     (

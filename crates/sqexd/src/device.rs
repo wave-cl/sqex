@@ -155,7 +155,8 @@ CREATE TABLE IF NOT EXISTS lodged (
     at      INTEGER NOT NULL
 );
 -- SIP-45: where each device asked to be woken, until when, and when it last
--- was. Never served back; a place to post to and nothing else.
+-- was. Served to one party only -- the account's home, on its Move
+-- (SIP-84) -- and otherwise a place to post to and nothing else.
 CREATE TABLE IF NOT EXISTS wake (
     device   BLOB PRIMARY KEY,
     endpoint TEXT NOT NULL,
@@ -244,6 +245,17 @@ impl Registry {
             "backup_collected",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        // SIP-84: whether the account's wake registrations at this origin
+        // were collected, and which account a collected registration is
+        // held for -- a device that registered at the former home and has
+        // not connected here is in no `device` row of ours.
+        add_column(
+            &db,
+            "home_origin",
+            "wakes_collected",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column(&db, "wake", "account", "BLOB")?;
         Ok(Registry { db: Mutex::new(db) })
     }
 
@@ -791,7 +803,7 @@ impl Registry {
             devices.push(*account);
         }
         let mut out = Vec::new();
-        for d in devices {
+        for d in &devices {
             let row: Option<(String, i64)> = db
                 .query_row(
                     "SELECT endpoint, woken FROM wake WHERE device = ?1 AND expires >= ?2",
@@ -802,10 +814,94 @@ impl Registry {
                 .ok()
                 .flatten();
             if let Some((endpoint, woken)) = row {
-                out.push((d, endpoint, woken as u64));
+                out.push((*d, endpoint, woken as u64));
+            }
+        }
+        // SIP-84: and the registrations held for the account -- collected
+        // from its former home for devices that have not connected here.
+        if let Ok(mut st) = db.prepare(
+            "SELECT device, endpoint, woken FROM wake WHERE account = ?1 AND expires >= ?2",
+        ) && let Ok(rows) = st.query_map(params![account.as_bytes(), now as i64], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }) {
+            for (d, endpoint, woken) in rows.filter_map(|r| r.ok()) {
+                if let Ok(b) = <[u8; 32]>::try_from(d) {
+                    let d = PubKey::new(b);
+                    if !out.iter().any(|(k, _, _)| *k == d) {
+                        out.push((d, endpoint, woken as u64));
+                    }
+                }
             }
         }
         out
+    }
+
+    /// SIP-84: the live registrations of `account`'s devices and of the
+    /// account key itself, for its home to copy.
+    pub fn wakes_of(&self, account: &PubKey) -> Vec<(PubKey, String, u64)> {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        let mut devices: Vec<PubKey> = db
+            .prepare("SELECT device FROM device WHERE account = ?1 AND not_after >= ?2")
+            .ok()
+            .and_then(|mut st| {
+                st.query_map(params![account.as_bytes(), now as i64], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })
+                .ok()
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .filter_map(|b| b.try_into().ok().map(PubKey::new))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        devices.push(*account);
+        let mut out = Vec::new();
+        for d in devices {
+            let row: Option<(String, i64)> = db
+                .query_row(
+                    "SELECT endpoint, expires FROM wake WHERE device = ?1 AND expires >= ?2",
+                    params![d.as_bytes(), now as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if let Some((endpoint, expires)) = row {
+                out.push((d, endpoint, expires as u64));
+            }
+        }
+        out
+    }
+
+    /// SIP-84: hold a registration collected from the account's former home.
+    /// A registration the device already made here stands: `false`.
+    pub fn import_wake(
+        &self,
+        device: &PubKey,
+        account: &PubKey,
+        endpoint: &str,
+        until: u64,
+    ) -> Result<bool, DeviceError> {
+        let db = self.db.lock().unwrap();
+        let n = db
+            .execute(
+                "INSERT OR IGNORE INTO wake (device, account, endpoint, expires, woken)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![
+                    device.as_bytes(),
+                    account.as_bytes(),
+                    endpoint,
+                    until as i64
+                ],
+            )
+            .map_err(storage("import wake"))?;
+        Ok(n > 0)
     }
 
     /// SIP-45: note that `device` was just woken.
@@ -1204,6 +1300,45 @@ impl Registry {
         let db = self.db.lock().unwrap();
         let _ = db.execute(
             "UPDATE home_origin SET backup_collected = 1 WHERE account = ?1 AND origin = ?2",
+            params![account.as_bytes(), origin.as_bytes()],
+        );
+    }
+
+    /// SIP-84: the (account, origin) hints of accounts homed here whose wake
+    /// registrations at that origin have not been collected yet.
+    pub fn wakes_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey)> {
+        let db = self.db.lock().unwrap();
+        db.prepare(
+            "SELECT o.account, o.origin FROM home_origin o
+             JOIN home h ON h.account = o.account
+             WHERE h.home = ?1 AND o.wakes_collected = 0",
+        )
+        .ok()
+        .and_then(|mut st| {
+            st.query_map(params![me.as_bytes()], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .ok()
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .filter_map(|(a, o)| {
+                        Some((
+                            PubKey::new(a.try_into().ok()?),
+                            PubKey::new(o.try_into().ok()?),
+                        ))
+                    })
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+    }
+
+    /// SIP-84: the account's wake registrations at `origin` were collected,
+    /// or the origin answered it holds none.
+    pub fn mark_wakes_collected(&self, account: &PubKey, origin: &PubKey) {
+        let db = self.db.lock().unwrap();
+        let _ = db.execute(
+            "UPDATE home_origin SET wakes_collected = 1 WHERE account = ?1 AND origin = ?2",
             params![account.as_bytes(), origin.as_bytes()],
         );
     }

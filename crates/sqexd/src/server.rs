@@ -70,7 +70,7 @@ use sqex_proto::peer::{
     Carried, Changed, Forward as PeerForward, ForwardAction, Forwarded, Hello as PeerHello, Hi,
     Mine, PEER_VERSION, PeerFolded, PeerInvited, PeerMoved, PeerWait, Pull as PeerPull, PullBackup,
     PullBackupBlob, PullBlob, PullEnvelopes, PullMail, PullMine, PullRecord, PullShape,
-    PullStanding, TookBackup, TookMail,
+    PullStanding, PullWakes, TookBackup, TookMail, WakeRow, Wakes,
 };
 use sqex_proto::prekey::{Publish as PrekeyPublish, Take as PrekeyTake};
 use sqex_proto::profile::{
@@ -1034,6 +1034,12 @@ impl Server {
             return Ok((FROM_STALE, self.devices.list(account)?));
         }
         Ok((FROM_HERE, self.devices.list(account)?))
+    }
+
+    /// SIP-84: whether this exchange would post to `endpoint` -- its own
+    /// policy, applied to a registration collected from a former home.
+    pub(crate) fn wake_endpoint_ok(&self, endpoint: &str) -> bool {
+        sqex_proto::wake::acceptable(endpoint, self.wake_loopback)
     }
 
     /// SIP-80: forget unfound origins not in `keep` -- the ones no account
@@ -4437,6 +4443,39 @@ async fn route(
                     200,
                     "application/octet-stream",
                     ChannelAck { now: now_unix() }.encode(),
+                )
+            }
+            _ => peering_refused(),
+        },
+        // SIP-84: the account's home copies its wake registrations, gated
+        // as the mailbox is. Nothing is removed: a former home goes on
+        // waking for the channels it still orders.
+        ("POST", "/peer/wakes") => match (peer.identity, PullWakes::decode(body)) {
+            (Some(who), Ok(req))
+                if server.peering(&who).is_some()
+                    && server
+                        .devices
+                        .home_of(&req.account)
+                        .is_some_and(|(h, _, _)| h == who) =>
+            {
+                let rows = server
+                    .devices
+                    .wakes_of(&req.account)
+                    .into_iter()
+                    .map(|(device, endpoint, until)| WakeRow {
+                        device,
+                        until,
+                        endpoint,
+                    })
+                    .collect();
+                (
+                    200,
+                    "application/octet-stream",
+                    Wakes {
+                        now: now_unix(),
+                        rows,
+                    }
+                    .encode(),
                 )
             }
             _ => peering_refused(),

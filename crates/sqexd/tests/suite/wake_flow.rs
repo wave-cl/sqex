@@ -54,12 +54,12 @@ fn identity(b: u8) -> ([u8; 32], PubKey) {
 
 /// A push distributor, as far as an exchange can tell: something that takes
 /// a POST on loopback and remembers what arrived. Answers `status`.
-struct Distributor {
-    url: String,
+pub(crate) struct Distributor {
+    pub(crate) url: String,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-async fn distributor(status: u16) -> Distributor {
+pub(crate) async fn distributor(status: u16) -> Distributor {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
@@ -117,7 +117,7 @@ async fn distributor(status: u16) -> Distributor {
     }
 }
 
-async fn wakes_within(d: &Distributor, n: usize, secs: u64) -> bool {
+pub(crate) async fn wakes_within(d: &Distributor, n: usize, secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     while tokio::time::Instant::now() < deadline {
         if d.bodies.lock().unwrap().len() >= n {
