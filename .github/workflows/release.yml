@@ -47,11 +47,13 @@ jobs:
               echo "no CI run for ${sha} yet (${i})"; sleep 20; continue
             fi
             # "<checks> <passed> <failed>": every non-warm job, those that
-            # concluded success, those that concluded anything worse.
+            # concluded success, those that *completed* with anything worse
+            # -- a running job reports an empty conclusion, not a null one,
+            # and the first version of this read that as a failure.
             read -r checks passed failed <<EOF
           $(gh run view --repo "${GITHUB_REPOSITORY}" "${run}" --json jobs --jq '
               [.jobs[] | select(.name | startswith("warm") | not)]
-              | "\(length) \(map(select(.conclusion == "success")) | length) \(map(select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped")) | length)"')
+              | "\(length) \(map(select(.conclusion == "success")) | length) \(map(select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")) | length)"')
           EOF
             if [ "${failed:-0}" -gt 0 ]; then
               echo "::error::CI failed for ${sha} (${failed} of ${checks} checks); not releasing" >&2; exit 1
