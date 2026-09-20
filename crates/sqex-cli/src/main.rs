@@ -1226,7 +1226,7 @@ async fn meet(cli: &Cli, cfg: &Config, peer: &str, wait: u16, dry_run: bool) -> 
             println!("no introduction: both sides must ask, and this one has not completed");
             return Ok(());
         }
-        // SIP-69. Both asked, so saying so discloses nothing that being
+        // SIP-25 §Both asked, and share no family. Both asked, so saying so discloses nothing that being
         // introduced would not have.
         direct::Meeting::NoSharedFamily(learned) => {
             println!("no introduction: {}", learned.why());

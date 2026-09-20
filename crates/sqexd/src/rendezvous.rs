@@ -38,7 +38,7 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
-/// SIP-69: which address family a request was made over.
+/// SIP-25 §The family of a request is the family it arrived over: which address family a request was made over.
 ///
 /// **Observed, never asserted** -- it is the family of the address the
 /// exchange saw the request arrive from, which is SIP-25's rule for the
@@ -78,7 +78,7 @@ struct Asked {
 /// Who has asked to meet whom.
 #[derive(Default)]
 pub struct Rendezvous {
-    /// Keyed by the family as well as the pair (SIP-69): a party reachable on
+    /// Keyed by the family as well as the pair (SIP-25 §Offering more than one family): a party reachable on
     /// more than one offers each by asking over it, and a pair is introduced
     /// only on a family both offered.
     asked: Mutex<HashMap<(PubKey, PubKey, Family), Asked>>,
@@ -140,7 +140,7 @@ impl Rendezvous {
         // Nothing about this request creates it, which is what "genuinely
         // independent" means in SIP-25's reflection argument.
         let Some(theirs) = asked.get(&(*peer, *asker, family)).copied() else {
-            // SIP-69: both asked and share no family, or the peer has not
+            // SIP-25 §Both asked, and share no family: both asked and share no family, or the peer has not
             // asked at all. The two are different answers and only the first
             // may be disclosed -- and it may, because a party that has asked
             // has consented, which is the same gate `Ready` passes.
@@ -195,7 +195,7 @@ impl Rendezvous {
                 now,
             },
             _ => {
-                // SIP-69, as in `request`: both asked but on no common family.
+                // SIP-25 §Both asked, and share no family, as in `request`: both asked but on no common family.
                 let elsewhere = [Family::V4, Family::V6]
                     .into_iter()
                     .filter(|f| *f != family)
@@ -225,7 +225,7 @@ impl Rendezvous {
         let addr = canonical(addr);
         let family = Family::of(addr);
         let first = self.request(asker, addr, peer);
-        // SIP-69: a pair that shares no family is settled, not pending. Waiting
+        // SIP-25 §Both asked, and share no family: a pair that shares no family is settled, not pending. Waiting
         // on it is the wasted attempt this document exists to remove; a caller
         // reachable on another family asks again over that one.
         if !matches!(first.answer, sqex_proto::rendezvous::Answer::Waiting) || wait_secs == 0 {
@@ -304,7 +304,7 @@ mod tests {
         SocketAddr::from(([0x20, 0x01, 0, 0, 0, 0, 0, 1], 5400))
     }
 
-    /// SIP-69: both asked, each over a family the other is not on, so neither
+    /// SIP-25 §Both asked, and share no family: both asked, each over a family the other is not on, so neither
     /// could dial the other. Told so rather than left to wait and then blame
     /// a NAT, and told only because both asked.
     #[test]
@@ -405,7 +405,7 @@ mod tests {
     }
 
     /// A mapped IPv4 party and a real IPv6 party still share no family: the
-    /// fix must not collapse the distinction SIP-69 exists to draw.
+    /// fix must not collapse the distinction SIP-25 §Address families exists to draw.
     #[test]
     fn a_mapped_ipv4_party_and_a_real_ipv6_party_share_no_family() {
         let r = Rendezvous::default();

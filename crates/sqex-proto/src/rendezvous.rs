@@ -31,7 +31,7 @@ use sqnr_core::{Error, PubKey, Result};
 
 pub const TYPE_INTRODUCE: u8 = 0x01;
 
-/// SIP-69: the same request from a caller that understands
+/// SIP-25 §Asking for the third answer: the same request from a caller that understands
 /// [`Answer::NoSharedFamily`]. A SIP-25 caller sends [`TYPE_INTRODUCE`] and
 /// is never told it -- where the families do not meet it is answered with the
 /// same waiting it would have received had the peer not asked at all.
@@ -57,9 +57,9 @@ pub struct Introduce {
     pub peer: PubKey,
     /// How long to hold the request open waiting for the other side.
     pub wait_secs: u16,
-    /// SIP-69: whether this caller can be told the two share no address
+    /// SIP-25 §Both asked, and share no family: whether this caller can be told the two share no address
     /// family. Sent as the type byte, so an exchange that does not implement
-    /// SIP-69 refuses it as malformed and the caller falls back.
+    /// SIP-25 §Asking for the third answer refuses it as malformed and the caller falls back.
     pub family_aware: bool,
 }
 
@@ -120,7 +120,7 @@ pub enum Answer {
     Waiting = 0,
     /// Both asked, on a family they share. The address is the peer's.
     Ready = 1,
-    /// SIP-69: both asked, and they share no address family, so neither could
+    /// SIP-25 §Both asked, and share no family: both asked, and they share no address family, so neither could
     /// dial the other. Served **only when both have asked**, which is what
     /// makes it safe: it tells a party who has consented by asking something
     /// about a party who has consented by asking.
@@ -155,7 +155,7 @@ impl Introduced {
         }
     }
 
-    /// SIP-69: both asked, and no family is common to them.
+    /// SIP-25 §Both asked, and share no family: both asked, and no family is common to them.
     pub fn no_shared_family(now: u64) -> Introduced {
         Introduced {
             answer: Answer::NoSharedFamily,
@@ -244,7 +244,7 @@ mod tests {
         PubKey::new([b; 32])
     }
 
-    /// SIP-69 rides on the type byte, so an exchange that predates it refuses
+    /// SIP-25 §Asking for the third answer rides on the type byte, so an exchange that predates it refuses
     /// the request as malformed -- which is how a caller discovers it and
     /// falls back rather than being silently misunderstood.
     #[test]

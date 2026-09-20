@@ -43,14 +43,14 @@ pub async fn connect(
     {
         Meeting::Introduced(intro) => intro,
         Meeting::NobodyAsked => return Ok(None),
-        // SIP-69. An `Err` rather than `Ok(None)`, because there is something
+        // SIP-25 §Address families. An `Err` rather than `Ok(None)`, because there is something
         // to report: `Ok(None)` is SIP-25's silence, which says nothing about
         // whether the peer asked, and this says they did and why it cannot
         // work. The words matter -- what this used to produce was a report
         // that symmetric NAT had defeated the punch, which sends whoever
         // reads it to look at a NAT that was never the problem.
         // Which side found it out is in the words: only the exchange's
-        // answer proves SIP-69's server half ran, and a reader cannot infer
+        // answer proves the exchange's half of SIP-25 §Address families ran, and a reader cannot infer
         // that from a sentence both paths share.
         Meeting::NoSharedFamily(learned) => return Err(learned.why().into()),
     };

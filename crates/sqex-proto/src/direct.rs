@@ -75,15 +75,15 @@ pub const UNREACHABLE: &str = "no direct connection: this needs endpoint-indepen
                                mapping at both ends, and symmetric NAT allocates a fresh \
                                external port per destination";
 
-/// SIP-69: said instead of [`UNREACHABLE`] when the two never had a path to
+/// SIP-25 §Address families: said instead of [`UNREACHABLE`] when the two never had a path to
 /// try. The distinction is the point -- one is a punch that failed and the
 /// other is a punch that could not be attempted, and blaming the NAT for the
 /// second sends whoever reads it to look in the wrong place.
 ///
-/// There are two of these because SIP-69 reaches the same conclusion in two
+/// There are two of these because SIP-25 §Address families reaches the same conclusion in two
 /// places, and they are **not the same finding**. A live run on 2026-09-18
 /// could not tell which had fired, because both said one sentence: the
-/// exchange's half of SIP-69 could not be shown to have run at all, and the
+/// exchange's half of SIP-25 §Address families could not be shown to have run at all, and the
 /// timestamps on two devices were half a second apart with no shared clock
 /// to order them by. Whoever reads a log should not have to infer this.
 ///
@@ -95,9 +95,9 @@ pub const NO_SHARED_FAMILY_BY_EXCHANGE: &str = "no direct connection: the exchan
      not the NAT";
 
 /// The other half: an exchange introduced the two and disclosed an address
-/// this host has no route to. SIP-69's compatibility rule -- an exchange is
+/// this host has no route to. The compatibility rule of SIP-25 §Asking for the third answer -- an exchange is
 /// not the authority on what a client's network can reach -- and the only
-/// answer available from an exchange predating SIP-69.
+/// answer available from an exchange from before sqex 0.88.0 (SIP-25 §Address families).
 pub const NO_SHARED_FAMILY_IN_THE_ADDRESS: &str = "no direct connection: the exchange offered an address on an address family this device \
      has no route to, so there was nothing to dial. This is the network, not the NAT";
 
@@ -105,7 +105,7 @@ pub const NO_SHARED_FAMILY_IN_THE_ADDRESS: &str = "no direct connection: the exc
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Learned {
     /// The exchange answered `ready = 2`. Nothing else produces this, so a
-    /// log carrying it **is** the evidence that SIP-69's server half ran.
+    /// log carrying it **is** the evidence that the exchange's half of SIP-25 §Address families ran.
     FromExchange,
     /// We were introduced and refused the address ourselves.
     FromTheAddress,
@@ -156,7 +156,7 @@ pub enum Meeting {
     /// The wait ended without the peer asking. Nothing is said about whether
     /// they asked at all, which is SIP-25's rule, and nothing was disclosed.
     NobodyAsked,
-    /// SIP-69: both asked, and the two are on networks with no address family
+    /// SIP-25 §Both asked, and share no family: both asked, and the two are on networks with no address family
     /// in common, so neither could dial the other. Carries which side worked
     /// that out, because the two are different findings and a log that cannot
     /// separate them cannot show the exchange's half ran.
@@ -190,11 +190,11 @@ async fn wait_until_free(addr: SocketAddr, within: Duration) -> bool {
     }
 }
 
-/// SIP-69: whether an address the exchange disclosed is one this side could
+/// SIP-25 §Address families: whether an address the exchange disclosed is one this side could
 /// dial from the port it asked over.
 ///
 /// **Checked whatever the exchange said.** An exchange is not the authority
-/// on what this machine's network can reach, and one that predates SIP-69
+/// on what this machine's network can reach, and one from before sqex 0.88.0 (SIP-25 §Asking for the third answer)
 /// pairs on identity alone -- it will hand over an address of any family.
 /// Dialling one there is no route to fails inside the transport, which
 /// reports it as a punch that did not work and sends whoever reads that to
@@ -211,7 +211,7 @@ fn dialable_from(ours: SocketAddr, theirs: SocketAddr) -> bool {
 /// the desktop holding no IPv6 address at all, both ends still reported that
 /// they had reached the exchange on different families and fell back to the
 /// relay. The families were the same; only the spelling differed, and every
-/// comparison in SIP-69 was made on the spelling.
+/// comparison in SIP-25 §The family of a request is the family it arrived over was made on the spelling.
 ///
 /// Canonicalising here rather than only at the exchange is deliberate: an
 /// exchange that has not been redeployed still discloses the mapped form,
@@ -478,7 +478,7 @@ mod tests {
         assert!(dialable_from(mapped, mapped));
 
         // And a genuine IPv6 peer is still another family, which is the
-        // distinction SIP-69 exists to draw.
+        // distinction SIP-25 §Address families exists to draw.
         assert!(!dialable_from(plain, real_v6));
         assert!(!dialable_from(mapped, real_v6));
         assert!(dialable_from(real_v6, real_v6));
@@ -502,7 +502,7 @@ mod tests {
         );
     }
 
-    /// The two ways SIP-69 reaches its conclusion say different things, and
+    /// The two ways SIP-25 §Address families reaches its conclusion say different things, and
     /// a reader can tell which fired. This is the whole of the change: on
     /// 2026-09-18 a live run produced this message on both devices and
     /// nothing in either log said whether the exchange had refused the pair
@@ -534,7 +534,7 @@ mod tests {
         }
     }
 
-    /// SIP-69: an address of the other family is not one this side can dial,
+    /// SIP-25 §Both asked, and share no family: an address of the other family is not one this side can dial,
     /// whatever the exchange said about it.
     #[test]
     fn an_address_of_the_other_family_is_not_dialable() {

@@ -2446,7 +2446,7 @@ async fn route(
                         .wait(&me, peer.addr, &req.peer, req.wait_secs)
                         .await
                 };
-                // SIP-69: a caller that sent SIP-25's type byte is never told
+                // SIP-25 §Asking for the third answer: a caller that sent the `0x01` type byte is never told
                 // the two share no family. It receives the same waiting it
                 // would have had if the peer had not asked -- which is what it
                 // already knows how to read, and discloses no more than SIP-25
