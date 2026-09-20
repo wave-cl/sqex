@@ -55,6 +55,7 @@ mod open_peering_flow;
 mod open_room_flow;
 mod private_channel_flow;
 mod profile_flow;
+mod pulled_wake_flow;
 mod reaching_flow;
 mod receipt_flow;
 mod refusal_flow;

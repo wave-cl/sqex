@@ -623,6 +623,24 @@ pub async fn pull_once_from(
             pull_blobs(client, store, channel).await;
             pull_profiles(client, server, store, channel).await;
         }
+        // SIP-35 §What a copy tells its members: what was stored is told of
+        // as an entry ordered here would be -- the SIP-30 event on the
+        // members' streams and the SIP-45 wake to their devices that are
+        // not listening. After the envelopes and blobs, so a device woken
+        // finds something it can read. `store_pulled` poked the long poll
+        // already; `tell` poking it again costs nothing. Before this the
+        // copy was a copy only to a client that polled: a phone asleep with
+        // its registration at its home was never told of a post at a room
+        // the home merely copies.
+        if took.stored > 0 {
+            server.tell(
+                channel,
+                sqex_proto::events::Event::Channel {
+                    channel: *channel,
+                    last_seq: store.last_seq(channel),
+                },
+            );
+        }
         all.insert(*channel, took);
     }
     Ok(all)

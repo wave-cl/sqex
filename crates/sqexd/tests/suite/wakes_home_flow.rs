@@ -27,7 +27,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-async fn enrol(c: &mut Client, account_seed: &[u8; 32], device: &PubKey) {
+pub(crate) async fn enrol(c: &mut Client, account_seed: &[u8; 32], device: &PubKey) {
     let n = now();
     let credential = Credential::issue(account_seed, device, SCOPE_CHAT, n - 1, n + 3600).unwrap();
     let (code, body) = c
@@ -37,7 +37,7 @@ async fn enrol(c: &mut Client, account_seed: &[u8; 32], device: &PubKey) {
     assert_eq!(code, 200, "{}", common::said(&body));
 }
 
-async fn register_wake(c: &mut Client, d: &Distributor) -> u16 {
+pub(crate) async fn register_wake(c: &mut Client, d: &Distributor) -> u16 {
     let (code, _) = c
         .post(
             "/wake/register",
@@ -52,7 +52,7 @@ async fn register_wake(c: &mut Client, d: &Distributor) -> u16 {
     code
 }
 
-async fn move_to(
+pub(crate) async fn move_to(
     c: &mut Client,
     seed: &[u8; 32],
     home: &PubKey,
@@ -77,7 +77,7 @@ async fn move_to(
 
 /// A public room by `owner` with `member` in it, and one post -- the
 /// event that wakes `member`'s devices at this exchange.
-async fn room_and_post(
+pub(crate) async fn room_and_post(
     c: &mut Client,
     owner_seed: [u8; 32],
     owner: PubKey,
