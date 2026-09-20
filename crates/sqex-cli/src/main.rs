@@ -2860,9 +2860,16 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
     // and the first should stop growing, and an operator who could only see
     // uptime had no way to tell whether that was happening.
     println!(
-        "  {} requests · {} event stream(s) open",
+        "  {} requests · {} event stream(s) open · mailbox {}",
         v["requests"].as_u64().unwrap_or(0),
         v["event_streams"].as_u64().unwrap_or(0),
+        // SIP-5 §Durability: a memory-only deployment loses every waiting
+        // item on restart, and says so here rather than in the loss.
+        match v["mailbox_durable"].as_bool() {
+            Some(true) => "durable",
+            Some(false) => "MEMORY ONLY",
+            None => "(not reported)",
+        },
     );
     // The SIP-29 retirement question, in the only form that can answer it:
     // which envelope versions this exchange accepts, and which ones callers
