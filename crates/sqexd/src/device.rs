@@ -603,13 +603,13 @@ impl Registry {
             params![account.as_bytes()],
         )
         .map_err(storage("clear lodged"))?;
-        // SIP-62: the account's home records follow the key here too.
+        // SIP-44 §The handover: the account's home records follow the key here too.
         follow_succession(&tx, account, successor)?;
         tx.commit().map_err(storage("commit succeed"))?;
         Ok(())
     }
 
-    /// SIP-62: a succession by the account's own hand, with the devices it
+    /// SIP-44 §The handover: a succession by the account's own hand, with the devices it
     /// keeps registered to the successor under the credentials the new key
     /// signed -- in the one transaction, so no request in between finds
     /// a device that belongs to nobody. The credentials are verified by
@@ -687,7 +687,7 @@ impl Registry {
         Ok(())
     }
 
-    /// SIP-62: re-key what this exchange holds of an account under SIP-59
+    /// SIP-44 §The handover: re-key what this exchange holds of an account under SIP-59
     /// and SIP-60 -- its Move, its origin hints, a learned home -- to its
     /// successor, the Move's signature cleared. At an origin or a copy,
     /// on a succession learned from the log.
@@ -696,9 +696,9 @@ impl Registry {
         let _ = follow_succession(&db, account, successor);
     }
 
-    /// SIP-64 §Following: an exchange this registry holds a key for rotated. Every
+    /// SIP-40 §Following: an exchange this registry holds a key for rotated. Every
     /// holding of `from` becomes one of `to`: an account's signed home
-    /// **with its signature cleared** (the account named `from`; SIP-62's
+    /// **with its signature cleared** (the account named `from`; SIP-44 §The handover's
     /// shape for a record the exchange acts on and does not vouch for),
     /// the origin hints, the learned homes. How many rows moved.
     pub fn follow_exchange(&self, from: &PubKey, to: &PubKey) -> usize {
@@ -1003,7 +1003,7 @@ impl Registry {
         if let Some(issued) = held
             && mv.issued <= issued as u64
         {
-            // SIP-62: a record re-keyed by a handover carries no signature
+            // SIP-44 §The handover: a record re-keyed by a handover carries no signature
             // and is replaced by any Move the new key signs.
             let cleared: bool = tx
                 .query_row(
@@ -1051,7 +1051,7 @@ impl Registry {
     /// SIP-59: the home on record for an account -- key, domain hint,
     /// `issued` -- if a Move was ever presented here.
     ///
-    /// SIP-62: a record re-keyed by a handover has its signature cleared
+    /// SIP-44 §The handover: a record re-keyed by a handover has its signature cleared
     /// and answers `since = 0`, so the successor's client signs a fresh
     /// Move; the record still says where the account lives.
     pub fn home_of(&self, account: &PubKey) -> Option<(PubKey, String, u64)> {
@@ -1074,7 +1074,7 @@ impl Registry {
     }
 
     /// SIP-59: the Move on record, as presented, for carrying on. `None`
-    /// for a record a handover re-keyed (SIP-62): the exchange acts on it
+    /// for a record a handover re-keyed (SIP-44 §The handover): the exchange acts on it
     /// and does not carry it, until the new key has signed one.
     pub fn move_of(&self, account: &PubKey) -> Option<(sqex_proto::home::Move, String)> {
         let db = self.db.lock().unwrap();
@@ -1107,7 +1107,7 @@ impl Registry {
             .map(|(home, domain, _)| (home, domain))
     }
 
-    /// SIP-63: the recorded homes of `accounts`, other than `me` -- what a
+    /// SIP-35 §Open peering: the recorded homes of `accounts`, other than `me` -- what a
     /// transport whitelist admits because of the accounts that chose them,
     /// as SIP-47 admits their devices. A record a handover re-keyed still
     /// names the home and still counts; a later Move naming `me` ends it.
@@ -1391,7 +1391,7 @@ impl Registry {
     }
 }
 
-/// SIP-62: the home records of `account` become `successor`'s, the Move's
+/// SIP-44 §The handover: the home records of `account` become `successor`'s, the Move's
 /// signature cleared (it was the old key's). The successor's own rows, if
 /// it has any, stand -- a fresh key has none.
 fn follow_succession(

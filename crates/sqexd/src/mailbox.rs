@@ -266,7 +266,7 @@ impl Mailbox {
         Ok(true)
     }
 
-    /// SIP-70: the messages waiting for any of `recipients` -- a device's
+    /// SIP-5 §Collection by a device: the messages waiting for any of `recipients` -- a device's
     /// own and its account's -- together, oldest first by arrival.
     pub fn list_for(&self, recipients: &[PubKey]) -> Listing {
         let now = now_unix();
@@ -293,12 +293,12 @@ impl Mailbox {
         Listing { entries, now }
     }
 
-    /// SIP-70: [`Self::fetch`] for whichever of `recipients` the item is for.
+    /// SIP-5 §Collection by a device: [`Self::fetch`] for whichever of `recipients` the item is for.
     pub fn fetch_for(&self, recipients: &[PubKey], id: u64) -> Option<(PubKey, u64, Sealed)> {
         recipients.iter().find_map(|r| self.fetch(r, id))
     }
 
-    /// SIP-70: [`Self::delete`] for whichever of `recipients` the item is for.
+    /// SIP-5 §Collection by a device: [`Self::delete`] for whichever of `recipients` the item is for.
     pub fn delete_for(&self, recipients: &[PubKey], id: u64) -> bool {
         recipients.iter().any(|r| self.delete(r, id))
     }

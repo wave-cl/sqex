@@ -35,13 +35,13 @@ pub const TYPE_ENTRIES: u8 = 0x04;
 pub const TYPE_KEYS: u8 = 0x05;
 pub const TYPE_BLOB: u8 = 0x06;
 pub const TYPE_DONE: u8 = 0x07;
-/// SIP-62 §Entrusting the key: the account's key, entrusted to a sibling.
+/// SIP-44 §Entrusting the key: the account's key, entrusted to a sibling.
 pub const TYPE_KEY: u8 = 0x08;
-/// SIP-72: the ended incarnations this side keeps, offered before `Have`.
+/// SIP-42 §Generations: the ended incarnations this side keeps, offered before `Have`.
 pub const TYPE_EARLIER: u8 = 0x09;
-/// SIP-72: which of those are wanted, sent before `Want`.
+/// SIP-42 §Generations: which of those are wanted, sent before `Want`.
 pub const TYPE_WANT_EARLIER: u8 = 0x0a;
-/// SIP-72: a generation's keys, named for the incarnation they belong to.
+/// SIP-42 §Generations: a generation's keys, named for the incarnation they belong to.
 pub const TYPE_KEYS_OF: u8 = 0x0b;
 
 /// Entries per page, as SIP-35's pull.
@@ -90,15 +90,15 @@ pub enum Message {
         bytes: Vec<u8>,
     },
     Done,
-    /// SIP-62 §Entrusting the key: the account's Ed25519 seed, given to a sibling the person
+    /// SIP-44 §Entrusting the key: the account's Ed25519 seed, given to a sibling the person
     /// named on the device that holds it. In the clear inside the sealed
     /// frame, as the epoch keys are.
     Key([u8; 32]),
-    /// SIP-72: the ended incarnations this side keeps, one row each.
+    /// SIP-42 §Generations: the ended incarnations this side keeps, one row each.
     Earlier(Vec<Generation>),
-    /// SIP-72: `(channel, instance, since)` for each generation wanted.
+    /// SIP-42 §Generations: `(channel, instance, since)` for each generation wanted.
     WantEarlier(Vec<([u8; 32], [u8; 32], u64)>),
-    /// SIP-72: a generation's keys.
+    /// SIP-42 §Generations: a generation's keys.
     KeysOf {
         channel: [u8; 32],
         instance: [u8; 32],
@@ -418,7 +418,7 @@ pub struct Progress {
 }
 
 /// One thing owed to the sibling: a channel from a position, of the live
-/// incarnation or (SIP-72) of a generation this side keeps.
+/// incarnation or (SIP-42 §Generations) of a generation this side keeps.
 #[derive(Debug, Clone, Copy)]
 struct Owed {
     channel: [u8; 32],
@@ -449,25 +449,25 @@ pub struct Sync {
     inbox: Vec<u8>,
 
     /// What we owe them: channels they wanted, with where they had got to
-    /// -- and, SIP-72, which generation where it is not the live one.
+    /// -- and, SIP-42 §Generations, which generation where it is not the live one.
     owed: VecDeque<Owed>,
     /// Channels (and generations) we have sent keys for this session.
     keyed: HashSet<([u8; 32], Option<u64>)>,
-    /// SIP-72: the generations the sibling offered, by (channel, instance).
+    /// SIP-42 §Generations: the generations the sibling offered, by (channel, instance).
     offered: HashMap<([u8; 32], [u8; 32]), Generation>,
-    /// SIP-72: the generations this side asked for, with the origin each
+    /// SIP-42 §Generations: the generations this side asked for, with the origin each
     /// verifies under -- the only incarnations `Entries` may name besides
     /// the live one.
     asked: HashMap<([u8; 32], [u8; 32]), PubKey>,
     got_have: bool,
     got_want: bool,
     sent_done: bool,
-    /// SIP-62 §Entrusting the key: the account key to give this sibling once admitted, because
+    /// SIP-44 §Entrusting the key: the account key to give this sibling once admitted, because
     /// the person said so on this device. Taken when sent.
     entrust: Option<[u8; 32]>,
-    /// SIP-62 §Entrusting the key: whether this side was given the key this session.
+    /// SIP-44 §Entrusting the key: whether this side was given the key this session.
     pub entrusted: bool,
-    /// SIP-62 §Entrusting the key: whether this side gave the key this session -- sent once the
+    /// SIP-44 §Entrusting the key: whether this side gave the key this session -- sent once the
     /// sibling was admitted, whatever the history trade did afterwards.
     pub gave_key: bool,
     got_done: bool,
@@ -514,7 +514,7 @@ impl Sync {
         self.phase
     }
 
-    /// SIP-62 §Entrusting the key: give this sibling the account key, once its `Hello` has
+    /// SIP-44 §Entrusting the key: give this sibling the account key, once its `Hello` has
     /// been verified. The person asked for it on this device; a sibling
     /// cannot ask.
     pub fn entrusting(mut self, seed: [u8; 32]) -> Sync {
@@ -686,12 +686,12 @@ impl Sync {
                     }
                 }
                 // Admitted: say what we hold -- and, where the person said
-                // so here, give them the key (SIP-62 §Entrusting the key).
+                // so here, give them the key (SIP-44 §Entrusting the key).
                 if let Some(seed) = self.entrust.take() {
                     self.queue(&Message::Key(seed))?;
                     self.gave_key = true;
                 }
-                // SIP-72: the ended incarnations this side keeps, before
+                // SIP-42 §Generations: the ended incarnations this side keeps, before
                 // `Have`, so the sibling has them in hand when it wants.
                 let earlier = chat.held_generations()?;
                 if !earlier.is_empty() {
@@ -735,7 +735,7 @@ impl Sync {
                         wants.push((h.channel, since));
                     }
                 }
-                // SIP-72: of the generations offered, the ones this side
+                // SIP-42 §Generations: of the generations offered, the ones this side
                 // lacks -- not one it holds live (its next poll settles
                 // that), not one under an origin it does not know -- sent
                 // before `Want`, so `Want` still closes the list.
@@ -850,7 +850,7 @@ impl Sync {
                 instance,
                 entries,
             } if self.asked.contains_key(&(channel, instance)) => {
-                // SIP-72: a generation this side asked for, verified under
+                // SIP-42 §Generations: a generation this side asked for, verified under
                 // the origin the sibling named and this side knows.
                 let origin = self.asked[&(channel, instance)];
                 let generation = chat.store().generation_of(&channel, &instance)?;
@@ -951,7 +951,7 @@ impl Sync {
             Message::Done => {
                 self.got_done = true;
             }
-            // SIP-62 §Entrusting the key: the account key from a verified sibling. Kept only
+            // SIP-44 §Entrusting the key: the account key from a verified sibling. Kept only
             // where it is this account's; anything else ends the session.
             Message::Key(seed) => {
                 let public = PubKey::new(
@@ -974,7 +974,7 @@ impl Sync {
 
     /// Serve the next page of one owed channel: keys once, then entries,
     /// then the blobs the page names; the channel is owed no more once a
-    /// page comes back short. A generation (SIP-72) is served the same
+    /// page comes back short. A generation (SIP-42 §Generations) is served the same
     /// way from what is kept of it, its keys named for its incarnation.
     fn serve(&mut self, chat: &mut Chat, owed: Owed) -> Result<()> {
         let Owed {
@@ -1079,7 +1079,7 @@ impl Sync {
     }
 }
 
-/// SIP-72: `blobs_named`, read through a generation's keys where the entry
+/// SIP-42 §Generations: `blobs_named`, read through a generation's keys where the entry
 /// is of one.
 fn blobs_named_in(
     chat: &Chat,

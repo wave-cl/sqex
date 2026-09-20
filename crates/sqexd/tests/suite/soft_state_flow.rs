@@ -1,4 +1,4 @@
-//! SIP-54: a read mark set at a copy reaches the origin and every copy; a
+//! SIP-43 §Read marks at a replica: a read mark set at a copy reaches the origin and every copy; a
 //! signal sent at either end reaches members at the other; a ring at the
 //! origin rings a member at the copy.
 

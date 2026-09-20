@@ -135,7 +135,7 @@ enum Cmd {
     /// the domain it is reached at where the operator recorded one. A hint:
     /// reach one by discovering its domain, and refuse it if the key differs.
     Peers,
-    /// The exchange's earlier keys (SIP-64): the SIP-40 handovers it has
+    /// The exchange's earlier keys (SIP-40 §Lineage): the SIP-40 handovers it has
     /// signed, oldest first, verified back from the key this command
     /// connected under. What a peer or a client reads its past under.
     Lineage,
@@ -1180,7 +1180,7 @@ async fn fetch_one(
     if !f.found {
         return Ok(None);
     }
-    // SIP-70: a device is shown its account's mail beside its own, and an
+    // SIP-5 §Collection by a device: a device is shown its account's mail beside its own, and an
     // item sealed to the account opens only where the account's key is.
     // Said as that, not as damage; and not deleted, which is the rule.
     let plain = mailbox::open(&signer.seed(), &f.sealed).map_err(|_| {

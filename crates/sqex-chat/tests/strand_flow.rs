@@ -1,4 +1,4 @@
-//! SIP-74: a post stranded by a move is posted again. Alice's channel at X
+//! SIP-53 §Posting again: a post stranded by a move is posted again. Alice's channel at X
 //! is replicated to Y; she posts "only x" at X, X goes away before Y sees
 //! it, and she rehomes the channel at Y -- which strands "only x". Her
 //! client keeps it aside, chains on from what Y holds, and posts it again

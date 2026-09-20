@@ -18,7 +18,7 @@ pub const TYPE_WILL: u8 = 0x01;
 pub const TYPE_POLICY: u8 = 0x02;
 pub const TYPE_VOUCH: u8 = 0x03;
 pub const TYPE_CLAIM: u8 = 0x04;
-/// SIP-62: a will presented by its own signer, now, with the credentials
+/// SIP-44 §The handover: a will presented by its own signer, now, with the credentials
 /// the new key signed for the devices the account keeps.
 pub const TYPE_HANDOVER: u8 = 0x05;
 
@@ -505,7 +505,7 @@ impl Claim {
     }
 }
 
-/// SIP-62: `POST /account/handover`. The account, still holding its key,
+/// SIP-44 §The handover: `POST /account/handover`. The account, still holding its key,
 /// names its successor by the same will SIP-44 uses, and carries a
 /// credential from the successor for each device it keeps.
 /// `| type = 0x05 | Will | count: u8 | count × Credential(len-prefixed u16) |`

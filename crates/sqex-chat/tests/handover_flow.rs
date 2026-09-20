@@ -1,4 +1,4 @@
-//! SIP-62 at the client. Alice hands her account over to a new key from
+//! SIP-44 §The handover at the client. Alice hands her account over to a new key from
 //! inside the client: it goes on acting, now for the successor, on the
 //! same device key and the same store; the sealed direct message with Bob
 //! keeps its channel on both sides -- Bob's client follows the contact and
@@ -203,7 +203,7 @@ async fn a_client_hands_its_account_over_and_the_conversation_keeps_its_channel(
     );
 }
 
-/// SIP-62 §Which account a device is. Alice's phone (a linked device) holds a stale store after she
+/// SIP-44 §Which account a device is. Alice's phone (a linked device) holds a stale store after she
 /// hands over from the laptop: on its next start it asks whose device it
 /// is, follows the successor -- account, credential, the direct message
 /// with Bob -- and reads and posts as the new account. It holds no key
@@ -335,7 +335,7 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         "a sync that was not asked gave the key"
     );
 
-    // SIP-70: mail sent to the account is listed on the phone beside its
+    // SIP-5 §Collection by a device: mail sent to the account is listed on the phone beside its
     // own; without the key the phone can read what was sealed to it and
     // only list what was sealed to the account -- and must not delete that.
     {
@@ -407,7 +407,7 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         HomeSaid::Presented,
         "the entrusted phone signed no Move"
     );
-    // SIP-70: and, entrusted, it opens what is sealed to the account.
+    // SIP-5 §Collection by a device: and, entrusted, it opens what is sealed to the account.
     {
         let (carol_seed, _) = identity(14);
         let mut carol = Client::connect_as(addr, &server_pub, &carol_seed)

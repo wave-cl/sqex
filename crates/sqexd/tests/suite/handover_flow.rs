@@ -1,4 +1,4 @@
-//! SIP-62: an account hands itself over to a new key while it still holds
+//! SIP-44 §The handover: an account hands itself over to a new key while it still holds
 //! the old one. Its device -- itself, device-less -- follows under the new
 //! key's credential, so the same connection acts for the successor from
 //! the next request; its name and its seat in the room follow as SIP-44

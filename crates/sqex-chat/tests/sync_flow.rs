@@ -684,7 +684,7 @@ async fn nobody_but_a_sibling_gets_past_hello() {
     }
 }
 
-/// SIP-72: the conversation is destroyed and rebuilt under the same
+/// SIP-42 §Generations: the conversation is destroyed and rebuilt under the same
 /// identifier; the phone keeps what it read as a generation, and the
 /// laptop -- which never saw the first incarnation -- receives it as an
 /// earlier copy, verified, and nothing of it lands in the conversation
@@ -753,7 +753,7 @@ async fn an_earlier_incarnation_reaches_a_sibling_as_history() {
     assert_eq!(xp.progress.entries_in, 0, "{:?}", xp.progress);
 }
 
-/// SIP-72: a courier offering an earlier incarnation is held to the same
+/// SIP-42 §Generations: a courier offering an earlier incarnation is held to the same
 /// checks -- an altered entry is refused and the rest kept -- and one
 /// naming an origin this device does not know is not asked for at all.
 #[tokio::test]

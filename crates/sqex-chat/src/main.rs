@@ -151,7 +151,7 @@ enum Cmd {
         #[arg(long)]
         signed: Option<String>,
     },
-    /// Hand this account over to a new key (SIP-62), keeping this client
+    /// Hand this account over to a new key (SIP-44 §The handover), keeping this client
     /// and your other devices. The new key is made here and kept sealed in
     /// this store, unless you signed the will and the credentials
     /// elsewhere (`sqex succession will`, `sqex device link`) and pass
@@ -170,7 +170,7 @@ enum Cmd {
         /// The account, base58, or a name here. Yours if omitted.
         who: Option<String>,
     },
-    /// Mail (SIP-5) for this device and for its account (SIP-70), read
+    /// Mail (SIP-5) for this device and for its account (SIP-5 §Collection by a device), read
     /// with every key this store holds -- the account's included, where
     /// this device made it or was entrusted with it.
     Mail {
@@ -252,7 +252,7 @@ enum DeviceCmd {
         #[arg(long, default_value_t = 60)]
         wait: u64,
     },
-    /// Give one other device of this account the account key (SIP-62 §Entrusting the key),
+    /// Give one other device of this account the account key (SIP-44 §Entrusting the key),
     /// over the same session `device sync` uses, once it has proved
     /// itself. That device can then sign what only the account may -- a
     /// Move, a will, a handover -- and **cannot be put out of the account
@@ -344,7 +344,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     chat.top_up_prekeys()
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
-    // SIP-62 §Which account a device is: whose device this is, before anything is signed -- a handover
+    // SIP-44 §Which account a device is: whose device this is, before anything is signed -- a handover
     // presented from a sibling moves this device to the successor, and the
     // registry is what says so.
     match chat.follow_account().await {
@@ -890,7 +890,7 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                 let p = &sync.progress;
                 if sync.entrusted {
                     println!(
-                        "{sibling}  gave this device the account key (SIP-62 §Entrusting the key): this device is the \
+                        "{sibling}  gave this device the account key (SIP-44 §Entrusting the key): this device is the \
                          account now, and revoking it would not put it out. If it is lost, hand \
                          the account over from another device that holds the key."
                     );
@@ -3226,7 +3226,7 @@ enum Command {
     /// is ordered: to a replica, from its origin; or to the exchange this
     /// client is at, when the origin is gone.
     Rehome(String, String),
-    /// SIP-74: send again what a move stranded.
+    /// SIP-53 §Posting again: send again what a move stranded.
     Repost,
     Unstrand,
     /// `/name <name>` — rename, as a sealed entry the exchange cannot read.
@@ -4069,7 +4069,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
                 text,
                 seq: m.seq,
                 has_file,
-                // SIP-74: shown at when it was first said, marked.
+                // SIP-53 §Posting again: shown at when it was first said, marked.
                 at: m.post.said().filter(|s| *s <= m.posted).unwrap_or(m.posted),
                 again: m.post.said().is_some_and(|s| s <= m.posted),
                 edited: m.edited.is_some(),

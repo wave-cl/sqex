@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS contact (
     label   TEXT NOT NULL,
     added   INTEGER NOT NULL
 );
--- SIP-62: a direct message whose other party changed key keeps its
+-- SIP-44 §The handover: a direct message whose other party changed key keeps its
 -- channel; this is how the conversation with the *new* key is found
 -- without deriving a second one. A fact about the correspondent, not
 -- about an exchange: the channel keeps its identifier at every copy, so
@@ -142,7 +142,7 @@ CREATE TABLE IF NOT EXISTS message_history (
     sealed     BLOB,
     PRIMARY KEY (exchange, channel, generation, seq)
 );
--- SIP-72: an ended incarnation, whole -- which one it was (SIP-31) and the
+-- SIP-42 §Generations: an ended incarnation, whole -- which one it was (SIP-31) and the
 -- exchange that ordered it, beside `message_history`'s plaintext: the
 -- signed entries a sibling can verify and the keys that open them. What a
 -- reset used to delete, kept so it can travel (SIP-42) and be shown.
@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS channel_key_history (
     sealed     BLOB    NOT NULL,
     PRIMARY KEY (exchange, channel, generation, epoch)
 );
--- SIP-74: this device's own posts that a move stranded (SIP-53): kept
+-- SIP-53 §Posting again: this device's own posts that a move stranded: kept
 -- aside with when each was first posted and the fork it fell past, to be
 -- offered to the person and posted again. Sealed at rest: plaintext. A
 -- fact about this device's own words, not about an exchange: found where
@@ -241,7 +241,7 @@ CREATE TABLE IF NOT EXISTS chain (
     head      BLOB    NOT NULL,
     PRIMARY KEY (exchange, channel)
 );
--- SIP-74: every chain head this device computed, by the position it is
+-- SIP-53 §Posting again: every chain head this device computed, by the position it is
 -- the link into. `chain` holds only the latest; putting the chain back to
 -- an earlier position after a fork needs the head that stood there, and a
 -- system entry's action cannot be re-linked from what the exchange serves.
@@ -969,7 +969,7 @@ pub struct Kept<'a> {
     pub plain: Option<&'a [u8]>,
 }
 
-/// SIP-72: an ended incarnation as this store keeps it, and as a sibling
+/// SIP-42 §Generations: an ended incarnation as this store keeps it, and as a sibling
 /// is offered it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Generation {
@@ -1094,7 +1094,7 @@ impl Store {
         follow_handover(&self.db, from, to)
     }
 
-    /// SIP-62: the position just before the first `seq` missing from what
+    /// SIP-44 §The handover: the position just before the first `seq` missing from what
     /// this store holds of a channel -- an entry the exchange did not serve
     /// when the cursor passed it (a copy that had refused it, since
     /// filled), which a fetch from the cursor would never see again.
@@ -2078,7 +2078,7 @@ impl Store {
             .map_err(storage("read credential"))
     }
 
-    /// SIP-62: the account's own seed, where this client made the key it
+    /// SIP-44 §The handover: the account's own seed, where this client made the key it
     /// handed over to -- sealed, and what signs for the account from then
     /// on (a Move, a credential, the next handover). `None` where the
     /// account is this device's key or is held elsewhere.
@@ -2094,7 +2094,7 @@ impl Store {
         self.set_meta("account_seed", &sealed)
     }
 
-    /// SIP-62: a correspondent changed key; the contact row follows, label
+    /// SIP-44 §The handover: a correspondent changed key; the contact row follows, label
     /// and all. Verification (SIP-41) does not: a new key is unverified.
     pub fn rekey_contact(&self, old: &PubKey, new: &PubKey) -> Result<()> {
         self.db
@@ -2106,7 +2106,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-62: the direct message with `account`, where it is a channel
+    /// SIP-44 §The handover: the direct message with `account`, where it is a channel
     /// whose identifier no longer derives from the pair. Read whatever
     /// exchange the store is scoped to: a conversation keeps its channel
     /// at every copy, and a client that learned the alias reading through
@@ -2533,7 +2533,7 @@ impl Store {
         Ok(false)
     }
 
-    /// SIP-71, SIP-72: keep the incarnation that just ended as the channel's
+    /// SIP-71, SIP-42 §Generations: keep the incarnation that just ended as the channel's
     /// next generation -- what this client read, the signed entries under
     /// it, the keys that open them, which incarnation it was and the
     /// exchange that ordered it. Called by `reset_sequence_space`, which
@@ -2575,7 +2575,7 @@ impl Store {
         Ok(Some(generation))
     }
 
-    /// SIP-72: a fresh generation row for `channel`, numbered after the
+    /// SIP-42 §Generations: a fresh generation row for `channel`, numbered after the
     /// ones held.
     pub fn new_generation(
         &self,
@@ -2603,7 +2603,7 @@ impl Store {
         Ok(generation as u64)
     }
 
-    /// SIP-72: the generation holding `instance` of `channel`, if any.
+    /// SIP-42 §Generations: the generation holding `instance` of `channel`, if any.
     pub fn generation_of(&self, channel: &[u8; 32], instance: &[u8; 32]) -> Result<Option<u64>> {
         self.db
             .query_row(
@@ -2617,7 +2617,7 @@ impl Store {
             .map_err(storage("find a generation"))
     }
 
-    /// SIP-72: every generation held, with what a sibling is offered of it:
+    /// SIP-42 §Generations: every generation held, with what a sibling is offered of it:
     /// the incarnation, its origin, the range of signed entries and how
     /// many keys.
     pub fn generations(&self) -> Result<Vec<Generation>> {
@@ -2655,7 +2655,7 @@ impl Store {
             .map_err(storage("read generations"))
     }
 
-    /// SIP-72: a generation's signed entries above `since`, ascending, at
+    /// SIP-42 §Generations: a generation's signed entries above `since`, ascending, at
     /// most `max`.
     pub fn history_entries_after(
         &self,
@@ -2730,7 +2730,7 @@ impl Store {
             .is_some()
     }
 
-    /// SIP-72: a generation's keys.
+    /// SIP-42 §Generations: a generation's keys.
     pub fn history_keys(
         &self,
         channel: &[u8; 32],
@@ -2782,7 +2782,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-72: keep a message read out of a generation's entries.
+    /// SIP-42 §Generations: keep a message read out of a generation's entries.
     pub fn put_history_message(
         &self,
         channel: &[u8; 32],
@@ -2862,7 +2862,7 @@ impl Store {
     }
 
     pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
-        // SIP-71, SIP-72: the incarnation that ended is history, not waste.
+        // SIP-71, SIP-42 §Generations: the incarnation that ended is history, not waste.
         // Kept here, at the one place every reset passes -- and the signed
         // entries go with it, or they would be offered to a sibling as the
         // conversation's (SIP-42).
@@ -2990,7 +2990,7 @@ impl Store {
     /// which is recorded first because a burnt nonce costs nothing and a reused
     /// one costs two plaintexts. A position is only spent once something is in
     /// the log at it, so a refused request leaves the chain where it was.
-    /// SIP-74: the head this device computed after taking position
+    /// SIP-53 §Posting again: the head this device computed after taking position
     /// `chain_seq` -- the link into the next -- where it logged one.
     pub fn head_after(&self, channel: &[u8; 32], chain_seq: u64) -> Result<Option<[u8; 32]>> {
         self.db
@@ -3004,7 +3004,7 @@ impl Store {
             .map_err(storage("read a logged head"))
     }
 
-    /// SIP-74: put the chain **back** so that `next` is the next position
+    /// SIP-53 §Posting again: put the chain **back** so that `next` is the next position
     /// to sign at, with `head` the link into it -- the one case a lower
     /// position is taken, on this client's own evidence that the entries
     /// between were stranded. `next == 0` is a chain that starts over.
@@ -3030,7 +3030,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-74: keep one of this device's own posts that a move stranded.
+    /// SIP-53 §Posting again: keep one of this device's own posts that a move stranded.
     pub fn put_stranded(
         &self,
         channel: &[u8; 32],
@@ -3067,7 +3067,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-74: the stranded posts held for a channel: `(seq, posted, fork,
+    /// SIP-53 §Posting again: the stranded posts held for a channel: `(seq, posted, fork,
     /// plain body)`, in the order they were first posted.
     #[allow(clippy::type_complexity)]
     pub fn stranded(&self, channel: &[u8; 32]) -> Result<Vec<(u64, u64, u64, Vec<u8>)>> {
@@ -3106,7 +3106,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-74: forget everything held above the fork -- messages, signed
+    /// SIP-53 §Posting again: forget everything held above the fork -- messages, signed
     /// entries, timers -- and put the cursor back to it. The losing side
     /// of a fork is not the conversation, and its numbers are the winning
     /// history's now.

@@ -270,7 +270,7 @@ fn handover(
         "It grants nothing until `k={to}` is published too, and cannot be withdrawn once \
          published — only outlived, at {until}."
     );
-    // SIP-64: kept, so the successor serves it as its lineage for as long
+    // SIP-40 §Lineage: kept, so the successor serves it as its lineage for as long
     // as the history it covers -- the zone keeps it thirty days at most.
     sqexd::lineage::append(lineage_file, &domain, &h).map_err(|e| {
         format!(
@@ -279,7 +279,7 @@ fn handover(
         )
     })?;
     eprintln!(
-        "Kept in {} (SIP-64): the daemon running as `{to}` serves it as its lineage.",
+        "Kept in {} (SIP-40): the daemon running as `{to}` serves it as its lineage.",
         lineage_file.display()
     );
     Ok(())

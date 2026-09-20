@@ -289,7 +289,7 @@ async fn a_malformed_or_oversized_send_is_refused() {
     handle.abort();
 }
 
-/// SIP-70: a device registered to an account is shown the account's mail
+/// SIP-5 §Collection by a device: a device registered to an account is shown the account's mail
 /// beside its own, fetches and deletes either by id, and a stranger sees
 /// neither. Sealing is untouched: what was sealed to the account opens
 /// with the account's key alone.

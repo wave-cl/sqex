@@ -1,4 +1,4 @@
-//! SIP-64: the handovers this exchange has signed, kept beside its key.
+//! SIP-40 §Lineage: the handovers this exchange has signed, kept beside its key.
 //!
 //! One per line, `<domain> <record>`, the record being the SIP-40 TXT
 //! value `sqexd handover` printed -- the domain is not in the record (it

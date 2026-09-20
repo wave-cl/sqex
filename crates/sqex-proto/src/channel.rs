@@ -117,7 +117,7 @@ pub const TYPE_CREATE_AT: u8 = 0x22;
 /// SIP-71: read the folded log of a direct message this exchange ended,
 /// a `ByChannel` answered with `Entries` to either member.
 pub const TYPE_FOLDED: u8 = 0x23;
-/// SIP-77: the calling device's chain heads by position, as the exchange
+/// SIP-43 §The heads by position: the calling device's chain heads by position, as the exchange
 /// holds them.
 pub const TYPE_CHAIN: u8 = 0x24;
 
@@ -1503,7 +1503,7 @@ impl Stranded {
     }
 }
 
-/// SIP-77: `| type = 0x24 | channel[32] | from: u64 |` at `POST /channel/chain`.
+/// SIP-43 §The heads by position: `| type = 0x24 | channel[32] | from: u64 |` at `POST /channel/chain`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChainAsk {
     pub channel: [u8; 32],
@@ -1530,14 +1530,14 @@ impl ChainAsk {
     }
 }
 
-/// SIP-77: `| count: u16 | count × (chain_seq: u64 | head[32]) |` -- the
+/// SIP-43 §The heads by position: `| count: u16 | count × (chain_seq: u64 | head[32]) |` -- the
 /// head after each position, ascending.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Heads {
     pub heads: Vec<(u64, [u8; 32])>,
 }
 
-/// SIP-77: heads per answer.
+/// SIP-43 §The heads by position: heads per answer.
 pub const MAX_HEADS: usize = 256;
 
 impl Heads {

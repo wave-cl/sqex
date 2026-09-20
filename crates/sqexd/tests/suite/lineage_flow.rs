@@ -1,4 +1,4 @@
-//! SIP-64: an exchange's earlier keys. An origin rotates its key; a home
+//! SIP-40 §Lineage: an exchange's earlier keys. An origin rotates its key; a home
 //! that meets it afterwards on an account's word alone holds only the new
 //! key, and everything receipted under the old one is repudiated there --
 //! until the origin serves its lineage, which the home verifies back from

@@ -1,4 +1,4 @@
-//! SIP-61: a replica waits on the origin instead of polling. On the wire,
+//! SIP-35 §Waiting: a replica waits on the origin instead of polling. On the wire,
 //! `/peer/wait` answers at once for a channel with an entry past `since`,
 //! within a second for one that gains an entry or a signal, with nothing
 //! when the wait runs out, and never about a channel the peer may not

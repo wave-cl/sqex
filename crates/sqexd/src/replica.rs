@@ -346,14 +346,14 @@ pub async fn pull_once(
 /// the moment's -- the origin's registry answered late, a credential the
 /// copy could not yet bind -- and a copy that pulled from its highest
 /// stored position would never see the entry again. Bounded: an entry
-/// refused `HOLE_TRIES` times is left where it is, and the wait (SIP-61)
+/// refused `HOLE_TRIES` times is left where it is, and the wait (SIP-35 §Waiting)
 /// is told not to fire on it.
 pub type Holes = HashMap<[u8; 32], (u64, u32)>;
 
 /// How many pulls a refused entry is asked for again.
 pub const HOLE_TRIES: u32 = 30;
 
-/// SIP-61/62: remember the holes a pull left, drop the ones it filled, and
+/// SIP-35 §Waiting/62: remember the holes a pull left, drop the ones it filled, and
 /// give up on the ones that will not fill.
 pub fn note_holes(holes: &mut Holes, took: &HashMap<[u8; 32], Took>) {
     for (channel, t) in took {
@@ -381,7 +381,7 @@ pub fn note_holes(holes: &mut Holes, took: &HashMap<[u8; 32], Took>) {
     }
 }
 
-/// SIP-62: the holes a replica finds in what it already holds, when it
+/// SIP-44 §The handover: the holes a replica finds in what it already holds, when it
 /// starts -- entries refused before this process began. Seeded once, so a
 /// hole nothing will fill costs `HOLE_TRIES` pulls per start and not one
 /// per cycle.
@@ -417,7 +417,7 @@ pub async fn pull_once_from(
         return Err(format!("the origin refused peering ({code})"));
     }
     let hi = Hi::decode(&body).map_err(|e| e.to_string())?;
-    // SIP-64: the origin's earlier keys, before the first pull from it.
+    // SIP-40 §Lineage: the origin's earlier keys, before the first pull from it.
     if server.lineage_due(&origin.key, false) {
         learn_lineage(client, server, origin).await;
     }
@@ -500,10 +500,10 @@ pub async fn pull_once_from(
         // them, as SIP-40's predecessors do.
         let mut predecessors = origin.predecessors.clone();
         predecessors.extend(store.origin_history(channel));
-        // SIP-64: and the keys the origin's lineage said it moved from.
+        // SIP-40 §Lineage: and the keys the origin's lineage said it moved from.
         predecessors.extend(store.lineage_of(&origin.key));
         let mut took = take_under(store, &origin.key, &predecessors, channel, &pulled, &lookup);
-        // SIP-54: the members' marks and the signal log, merged and handed
+        // SIP-43 §Read marks at a replica: the members' marks and the signal log, merged and handed
         // on as if made here.
         pull_soft_state(client, server, channel).await;
         // SIP-53: a rehome among what was pulled moved the channel. Where it
@@ -564,7 +564,7 @@ pub async fn pull_once_from(
                 took.equivocated |= again.equivocated;
             }
         }
-        // SIP-64: a receipt under a key this replica does not hold is the
+        // SIP-40 §Lineage: a receipt under a key this replica does not hold is the
         // ordinary sign of a rotation since the lineage was last asked.
         // Asked again, bounded; what it learns takes effect on the next
         // pull, which the hole left here already asks for.
@@ -599,7 +599,7 @@ pub async fn pull_once_from(
                 let _ = store.apply_succession(channel, &sys.actor, &sys.subject);
                 verified = true;
             }
-            // SIP-62: what this exchange holds of the account under SIP-59
+            // SIP-44 §The handover: what this exchange holds of the account under SIP-59
             // and SIP-60 follows the key, once the succession is checked.
             if verified {
                 server.devices.follow_succession(&sys.actor, &sys.subject);
@@ -872,9 +872,9 @@ async fn collect_wakes(
     }
 }
 
-/// SIP-64: ask the origin for its lineage, verify it back from the key
+/// SIP-40 §Lineage: ask the origin for its lineage, verify it back from the key
 /// this replica holds (and the domain, where it holds one), and keep the
-/// predecessors with the origin. An origin from before SIP-64 answers
+/// predecessors with the origin. An origin from before 0.81.0 (SIP-40 §Lineage) answers
 /// `not_found`, which is an empty lineage; a lineage that fails a rule is
 /// dropped whole and what was held stays. `true` when something changed.
 async fn learn_lineage(
@@ -971,7 +971,7 @@ async fn pull_envelopes(
     };
     for (epoch, e) in &got.envelopes {
         // Under the origin's key, then each key it held before (SIP-40,
-        // SIP-64) and each exchange that ordered the channel before
+        // SIP-40 §Lineage) and each exchange that ordered the channel before
         // (SIP-53): an envelope names the place it was published to, and
         // the place was under whichever of these was current then. A copy
         // that checked the current key alone refused every envelope from
@@ -1121,7 +1121,7 @@ async fn pull_profiles(
 ///
 /// Asked by the **account the entry names**, since SIP-22's list is by
 /// account: asking by the device key found nothing for any linked device,
-/// and a copy refused every entry a linked device ever signed (SIP-62
+/// and a copy refused every entry a linked device ever signed (SIP-44 §The handover
 /// turned that up, since a handover makes every account's own key a
 /// linked device of the new one).
 pub async fn account_for(
@@ -1384,13 +1384,13 @@ fn carried(carry: Option<&sqex_proto::credential::Credential>, inner: Vec<u8>) -
     }
 }
 
-/// SIP-61: how a wait on the origin ended.
+/// SIP-35 §Waiting: how a wait on the origin ended.
 enum Waited {
     /// Something changed in at least one channel.
     Changed,
     /// The wait ran out with nothing.
     Quiet,
-    /// The origin does not speak SIP-61 (or refuses this peer the route).
+    /// The origin does not speak SIP-35 §Waiting (or refuses this peer the route).
     Unsupported,
     /// The connection went; the caller redials.
     Lost,
@@ -1399,7 +1399,7 @@ enum Waited {
 /// How long after an origin refused a wait before trying it again.
 const WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// SIP-61: hold one request at the origin naming `channels` and where each
+/// SIP-35 §Waiting: hold one request at the origin naming `channels` and where each
 /// stands here, for up to `secs`. At most `MAX_WAIT_CHANNELS` are named.
 ///
 /// `seen` is the highest seq this replica was *shown* per channel, refused
@@ -1432,7 +1432,7 @@ async fn wait_on(
     }
 }
 
-/// Between pulls: wait on the origin (SIP-61) where it lets us, sleep the
+/// Between pulls: wait on the origin (SIP-35 §Waiting) where it lets us, sleep the
 /// interval where it does not, and come back early for a poke either way.
 /// `waits_from` is when the origin may next be asked to wait, after a
 /// refusal. Returns whether the connection is still good.
@@ -1469,7 +1469,7 @@ async fn pause_or_wait(
     }
 }
 
-/// SIP-61: what a pull showed this replica, refused entries included, so a
+/// SIP-35 §Waiting: what a pull showed this replica, refused entries included, so a
 /// wait does not fire on an entry it will refuse again.
 fn note_seen(seen: &mut HashMap<[u8; 32], u64>, took: &HashMap<[u8; 32], Took>) {
     for (channel, t) in took {
@@ -1480,7 +1480,7 @@ fn note_seen(seen: &mut HashMap<[u8; 32], u64>, took: &HashMap<[u8; 32], Took>) 
     }
 }
 
-/// SIP-61 for the loops that pull from several origins a cycle: wait on
+/// SIP-35 §Waiting for the loops that pull from several origins a cycle: wait on
 /// all of them at once, and come back when any changes, when `notify`
 /// fires, or when the interval runs out. Each origin's connection is
 /// spent on its wait; the next cycle dials afresh.
@@ -1530,7 +1530,7 @@ async fn wait_any(
 /// Waits its interval between pulls, floored by SIP-35 at `PEER_MIN_INTERVAL`
 /// — a replica that hammered an origin would be a worse citizen than one that
 /// lagged -- or less, when a post this replica forwarded was taken and the
-/// member who wrote it is waiting to read it back. SIP-61: where the origin
+/// member who wrote it is waiting to read it back. SIP-35 §Waiting: where the origin
 /// lets a replica wait on it, the wait replaces the sleep and a change at
 /// the origin is pulled at once.
 pub async fn run(
@@ -1687,7 +1687,7 @@ pub async fn run_homed(
     let mut told_folds: std::collections::HashSet<(PubKey, [u8; 32])> =
         std::collections::HashSet::new();
     loop {
-        // SIP-61: wait on every origin pulled last cycle; a move here or a
+        // SIP-35 §Waiting: wait on every origin pulled last cycle; a move here or a
         // forward through here comes back early either way.
         wait_any(
             &server,
@@ -1772,7 +1772,7 @@ pub async fn run_homed(
                         crate::server::UnfoundWhy::Unreachable,
                         interval.as_secs(),
                     );
-                    // SIP-64 §Following: the way there is forgotten, so the next cycle
+                    // SIP-40 §Following: the way there is forgotten, so the next cycle
                     // resolves the domain again -- which is how a rotation
                     // is noticed when the address stayed the same.
                     server.forget_forwarder(&origin);
@@ -1789,7 +1789,7 @@ pub async fn run_homed(
             let mut channels: Vec<[u8; 32]> = Vec::new();
             for account in &accounts {
                 // Carried once per Move per origin, not once per cycle: the
-                // origin's peering-write limit (SIP-63, 60 an hour per
+                // origin's peering-write limit (SIP-35 §Open peering, 60 an hour per
                 // caller) is shared with every forward this home makes
                 // there, and a home carrying every account's Move every
                 // `home_secs` spent it all on saying what the origin had
@@ -1917,8 +1917,8 @@ pub async fn run_homed(
     }
 }
 
-/// SIP-54: pull the origin's read marks and signal log for a channel and
-/// apply them here. Best effort: an origin from before SIP-54 refuses both
+/// SIP-43 §Read marks at a replica: pull the origin's read marks and signal log for a channel and
+/// apply them here. Best effort: an origin from before 0.71.0 (SIP-43 §Read marks at a replica) refuses both
 /// as it refuses any peering route it lacks, and nothing changes.
 async fn pull_soft_state(
     client: &mut H3Client,

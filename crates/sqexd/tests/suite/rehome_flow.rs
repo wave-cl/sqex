@@ -484,7 +484,7 @@ async fn a_replica_takes_a_channel_whose_origin_is_gone_and_the_origin_follows_w
             );
         }
     }
-    // SIP-77: Y, unable to ask X, reports the admin's chain as its own
+    // SIP-43 §The heads by position: Y, unable to ask X, reports the admin's chain as its own
     // entries show it -- exactly what was rebuilt above by hand -- and
     // serves the heads by position, the last of them the same.
     let info = s.info(&mut at_y, channel).await;

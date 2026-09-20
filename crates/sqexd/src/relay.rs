@@ -107,7 +107,7 @@ pub enum Find {
     /// discovery replaced.
     Fixed(HashMap<String, (PubKey, SocketAddr)>),
     /// As `Fixed`, but shared with the test, which changes what a domain
-    /// names -- a rotation (SIP-64 §Recognising a rotation) is a domain naming another key.
+    /// names -- a rotation (SIP-40 §Recognising a rotation) is a domain naming another key.
     Live(Arc<std::sync::RwLock<HashMap<String, (PubKey, SocketAddr)>>>),
 }
 
@@ -1175,7 +1175,7 @@ pub async fn find_by_domain(
     find_peer(server, domain).await
 }
 
-/// SIP-64 §Recognising a rotation: [`find_peer`], also saying which key the pin moved from on this
+/// SIP-40 §Recognising a rotation: [`find_peer`], also saying which key the pin moved from on this
 /// lookup, when SIP-40 moved it.
 pub(crate) async fn find_peer_moved(
     server: &Arc<Server>,

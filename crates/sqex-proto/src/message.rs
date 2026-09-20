@@ -82,7 +82,7 @@ pub const PART_MENTION: u8 = 0x05;
 /// SIP-43: the exchange the poster sent this through, where that is not the
 /// channel's origin -- the poster's own word about the poster's own act.
 pub const PART_VIA: u8 = 0x06;
-/// SIP-74: when the poster first said this -- a post sent again after the
+/// SIP-53 §Posting again: when the poster first said this -- a post sent again after the
 /// entry that carried it was stranded by a move (SIP-53).
 pub const PART_SAID: u8 = 0x07;
 
@@ -154,7 +154,7 @@ pub enum Part {
     /// by the key -- and concludes nothing else from it: no exchange said
     /// it, and nothing says who carried a message the poster did not label.
     Via(PubKey),
-    /// SIP-74: when the poster first posted this, where the entry that
+    /// SIP-53 §Posting again: when the poster first posted this, where the entry that
     /// carried it was stranded and this is it posted again. The poster's
     /// own word; a reader shows the message at this time, marked, and the
     /// entry's `posted` still orders the log.
@@ -295,7 +295,7 @@ impl Post {
         })
     }
 
-    /// SIP-74: when the poster says this was first said, where it was
+    /// SIP-53 §Posting again: when the poster says this was first said, where it was
     /// posted again after being stranded.
     pub fn said(&self) -> Option<u64> {
         self.parts.iter().find_map(|p| match p {
@@ -909,7 +909,7 @@ mod tests {
         });
     }
 
-    /// SIP-74: a post sent again says when it was first said, once.
+    /// SIP-53 §Posting again: a post sent again says when it was first said, once.
     #[test]
     fn a_said_part_round_trips_and_is_at_most_one() {
         let mut post = Post::text("still true");

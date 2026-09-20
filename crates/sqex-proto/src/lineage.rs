@@ -1,4 +1,4 @@
-//! SIP-64: an exchange's earlier keys.
+//! SIP-40 §Lineage: an exchange's earlier keys.
 //!
 //! An exchange keeps every SIP-40 handover it signed and serves the chain
 //! -- its lineage -- to anyone who asks. A verifier holding the current
@@ -168,7 +168,7 @@ impl Lineage {
         Ok(Lineage { links })
     }
 
-    /// SIP-64 §Verifying a lineage, the four rules; `until` is not one of
+    /// SIP-40 §Verifying a lineage, the four rules; `until` is not one of
     /// them. Returns the predecessors, **newest first**. An empty lineage
     /// is accepted and yields none.
     pub fn predecessors_for(

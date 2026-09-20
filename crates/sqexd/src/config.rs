@@ -59,12 +59,12 @@ pub struct FileConfig {
     pub listen: String,
     /// Hex Ed25519 seed for this server's identity.
     pub key_file: PathBuf,
-    /// SIP-64: the handovers this exchange has signed, one per line as
+    /// SIP-40 §Lineage: the handovers this exchange has signed, one per line as
     /// `<domain> <record>`; `sqexd handover` appends to it. Defaults to
     /// `lineage` beside the key file. Absent means no rotation behind us.
     #[serde(default)]
     pub lineage_file: Option<PathBuf>,
-    /// SIP-64: seconds before a repudiated entry from an origin makes this
+    /// SIP-40 §Lineage: seconds before a repudiated entry from an origin makes this
     /// exchange ask for that origin's lineage again. Default 600.
     #[serde(default)]
     pub lineage_retry_secs: Option<u64>,
@@ -247,7 +247,7 @@ pub struct FileConfig {
     /// hint.
     #[serde(default)]
     pub domain: Option<String>,
-    /// SIP-63: serve the peering routes to any identified caller, granting
+    /// SIP-35 §Open peering: serve the peering routes to any identified caller, granting
     /// nothing by it -- what a caller may pull is what a member's signed
     /// statement (an admin's `0x0b`, an account's Move) entitles it to,
     /// listed or not. Off, the default, is SIP-35 as written: only
@@ -282,7 +282,7 @@ pub struct FileLimits {
     pub uploads: Option<[u32; 2]>,
     #[serde(default)]
     pub reports: Option<[u32; 2]>,
-    /// SIP-63: the writes a peer causes, per caller key.
+    /// SIP-35 §Open peering: the writes a peer causes, per caller key.
     #[serde(default)]
     pub peering: Option<[u32; 2]>,
     /// SIP-65: cross-exchange calls, per caller account.
@@ -379,9 +379,9 @@ fn default_pull_interval() -> u64 {
 pub struct Config {
     pub listen: SocketAddr,
     pub key_file: PathBuf,
-    /// SIP-64: where this exchange's signed handovers are kept.
+    /// SIP-40 §Lineage: where this exchange's signed handovers are kept.
     pub lineage_file: PathBuf,
-    /// SIP-64: how long after asking an origin's lineage a repudiated
+    /// SIP-40 §Lineage: how long after asking an origin's lineage a repudiated
     /// entry may make this exchange ask again.
     pub lineage_retry: std::time::Duration,
     pub state_file: Option<PathBuf>,
@@ -416,7 +416,7 @@ pub struct Config {
     pub home_secs: u64,
     /// SIP-60: this exchange's own domain, lowercased; `None` when unknown.
     pub domain: Option<String>,
-    /// SIP-63: the peering routes are served to any identified caller.
+    /// SIP-35 §Open peering: the peering routes are served to any identified caller.
     pub open_peering: bool,
     /// SIP-65: calls are carried for an exchange nobody listed, on the
     /// caller's word and a shared conversation.

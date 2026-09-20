@@ -68,11 +68,11 @@ pub const TYPE_FORWARD_ACTION: u8 = 0x09;
 /// SIP-17 counter -- which a replica does not track and a device with a
 /// fresh store cannot otherwise learn.
 pub const TYPE_STANDING: u8 = 0x08;
-/// SIP-54: a replica asks the origin for every member's read marks.
+/// SIP-43 §Read marks at a replica: a replica asks the origin for every member's read marks.
 pub const TYPE_CURSORS: u8 = 0x0a;
-/// SIP-54: a replica asks the origin for the signals logged since a point.
+/// SIP-43 §Signals at a replica: a replica asks the origin for the signals logged since a point.
 pub const TYPE_SIGNALS: u8 = 0x0b;
-/// SIP-54: signals the origin keeps per channel for replicas to pull.
+/// SIP-43 §Signals at a replica: signals the origin keeps per channel for replicas to pull.
 pub const SIGNAL_LOG: usize = 256;
 /// SIP-57: a replica asks the origin what was redacted since a time.
 pub const TYPE_TOMBSTONES: u8 = 0x0c;
@@ -87,9 +87,9 @@ pub const TYPE_MOVED: u8 = 0x0f;
 /// SIP-60: an origin tells an account's home that it put the account in a
 /// channel.
 pub const TYPE_INVITED: u8 = 0x10;
-/// SIP-61: a replica waits on the origin for any of its channels to change.
+/// SIP-35 §Waiting: a replica waits on the origin for any of its channels to change.
 pub const TYPE_WAIT: u8 = 0x11;
-/// SIP-61: channels one wait may name.
+/// SIP-35 §Waiting: channels one wait may name.
 pub const MAX_WAIT_CHANNELS: usize = 256;
 
 /// Agree on a version, and say who is asking.
@@ -1211,7 +1211,7 @@ mod shape_tests {
     }
 }
 
-/// SIP-54: `POST /peer/cursors`, answered with SIP-16's `Marks`.
+/// SIP-43 §Read marks at a replica: `POST /peer/cursors`, answered with SIP-16's `Marks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullCursors {
     pub channel: [u8; 32],
@@ -1235,7 +1235,7 @@ impl PullCursors {
     }
 }
 
-/// SIP-54: `POST /peer/signals`: the channel's signal log above `since`.
+/// SIP-43 §Signals at a replica: `POST /peer/signals`: the channel's signal log above `since`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullSignals {
     pub channel: [u8; 32],
@@ -1262,7 +1262,7 @@ impl PullSignals {
     }
 }
 
-/// SIP-54: one signal as the origin logged it.
+/// SIP-43 §Signals at a replica: one signal as the origin logged it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Logged {
     pub seq: u64,
@@ -1273,7 +1273,7 @@ pub struct Logged {
     pub body: Vec<u8>,
 }
 
-/// SIP-54: the answer to a signals pull.
+/// SIP-43 §Signals at a replica: the answer to a signals pull.
 ///
 /// `| next: u64 | count: u16 | count × (seq: u64 | account[32] | device[32] | kind: u8 | at: u64 | len: u16 | body) |`
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1899,7 +1899,7 @@ mod invited_tests {
     }
 }
 
-/// SIP-61: one held request per origin, naming the channels the replica
+/// SIP-35 §Waiting: one held request per origin, naming the channels the replica
 /// holds from it and where each stands. Answered at once where any has an
 /// entry past `since`, otherwise when any changes, otherwise empty when
 /// the wait runs out.
@@ -1955,7 +1955,7 @@ impl PeerWait {
     }
 }
 
-/// SIP-61: the channels, among those waited on, that changed.
+/// SIP-35 §Waiting: the channels, among those waited on, that changed.
 /// `| now: u64 | count: u16 | count × channel[32] |`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Changed {

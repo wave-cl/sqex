@@ -557,7 +557,7 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
     // **A gap in the middle is a hole, and a hole is asked for again.** A
     // replica that refused one entry -- the origin's registry answered late
     // -- and stored what came after would pull from its highest for ever
-    // and never see the entry again (SIP-62 found it). The holes a replica
+    // and never see the entry again (SIP-44 §The handover found it). The holes a replica
     // finds in what it holds are pulled from, and filled.
     let holed_dir = tempfile::tempdir().unwrap();
     std::fs::write(holed_dir.path().join("host_key"), hex::encode(peer_seed)).unwrap();

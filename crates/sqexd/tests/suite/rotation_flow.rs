@@ -1,7 +1,7 @@
-//! SIP-64 §Following: a home follows an origin's rotation, and an origin follows a
+//! SIP-40 §Following: a home follows an origin's rotation, and an origin follows a
 //! home's. Each holds the other's key for a domain; when the domain is
 //! found naming another key, the successor is taken on the retiring key's
-//! own signed word -- here its lineage (SIP-64), the window long closed --
+//! own signed word -- here its lineage (SIP-40 §Lineage), the window long closed --
 //! and every holding of the old key becomes one of the new: the copies a
 //! home pulls, and the account's signed Move at the origin, with its
 //! signature cleared.

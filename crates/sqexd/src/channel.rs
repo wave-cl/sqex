@@ -387,11 +387,11 @@ pub struct Channels {
     /// is at. SIP-16 forbids storing these at all, and an exchange that dropped
     /// every one of them would still conform.
     signals: Mutex<SignalQueues>,
-    /// SIP-54: the last `SIGNAL_LOG` signals queued per channel, numbered,
+    /// SIP-43 §Signals at a replica: the last `SIGNAL_LOG` signals queued per channel, numbered,
     /// for replicas to pull. In memory, like the queues: a signal is
     /// nothing after `SIGNAL_TTL`.
     signal_log: Mutex<HashMap<[u8; 32], SignalLog>>,
-    /// SIP-54: at a replica, how far into each origin's signal log this
+    /// SIP-43 §Signals at a replica: at a replica, how far into each origin's signal log this
     /// exchange has pulled.
     signal_since: Mutex<HashMap<[u8; 32], u64>>,
     /// SIP-57: at a replica, the origin's clock when tombstones were last
@@ -612,7 +612,7 @@ CREATE TABLE IF NOT EXISTS origin_history (
     moved_at INTEGER NOT NULL,
     PRIMARY KEY (channel, from_seq)
 );
--- SIP-64: an origin's earlier keys, as its lineage said and this exchange
+-- SIP-40 §Lineage: an origin's earlier keys, as its lineage said and this exchange
 -- verified. Kept with the origin, so a restart does not ask again and an
 -- origin since gone still has its past verified.
 CREATE TABLE IF NOT EXISTS lineage (
@@ -939,7 +939,7 @@ impl Channels {
     }
 
     /// Wake whoever waits on `channel` -- a client's long poll, or a
-    /// peer's SIP-61 wait. Callable from the route layer for the changes
+    /// peer's SIP-35 §Waiting wait. Callable from the route layer for the changes
     /// the store does not write as entries (a signal, a read mark).
     pub(crate) fn wake(&self, channel: &[u8; 32]) {
         if let Some(n) = self.waiters.lock().unwrap().get(channel) {
@@ -947,13 +947,13 @@ impl Channels {
         }
     }
 
-    /// SIP-61: the newest `seq` held for a channel, 0 for none.
+    /// SIP-35 §Waiting: the newest `seq` held for a channel, 0 for none.
     pub fn last_seq(&self, channel: &[u8; 32]) -> u64 {
         let db = self.db.lock().unwrap();
         window(&db, channel).1
     }
 
-    /// SIP-62: the position just before the first `seq` missing from a
+    /// SIP-44 §The handover: the position just before the first `seq` missing from a
     /// channel this exchange holds -- an entry a pull refused, since the
     /// origin serves its log contiguously and a tombstone keeps its row.
     /// `None` where nothing is missing.
@@ -975,7 +975,7 @@ impl Channels {
     }
 }
 
-/// SIP-54: a channel's numbered signal log -- the next number, and the
+/// SIP-43 §Signals at a replica: a channel's numbered signal log -- the next number, and the
 /// signals kept.
 type SignalLog = (u64, std::collections::VecDeque<Logged>);
 
@@ -3913,7 +3913,7 @@ impl Channels {
 
     /// SIP-53: every exchange that has ordered `channel`, for verifying
     /// entries from before a move. The creator where the history has none.
-    /// SIP-64 §Following: an origin this store copies from rotated. Every copy of
+    /// SIP-40 §Following: an origin this store copies from rotated. Every copy of
     /// `from` becomes a copy of `to`, with `from` in the channel's origin
     /// history so what it receipted goes on verifying; the lineage held
     /// for `from` is dropped, to be learned again for `to`. How many
@@ -3954,7 +3954,7 @@ impl Channels {
         channels.len()
     }
 
-    /// SIP-64: the origin's earlier keys as learned from its lineage,
+    /// SIP-40 §Lineage: the origin's earlier keys as learned from its lineage,
     /// newest first.
     pub fn lineage_of(&self, origin: &PubKey) -> Vec<PubKey> {
         let db = self.db.lock().unwrap();
@@ -3972,7 +3972,7 @@ impl Channels {
             .unwrap_or_default()
     }
 
-    /// SIP-64: keep what an origin's verified lineage said. `true` when it
+    /// SIP-40 §Lineage: keep what an origin's verified lineage said. `true` when it
     /// differs from what was held.
     pub fn learn_lineage(&self, origin: &PubKey, predecessors: &[PubKey]) -> bool {
         if self.lineage_of(origin) == predecessors {
@@ -4088,7 +4088,7 @@ impl Channels {
             .collect()
     }
 
-    /// SIP-77: a device's chain heads by position, from the entries held:
+    /// SIP-43 §The heads by position: a device's chain heads by position, from the entries held:
     /// each member entry the device signed and each system entry recording
     /// an action of its, at or above `from`, with the head after it -- the
     /// entry's hash as receipted -- ascending; then the mark this exchange
@@ -4115,7 +4115,7 @@ impl Channels {
         Ok(Heads { heads })
     }
 
-    /// SIP-77: a device's chain as this exchange's entries show it -- the
+    /// SIP-43 §The heads by position: a device's chain as this exchange's entries show it -- the
     /// position after its highest held entry or action, and the head after
     /// it -- for a copy whose origin cannot be asked. `(0, GENESIS)` where
     /// it holds none.
@@ -6187,7 +6187,7 @@ impl Channels {
 ///
 /// Kept independently of the entries, so pruning cannot understate it — a
 /// device resuming from an understated mark would fork its own chain.
-/// SIP-77: the positions and heads of `device`'s held entries and actions
+/// SIP-43 §The heads by position: the positions and heads of `device`'s held entries and actions
 /// in `channel` at or above `from`, ascending. A system entry's actor and
 /// step are inside its body (as `rebuild_standing` reads them); its
 /// `entry_hash` is the head after the action, kept because it cannot be
@@ -7145,7 +7145,7 @@ impl Channels {
         Ok(())
     }
 
-    /// SIP-54: a mark carried from a copy. The copy served the member what
+    /// SIP-43 §Read marks at a replica: a mark carried from a copy. The copy served the member what
     /// they read, so delivery here is raised to the mark before the
     /// ordinary clamp applies; the origin never served them itself.
     pub fn set_cursor_forwarded(
@@ -7374,7 +7374,7 @@ impl Channels {
         };
 
         let now = now_unix();
-        // SIP-54: logged for replicas to pull, whoever it was for.
+        // SIP-43 §Read marks at a replica: logged for replicas to pull, whoever it was for.
         {
             let mut log = self.signal_log.lock().unwrap();
             let (next, q) = log.entry(*channel).or_insert((1, Default::default()));
@@ -7413,7 +7413,7 @@ impl Channels {
         Ok(())
     }
 
-    /// SIP-54: the channel's signal log above `since`, for a replica.
+    /// SIP-43 §Signals at a replica: the channel's signal log above `since`, for a replica.
     pub fn signals_since(&self, channel: &[u8; 32], since: u64) -> Signals {
         let now = now_unix();
         let mut log = self.signal_log.lock().unwrap();
@@ -7441,7 +7441,7 @@ impl Channels {
         self.tombstone_since.lock().unwrap().insert(*channel, at);
     }
 
-    /// SIP-54: where this replica's pull of a channel's signals got to.
+    /// SIP-43 §Signals at a replica: where this replica's pull of a channel's signals got to.
     pub fn signal_mark(&self, channel: &[u8; 32]) -> u64 {
         *self.signal_since.lock().unwrap().get(channel).unwrap_or(&0)
     }
@@ -7453,7 +7453,7 @@ impl Channels {
             .insert(*channel, next.saturating_sub(1));
     }
 
-    /// SIP-54: every present member's marks, for a peer holding the channel
+    /// SIP-43 §Read marks at a replica: every present member's marks, for a peer holding the channel
     /// whole -- receipts withheld from nobody.
     pub fn all_cursors(&self, channel: &[u8; 32]) -> Result<Marks, ChannelError> {
         let db = self.db.lock().unwrap();
@@ -7483,7 +7483,7 @@ impl Channels {
         })
     }
 
-    /// SIP-54: merge marks pulled from the origin, higher wins. Returns
+    /// SIP-43 §Read marks at a replica: merge marks pulled from the origin, higher wins. Returns
     /// whether anything moved.
     pub fn merge_cursors(&self, channel: &[u8; 32], marks: &Marks) -> Result<bool, ChannelError> {
         let mut db = self.db.lock().unwrap();

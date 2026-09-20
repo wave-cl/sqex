@@ -137,7 +137,7 @@ pub struct Said {
     pub has_file: bool,
     pub at: u64,
     pub edited: bool,
-    /// SIP-74: posted again after being stranded; `at` is when it was
+    /// SIP-53 §Posting again: posted again after being stranded; `at` is when it was
     /// first said, by the poster's own word.
     pub again: bool,
     /// SIP-43: the exchange the sender says they posted this through, when
@@ -232,7 +232,7 @@ pub struct Trouble {
     /// key signed and says nothing about whose it is, so the attribution is
     /// withheld rather than assumed.
     pub unattributed: usize,
-    /// SIP-74: posts of yours a move stranded, waiting to be sent again
+    /// SIP-53 §Posting again: posts of yours a move stranded, waiting to be sent again
     /// or let go.
     pub stranded: usize,
     /// Anything else — a refusal, a dropped connection.
@@ -1184,7 +1184,7 @@ fn bubble(app: &App, s: &Said, picked: bool, head: bool, width: usize) -> Vec<Li
     if s.has_file && !s.redacted {
         tail += &format!("  /save {}", s.seq);
     }
-    // SIP-74: shown at when it was first said, and said so.
+    // SIP-53 §Posting again: shown at when it was first said, and said so.
     if s.again && !s.redacted {
         tail += "  (posted again)";
     }

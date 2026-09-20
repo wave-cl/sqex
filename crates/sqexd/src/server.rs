@@ -126,12 +126,12 @@ const MAX_BODY: usize = 64 * 1024;
 /// Said when the SIP-38 name route is disabled (`name_registration = "off"`).
 const NAME_ROUTE_OFF: &str = "this exchange does not offer names";
 
-/// SIP-63: how many `/peer/wait` requests one caller may hold open at
+/// SIP-35 §Open peering: how many `/peer/wait` requests one caller may hold open at
 /// once. A replica holds one per origin and never meets it; a stranger
-/// past it is refused uniformly, which SIP-61 reads as "does not wait".
+/// past it is refused uniformly, which SIP-35 §Waiting reads as "does not wait".
 const MAX_WAITS_PER_PEER: usize = 8;
 
-/// SIP-63: one held wait, counted against its caller until dropped.
+/// SIP-35 §Open peering: one held wait, counted against its caller until dropped.
 struct WaitHeld {
     server: Arc<Server>,
     who: PubKey,
@@ -375,13 +375,13 @@ pub struct Server {
     /// peering routes; it gives it no channel, which takes a signed
     /// authorisation from one of that channel's admins.
     replication_peers: Vec<crate::config::ReplicationPeer>,
-    /// SIP-63: the peering routes are served to any identified caller. A
+    /// SIP-35 §Open peering: the peering routes are served to any identified caller. A
     /// caller not on the list above is then a peer with no standing grant;
     /// what it may pull is what a member's signed statement entitles it to.
     open_peering: bool,
-    /// SIP-63: how many `/peer/wait` requests each caller holds open now.
+    /// SIP-35 §Open peering: how many `/peer/wait` requests each caller holds open now.
     waits: Mutex<HashMap<PubKey, usize>>,
-    /// SIP-64: the handovers this exchange signed, oldest first, served
+    /// SIP-40 §Lineage: the handovers this exchange signed, oldest first, served
     /// to anyone who asks; re-read when the file changes, so a rotation
     /// done before 0.81.0 can be added without a restart. With the file's
     /// modification time as last read.
@@ -392,8 +392,8 @@ pub struct Server {
     /// SIP-65: the `(caller, eph)` pairs rung on lately, so a word is
     /// honoured once within `CALL_WORD_SECS`. Value: when it was seen.
     call_words: Mutex<HashMap<(PubKey, [u8; 32]), u64>>,
-    /// SIP-64: when each origin's lineage was last asked for, so a
-    /// repudiated entry at a pre-SIP-64 origin does not ask every pull.
+    /// SIP-40 §Lineage: when each origin's lineage was last asked for, so a
+    /// repudiated entry at a pre-SIP-40 §Lineage origin does not ask every pull.
     lineage_asked: Mutex<HashMap<PubKey, std::time::Instant>>,
     lineage_retry: std::time::Duration,
     /// SIP-35: the origins this one replicates *from*, and the seed it dials
@@ -523,7 +523,7 @@ impl Server {
         // it, and removing the account removes its devices with it.
         let (devices, expiry) = self.devices.registered_to(&state.keys());
         allowed.extend(devices.iter().filter_map(derive));
-        // SIP-63: so is the recorded home of an admitted account, for as
+        // SIP-35 §Open peering: so is the recorded home of an admitted account, for as
         // long as its Move names one -- the same shape, the person's own
         // signature naming a key that acts for them.
         allowed.extend(
@@ -570,7 +570,7 @@ impl Server {
             .or_insert_with(|| Arc::new(crate::replica::Forwarder::new(origin, addr, domain)));
     }
 
-    /// SIP-64 §Following: drop the way to `origin`, so the next reach resolves anew.
+    /// SIP-40 §Following: drop the way to `origin`, so the next reach resolves anew.
     pub(crate) fn forget_forwarder(&self, origin: &PubKey) {
         self.origins.write().unwrap().remove(origin);
     }
@@ -587,7 +587,7 @@ impl Server {
             .map_err(ChannelError::RateLimited)
     }
 
-    /// SIP-63: one write a peer caused -- a hint, a Move, a rehome notice,
+    /// SIP-35 §Open peering: one write a peer caused -- a hint, a Move, a rehome notice,
     /// a carried registration -- against the caller's own bucket. The one
     /// reply on a peering route that is not the uniform refusal: it is
     /// about the caller and says nothing of any channel or account.
@@ -595,7 +595,7 @@ impl Server {
         self.limit(crate::limits::Kind::Peering, who, [0; 32])
     }
 
-    /// SIP-54: a signal pulled from the origin's log, handed to this
+    /// SIP-43 §Signals at a replica: a signal pulled from the origin's log, handed to this
     /// exchange's members as if its sender had sent it here. Skipped when
     /// the sender's device is connected here: it did send it here, and
     /// was delivered at the time.
@@ -625,7 +625,7 @@ impl Server {
         }
     }
 
-    /// SIP-54: marks pulled from the origin, merged; the members are told
+    /// SIP-43 §Read marks at a replica: marks pulled from the origin, merged; the members are told
     /// where anything moved.
     pub(crate) fn merge_pulled_cursors(
         &self,
@@ -681,7 +681,7 @@ impl Server {
             })?;
         let (found, moved_from, addr) = crate::relay::find_peer_moved(self, &domain).await.ok()?;
         if found != *key {
-            // SIP-64 §Recognising a rotation: the domain names another key. Its successor, on the
+            // SIP-40 §Recognising a rotation: the domain names another key. Its successor, on the
             // retiring key's own word -- a handover the pin followed, or the
             // successor's lineage naming the key held -- and never on the
             // zone's word alone.
@@ -707,7 +707,7 @@ impl Server {
         Some((addr, domain))
     }
 
-    /// SIP-64 §Recognising a rotation: whether `successor`, reached at `addr` for `domain`, serves a
+    /// SIP-40 §Recognising a rotation: whether `successor`, reached at `addr` for `domain`, serves a
     /// lineage that verifies for it and names `held` among its earlier keys.
     async fn lineage_names(
         &self,
@@ -737,7 +737,7 @@ impl Server {
         }
     }
 
-    /// SIP-64 §Following: re-key every holding of `from` to `to` -- the registry's
+    /// SIP-40 §Following: re-key every holding of `from` to `to` -- the registry's
     /// homes and hints, the channel store's copies and lineage, the way
     /// there -- and learn `to`'s lineage, so what `from` receipted goes on
     /// verifying. Logged once: the one time an operator sees it happen.
@@ -754,7 +754,7 @@ impl Server {
         self.add_forwarder(*to, addr, domain.to_string());
         tracing::info!(
             %domain, from = %from, to = %to, registry, copies,
-            "an exchange rotated its key; every holding of it followed (SIP-64)"
+            "an exchange rotated its key; every holding of it followed (SIP-40)"
         );
         // Asked now rather than on the next pull, since the copies' past
         // is under the old key and the next pull is what verifies it.
@@ -1110,7 +1110,7 @@ impl Server {
     /// Whether `who` may speak the SIP-35 peering routes at all.
     ///
     /// The operational half of the gate, and only that half — what a peer may
-    /// then *pull* is [`Self::may_pull`]. SIP-63: an exchange that peers
+    /// then *pull* is [`Self::may_pull`]. SIP-35 §Open peering: an exchange that peers
     /// openly answers anyone, as a peer that holds no grant of its own --
     /// the entitlement functions see an empty `for` list and decide from
     /// the log and the home records alone.
@@ -1127,14 +1127,14 @@ impl Server {
             })
     }
 
-    /// SIP-63: whether `key`, found for a domain, may be asked on a
+    /// SIP-35 §Open peering: whether `key`, found for a domain, may be asked on a
     /// client's behalf -- a listed peer, or anyone when peering openly.
     /// Calls are not asked here; they keep SIP-39's list.
     pub(crate) fn may_ask(&self, key: &PubKey) -> bool {
         self.open_peering || self.peers_with(key)
     }
 
-    /// SIP-64: this exchange's lineage, re-read when the file changed. A
+    /// SIP-40 §Lineage: this exchange's lineage, re-read when the file changed. A
     /// file that has gone wrong since start is logged and the last good
     /// lineage kept: a peer is never served a chain that fails its own
     /// check, and the operator sees why.
@@ -1167,7 +1167,7 @@ impl Server {
         self.names.resolve(label)
     }
 
-    /// SIP-70: the keys whose mailbox `device` reads: its own, and its
+    /// SIP-5 §Collection by a device: the keys whose mailbox `device` reads: its own, and its
     /// account's where the registry binds it to one.
     pub(crate) fn mine_and_accounts(&self, device: &PubKey) -> Vec<PubKey> {
         let account = self.account_of(device);
@@ -1238,7 +1238,7 @@ impl Server {
         }
     }
 
-    /// SIP-64: whether to ask `origin` for its lineage now -- never asked
+    /// SIP-40 §Lineage: whether to ask `origin` for its lineage now -- never asked
     /// this process, or (`again`) a repudiated entry and the last ask is
     /// `lineage_retry` behind us. Marks the ask.
     pub(crate) fn lineage_due(&self, origin: &PubKey, again: bool) -> bool {
@@ -1253,7 +1253,7 @@ impl Server {
         due
     }
 
-    /// SIP-63: hold one more wait for `who`, or say the caller is over
+    /// SIP-35 §Open peering: hold one more wait for `who`, or say the caller is over
     /// `MAX_WAITS_PER_PEER`. The guard lets go when dropped.
     fn hold_wait(self: &Arc<Self>, who: PubKey) -> Option<WaitHeld> {
         let mut waits = self.waits.lock().unwrap();
@@ -1425,7 +1425,7 @@ impl Server {
         let to = self.channels.members_of(channel);
         self.events.publish(&to, event);
         self.wake(&to, &event);
-        // SIP-61: and the peers waiting on this channel, for everything a
+        // SIP-35 §Waiting: and the peers waiting on this channel, for everything a
         // pull would carry -- an entry woke them already; a signal, a
         // read mark or a redaction only gets here.
         self.channels.wake(channel);
@@ -1536,7 +1536,7 @@ pub async fn bind_with(
     find: crate::relay::Find,
 ) -> Result<Bound> {
     let public_key = PubKey::new(signing_key.verifying_key().to_bytes());
-    // SIP-64: a lineage that does not end at this key is not this
+    // SIP-40 §Lineage: a lineage that does not end at this key is not this
     // exchange's, and is refused here rather than served.
     let lineage =
         crate::lineage::load(&config.lineage_file, &public_key).map_err(Error::Malformed)?;
@@ -1750,7 +1750,7 @@ pub async fn bind_with(
         connections: AtomicU64::new(0),
         requests: AtomicU64::new(0),
     });
-    // SIP-64 §Following: what this exchange held for its own earlier keys is its own
+    // SIP-40 §Following: what this exchange held for its own earlier keys is its own
     // now -- an account's Move naming the key it rotated from, an origin
     // hint, a learned home -- with the Move's signature cleared, as at any
     // other holder. Done at every start, so a store from before the
@@ -1758,7 +1758,7 @@ pub async fn bind_with(
     for earlier in &own_predecessors {
         let n = server.devices.follow_exchange(earlier, &public_key);
         if n > 0 {
-            tracing::info!(from = %earlier, rows = n, "holdings of this exchange's earlier key followed to it (SIP-64)");
+            tracing::info!(from = %earlier, rows = n, "holdings of this exchange's earlier key followed to it (SIP-40)");
         }
     }
     // The front door, made once and found by name thereafter. An exchange
@@ -2717,7 +2717,7 @@ async fn route(
                 None => refuse(404, Code::NotFound, None),
             },
         },
-        // SIP-62: the account, still holding its key, names its successor
+        // SIP-44 §The handover: the account, still holding its key, names its successor
         // and keeps its devices under the new key's credentials.
         ("POST", "/account/handover") => match (account, Handover::decode(body)) {
             (None, _) => no_identity("handing an account over"),
@@ -3053,7 +3053,7 @@ async fn route(
         // every credential carries both keys in the clear to whoever verifies
         // one. Pretending otherwise would protect something already published
         // while making a member list impossible to render.
-        // SIP-62 §Which account a device is: whose device the caller is, from the registry -- the one
+        // SIP-44 §Which account a device is: whose device the caller is, from the registry -- the one
         // party that knows after a handover moved it. Its own key twice
         // where it is registered to nobody: every key is an account until
         // the registry says otherwise (SIP-22).
@@ -3557,7 +3557,7 @@ async fn route(
                 .encode(),
             ),
         },
-        // SIP-77: the calling device's chain heads by position, from the
+        // SIP-43 §The heads by position: the calling device's chain heads by position, from the
         // entries this exchange holds and the mark it keeps.
         ("POST", "/channel/chain") => {
             match (account, sqex_proto::channel::ChainAsk::decode(body)) {
@@ -3666,7 +3666,7 @@ async fn route(
                                     info.my_chain_head = standing.head;
                                     info.my_msg_seq = standing.msg_seq;
                                 }
-                                // SIP-77: the origin cannot be asked; the
+                                // SIP-43 §The heads by position: the origin cannot be asked; the
                                 // chain as this copy's own entries show it,
                                 // which is what a rehome here would rebuild.
                                 None => {
@@ -4044,7 +4044,7 @@ async fn route(
                     .set_cursor(&me, &req.channel, req.read, req.receipts)
                 {
                     Ok(()) => {
-                        // SIP-54: recorded here for this exchange's readers,
+                        // SIP-43 §Read marks at a replica: recorded here for this exchange's readers,
                         // and carried to the origin for everybody else's.
                         // Best effort: a mark the origin did not get is a
                         // mark the next one covers.
@@ -4123,7 +4123,7 @@ async fn route(
                             .signal(&me, &dev, &req.channel, req.kind, &req.body)
                     }) {
                     Ok(()) => {
-                        // SIP-54: delivered here at once, and carried to
+                        // SIP-43 §Read marks at a replica: delivered here at once, and carried to
                         // the origin, whose log every copy pulls.
                         let _ = forward_action(server, &dev, &req.channel, path, body).await;
                         // Not to the sender: a client does not need telling
@@ -4242,7 +4242,7 @@ async fn route(
             _ => peering_refused(),
         },
 
-        // SIP-54: a replica pulls every member's marks, and the signal log.
+        // SIP-43 §Read marks at a replica: a replica pulls every member's marks, and the signal log.
         ("POST", "/peer/cursors") => {
             match (peer.identity, sqex_proto::peer::PullCursors::decode(body)) {
                 (Some(who), Ok(req))
@@ -4564,13 +4564,13 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-61: a replica waits here for any of its channels to change.
+        // SIP-35 §Waiting: a replica waits here for any of its channels to change.
         // Channels the peer may not pull are left out of every answer and
         // never waited on, so the answer says nothing about them.
         ("POST", "/peer/wait") => match (peer.identity, PeerWait::decode(body)) {
             (Some(who), Ok(req)) if server.peering(&who).is_some() => {
                 let p = server.peering(&who).unwrap();
-                // SIP-63: past the caller's share of held waits, the
+                // SIP-35 §Open peering: past the caller's share of held waits, the
                 // uniform refusal -- which a replica reads as "does not
                 // wait" and polls instead, rather than looping on an
                 // empty answer.
@@ -4643,7 +4643,7 @@ async fn route(
                     if carried.credential.delegate != device {
                         return peering_refused();
                     }
-                    // SIP-63: a registration this exchange had not seen is
+                    // SIP-35 §Open peering: a registration this exchange had not seen is
                     // a write the caller caused, counted against it.
                     if server.devices.account_for(&device) == device
                         && let Err(e) = server.peer_write(&who)
@@ -4831,7 +4831,7 @@ async fn route(
                         }
                         _ => return peering_refused(),
                     },
-                    // SIP-54: a member's read mark, set at a copy.
+                    // SIP-43 §Read marks at a replica: a member's read mark, set at a copy.
                     "/channel/cursor" => match ChannelCursor::decode(&req.body) {
                         Ok(r)
                             if server
@@ -4858,7 +4858,7 @@ async fn route(
                         }
                         _ => return peering_refused(),
                     },
-                    // SIP-54: a signal sent at a copy, queued here and logged
+                    // SIP-43 §Signals at a replica: a signal sent at a copy, queued here and logged
                     // for every copy to pull.
                     "/channel/signal" => match SignalOut::decode(&req.body) {
                         Ok(r)
@@ -5297,7 +5297,7 @@ async fn route(
                 Err(e) => refuse(507, e.code(), None),
             },
         },
-        // SIP-70: a device reads its account's queue beside its own -- the
+        // SIP-5 §Collection by a device: a device reads its account's queue beside its own -- the
         // registry says whose device it is (SIP-22), as it does for every
         // other service. Nothing is re-sealed: an item sealed to the account
         // opens only where the account's key is.
@@ -5433,7 +5433,7 @@ async fn route(
         // The runtime peer list and nothing else; a peer's label is its
         // domain when the label is a DNS name, and empty otherwise -- an
         // operator's note is not a place to be reached.
-        // SIP-64: this exchange's earlier keys, to anyone. Every link was
+        // SIP-40 §Lineage: this exchange's earlier keys, to anyone. Every link was
         // in a public zone once; a peer's `post` with no body asks too.
         ("GET", "/exchange/lineage") | ("POST", "/exchange/lineage") => (
             200,
@@ -5854,7 +5854,7 @@ async fn succeed(server: &Server, me: &PubKey, claim: Claim) -> (u16, &'static s
         || server.devices.successor_of(&successor).is_some()
         || server.devices.has_devices(&successor)
         || !server.names.names_for(&successor).is_empty()
-        // SIP-62: a key that is a member somewhere is an account too.
+        // SIP-44 §The handover: a key that is a member somewhere is an account too.
         || server.channels.has_memberships(&successor)
     {
         return refused();
@@ -5909,7 +5909,7 @@ async fn succeed(server: &Server, me: &PubKey, claim: Claim) -> (u16, &'static s
     )
 }
 
-/// SIP-62: verify a handover and carry it out through SIP-44's path, with
+/// SIP-44 §The handover: verify a handover and carry it out through SIP-44's path, with
 /// the devices kept. One refusal for every way it can be wrong, as for a
 /// claim.
 async fn handover(server: &Server, me: &PubKey, h: Handover) -> (u16, &'static str, Vec<u8>) {
@@ -6405,7 +6405,7 @@ fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
 ///
 /// It carries no detail for the same reason. A detail string is a reply that
 /// varies.
-/// SIP-61: the channels among `watched` that have an entry past the seq
+/// SIP-35 §Waiting: the channels among `watched` that have an entry past the seq
 /// the peer holds, at once; else the first to change -- an entry, a
 /// signal, a read mark, a redaction -- within `secs`; else none. The
 /// notifiers are taken before the first look, as `fetch_waiting` takes
@@ -6564,7 +6564,7 @@ fn record_move(
             } else {
                 tracing::info!(account = %mv.account, home = %mv.home, domain, "an account moved away");
             }
-            // SIP-63: a whitelist admits the home an admitted account
+            // SIP-35 §Open peering: a whitelist admits the home an admitted account
             // named, and stops when the account names another.
             server.resync_transport();
             (
@@ -6572,7 +6572,7 @@ fn record_move(
                 "application/octet-stream",
                 sqex_proto::home::Moved {
                     now: now_unix(),
-                    // SIP-63: open peering answers any home, and `peering`
+                    // SIP-35 §Open peering: open peering answers any home, and `peering`
                     // says so; a listed exchange answers from its list.
                     peered: mv.home == me || server.peering(&mv.home).is_some(),
                 }

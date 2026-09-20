@@ -262,7 +262,7 @@ pub enum ChatError {
     /// revoked since may be on it and one linked since is not. No key was
     /// sealed to it; the epoch stays where it is until the home answers.
     DevicesStale(PubKey),
-    /// SIP-70: a mail item this device fetched is sealed to a key it does
+    /// SIP-5 §Collection by a device: a mail item this device fetched is sealed to a key it does
     /// not hold -- its account's, on a device that was not entrusted with
     /// it -- and must not be deleted from here.
     MailSealedElsewhere(u64),
@@ -827,9 +827,9 @@ pub struct Chat {
     /// SIP-60: where people this client located live -- their home's key
     /// and domain -- for opening a direct message where it belongs.
     located: HashMap<PubKey, (PubKey, String)>,
-    /// SIP-70: mail items this device has opened, and so may delete.
+    /// SIP-5 §Collection by a device: mail items this device has opened, and so may delete.
     mail_opened: std::collections::HashSet<u64>,
-    /// SIP-62: channels whose store gap was asked for this run.
+    /// SIP-44 §The handover: channels whose store gap was asked for this run.
     gap_asked: std::collections::HashSet<[u8; 32]>,
     /// SIP-57: the timer this client puts on what it sends, per channel;
     /// seconds, none where unset.
@@ -838,13 +838,13 @@ pub struct Chat {
     /// origin, newest first. What they signed and receipted verifies under
     /// them, as a key's predecessors do (SIP-40).
     former: HashMap<[u8; 32], Vec<PubKey>>,
-    /// SIP-74: forks already dealt with, `(channel, fork)`, so a `Home`
+    /// SIP-53 §Posting again: forks already dealt with, `(channel, fork)`, so a `Home`
     /// answer read again does not strand again.
     forks_seen: HashSet<([u8; 32], u64)>,
-    /// SIP-74: forks met while folding a batch -- a rehome entry read --
+    /// SIP-53 §Posting again: forks met while folding a batch -- a rehome entry read --
     /// dealt with once the batch is done, where a network call is possible.
     pending_forks: Vec<([u8; 32], PubKey, u64)>,
-    /// SIP-74: channels whose entries carried a receipt under no origin
+    /// SIP-53 §Posting again: channels whose entries carried a receipt under no origin
     /// this client knows -- the first sign, for a client whose cursor is
     /// above a fork, that the origin changed. Its home is asked again.
     reask_home: HashSet<[u8; 32]>,
@@ -2119,7 +2119,7 @@ impl Chat {
 
     /// The channel two accounts share. Derived, not asked for.
     ///
-    /// SIP-62: a conversation whose other party changed key keeps its
+    /// SIP-44 §The handover: a conversation whose other party changed key keeps its
     /// channel, and is found here before anything is derived.
     pub fn dm_with(&self, them: &PubKey) -> [u8; 32] {
         if let Ok(Some(c)) = self.store.dm_alias(them) {
@@ -2232,7 +2232,7 @@ impl Chat {
         Ok(channel)
     }
 
-    // ---- SIP-62: account key handover ------------------------------------
+    // ---- SIP-44 §The handover: account key handover ------------------------------------
 
     /// Hand this account over to a new key while the old one is still
     /// held: the will under the account's key, a credential from the new
@@ -2328,7 +2328,7 @@ impl Chat {
         Ok(())
     }
 
-    /// SIP-62: a correspondent's key changed, seen in a channel's log. The
+    /// SIP-44 §The handover: a correspondent's key changed, seen in a channel's log. The
     /// contact follows; where the channel was the direct message with the
     /// old key, it is the direct message with the new.
     fn follow_correspondent(&mut self, channel: &[u8; 32], old: &PubKey, new: &PubKey) {
@@ -2679,7 +2679,7 @@ impl Chat {
             // served it to. Verifying the zeroes it arrived with would fail on
             // every honest envelope.
             // Under any key the channel's receipts verify under: the
-            // exchange that orders it, its earlier keys (SIP-40, SIP-64)
+            // exchange that orders it, its earlier keys (SIP-40, SIP-40 §Lineage)
             // and the exchanges that ordered it before (SIP-53) -- the
             // envelope names the place as it was when published.
             let addressed = Envelope {
@@ -2908,15 +2908,15 @@ impl Chat {
             .devices)
     }
 
-    /// SIP-70: the mail waiting for this device and for its account, as
+    /// SIP-5 §Collection by a device: the mail waiting for this device and for its account, as
     /// the exchange lists them together.
     pub async fn mail_list(&mut self) -> Result<sqex_proto::mailbox::Listing> {
         let body = self.post("/mailbox/list", Vec::new()).await?;
         sqex_proto::mailbox::Listing::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
-    /// SIP-70: fetch and open one item with every key this device holds --
-    /// its own, then the account's (SIP-62 §Which account a device is). `Ok(None)` where
+    /// SIP-5 §Collection by a device: fetch and open one item with every key this device holds --
+    /// its own, then the account's (SIP-44 §Which account a device is). `Ok(None)` where
     /// there is no such item; `Err(MailSealedElsewhere)` where it is for a
     /// key this device does not hold, which it must then not delete.
     pub async fn mail_read(&mut self, id: u64) -> Result<Option<(PubKey, Vec<u8>)>> {
@@ -2946,7 +2946,7 @@ impl Chat {
         Err(ChatError::MailSealedElsewhere(id))
     }
 
-    /// SIP-70: complete collection of an item this device has read. An
+    /// SIP-5 §Collection by a device: complete collection of an item this device has read. An
     /// item it has not opened is refused here rather than at the exchange:
     /// deleting completes collection for every device of the account.
     pub async fn mail_delete(&mut self, id: u64) -> Result<bool> {
@@ -2965,7 +2965,7 @@ impl Chat {
         Ok(body.first().copied().unwrap_or(0) != 0)
     }
 
-    /// SIP-62 §Which account a device is: whose device this is, as the registry has it -- the one party
+    /// SIP-44 §Which account a device is: whose device this is, as the registry has it -- the one party
     /// that knows after a handover moved it.
     pub async fn whose(&mut self) -> Result<sqex_proto::device::Whose> {
         if self.offline() {
@@ -2996,9 +2996,9 @@ impl Chat {
         sqex_proto::device::Whose::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
-    /// SIP-62 §Which account a device is: follow this device's own account as the registry has it.
+    /// SIP-44 §Which account a device is: follow this device's own account as the registry has it.
     /// Where the account answered is not the one the store names -- a
-    /// handover (SIP-62) presented from a sibling moved this device -- the
+    /// handover (SIP-44 §The handover) presented from a sibling moved this device -- the
     /// store's account, its credential and its direct messages follow, as
     /// the presenting device's did. Returns the account followed to, if any.
     pub async fn follow_account(&mut self) -> Result<Option<PubKey>> {
@@ -3018,7 +3018,7 @@ impl Chat {
         // before the account changes under them.
         //
         // The exchange has already moved the membership to the new key
-        // (SIP-62: channels follow), so the members are `new` and the
+        // (SIP-44 §The handover: channels follow), so the members are `new` and the
         // other party, in whichever order the exchange lists them. The
         // other party is the one that is neither -- taking "the first that
         // is not `old`" found `new` half the time and derived nothing.
@@ -3216,7 +3216,7 @@ impl Chat {
         Ok(out)
     }
 
-    /// SIP-72: the ended incarnations this device keeps, as a sibling is
+    /// SIP-42 §Generations: the ended incarnations this device keeps, as a sibling is
     /// offered them.
     pub fn held_generations(&self) -> Result<Vec<crate::store::Generation>> {
         Ok(self
@@ -3229,7 +3229,7 @@ impl Chat {
             .collect())
     }
 
-    /// SIP-72: whether `key` is an exchange this device knows -- the one
+    /// SIP-42 §Generations: whether `key` is an exchange this device knows -- the one
     /// it talks to, one a channel of its lives or lived at, or an earlier
     /// key of one of those. A sibling's word for an origin it does not
     /// know is not taken.
@@ -3248,7 +3248,7 @@ impl Chat {
             .any(|(k, older)| k == key || older.contains(key))
     }
 
-    /// SIP-72: take a sibling's entries of an ended incarnation as a
+    /// SIP-42 §Generations: take a sibling's entries of an ended incarnation as a
     /// generation. Verified as `import` verifies the live one -- each
     /// entry's signature, its device's credential, the chain -- with the
     /// receipts under `origin` and its earlier keys in place of the
@@ -4287,7 +4287,7 @@ impl Chat {
             let (origin, domain) = (home.origin, home.domain.clone());
             let _ = self.hint_home(&origin, &domain).await;
         }
-        // SIP-74: a former origin whose regime ended below what this client
+        // SIP-53 §Posting again: a former origin whose regime ended below what this client
         // holds is a fork this client was on the losing side of.
         let forks: Vec<(u64, PubKey)> = home
             .former
@@ -4303,7 +4303,7 @@ impl Chat {
         Ok(home)
     }
 
-    /// SIP-74: deal with a fork at `fork` that `former` lost. What this
+    /// SIP-53 §Posting again: deal with a fork at `fork` that `former` lost. What this
     /// client holds above it under the former origin's receipts is of the
     /// losing regime: its own posts are kept aside as stranded, the rest
     /// dropped, the cursor put back to the fork, and the chain continued
@@ -4421,7 +4421,7 @@ impl Chat {
         Ok(stranded)
     }
 
-    /// SIP-74: the chain continues from the last entry the winning origin
+    /// SIP-53 §Posting again: the chain continues from the last entry the winning origin
     /// holds. Asked plainly: `info` asks `home`, which may have asked here.
     async fn chain_back_to_origin(&mut self, channel: &[u8; 32]) -> Result<()> {
         let asked = self
@@ -4435,10 +4435,10 @@ impl Chat {
         let Some(info) = asked else {
             return Ok(());
         };
-        // A replica tracked no chains (SIP-53). SIP-77 has it report the
+        // A replica tracked no chains (SIP-53). SIP-43 §The heads by position has it report the
         // chain as its entries show it, and serve the heads by position;
         // an exchange from before that reports zero, and this client
-        // rebuilds from the entries it holds itself (SIP-74).
+        // rebuilds from the entries it holds itself (SIP-53 §Posting again).
         let (target_seq, target_head) = if info.my_chain_seq > 0 {
             (info.my_chain_seq, info.my_chain_head)
         } else if let Ok(Some((seq, head))) = self
@@ -4458,7 +4458,7 @@ impl Chat {
         Ok(())
     }
 
-    /// SIP-77: this device's chain heads by position as the exchange holds
+    /// SIP-43 §The heads by position: this device's chain heads by position as the exchange holds
     /// them, from `from` up. Empty where the exchange predates the route.
     pub async fn chain_heads(
         &mut self,
@@ -4487,7 +4487,7 @@ impl Chat {
             .heads)
     }
 
-    /// SIP-74: this device's chain as the entries held up to `upto` have
+    /// SIP-53 §Posting again: this device's chain as the entries held up to `upto` have
     /// it -- the next position and the link -- or `None` where it signed
     /// nothing held. A post of this device's links over its entry terms;
     /// an action of this device's (a system entry naming it) links over an
@@ -4553,7 +4553,7 @@ impl Chat {
         Ok(last)
     }
 
-    /// SIP-74: this client's own posts a move stranded, oldest first:
+    /// SIP-53 §Posting again: this client's own posts a move stranded, oldest first:
     /// `(seq, posted, post)`.
     pub fn stranded_posts(&self, channel: &[u8; 32]) -> Result<Vec<(u64, u64, SipPost)>> {
         let mut out = Vec::new();
@@ -4565,7 +4565,7 @@ impl Chat {
         Ok(out)
     }
 
-    /// SIP-74: post a stranded post again, as a fresh entry saying when it
+    /// SIP-53 §Posting again: post a stranded post again, as a fresh entry saying when it
     /// was first said. A reply to something above the fork loses its
     /// reply: what it answered was stranded too.
     pub async fn post_again(&mut self, channel: &[u8; 32], seq: u64) -> Result<Posted> {
@@ -4591,7 +4591,7 @@ impl Chat {
         Ok(sent)
     }
 
-    /// SIP-74: let a stranded post go unsent.
+    /// SIP-53 §Posting again: let a stranded post go unsent.
     pub fn forget_stranded(&mut self, channel: &[u8; 32], seq: u64) -> Result<()> {
         Ok(self.store.drop_stranded(channel, seq)?)
     }
@@ -4730,7 +4730,7 @@ impl Chat {
         domain: &str,
     ) -> Result<()> {
         let info = self.info(channel).await?;
-        // SIP-74: rehoming at a replica whose origin is gone strands, by that
+        // SIP-53 §Posting again: rehoming at a replica whose origin is gone strands, by that
         // act, everything above the replica's last position -- this client's
         // own included -- and the rehome must chain from what the replica
         // holds, or it links to a hash the replica has never seen.
@@ -4784,7 +4784,7 @@ impl Chat {
         .await?;
         // The exchange just learned the channel moved; what it answers for
         // the channel's home has changed, and so may what this client holds
-        // above the fork (SIP-74).
+        // above the fork (SIP-53 §Posting again).
         self.homes.remove(channel);
         let _ = self.home(channel).await;
         Ok(true)
@@ -4794,7 +4794,7 @@ impl Chat {
     /// receipted, if any.
     fn rehome_entry(&self, channel: &[u8; 32]) -> Result<Option<Entry>> {
         // Under any connection: the entry was read at the new origin, and is
-        // carried from a connection to the old one (SIP-74 found this).
+        // carried from a connection to the old one (SIP-53 §Posting again found this).
         let raw = self.store.entries_anywhere(channel)?;
         let mut found = None;
         for (_, b) in &raw {
@@ -4848,17 +4848,17 @@ impl Chat {
 
     /// What signs for the account here: this device's own key where the
     /// device is the account, or the account seed the store keeps from a
-    /// handover this client made (SIP-62). `None` for a linked device of an
+    /// handover this client made (SIP-44 §The handover). `None` for a linked device of an
     /// account held elsewhere.
     /// The account's seed, where this device holds it: its own where it
-    /// is the account, the one it made (SIP-62) or was entrusted with
-    /// (SIP-62 §Entrusting the key) otherwise.
+    /// is the account, the one it made (SIP-44 §The handover) or was entrusted with
+    /// (SIP-44 §Entrusting the key) otherwise.
     pub fn account_seed(&self) -> Option<[u8; 32]> {
         if self.me == self.device {
             return Some(self.seed);
         }
         // Only the key of the account this device is *now*: a seed kept
-        // from before a handover another device presented (SIP-62 §Entrusting the key) would
+        // from before a handover another device presented (SIP-44 §Entrusting the key) would
         // sign as a retired account, and every verifier would take it.
         self.store.account_seed().ok().flatten().filter(|seed| {
             PubKey::new(
@@ -4869,13 +4869,13 @@ impl Chat {
         })
     }
 
-    /// SIP-62 §Entrusting the key: keep an account seed a sibling entrusted to this device.
+    /// SIP-44 §Entrusting the key: keep an account seed a sibling entrusted to this device.
     /// The store keeps it sealed; the caller checked it is this account's.
     pub fn take_account_seed(&mut self, seed: [u8; 32]) {
         let _ = self.store.set_account_seed(&seed);
     }
 
-    /// SIP-62 §Entrusting the key: whether this device holds the account key.
+    /// SIP-44 §Entrusting the key: whether this device holds the account key.
     pub fn holds_account_key(&self) -> bool {
         self.account_seed().is_some()
     }
@@ -5956,7 +5956,7 @@ impl Chat {
     /// The asking half of [`poll`](Self::poll), on this client's own borrow.
     async fn ask(&mut self, channel: &[u8; 32], wait_secs: u16) -> Result<Fetched> {
         let (mut since, _, _) = self.store.cursor(channel)?;
-        // SIP-62: a hole in what this store holds is asked for again, once
+        // SIP-44 §The handover: a hole in what this store holds is asked for again, once
         // per channel per run -- an entry a copy refused and later took
         // sits below the cursor, where a fetch from the cursor never looks.
         if !self.gap_asked.contains(channel)
@@ -6100,7 +6100,7 @@ impl Chat {
             if let Some(stamp) = &e.stamp {
                 last_head = Some((e.seq, stamp.head));
             }
-            // SIP-74: a receipt under no origin this client knows is how a
+            // SIP-53 §Posting again: a receipt under no origin this client knows is how a
             // client with its cursor above a fork first meets the new origin.
             if standing == Standing::Repudiated {
                 self.reask_home.insert(*channel);
@@ -6191,7 +6191,7 @@ impl Chat {
             {
                 let was = self.exchange_of(channel);
                 self.moved_origin(channel, &sys.subject);
-                // SIP-74: everything held above the position before this
+                // SIP-53 §Posting again: everything held above the position before this
                 // entry, under the old origin, is the losing side of a fork.
                 if was != sys.subject {
                     self.pending_forks
@@ -6365,7 +6365,7 @@ impl Chat {
                 .map_err(|e| ChatError::Protocol(e.to_string()))?;
         }
 
-        // SIP-62: a correspondent who changed key is followed as a contact
+        // SIP-44 §The handover: a correspondent who changed key is followed as a contact
         // and as a conversation, before anything is folded.
         let successions: Vec<(PubKey, PubKey)> = entries
             .entries
@@ -6446,7 +6446,7 @@ impl Chat {
         if last > since {
             self.store.set_since(channel, last)?;
         }
-        // SIP-74: a rehome read in this batch is a fork; what was held above
+        // SIP-53 §Posting again: a rehome read in this batch is a fork; what was held above
         // it under the old origin is dealt with now, and the next poll reads
         // the winning history from there. A receipt under a key this client
         // does not know has the home asked again, which finds the fork the

@@ -310,7 +310,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::pull_soft_state"),
         ReplicationPeer,
     ),
-    // SIP-54: a replica pulls the members' marks and the signal log.
+    // SIP-43 §Read marks at a replica: a replica pulls the members' marks and the signal log.
     (
         "POST",
         "/peer/cursors",
@@ -350,7 +350,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Cli("sqex succession show"),
         Identity,
     ),
-    // SIP-62: the account hands itself over to a new key, devices kept.
+    // SIP-44 §The handover: the account hands itself over to a new key, devices kept.
     (
         "POST",
         "/account/handover",
@@ -401,7 +401,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::run_homed"),
         ReplicationPeer,
     ),
-    // SIP-61: a replica waits on the origin for its channels to change.
+    // SIP-35 §Waiting: a replica waits on the origin for its channels to change.
     (
         "POST",
         "/peer/wait",
@@ -502,7 +502,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Chat("Chat::stranded_entries"),
         SelfOnly,
     ),
-    // SIP-77: the calling device's chain heads by position.
+    // SIP-43 §The heads by position: the calling device's chain heads by position.
     ("POST", "/channel/chain", Chat("Chat::chain_heads"), Member),
     // SIP-71: the folded log of a direct message this exchange ended, to
     // either of its two members.
@@ -573,10 +573,10 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ),
     ("GET", "/exchange/ping", Probe, Whitelisted),
     ("GET", "/exchange/peers", Cli("sqex peers"), Anyone),
-    // SIP-64: a client asks with GET, a replica -- whose H3 client only
+    // SIP-40 §Lineage: a client asks with GET, a replica -- whose H3 client only
     // posts -- with an empty POST. Public: every link was in a zone once.
     ("GET", "/exchange/lineage", Cli("sqex lineage"), Anyone),
-    // SIP-62 §Which account a device is: a client asks whose device it is before it signs anything.
+    // SIP-44 §Which account a device is: a client asks whose device it is before it signs anything.
     ("GET", "/device/account", Chat("Chat::whose"), Identity),
     // SIP-60 §A device hints its home: a device tells its home which origin to pull from.
     ("POST", "/account/hint", Chat("Chat::hint_home"), Identity),

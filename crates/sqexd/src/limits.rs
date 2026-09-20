@@ -17,7 +17,7 @@ pub enum Kind {
     Creates,
     Uploads,
     Reports,
-    /// SIP-63: the writes a peer causes -- hints, Moves, rehome notices,
+    /// SIP-35 §Open peering: the writes a peer causes -- hints, Moves, rehome notices,
     /// carried registrations -- per caller key.
     Peering,
     /// SIP-65: cross-exchange calls dialled or rung, per caller account.

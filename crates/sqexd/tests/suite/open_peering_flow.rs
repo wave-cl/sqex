@@ -1,4 +1,4 @@
-//! SIP-63: peering on a member's word. An exchange that peers openly
+//! SIP-35 §Open peering: peering on a member's word. An exchange that peers openly
 //! serves the peering routes to anyone and grants nothing by it: a home
 //! nobody listed pulls on the account's Move, an origin nobody listed
 //! tells a home of a channel, a name is located at an unlisted domain --

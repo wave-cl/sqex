@@ -138,7 +138,7 @@ pub struct ListDevices {
     pub account: PubKey,
 }
 
-/// SIP-62 §Which account a device is: `GET /device/account`, the account the caller's transport
+/// SIP-44 §Which account a device is: `GET /device/account`, the account the caller's transport
 /// identity is registered to, and the identity itself -- the caller's own
 /// key twice where it is registered to nobody.
 /// `| account[32] | device[32] |`
