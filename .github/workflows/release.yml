@@ -20,8 +20,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # No release from a red main. A tag does not wait for CI, and four releases
   # went out on 2026-09-20 while the snapshot job had been failing since the
-  # first of them. This waits for the tagged commit's CI run and refuses to
-  # build unless it succeeded -- so a broken main costs a tag, not a release.
+  # first of them. This waits for the tagged commit's CI run, in parallel
+  # with the build, and the publish step refuses unless it succeeded -- so a
+  # broken main costs a tag, not a release.
   # ---------------------------------------------------------------------------
   gate:
     runs-on: ubuntu-latest
@@ -37,22 +38,34 @@ jobs:
           set -eu
           sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)"
           echo "tag ${REF} is ${sha}"
+          # The checks, not the cache: `warm` only fills the release cache
+          # and may still be running when everything that tests is green.
           for i in $(seq 1 60); do
-            state="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow ci.yml --commit "${sha}" \
-                       --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion)"' || true)"
-            case "${state}" in
-              "completed success") echo "CI succeeded for ${sha}"; exit 0 ;;
-              "completed "*) echo "::error::CI concluded '${state#completed }' for ${sha}; not releasing" >&2; exit 1 ;;
-              "") echo "no CI run for ${sha} yet (${i})" ;;
-              *) echo "CI is ${state} (${i})" ;;
-            esac
+            run="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow ci.yml --commit "${sha}" \
+                     --json databaseId --jq '.[0].databaseId' || true)"
+            if [ -z "${run}" ]; then
+              echo "no CI run for ${sha} yet (${i})"; sleep 20; continue
+            fi
+            # "<checks> <passed> <failed>": every non-warm job, those that
+            # concluded success, those that concluded anything worse.
+            read -r checks passed failed <<EOF
+          $(gh run view --repo "${GITHUB_REPOSITORY}" "${run}" --json jobs --jq '
+              [.jobs[] | select(.name | startswith("warm") | not)]
+              | "\(length) \(map(select(.conclusion == "success")) | length) \(map(select(.conclusion != null and .conclusion != "success" and .conclusion != "skipped")) | length)"')
+          EOF
+            if [ "${failed:-0}" -gt 0 ]; then
+              echo "::error::CI failed for ${sha} (${failed} of ${checks} checks); not releasing" >&2; exit 1
+            fi
+            if [ "${checks:-0}" -gt 0 ] && [ "${passed}" -eq "${checks}" ]; then
+              echo "CI checks succeeded for ${sha} (${passed} of ${checks})"; exit 0
+            fi
+            echo "CI checks: ${passed:-0} of ${checks:-0} passed (${i})"
             sleep 20
           done
           echo "::error::CI did not finish for ${sha} within 20 minutes" >&2
           exit 1
 
   build:
-    needs: gate
     strategy:
       matrix:
         include:
@@ -127,7 +140,9 @@ jobs:
           path: ${{ env.ARCHIVE }}
 
   release:
-    needs: build
+    # Beside the build, not in front of it: the build and CI run at the same
+    # time, and publishing is what waits for both.
+    needs: [build, gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
