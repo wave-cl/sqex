@@ -1,4 +1,4 @@
-//! SIP-52: catching up in one round trip.
+//! SIP-47 §Catching up in one round trip: catching up in one round trip.
 //!
 //! A device that has been away names the channels it holds, with where it
 //! got to in each, and receives for each **the bytes `Fetch` and `Get` would

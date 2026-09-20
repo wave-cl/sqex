@@ -257,7 +257,7 @@ impl ChannelError {
             ChannelError::StaleGeneration(g) => Some(g.to_string()),
             ChannelError::OriginReachable(a) => Some(a.to_string()),
             // SIP-35: the refusal names the origin, so a client can go there
-            // -- and SIP-71 sends a create there by the same word.
+            // -- and a fold (SIP-60 §What a fold record does) sends a create there by the same word.
             ChannelError::Replicated(origin) => Some(origin.to_string()),
             _ => None,
         }
@@ -631,7 +631,7 @@ CREATE TABLE IF NOT EXISTS stranded (
     posted   INTEGER NOT NULL,
     PRIMARY KEY (channel, seq)
 );
--- SIP-71: direct messages this exchange ordered that were strays -- the
+-- SIP-60 §A direct message opened twice: direct messages this exchange ordered that were strays -- the
 -- conversation lives at the lower key's home -- and were folded on the
 -- home's word. The identifier points at the conversation while the row
 -- stands; the log is kept beside it for both members to read.
@@ -644,7 +644,7 @@ CREATE TABLE IF NOT EXISTS folded (
     second   BLOB NOT NULL,
     at       INTEGER NOT NULL
 );
--- SIP-71 §Folded attachments: the stray's attachments, kept with its folded log for the same
+-- SIP-60 §Folded attachments: the stray's attachments, kept with its folded log for the same
 -- window and the same two members. A blob lives while any attachment or
 -- folded attachment names it.
 CREATE TABLE IF NOT EXISTS folded_attachment (
@@ -653,7 +653,7 @@ CREATE TABLE IF NOT EXISTS folded_attachment (
     at      INTEGER NOT NULL,
     PRIMARY KEY (channel, blob)
 );
--- SIP-71: the folded log, the entry table's columns under the stray's
+-- SIP-60 §Reading the folded log: the folded log, the entry table's columns under the stray's
 -- incarnation. Never served as the conversation; served whole to the
 -- two members at `/channel/folded` for `FOLDED_SECS`.
 CREATE TABLE IF NOT EXISTS folded_entry (
@@ -1137,7 +1137,7 @@ impl Channels {
             }
         }
 
-        // SIP-71: while a fold record stands, the identifier points at the
+        // SIP-60 §What a fold record does: while a fold record stands, the identifier points at the
         // conversation, and one of its two parties opening it here is sent
         // there -- the refusal a copy gives a write, for the same reason.
         if let Some((into, _, first, second)) = folded_row(&tx, &req.channel, now)
@@ -2487,8 +2487,8 @@ impl Channels {
         };
 
         let _ = expire_uploads(&tx, now);
-        // SIP-71: a fold record and its log outlive their window by nothing.
-        // SIP-71 §Folded attachments: nor do its attachments; a blob nothing else names goes.
+        // SIP-60 §What a fold record does: a fold record and its log outlive their window by nothing.
+        // SIP-60 §Folded attachments: nor do its attachments; a blob nothing else names goes.
         let expired_blobs: Vec<[u8; 32]> = tx
             .prepare("SELECT blob FROM folded_attachment WHERE at + ?1 <= ?2")
             .ok()
@@ -3361,7 +3361,7 @@ impl Channels {
     pub fn orders(&self, channel: &[u8; 32]) -> bool {
         let db = self.db.lock().unwrap();
         // `id`, not `channel`: the column was misnamed here from SIP-59
-        // until SIP-71, the query failed quietly, and this answered false
+        // until sqex 0.89.0 (SIP-60 §A direct message opened twice), the query failed quietly, and this answered false
         // for every channel -- so a home pulled its own channels from any
         // origin that listed them and `adopt` marked them replicated.
         let here: bool = db
@@ -4127,7 +4127,7 @@ impl Channels {
             .unwrap_or((0, GENESIS))
     }
 
-    /// SIP-71: the two accounts of a direct message this exchange orders,
+    /// SIP-60 §A direct message opened twice: the two accounts of a direct message this exchange orders,
     /// lesser first -- `None` for a channel it does not order, or one that is
     /// not a direct message by SIP-16's arithmetic.
     pub fn direct_pair(&self, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
@@ -4138,7 +4138,7 @@ impl Channels {
         pair_of(&db, channel)
     }
 
-    /// SIP-71: the same, for a direct message this exchange holds either
+    /// SIP-60 §A direct message opened twice: the same, for a direct message this exchange holds either
     /// way -- ordered, or as a copy.
     pub fn held_direct_pair(&self, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
         let db = self.db.lock().unwrap();
@@ -4160,7 +4160,7 @@ impl Channels {
         .and_then(|i| i.try_into().ok())
     }
 
-    /// SIP-71: fold a stray. The channel this exchange orders under
+    /// SIP-60 §The stray's exchange verifies, then folds: fold a stray. The channel this exchange orders under
     /// `channel` is a direct message whose lesser member's home, `into`,
     /// holds the conversation under `instance`; its log is kept for both
     /// members and the channel is destroyed, its incarnation retired, and
@@ -4255,7 +4255,7 @@ impl Channels {
             params![&channel[..], &own[..]],
         )
         .map_err(storage("retire folded instance"))?;
-        // SIP-71 §Folded attachments: the attachments are kept with the log, for the pair and the
+        // SIP-60 §Folded attachments: the attachments are kept with the log, for the pair and the
         // window; a blob is not collected while a folded attachment names it.
         tx.execute(
             "DELETE FROM folded_attachment WHERE channel = ?1",
@@ -4273,14 +4273,14 @@ impl Channels {
         Ok((first, second))
     }
 
-    /// SIP-71: where a folded identifier points, with the domain hint and
+    /// SIP-60 §What a fold record does: where a folded identifier points, with the domain hint and
     /// the pair, while the record stands.
     pub fn folded_into(&self, channel: &[u8; 32]) -> Option<(PubKey, String, PubKey, PubKey)> {
         let db = self.db.lock().unwrap();
         folded_row(&db, channel, now_unix())
     }
 
-    /// SIP-71: standing fold records as origin hints -- where each folded
+    /// SIP-60 §What a fold record does: standing fold records as origin hints -- where each folded
     /// identifier's conversation lives, and the two accounts it is between.
     /// The home task reads these beside the accounts' own hints, which a
     /// Move replaces and a fold must outlast.
@@ -4316,7 +4316,7 @@ impl Channels {
             .collect()
     }
 
-    /// SIP-71: the folded log, whole, to either of its two members.
+    /// SIP-60 §Reading the folded log: the folded log, whole, to either of its two members.
     /// Anybody else, and an identifier with no standing fold, is answered
     /// as the channel would have answered them: not found.
     pub fn folded_log(&self, channel: &[u8; 32], caller: &PubKey) -> Result<Entries, ChannelError> {
@@ -4405,7 +4405,7 @@ impl Channels {
         // A channel this exchange orders is never adopted over: `INSERT OR
         // IGNORE` below would keep the row and mark it replicated, and the
         // origin's entries would land in a log this exchange signed for.
-        // SIP-71 makes the case ordinary -- a direct message ordered here
+        // SIP-60 §A copy of a stray makes the case ordinary -- a direct message ordered here
         // and at the origin -- and the stray is folded first, not adopted.
         // A copy already held under another incarnation is a recreation
         // (SIP-32): what it holds belongs to a channel that no longer exists,
@@ -5732,7 +5732,7 @@ impl Channels {
         Ok(())
     }
 
-    /// SIP-68 §Collecting the backup: one chunk of a blob `account` holds as its backup (attached
+    /// SIP-59 §Collecting the backup: one chunk of a blob `account` holds as its backup (attached
     /// to the account itself, SIP-48), for the account's home to collect.
     /// `BLOB_LIST` answers the one blob's `(id, size, chunks)` row, so the
     /// home knows how many chunks to ask for; the manifest is the list.
@@ -5775,7 +5775,7 @@ impl Channels {
         })
     }
 
-    /// SIP-68 §Collecting the backup: whether `account` holds `blob` here, so a collection that was
+    /// SIP-59 §Collecting the backup: whether `account` holds `blob` here, so a collection that was
     /// interrupted does not fetch twice.
     pub fn holds_backup_blob(&self, account: &PubKey, blob: &[u8; 32]) -> bool {
         let db = self.db.lock().unwrap();
@@ -5790,7 +5790,7 @@ impl Channels {
         .is_some()
     }
 
-    /// SIP-68 §Collecting the backup: store a blob collected for `account`'s backup, held by the
+    /// SIP-59 §Collecting the backup: store a blob collected for `account`'s backup, held by the
     /// account as a device's upload would be and counted against the same
     /// quota. The chunks have been checked against the id by the caller.
     pub fn store_backup_blob(
@@ -5829,7 +5829,7 @@ impl Channels {
         Ok(())
     }
 
-    /// SIP-68 §Collecting the backup: store a manifest the account's former home served, as the
+    /// SIP-59 §Collecting the backup: store a manifest the account's former home served, as the
     /// device wrote it, once every blob it names is held here. `false` when
     /// the account already holds a backup here, of any generation: written
     /// after the Move, by the account's own act, and the newer for it.
@@ -5885,7 +5885,7 @@ impl Channels {
         Ok(true)
     }
 
-    /// SIP-68 §Collecting the backup: the generation of the backup `account` holds here, 0 for none.
+    /// SIP-59 §Collecting the backup: the generation of the backup `account` holds here, 0 for none.
     pub fn backup_generation(&self, account: &PubKey) -> u64 {
         let db = self.db.lock().unwrap();
         db.query_row(
@@ -5899,7 +5899,7 @@ impl Channels {
         .unwrap_or(0) as u64
     }
 
-    /// SIP-68 §Collecting the backup: release what `account` holds, as `Drop` would, if the manifest
+    /// SIP-59 §Collecting the backup: release what `account` holds, as `Drop` would, if the manifest
     /// here is of `generation` -- the one the account's home says it stored.
     /// Any other generation releases nothing: `false`.
     pub fn release_backup_if(
@@ -5959,7 +5959,7 @@ impl Channels {
                 member = true;
             }
         }
-        // SIP-71 §Folded attachments: a blob a folded attachment names, to the two members of
+        // SIP-60 §Folded attachments: a blob a folded attachment names, to the two members of
         // the folded direct message, while the fold record stands. Counted
         // as private: it is never what lets a blob be fetched publicly.
         if !member {
@@ -6736,10 +6736,10 @@ pub const MAX_TOMBSTONES: usize = 256;
 pub const REHOME_MIN_SECS: u64 = 3600;
 /// SIP-53: stranded entries are kept this long for their authors.
 pub const STRANDED_SECS: u64 = 7 * 24 * 60 * 60;
-/// SIP-71: a fold record and its log are kept this long.
+/// SIP-60 §What a fold record does: a fold record and its log are kept this long.
 pub const FOLDED_SECS: u64 = STRANDED_SECS;
 
-/// SIP-71: the two present members of a direct message, lesser first, or
+/// SIP-60 §A direct message opened twice: the two present members of a direct message, lesser first, or
 /// `None` where the channel is not one by SIP-16's arithmetic.
 fn pair_of(db: &Connection, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
     if !is_direct_message(db, channel).ok()? {
@@ -6765,7 +6765,7 @@ fn pair_of(db: &Connection, channel: &[u8; 32]) -> Option<(PubKey, PubKey)> {
     }
 }
 
-/// SIP-71: the standing fold record for an identifier: where the
+/// SIP-60 §What a fold record does: the standing fold record for an identifier: where the
 /// conversation lives, its domain hint, and the two members.
 fn folded_row(
     db: &Connection,
@@ -6991,7 +6991,7 @@ fn succeeded_by(db: &Connection, account: &[u8; 32]) -> Option<PubKey> {
 /// survives; that is SIP-18's rule and it is why closing one channel does not
 /// take a photograph out of another.
 fn collect_blob(db: &Connection, blob: &[u8; 32]) -> Result<(), ChannelError> {
-    // SIP-71 §Folded attachments: a folded attachment holds a blob alive as any attachment does.
+    // SIP-60 §Folded attachments: a folded attachment holds a blob alive as any attachment does.
     let remaining: i64 = db
         .query_row(
             "SELECT (SELECT COUNT(*) FROM attachment WHERE blob = ?1)

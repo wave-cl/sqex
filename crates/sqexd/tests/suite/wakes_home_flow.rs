@@ -1,4 +1,4 @@
-//! SIP-68 §Collecting wakes: wakes follow the account home. Alice's phone left an endpoint
+//! SIP-59 §Collecting wakes: wakes follow the account home. Alice's phone left an endpoint
 //! at X; Alice moves to H. H copies the registration, so a post at H for
 //! Alice wakes the phone; X keeps its own and goes on waking for a post
 //! at X. A registration the phone made at H after the Move stands over

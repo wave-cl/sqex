@@ -300,20 +300,20 @@ impl Pulled {
     }
 }
 
-/// SIP-68: the home collects an account's waiting mail at its former home.
+/// SIP-59 §Collecting mail: the home collects an account's waiting mail at its former home.
 pub const TYPE_PULL_MAIL: u8 = 0x12;
-/// SIP-68: the ids the home stored, for the former home to delete.
+/// SIP-59 §What follows the home: the ids the home stored, for the former home to delete.
 pub const TYPE_TOOK_MAIL: u8 = 0x13;
-/// SIP-71: the home of a direct message's lower key tells an exchange that
+/// SIP-60 §The home learns of a stray: the home of a direct message's lower key tells an exchange that
 /// the channel of that identifier it orders is a stray, to be folded.
 pub const TYPE_FOLDED: u8 = 0x14;
-/// SIP-68 §Collecting the backup: the home collects an account's backup at its former home.
+/// SIP-59 §Collecting the backup: the home collects an account's backup at its former home.
 pub const TYPE_PULL_BACKUP: u8 = 0x15;
-/// SIP-68 §Collecting the backup: one chunk of a blob the account holds at its former home.
+/// SIP-59 §Collecting the backup: one chunk of a blob the account holds at its former home.
 pub const TYPE_PULL_BACKUP_BLOB: u8 = 0x16;
-/// SIP-68 §Collecting the backup: the generation the home stored, for the former home to release.
+/// SIP-59 §Collecting the backup: the generation the home stored, for the former home to release.
 pub const TYPE_TOOK_BACKUP: u8 = 0x17;
-/// SIP-68 §Collecting wakes: the home copies an account's wake registrations from its
+/// SIP-59 §Collecting wakes: the home copies an account's wake registrations from its
 /// former home.
 pub const TYPE_PULL_WAKES: u8 = 0x18;
 
@@ -600,7 +600,7 @@ pub struct Wakes {
     pub rows: Vec<WakeRow>,
 }
 
-/// SIP-68 §Collecting wakes: the most registrations one account can have -- its devices and
+/// SIP-59 §Collecting wakes: the most registrations one account can have -- its devices and
 /// its own key.
 pub const MAX_WAKE_ROWS: usize = crate::device::MAX_DEVICES + 1;
 
@@ -1725,7 +1725,7 @@ impl PeerMoved {
     }
 }
 
-/// SIP-71: `first`'s home holds the conversation of `channel` under
+/// SIP-60 §The home learns of a stray: `first`'s home holds the conversation of `channel` under
 /// `instance`; the exchange told orders a stray of the same identifier.
 ///
 /// `| type: u8 = 0x14 | channel[32] | first[32] | instance[32] | dom_len: u8 | domain |`

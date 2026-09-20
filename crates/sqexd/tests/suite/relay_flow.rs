@@ -781,7 +781,7 @@ async fn a_peer_added_by_an_administrator_works_without_a_restart() {
         "once peered, the call must reach the far exchange and ring"
     );
 
-    // SIP-46: the directory says so too, to anyone -- the stranger by key
+    // SIP-39 §The peer directory: the directory says so too, to anyone -- the stranger by key
     // alone (its label is nobody's domain), Y by key and the domain it
     // was labelled with, and never X itself.
     let mut anyone = Client::connect(x_addr, &x_server_pub).await.unwrap();

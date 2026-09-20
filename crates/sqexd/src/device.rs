@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS lodged (
 );
 -- SIP-45: where each device asked to be woken, until when, and when it last
 -- was. Served to one party only -- the account's home, on its Move
--- (SIP-68 §Collecting wakes) -- and otherwise a place to post to and nothing else.
+-- (SIP-59 §Collecting wakes) -- and otherwise a place to post to and nothing else.
 CREATE TABLE IF NOT EXISTS wake (
     device   BLOB PRIMARY KEY,
     endpoint TEXT NOT NULL,
@@ -231,21 +231,21 @@ impl Registry {
         // The account's own signed withdrawal, where there is one. A
         // device-initiated revocation is legitimate and local, and stores none.
         add_column(&db, "revoked", "revocation", "BLOB NOT NULL DEFAULT x''")?;
-        // SIP-68: whether the account's mail at this origin was collected.
+        // SIP-59 §Collecting mail: whether the account's mail at this origin was collected.
         add_column(
             &db,
             "home_origin",
             "mail_collected",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        // SIP-68 §Collecting the backup: whether the account's backup at this origin was collected.
+        // SIP-59 §Collecting the backup: whether the account's backup at this origin was collected.
         add_column(
             &db,
             "home_origin",
             "backup_collected",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        // SIP-68 §Collecting wakes: whether the account's wake registrations at this origin
+        // SIP-59 §Collecting wakes: whether the account's wake registrations at this origin
         // were collected, and which account a collected registration is
         // held for -- a device that registered at the former home and has
         // not connected here is in no `device` row of ours.
@@ -817,7 +817,7 @@ impl Registry {
                 out.push((*d, endpoint, woken as u64));
             }
         }
-        // SIP-68 §Waking: and the registrations held for the account -- collected
+        // SIP-59 §Waking: and the registrations held for the account -- collected
         // from its former home for devices that have not connected here.
         if let Ok(mut st) = db.prepare(
             "SELECT device, endpoint, woken FROM wake WHERE account = ?1 AND expires >= ?2",
@@ -840,7 +840,7 @@ impl Registry {
         out
     }
 
-    /// SIP-68 §Collecting wakes: the live registrations of `account`'s devices and of the
+    /// SIP-59 §Collecting wakes: the live registrations of `account`'s devices and of the
     /// account key itself, for its home to copy.
     pub fn wakes_of(&self, account: &PubKey) -> Vec<(PubKey, String, u64)> {
         let now = now_unix();
@@ -879,7 +879,7 @@ impl Registry {
         out
     }
 
-    /// SIP-68 §Collecting wakes: hold a registration collected from the account's former home.
+    /// SIP-59 §Collecting wakes: hold a registration collected from the account's former home.
     /// A registration the device already made here stands: `false`.
     pub fn import_wake(
         &self,
@@ -1221,7 +1221,7 @@ impl Registry {
         ok
     }
 
-    /// SIP-68: the (account, origin, domain) hints of accounts homed here
+    /// SIP-59 §Collecting mail: the (account, origin, domain) hints of accounts homed here
     /// whose mail at that origin has not been collected yet.
     pub fn mail_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey, String)> {
         let db = self.db.lock().unwrap();
@@ -1255,7 +1255,7 @@ impl Registry {
         .unwrap_or_default()
     }
 
-    /// SIP-68: the account's mail at `origin` has been collected (or the
+    /// SIP-59 §Collecting mail: the account's mail at `origin` has been collected (or the
     /// origin answered it holds none).
     pub fn mark_mail_collected(&self, account: &PubKey, origin: &PubKey) {
         let db = self.db.lock().unwrap();
@@ -1265,7 +1265,7 @@ impl Registry {
         );
     }
 
-    /// SIP-68 §Collecting the backup: the (account, origin) hints of accounts homed here whose
+    /// SIP-59 §Collecting the backup: the (account, origin) hints of accounts homed here whose
     /// backup at that origin has not been collected yet.
     pub fn backup_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey)> {
         let db = self.db.lock().unwrap();
@@ -1294,7 +1294,7 @@ impl Registry {
         .unwrap_or_default()
     }
 
-    /// SIP-68 §Collecting the backup: the account's backup at `origin` has been collected, or the
+    /// SIP-59 §Collecting the backup: the account's backup at `origin` has been collected, or the
     /// origin holds none, or the home gave up on it (over quota).
     pub fn mark_backup_collected(&self, account: &PubKey, origin: &PubKey) {
         let db = self.db.lock().unwrap();
@@ -1304,7 +1304,7 @@ impl Registry {
         );
     }
 
-    /// SIP-68 §Collecting wakes: the (account, origin) hints of accounts homed here whose wake
+    /// SIP-59 §Collecting wakes: the (account, origin) hints of accounts homed here whose wake
     /// registrations at that origin have not been collected yet.
     pub fn wakes_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey)> {
         let db = self.db.lock().unwrap();
@@ -1333,7 +1333,7 @@ impl Registry {
         .unwrap_or_default()
     }
 
-    /// SIP-68 §Collecting wakes: the account's wake registrations at `origin` were collected,
+    /// SIP-59 §Collecting wakes: the account's wake registrations at `origin` were collected,
     /// or the origin answered it holds none.
     pub fn mark_wakes_collected(&self, account: &PubKey, origin: &PubKey) {
         let db = self.db.lock().unwrap();

@@ -1,4 +1,4 @@
-//! SIP-52: a catch-up is the routes it composes, byte for byte -- and a
+//! SIP-47 §Catching up in one round trip: a catch-up is the routes it composes, byte for byte -- and a
 //! client that catches up holds what a client that polled holds.
 
 use std::net::SocketAddr;
@@ -309,7 +309,7 @@ async fn a_client_that_caught_up_holds_what_one_that_polled_holds() {
 
     // A route that is not there answers not_found, which the client reports
     // as `NoChatHere` -- the shape a caller falls back on for an exchange
-    // from before SIP-52.
+    // from before sqex 0.70.0 (SIP-47 §Catching up in one round trip).
     let mut client = bob.connection().unwrap();
     let (code, _) = raw(&mut client, "/channel/catchup-not-here", vec![0x01]).await;
     assert_eq!(code, 404);

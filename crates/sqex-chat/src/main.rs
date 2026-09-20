@@ -1018,7 +1018,7 @@ struct Open {
     /// client starting offline folds its own history correctly.
     admins: Vec<PubKey>,
     timeline: Timeline,
-    /// SIP-71: earlier copies of this conversation this client read, oldest
+    /// SIP-60 §The client keeps what it read: earlier copies of this conversation this client read, oldest
     /// first -- shown before `timeline` and never merged into it.
     earlier: Vec<Timeline>,
     /// How many messages we had last time, so a new one can be counted unread
@@ -1780,7 +1780,7 @@ async fn poll_one(chat: &mut Chat, conv: &mut Open, app: &App) {
                 .map(|s| s.len())
                 .unwrap_or(0);
             if got.restarted {
-                // SIP-71: what was read of the copy that ended is history
+                // SIP-60 §The client keeps what it read: what was read of the copy that ended is history
                 // now, and is shown as such.
                 conv.earlier = chat
                     .earlier(&conv.channel, &conv.admins)
@@ -2068,7 +2068,7 @@ async fn pick_mode(chat: &mut Chat, open: &mut Vec<Open>, app: &mut App, code: K
     };
     let (seq, mine, redacted, text) = (said.seq, said.mine, said.redacted, said.text.clone());
     let key = said.key.clone();
-    // SIP-71: a row from an earlier copy of the conversation can be read and
+    // SIP-60 §The client keeps what it read: a row from an earlier copy of the conversation can be read and
     // moved past, and nothing else: its sequence number names an entry in a
     // channel that no longer exists.
     if i < app.earlier_rows
@@ -3193,7 +3193,7 @@ enum Command {
     Send(String),
     File(std::path::PathBuf),
     Save(u64, std::path::PathBuf),
-    /// SIP-71 §Folded attachments: a file of a message in an earlier copy (SIP-71), by copy
+    /// SIP-60 §Folded attachments: a file of a message in an earlier copy (SIP-60 §The client keeps what it read), by copy
     /// number (from 1, oldest first) and message number.
     SaveEarlier(usize, u64, std::path::PathBuf),
     /// `/new <name>` — a private group, which you can then invite people into.
@@ -3325,8 +3325,8 @@ impl Command {
             "/file" => Command::Unknown("/file needs a path".into()),
             "/save" => {
                 let path = rest[first.len()..].trim();
-                // SIP-71 §Folded attachments: `e<n>.<seq>` names a message in the n-th earlier
-                // copy of this conversation (SIP-71), whose files are kept.
+                // SIP-60 §Folded attachments: `e<n>.<seq>` names a message in the n-th earlier
+                // copy of this conversation (SIP-60 §The client keeps what it read), whose files are kept.
                 let earlier = first
                     .strip_prefix('e')
                     .and_then(|r| r.split_once('.'))
@@ -4037,7 +4037,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
     // deleted messages without trace.
     //
     // One row-maker for the conversation and for its earlier copies
-    // (SIP-71): a reply's target is looked up in the timeline the message
+    // (SIP-60 §The client keeps what it read): a reply's target is looked up in the timeline the message
     // came from, never across copies.
     let said_of = |timeline: &Timeline, m: &sqex_proto::timeline::Message| -> Said {
         {
@@ -4134,7 +4134,7 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
             }
         }
     };
-    // SIP-71: the earlier copies first, oldest first, and a count of their
+    // SIP-60 §The client keeps what it read: the earlier copies first, oldest first, and a count of their
     // rows so the transcript can draw the divider and nothing acts on them.
     let mut said: Vec<Said> = Vec::new();
     for t in &conv.earlier {

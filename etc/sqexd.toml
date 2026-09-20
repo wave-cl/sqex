@@ -164,7 +164,7 @@ seed_relay_peers = [
 
 # SIP-48: bytes one account may hold at this exchange as its sealed backup
 # (history and keys the exchange cannot read, kept past its own retention).
-# Omit for the reference default of 512 MiB. SIP-68: a backup collected
+# Omit for the reference default of 512 MiB. SIP-59 §Collecting the backup: a backup collected
 # from an account's former home on its Move counts against the same
 # quota; one that would not fit is left where it was and said in the log.
 # backup_quota = 536870912
@@ -181,7 +181,7 @@ seed_relay_peers = [
 # replication peer, or peer openly (SIP-35 §Open peering), for the pulls to be served.
 # home_secs = 30
 
-# SIP-78: an origin that answers a peering write with its limit holds this
+# SIP-35 §Holding off: an origin that answers a peering write with its limit holds this
 # exchange's writes to it for the seconds it gave; a member whose act was
 # carried there is answered the origin's limit, or origin_refused where it
 # said no, and origin_away only where it did not answer. An origin the home
@@ -194,12 +194,12 @@ seed_relay_peers = [
 # tries is the account's to withdraw (a Move with no origins). Nothing to
 # configure.
 #
-# SIP-81: /device/list for an account that lives at another exchange answers
+# SIP-60 §Devices of an account that moved: /device/list for an account that lives at another exchange answers
 # what its home lists -- whether or not devices of it registered here before
 # it moved -- kept a minute; this exchange's own registry only where the
 # home cannot be asked. Nothing to configure.
 #
-# SIP-68: on an account's Move here, its wake registrations (SIP-45) at each
+# SIP-59 §Collecting wakes: on an account's Move here, its wake registrations (SIP-45) at each
 # hinted origin are copied and held for the account, so what arrives here
 # wakes its devices before they next connect; an endpoint this exchange's
 # own policy (wake_loopback) would refuse is not held. The former home
@@ -216,7 +216,7 @@ seed_relay_peers = [
 # is kept when its signer already shares a private channel with a member of
 # the room here. Nothing to configure beyond open_calls.
 
-# SIP-71: on those same pulls, a direct message this exchange already holds
+# SIP-60 §A direct message opened twice: on those same pulls, a direct message this exchange already holds
 # that an origin also orders is a stray there, and the origin is told to
 # fold it -- when the account pulled for is the lower of the two keys, whose
 # home the conversation lives at. Folded here, a direct message's log is

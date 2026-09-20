@@ -267,7 +267,7 @@ async fn a_moved_client_reads_its_sealed_history_at_the_new_home_and_is_heard_fr
     assert_eq!(bob_home.home, x_key);
 }
 
-/// SIP-81 made a former home refuse a device's registration with `moved`;
+/// SIP-60 §At a former home has a former home refuse a device's registration with `moved`;
 /// a client moving *back* to a former home presents the Move first, so
 /// the registration that follows lands at a home again.
 #[tokio::test]

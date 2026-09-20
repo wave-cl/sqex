@@ -1,4 +1,4 @@
-//! SIP-78 §Backing off: an origin that cannot be found. A home whose account hinted at
+//! SIP-35 §Backing off: an origin that cannot be found. A home whose account hinted at
 //! an origin nothing resolves backs off from it -- one cycle, two, four
 //! -- instead of trying every cycle forever, lists it in `/status` as
 //! unfound with the count and the next try, and, once the origin comes
@@ -187,7 +187,7 @@ async fn an_origin_that_comes_up_is_found_on_the_next_try_and_cleared() {
     assert!(row["reached"].as_u64().unwrap_or(999) < 30, "{row}");
 }
 
-/// SIP-78 §Backing off for a configured origin: a `[[replicate]]` origin that takes no
+/// SIP-35 §A configured origin: a `[[replicate]]` origin that takes no
 /// connection is held off like a hinted one, and listed the same way.
 #[tokio::test]
 async fn a_configured_origin_that_cannot_be_reached_is_held_off() {

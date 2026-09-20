@@ -1,4 +1,4 @@
-//! SIP-81 §Saying whose list it is: a client sealing a key to a member's devices waits when the
+//! SIP-60 §Saying whose list it is: a client sealing a key to a member's devices waits when the
 //! list its exchange has is stale -- the member lives at another exchange
 //! this one could not ask -- and seals to the home's list when it can be.
 

@@ -19,7 +19,7 @@
 //! **State is durable (SIP-5 §Durability).** The mailbox is SQLite beside the other
 //! stores, so an operator's restart is not a delivery failure: items,
 //! collection records, the identifier sequence and what a home collected
-//! from a former home (SIP-68) survive for the item's TTL. A memory-only
+//! from a former home (SIP-59 §Collecting mail) survive for the item's TTL. A memory-only
 //! deployment gets the same code over an in-memory database, and says so
 //! on `/status`.
 
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS mail (
     collected INTEGER
 );
 CREATE INDEX IF NOT EXISTS mail_by_recipient ON mail (recipient, id);
--- SIP-68: what was collected from a former home, so a pull answered twice
+-- SIP-59 §Collecting mail: what was collected from a former home, so a pull answered twice
 -- -- across a restart too -- stores nothing twice.
 CREATE TABLE IF NOT EXISTS collected_from (
     origin    BLOB    NOT NULL,
@@ -197,7 +197,7 @@ impl Mailbox {
         Ok((id, now))
     }
 
-    /// SIP-68: every item waiting for `recipient`, oldest first, as the
+    /// SIP-59 §Collecting mail: every item waiting for `recipient`, oldest first, as the
     /// home collects it -- what this exchange observed, and the sealed
     /// payload. Nothing is removed by asking.
     pub fn waiting_for(&self, recipient: &PubKey) -> Vec<sqex_proto::peer::MailItem> {
@@ -227,7 +227,7 @@ impl Mailbox {
         .unwrap_or_default()
     }
 
-    /// SIP-68: store an item collected from `origin` for `recipient` as the
+    /// SIP-59 §Collecting mail: store an item collected from `origin` for `recipient` as the
     /// former home observed it -- its sender and time kept -- once per
     /// `(origin, id)`. `Ok(true)` stored, `Ok(false)` already held, `Err`
     /// over the recipient's quota.

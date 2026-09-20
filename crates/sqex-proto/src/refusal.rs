@@ -157,7 +157,7 @@ pub enum Code {
     /// key's services -- mailbox, prekeys, resolution, wake, backup -- are
     /// handed off there.
     Moved,
-    /// SIP-78: the origin an act was forwarded to answered, and refused it
+    /// SIP-35 §Passing a limit through: the origin an act was forwarded to answered, and refused it
     /// -- distinct from `OriginAway`, which is an origin that did not
     /// answer.
     OriginRefused,

@@ -1,4 +1,4 @@
-//! SIP-68: mail follows the account home. What was queued for Alice at X
+//! SIP-59 §Collecting mail: mail follows the account home. What was queued for Alice at X
 //! before she moved to H is collected by H -- as the account would
 //! collect it, over the peering link, once -- and listed, fetched and
 //! opened at H with the sender and time X observed; X's queue is empty

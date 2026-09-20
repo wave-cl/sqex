@@ -367,7 +367,7 @@ pub struct App {
     /// somebody mid-sentence into a channel they had not chosen.
     pub selected: Option<[u8; 32]>,
     pub said: Vec<Said>,
-    /// SIP-71: how many rows at the head of `said` are from earlier copies
+    /// SIP-60 §The client keeps what it read: how many rows at the head of `said` are from earlier copies
     /// of this conversation -- a direct message folded into the one at its
     /// lower key's home, or a channel rebuilt (SIP-16). Read, kept, shown
     /// above a divider, and never acted on: their sequence numbers belong
@@ -1489,7 +1489,7 @@ fn transcript(f: &mut Frame, app: &App, area: Rect, height: u16) -> Drawn {
             owners.push(None);
             day = this_day;
         }
-        // SIP-71: where the earlier copies end and the conversation begins.
+        // SIP-60 §The client keeps what it read: where the earlier copies end and the conversation begins.
         if app.earlier_rows > 0 && i == app.earlier_rows {
             lines.push(
                 Line::from(Span::styled(

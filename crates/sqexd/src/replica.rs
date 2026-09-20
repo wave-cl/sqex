@@ -633,7 +633,7 @@ pub async fn pull_once_from(
 /// covers and this replica cannot recover from it. Until answered the row
 /// reads as private and unnamed; an origin from before SIP-43 refuses the
 /// route, and the row stays so.
-/// SIP-68: collect `account`'s waiting mail at `origin` into this
+/// SIP-59 §Collecting mail: collect `account`'s waiting mail at `origin` into this
 /// exchange's mailbox, as the origin observed it, and tell the origin
 /// what was stored. The hint is marked collected only on an answer; a
 /// refusal or a failure leaves it for the next cycle. What the quota
@@ -683,11 +683,11 @@ async fn collect_mail(
         server.devices.mark_mail_collected(account, origin);
     }
     if stored > 0 {
-        tracing::info!(%origin, %account, stored, "collected an account's mail from its former home (SIP-68)");
+        tracing::info!(%origin, %account, stored, "collected an account's mail from its former home (SIP-59)");
     }
 }
 
-/// SIP-68 §Collecting the backup: collect `account`'s backup at `origin` -- its former home --
+/// SIP-59 §Collecting the backup: collect `account`'s backup at `origin` -- its former home --
 /// into this exchange's store, as the device wrote it, and tell the origin
 /// the generation stored so it releases its copy. A backup the account
 /// already holds here, of any generation, was written after the Move and
@@ -733,7 +733,7 @@ async fn collect_backup(
         let _ = client.post("/peer/backup/took", took.encode()).await;
         server.devices.mark_backup_collected(account, origin);
         tracing::info!(%origin, %account, generation = held.generation,
-            "an account's backup at its former home was superseded by one written here (SIP-68)");
+            "an account's backup at its former home was superseded by one written here (SIP-59)");
         return;
     }
     for id in &held.blobs {
@@ -781,7 +781,7 @@ async fn collect_backup(
                 let _ = store.drop_backup(account);
                 server.devices.mark_backup_collected(account, origin);
                 tracing::warn!(%origin, %account, generation = held.generation,
-                    "an account's backup at its former home exceeds the backup quota here and was not collected (SIP-68)");
+                    "an account's backup at its former home exceeds the backup quota here and was not collected (SIP-59)");
                 return;
             }
             Err(e) => {
@@ -795,7 +795,7 @@ async fn collect_backup(
             let _ = client.post("/peer/backup/took", took.encode()).await;
             server.devices.mark_backup_collected(account, origin);
             tracing::info!(%origin, %account, generation = held.generation, blobs = held.blobs.len(),
-                "collected an account's backup from its former home (SIP-68)");
+                "collected an account's backup from its former home (SIP-59)");
         }
         // Written here while the blobs were coming: the account's own act
         // stands, as above.
@@ -809,7 +809,7 @@ async fn collect_backup(
     }
 }
 
-/// SIP-68 §Collecting wakes: copy `account`'s wake registrations from `origin` -- its former
+/// SIP-59 §Collecting wakes: copy `account`'s wake registrations from `origin` -- its former
 /// home -- so that what arrives here wakes its devices. Held for the
 /// account, since a device that registered there may never have connected
 /// here; a registration the device has made here since stands. Nothing is
@@ -868,7 +868,7 @@ async fn collect_wakes(
     }
     server.devices.mark_wakes_collected(account, origin);
     if stored > 0 {
-        tracing::info!(%origin, %account, stored, "collected an account's wake registrations from its former home (SIP-68)");
+        tracing::info!(%origin, %account, stored, "collected an account's wake registrations from its former home (SIP-59)");
     }
 }
 
@@ -1164,7 +1164,7 @@ pub async fn account_for(
 /// dropped on the first transport error, so the next post redials. One post
 /// at a time per origin -- they are small, and ordering the origin's
 /// answers is the origin's job, not this lock's.
-/// SIP-78: why a forward to an origin did not go through -- told apart so a
+/// SIP-35 §An origin that does not answer: why a forward to an origin did not go through -- told apart so a
 /// member is answered the right thing: a limit is passed on with its wait,
 /// an origin that answered no is `origin_refused`, and only an origin that
 /// did not answer is `origin_away`.
@@ -1188,7 +1188,7 @@ impl std::fmt::Display for ForwardFailed {
     }
 }
 
-/// SIP-78: read a peering refusal's status into a `ForwardFailed`.
+/// SIP-35 §Saying so: read a peering refusal's status into a `ForwardFailed`.
 fn refused_forward(code: u16, body: &[u8]) -> ForwardFailed {
     if code == 429 {
         let wait = sqex_proto::refusal::Refusal::decode(body)
@@ -1356,7 +1356,7 @@ impl Forwarder {
         };
         if code != 200 {
             // SIP-35's uniform peering refusal, an origin from before
-            // SIP-43, or (SIP-78) the origin's peering limit, told apart.
+            // SIP-43, or (SIP-35 §An origin that does not answer) the origin's peering limit, told apart.
             return Err(refused_forward(code, &body));
         }
         let forwarded =
@@ -1554,7 +1554,7 @@ pub async fn run(
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
-                // SIP-78 §Backing off: a configured origin that takes no connection is
+                // SIP-35 §Backing off: a configured origin that takes no connection is
                 // left alone for a hold that doubles with each miss, from
                 // one interval to an hour, and said so once per hold; a
                 // poke -- a member's act -- still ends the pause early.
@@ -1704,13 +1704,13 @@ pub async fn run_homed(
             .into_iter()
             .map(|(a, o, _)| (a, o))
             .collect();
-        // SIP-68 §Collecting the backup: likewise the account's backup, once per hinted origin.
+        // SIP-59 §Collecting the backup: likewise the account's backup, once per hinted origin.
         let pending_backup: std::collections::HashSet<(PubKey, PubKey)> =
             server.devices.backup_pending(&me).into_iter().collect();
-        // SIP-68 §Collecting wakes: and its wake registrations, copied once per hinted origin.
+        // SIP-59 §Collecting wakes: and its wake registrations, copied once per hinted origin.
         let pending_wakes: std::collections::HashSet<(PubKey, PubKey)> =
             server.devices.wakes_pending(&me).into_iter().collect();
-        // SIP-71: a fold record points a member homed here at the
+        // SIP-60 §What a fold record does: a fold record points a member homed here at the
         // conversation, beside the hints the accounts gave themselves.
         let mut by_origin = server.devices.homed_here(&me);
         for (into, domain, pair) in server.channels().folded_hints() {
@@ -1735,14 +1735,14 @@ pub async fn run_homed(
                 None => by_origin.push((into, domain, homed)),
             }
         }
-        // SIP-78 §Backing off: an unfound record outlives its hint otherwise, since
+        // SIP-35 §Backing off: an unfound record outlives its hint otherwise, since
         // nothing would try the origin again to clear it.
         server.retain_unfound(&by_origin.iter().map(|(o, _, _)| *o).collect());
         for (origin, domain, accounts) in by_origin {
             if origin == me {
                 continue;
             }
-            // SIP-78 §Backing off: an origin this home could not find or reach is left
+            // SIP-35 §Backing off: an origin this home could not find or reach is left
             // alone for a hold that doubles with each miss, from one cycle
             // to an hour. A stale hint cost one DNS lookup every cycle for
             // two days before this; a member's own act still goes out
@@ -1795,7 +1795,7 @@ pub async fn run_homed(
                 // `home_secs` spent it all on saying what the origin had
                 // already recorded -- found live, as a forwarded create
                 // refused because the Move before it had been refused.
-                // SIP-78: a write to an origin whose limit spoke waits for
+                // SIP-35 §Holding off: a write to an origin whose limit spoke waits for
                 // the seconds it gave; reads go on.
                 let held = server.origin_held(&origin).is_some();
                 if let Some((mv, home_domain)) = server.devices.move_of(account)
@@ -1828,7 +1828,7 @@ pub async fn run_homed(
                                 if already.contains(&c) || channels.contains(&c) {
                                     continue;
                                 }
-                                // SIP-71: a direct message this home already
+                                // SIP-60 §A direct message opened twice: a direct message this home already
                                 // holds -- ordered, or as a copy from
                                 // elsewhere -- is the conversation, and what
                                 // the origin holds under the identifier is a
@@ -1875,15 +1875,15 @@ pub async fn run_homed(
                         break;
                     }
                 }
-                // SIP-68: the account's mail waiting at this origin, once.
+                // SIP-59 §Collecting mail: the account's mail waiting at this origin, once.
                 if pending_mail.contains(&(*account, origin)) {
                     collect_mail(&mut client, &server, &origin, account).await;
                 }
-                // SIP-68 §Collecting the backup: and its backup, once.
+                // SIP-59 §Collecting the backup: and its backup, once.
                 if pending_backup.contains(&(*account, origin)) {
                     collect_backup(&mut client, &server, &origin, account).await;
                 }
-                // SIP-68 §Collecting wakes: and where its devices asked to be woken, once.
+                // SIP-59 §Collecting wakes: and where its devices asked to be woken, once.
                 if pending_wakes.contains(&(*account, origin)) {
                     collect_wakes(&mut client, &server, &origin, account).await;
                 }
@@ -1988,7 +1988,7 @@ async fn pull_soft_state(
     }
 }
 
-/// SIP-78: record what an origin refused on a peering write, with the wait
+/// SIP-35 §Passing a limit through: record what an origin refused on a peering write, with the wait
 /// where its limit spoke, so the home holds off and the operator can see.
 fn note_refused(
     server: &crate::server::Server,
@@ -2006,7 +2006,7 @@ fn note_refused(
     server.note_origin_refusal(origin, path, code, wait);
 }
 
-/// SIP-71: tell an origin that the direct message it orders under
+/// SIP-60 §The home learns of a stray: tell an origin that the direct message it orders under
 /// `channel` is a stray -- this home, `first`'s by its Move, holds the
 /// conversation under `instance`. The origin verifies and folds, or says
 /// why not; either way this home has done its part for the cycle.

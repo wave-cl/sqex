@@ -1,4 +1,4 @@
-//! SIP-78: a refusal a peer can act on. Y's peering-write limit is one an
+//! SIP-35 §An origin that does not answer: a refusal a peer can act on. Y's peering-write limit is one an
 //! hour; X, the home of Alice and Bob, carries Alice's Move and is refused
 //! Bob's with `rate_limited`. X holds its writes to Y, records the refusal
 //! where `/status` shows it, and when Bob's create is carried to Y and

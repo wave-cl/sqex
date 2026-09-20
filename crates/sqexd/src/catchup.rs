@@ -1,4 +1,4 @@
-//! SIP-52: one round trip for a device that has been away.
+//! SIP-47 §Catching up in one round trip: one round trip for a device that has been away.
 //!
 //! **Composition, not authority.** Every byte of a channel's answer comes
 //! from [`Channels::fetch`] and [`Channels::get_keys`], called exactly as the

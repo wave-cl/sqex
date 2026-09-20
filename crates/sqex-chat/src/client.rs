@@ -246,7 +246,7 @@ pub enum ChatError {
     /// SIP-43: the conversation lives at another exchange, and this one could
     /// not reach it to order the post. Nothing was sent; the draft stands.
     OriginAway,
-    /// SIP-78: the origin answered a forwarded act and refused it, with
+    /// SIP-35 §Passing a limit through: the origin answered a forwarded act and refused it, with
     /// its status where the exchange said.
     OriginRefused(Option<u16>),
     /// SIP-44: this account has been succeeded by the key named. Everything it
@@ -257,7 +257,7 @@ pub enum ChatError {
     /// its key, and the domain it is reached by where the refusing exchange
     /// knew one. This exchange hands the key's services off there.
     Moved(Option<PubKey>, String),
-    /// SIP-81 §Sealing to a list: this account lives at another exchange this one could not
+    /// SIP-60 §Sealing to a list: this account lives at another exchange this one could not
     /// ask, and the device list here is from before it left -- a device
     /// revoked since may be on it and one linked since is not. No key was
     /// sealed to it; the epoch stays where it is until the home answers.
@@ -328,7 +328,7 @@ fn classify(path: &str, code: u16, body: &[u8]) -> ChatError {
             // own devices, and only the exchange holds the facts to judge it.
             RefusalCode::NotAnAdmin => ChatError::NotAnAdmin,
             RefusalCode::OriginAway => ChatError::OriginAway,
-            // SIP-78: the origin answered, and said no -- a different
+            // SIP-35 §Passing a limit through: the origin answered, and said no -- a different
             // situation from one that could not be reached.
             RefusalCode::OriginRefused => {
                 ChatError::OriginRefused(r.detail.as_deref().and_then(|d| d.parse().ok()))
@@ -514,7 +514,7 @@ impl Chat {
         Ok(out)
     }
 
-    /// SIP-81 §Sealing to a list: an account's devices as a list a key may be sealed to.
+    /// SIP-60 §Sealing to a list: an account's devices as a list a key may be sealed to.
     /// Asked with the newer type byte, which says whose list it is; a
     /// stale one -- this exchange's own registry for an account that lives
     /// elsewhere, because the home could not be asked -- is refused as
@@ -582,7 +582,7 @@ impl Fetched {
         self.channel
     }
 
-    /// An `Entries` reply that arrived inside a SIP-52 catch-up rather than
+    /// An `Entries` reply that arrived inside a catch-up (SIP-47 §Catching up in one round trip) rather than
     /// as the answer to a fetch: the same bytes, absorbed the same way.
     fn carried(channel: [u8; 32], since: u64, body: Vec<u8>) -> Fetched {
         Fetched {
@@ -594,7 +594,7 @@ impl Fetched {
     }
 }
 
-/// One channel of a SIP-52 catch-up, as this client got it: the keys already
+/// One channel of a catch-up (SIP-47 §Catching up in one round trip), as this client got it: the keys already
 /// opened and kept, the entries still to be absorbed.
 #[derive(Debug)]
 pub struct Caught {
@@ -609,7 +609,7 @@ pub struct Caught {
     pub keys_opened: usize,
 }
 
-/// A SIP-52 answer, after the keys in it were kept.
+/// A catch-up answer (SIP-47 §The catch-up answer), after the keys in it were kept.
 #[derive(Debug)]
 pub struct CaughtUp {
     pub now: u64,
@@ -2181,7 +2181,7 @@ impl Chat {
                 origin.as_ref().map(|(h, _)| *h),
             )
             .await;
-        // SIP-71: the identifier was folded here -- the conversation lives
+        // SIP-60 §A direct message opened twice: the identifier was folded here -- the conversation lives
         // at the lower key's home, and this exchange says so by refusing the
         // create as a copy refuses a write. Opened there instead, as SIP-60
         // would have opened it; the copy is read here once it is pulled.
@@ -2643,7 +2643,7 @@ impl Chat {
 
     /// Open the envelopes a `Got` carries and keep what they hold. The
     /// second half of [`collect_keys`](Self::collect_keys), on its own so a
-    /// SIP-52 catch-up -- which carries a `Got` per channel -- opens them
+    /// A catch-up (SIP-47 §The catch-up answer) -- which carries a `Got` per channel -- opens them
     /// through exactly this and no second implementation of the prekey rules.
     async fn absorb_keys(
         &mut self,
@@ -2719,7 +2719,7 @@ impl Chat {
         Ok(opened)
     }
 
-    /// SIP-71: the folded log of a direct message this exchange ended, as
+    /// SIP-60 §Reading the folded log: the folded log of a direct message this exchange ended, as
     /// `/channel/folded` answers it to either member -- `None` where there
     /// is none, or this client is not one of the two.
     pub async fn folded_entries(&mut self, channel: &[u8; 32]) -> Result<Option<Entries>> {
@@ -2744,7 +2744,7 @@ impl Chat {
             .map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
-    /// SIP-71: before the incarnation this client holds is reset, read what
+    /// SIP-60 §The client keeps what it read: before the incarnation this client holds is reset, read what
     /// it had not yet read of it from the folded log, under the keys still
     /// held and the incarnation it was signed in -- so what goes to history
     /// is whole. Best effort: an exchange with no folded log, or a channel
@@ -2789,7 +2789,7 @@ impl Chat {
         );
     }
 
-    /// SIP-71: the earlier incarnations of a channel this client read --
+    /// SIP-60 §The client keeps what it read: the earlier incarnations of a channel this client read --
     /// each folded as `history` folds the current one, oldest first. Shown
     /// before the conversation, and never merged into it: their sequence
     /// numbers belong to channels that no longer exist.
@@ -4954,7 +4954,7 @@ impl Chat {
         // The Move first, then the device: a home the account is moving
         // *back* to is its former home until the Move is presented, and a
         // former home refuses a device's registration with `moved`
-        // (SIP-81). The Move needs no registration -- its signature is
+        // (SIP-60 §At a former home). The Move needs no registration -- its signature is
         // the authority.
         let moving = sqex_proto::home::Moving {
             mv,
@@ -5839,7 +5839,7 @@ impl Chat {
     ) -> Result<Conversation> {
         let got = match self.ask(channel, wait_secs).await {
             Ok(got) => got,
-            // SIP-71 §The client keeps what it read: a channel this client read that its exchange no
+            // SIP-60 §The client keeps what it read: a channel this client read that its exchange no
             // longer serves may have been folded there -- the conversation
             // lives at the lower key's home now, and this exchange may not
             // hold a copy yet, or ever. What was read is kept as an earlier
@@ -5872,7 +5872,7 @@ impl Chat {
         self.absorb(timeline, got).await
     }
 
-    /// SIP-71: whether a channel this exchange no longer serves was folded
+    /// SIP-60 §A direct message opened twice: whether a channel this exchange no longer serves was folded
     /// here -- `/channel/folded` answers a log -- and, if so, keep what was
     /// read as an earlier copy, once. `false` where nothing was held, or
     /// the exchange holds no folded log.
@@ -6271,7 +6271,7 @@ impl Chat {
         // incarnation that changed under us before we got here. The second is
         // the sharper signal and usually fires first, because it is checked
         // before anything is signed rather than after something is fetched.
-        // SIP-71 adds the third and plainest: the exchange's `info` names an
+        // SIP-60 §The client keeps what it read adds the third and plainest: the exchange's `info` names an
         // incarnation other than the one this store holds -- the copy this
         // client read replaced by another under the same identifier, a direct
         // message folded into the conversation at its lower key's home, or
@@ -6311,7 +6311,7 @@ impl Chat {
                     .insert(*channel, (told.clone(), std::time::Instant::now()));
             }
             let changed = differs(&told);
-            // SIP-71: what was read of the incarnation that ended is kept
+            // SIP-60 §The client keeps what it read: what was read of the incarnation that ended is kept
             // (the reset archives it), and what was not yet read is read
             // first, under the keys still held, so the history is whole.
             if let Some(known) = known {
@@ -6573,7 +6573,7 @@ impl Chat {
     }
 
     /// Mark everything up to `seq` read, so the other side's client can say so.
-    /// SIP-52: everything that moved in the named channels, in one round
+    /// SIP-47 §Catching up in one round trip: everything that moved in the named channels, in one round
     /// trip -- the entries since each cursor and the envelopes waiting for
     /// this device there, plus the channels the account is in that were not
     /// named and this device's prekey count.
@@ -6583,7 +6583,7 @@ impl Chat {
     /// to absorb into its timelines exactly as a poll's answer is. The store
     /// therefore sees the same rows whichever route fed it.
     ///
-    /// `Err(ChatError::NoChatHere(_))` is an exchange from before SIP-52; a
+    /// `Err(ChatError::NoChatHere(_))` is an exchange from before sqex 0.70.0 (SIP-47 §Catching up in one round trip); a
     /// caller falls back to polling, which is what it did.
     pub async fn catchup(&mut self, named: &[Named], budget: u32) -> Result<CaughtUp> {
         use sqex_proto::catchup::{Catchup, STATUS_OK};
@@ -6635,7 +6635,7 @@ impl Chat {
         })
     }
 
-    /// What this client would name in a SIP-52 catch-up: every channel the
+    /// What this client would name in a catch-up (SIP-47 §Catching up in one round trip): every channel the
     /// store holds, with where it got to in each.
     pub fn named_for_catchup(&self) -> Result<Vec<Named>> {
         let mut named = Vec::new();

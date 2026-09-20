@@ -1,6 +1,6 @@
 //! Exchange-level answers that belong to no service.
 //!
-//! Two routes. `/exchange/peers` (SIP-46) lists the exchanges this one
+//! Two routes. `/exchange/peers` (SIP-39 §The peer directory) lists the exchanges this one
 //! federates with -- a hint a client pins by SIP-33 before trusting.
 //! `/exchange/ping` exists to demonstrate SIP-9
 //! whitelist enforcement, and used to answer `{"pong": true}` — a constant that
@@ -58,7 +58,7 @@ pub struct PeerEntry {
     pub domain: String,
 }
 
-/// The directory (SIP-46).
+/// The directory (SIP-39 §The peer directory).
 ///
 /// `| type: u8 = 0x02 | count: u16 | (key[32] | domain_len: u8 | domain) * |`
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

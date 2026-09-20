@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS message (
     sealed  BLOB,
     PRIMARY KEY (exchange, channel, seq)
 );
--- SIP-71: what this client read of an earlier incarnation of a channel --
+-- SIP-60 §The client keeps what it read: what this client read of an earlier incarnation of a channel --
 -- a direct message folded into the conversation at the lower key's home,
 -- or one destroyed and rebuilt (SIP-16). Kept, not deleted: SIP-17 forbids
 -- decrypting a counter twice and the exchange serves an epoch key once,
@@ -2533,7 +2533,7 @@ impl Store {
         Ok(false)
     }
 
-    /// SIP-71, SIP-42 §Generations: keep the incarnation that just ended as the channel's
+    /// SIP-60 §The client keeps what it read, SIP-42 §Generations: keep the incarnation that just ended as the channel's
     /// next generation -- what this client read, the signed entries under
     /// it, the keys that open them, which incarnation it was and the
     /// exchange that ordered it. Called by `reset_sequence_space`, which
@@ -2815,7 +2815,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-71: the archived incarnations of a channel, oldest first, each
+    /// SIP-60 §The client keeps what it read: the archived incarnations of a channel, oldest first, each
     /// in the shape `messages` answers.
     #[allow(clippy::type_complexity)]
     pub fn message_history(
@@ -2862,7 +2862,7 @@ impl Store {
     }
 
     pub fn reset_sequence_space(&self, channel: &[u8; 32]) -> Result<()> {
-        // SIP-71, SIP-42 §Generations: the incarnation that ended is history, not waste.
+        // SIP-60 §The client keeps what it read, SIP-42 §Generations: the incarnation that ended is history, not waste.
         // Kept here, at the one place every reset passes -- and the signed
         // entries go with it, or they would be offered to a sibling as the
         // conversation's (SIP-42).
@@ -3543,7 +3543,7 @@ mod tests {
         s.save_pool(&pool).unwrap();
     }
 
-    /// SIP-71: a reset keeps what was read as an earlier generation, and a
+    /// SIP-60 §The client keeps what it read: a reset keeps what was read as an earlier generation, and a
     /// second reset a second one, oldest first; the live table starts empty.
     #[test]
     fn a_reset_archives_what_was_read() {

@@ -1,4 +1,4 @@
-//! SIP-71: a direct message opened twice, seen from the clients. Bob at B
+//! SIP-60 §A direct message opened twice: a direct message opened twice, seen from the clients. Bob at B
 //! opened it at his own exchange without locating Alice, as a client from
 //! before SIP-60 does; Alice, the lower key, opened it at her home A. Once A
 //! learns of B's copy and B folds it, Bob's client finds the conversation

@@ -131,7 +131,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AttestCmd,
     },
-    /// The exchanges this one federates with (SIP-46): each by key, and by
+    /// The exchanges this one federates with (SIP-39 §The peer directory): each by key, and by
     /// the domain it is reached at where the operator recorded one. A hint:
     /// reach one by discovering its domain, and refuse it if the key differs.
     Peers,
@@ -2774,7 +2774,7 @@ async fn wake(cli: &Cli, cfg: &Config, cmd: &WakeCmd) -> Result<(), String> {
     }
 }
 
-/// SIP-46: what this exchange federates with.
+/// SIP-39 §The peer directory: what this exchange federates with.
 async fn peers(cli: &Cli, cfg: &Config) -> Result<(), String> {
     let (mut client, _server) = connect(cli, cfg).await?;
     let (code, body) = client.get("/exchange/peers").await?;
@@ -2907,7 +2907,7 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
             t["mac2_verified"].as_u64().unwrap_or(0),
         );
     }
-    // SIP-78: the origins this exchange forwards to, and what each last
+    // SIP-35 §Saying so: the origins this exchange forwards to, and what each last
     // said. A held origin is one whose last answer was a refusal this
     // exchange is still honouring; nothing goes to it until the hold ends,
     // so an operator watching a homed member's create fail with
@@ -2944,7 +2944,7 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
                     )
                 })
                 .unwrap_or_default();
-            // SIP-78 §Saying so: an origin the home task could not find or reach,
+            // SIP-35 §Saying so: an origin the home task could not find or reach,
             // how many cycles in a row, and when it will look again.
             let unfound = o["unfound"]
                 .as_object()

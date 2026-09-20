@@ -415,7 +415,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("Server::tell_home"),
         ReplicationPeer,
     ),
-    // SIP-68: the account's home collects its mail here, on the Move.
+    // SIP-59 §Collecting mail: the account's home collects its mail here, on the Move.
     (
         "POST",
         "/peer/mailbox",
@@ -428,7 +428,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_mail"),
         ReplicationPeer,
     ),
-    // SIP-68 §Collecting the backup: the account's home collects its backup here, on the Move.
+    // SIP-59 §Collecting the backup: the account's home collects its backup here, on the Move.
     (
         "POST",
         "/peer/backup",
@@ -447,14 +447,14 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_backup"),
         ReplicationPeer,
     ),
-    // SIP-68 §Collecting wakes: the account's home copies its wake registrations, on the Move.
+    // SIP-59 §Collecting wakes: the account's home copies its wake registrations, on the Move.
     (
         "POST",
         "/peer/wakes",
         Peer("replica::collect_wakes"),
         ReplicationPeer,
     ),
-    // SIP-71: the lower key's home tells an origin its copy of a direct
+    // SIP-60 §The home learns of a stray: the lower key's home tells an origin its copy of a direct
     // message is a stray.
     (
         "POST",
@@ -504,7 +504,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ),
     // SIP-43 §The heads by position: the calling device's chain heads by position.
     ("POST", "/channel/chain", Chat("Chat::chain_heads"), Member),
-    // SIP-71: the folded log of a direct message this exchange ended, to
+    // SIP-60 §Reading the folded log: the folded log of a direct message this exchange ended, to
     // either of its two members.
     (
         "POST",
@@ -543,7 +543,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/channel/redact", Chat("/redact"), ChannelAdmin),
     ("POST", "/channel/signal", Chat("Chat::typing"), Member),
     ("POST", "/channel/fetch", Chat("Chat::poll"), Member),
-    // SIP-52: one round trip for a device that has been away, composed from
+    // SIP-47 §Catching up in one round trip: one round trip for a device that has been away, composed from
     // fetch, key/get, mine and prekey/count under their own rules. Any
     // identity may ask; each named channel is answered under `fetch`'s own
     // membership check, and one not the caller's reads as absent.

@@ -248,7 +248,7 @@ impl Connections {
 }
 
 /// Everything a request handler needs.
-/// SIP-78: what an origin last refused this exchange, and the hold it put
+/// SIP-35 §Passing a limit through: what an origin last refused this exchange, and the hold it put
 /// on this exchange's writes.
 #[derive(Debug, Clone)]
 pub struct OriginRefusal {
@@ -259,12 +259,12 @@ pub struct OriginRefusal {
     pub held_until: Option<u64>,
 }
 
-/// SIP-78: how long to hold writes to an origin whose limit gave no wait.
+/// SIP-35 §Holding off: how long to hold writes to an origin whose limit gave no wait.
 pub const HOLD_DEFAULT_SECS: u64 = 60;
-/// SIP-78: the most a stated wait holds this exchange off for.
+/// SIP-35 §Holding off: the most a stated wait holds this exchange off for.
 pub const MAX_HOLD_SECS: u64 = 3600;
 
-/// SIP-78 §Backing off: an origin the home task could not find or reach, and when it
+/// SIP-35 §Backing off: an origin the home task could not find or reach, and when it
 /// will try again. Cleared by the first answer from it, on any path.
 #[derive(Debug, Clone)]
 pub struct Unfound {
@@ -274,7 +274,7 @@ pub struct Unfound {
     pub why: UnfoundWhy,
 }
 
-/// SIP-78 §Backing off: why an origin was not found on the last attempt.
+/// SIP-35 §Backing off: why an origin was not found on the last attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnfoundWhy {
     /// No address for its key or hinted domain.
@@ -292,9 +292,9 @@ impl UnfoundWhy {
     }
 }
 
-/// SIP-78 §Backing off: the longest a home holds off from an origin it cannot find.
+/// SIP-35 §Backing off: the longest a home holds off from an origin it cannot find.
 pub const MAX_UNFOUND_SECS: u64 = MAX_HOLD_SECS;
-/// SIP-81: how long the home's device list for an away account is served
+/// SIP-60 §Devices of an account that moved: how long the home's device list for an away account is served
 /// again before it is asked for afresh.
 pub const DEVICES_TTL: u64 = 60;
 
@@ -410,13 +410,13 @@ pub struct Server {
     /// SIP-53: when each origin was last reached, so a replica can say how
     /// long one has been away. An origin never reached counts from start.
     contacts: Mutex<HashMap<PubKey, u64>>,
-    /// SIP-78: per origin, the last refusal this exchange met there and,
+    /// SIP-35 §Saying so: per origin, the last refusal this exchange met there and,
     /// where the origin's peering limit spoke, until when writes to it are
     /// held. Kept until replaced: a refusal is a thing to have seen.
     origin_refusals: Mutex<HashMap<PubKey, OriginRefusal>>,
-    /// SIP-78 §Backing off: origins the home task could not find or reach.
+    /// SIP-35 §Backing off: origins the home task could not find or reach.
     origin_unfound: Mutex<HashMap<PubKey, Unfound>>,
-    /// SIP-81: the home's device list for an account that lives elsewhere,
+    /// SIP-60 §Devices of an account that moved: the home's device list for an account that lives elsewhere,
     /// kept `DEVICES_TTL` so a poll's sixty asks are one round trip each.
     devices_elsewhere: Mutex<HashMap<PubKey, (u64, sqex_proto::device::Devices)>>,
     /// SIP-59: poked when an account moves here, so the home task pulls
@@ -813,7 +813,7 @@ impl Server {
         self.domain.clone().unwrap_or_default()
     }
 
-    /// SIP-78: note what `origin` refused, on which path, and hold this
+    /// SIP-35 §Passing a limit through: note what `origin` refused, on which path, and hold this
     /// exchange's peering writes to it where the refusal was the origin's
     /// peering limit. Logged at warn once per origin per window.
     pub(crate) fn note_origin_refusal(
@@ -855,7 +855,7 @@ impl Server {
         );
     }
 
-    /// SIP-78: whether peering writes to `origin` are held off, and until
+    /// SIP-35 §An origin that does not answer: whether peering writes to `origin` are held off, and until
     /// when.
     pub(crate) fn origin_held(&self, origin: &PubKey) -> Option<u64> {
         let now = now_unix();
@@ -867,7 +867,7 @@ impl Server {
             .filter(|until| *until > now)
     }
 
-    /// SIP-78: what to answer a member whose forwarded act did not go
+    /// SIP-35 §An origin that does not answer: what to answer a member whose forwarded act did not go
     /// through, by why -- a limit passed on with its wait, an origin that
     /// said no as `origin_refused`, and only silence as `origin_away`. The
     /// refusal is recorded against the origin either way.
@@ -894,7 +894,7 @@ impl Server {
         }
     }
 
-    /// SIP-78: the origins this exchange forwards to or pulls from, with
+    /// SIP-35 §An origin that does not answer: the origins this exchange forwards to or pulls from, with
     /// when each last answered, any hold in force, and the last refusal.
     fn origins_value(&self) -> serde_json::Value {
         let now = now_unix();
@@ -902,7 +902,7 @@ impl Server {
         let refusals = self.origin_refusals.lock().unwrap();
         let unfound = self.origin_unfound.lock().unwrap();
         let forwarders = self.origins.read().unwrap();
-        // SIP-78 §Saying so: and every origin an account homed here hinted at -- the
+        // SIP-35 §Saying so: and every origin an account homed here hinted at -- the
         // reason the home task is trying at all, and the row an operator
         // needed for an origin that never answered.
         let hinted: HashMap<PubKey, String> = self
@@ -952,14 +952,14 @@ impl Server {
         json!(rows)
     }
 
-    /// SIP-53: note that `origin` answered just now. SIP-78 §Backing off: and so is
+    /// SIP-53: note that `origin` answered just now. SIP-35 §Backing off: and so is
     /// no longer unfound.
     pub(crate) fn reached(&self, origin: &PubKey) {
         self.contacts.lock().unwrap().insert(*origin, now_unix());
         self.origin_unfound.lock().unwrap().remove(origin);
     }
 
-    /// SIP-78 §Backing off: a home-task cycle could not find or reach `origin`. Holds
+    /// SIP-35 §Backing off: a home-task cycle could not find or reach `origin`. Holds
     /// off from it for `interval << (tries - 1)`, at most
     /// `MAX_UNFOUND_SECS`, and says so once per hold. Returns the hold.
     pub(crate) fn note_unfound(
@@ -990,12 +990,12 @@ impl Server {
         );
         tracing::warn!(
             %origin, domain, why = why.as_str(), tries, next_in = hold,
-            "cannot find an account's origin; holding off (SIP-78)"
+            "cannot find an account's origin; holding off (SIP-35)"
         );
         hold
     }
 
-    /// SIP-81: `account`'s devices as its home `home` lists them -- the
+    /// SIP-60 §Devices of an account that moved: `account`'s devices as its home `home` lists them -- the
     /// answer kept within `DEVICES_TTL`, or a fresh ask. `None` where the
     /// home could not be asked; a failed ask is not kept.
     pub(crate) async fn devices_at_home(
@@ -1018,7 +1018,7 @@ impl Server {
         Some(theirs)
     }
 
-    /// SIP-81/83: an account's devices and whose list it is: this
+    /// SIP-60 §Saying whose list it is/83: an account's devices and whose list it is: this
     /// exchange's own (`FROM_HERE`) where the account lives here or
     /// nowhere on record; the home's (`FROM_HOME`) where it lives
     /// elsewhere and the home answered; this exchange's own for an
@@ -1036,13 +1036,13 @@ impl Server {
         Ok((FROM_HERE, self.devices.list(account)?))
     }
 
-    /// SIP-68 §What the home does with wakes: whether this exchange would post to `endpoint` -- its own
+    /// SIP-59 §What the home does with wakes: whether this exchange would post to `endpoint` -- its own
     /// policy, applied to a registration collected from a former home.
     pub(crate) fn wake_endpoint_ok(&self, endpoint: &str) -> bool {
         sqex_proto::wake::acceptable(endpoint, self.wake_loopback)
     }
 
-    /// SIP-78 §Saying so: forget unfound origins not in `keep` -- the ones no account
+    /// SIP-35 §Saying so: forget unfound origins not in `keep` -- the ones no account
     /// hints at any more. Nothing will try them, so nothing would ever
     /// clear them, and a row for an origin nobody has a reason to contact
     /// is not a readout.
@@ -1053,7 +1053,7 @@ impl Server {
             .retain(|k, _| keep.contains(k));
     }
 
-    /// SIP-78 §Backing off: whether the home task is holding off from `origin`, and
+    /// SIP-35 §Backing off: whether the home task is holding off from `origin`, and
     /// until when.
     pub(crate) fn origin_unfound_until(&self, origin: &PubKey) -> Option<u64> {
         let now = now_unix();
@@ -1342,7 +1342,7 @@ impl Server {
         self.state.lock().unwrap().peers_with(key)
     }
 
-    /// SIP-46: the peer list as a directory. Never this exchange itself,
+    /// SIP-39 §The peer directory: the peer list as a directory. Never this exchange itself,
     /// and a label only where it is a domain.
     pub(crate) fn peer_directory(&self) -> Peers {
         let me = self.public_key;
@@ -2331,7 +2331,7 @@ async fn route(
                 | "/wake/register"
                 | "/backup/write"
                 | "/resolve/publish"
-                // SIP-81: a device registering or revoking at a former home
+                // SIP-60 §At a former home: a device registering or revoking at a former home
                 // would be seen by nobody, since the former home answers the
                 // home's list; it is told where to go instead.
                 | "/device/register"
@@ -3070,13 +3070,13 @@ async fn route(
             ),
         },
         // SIP-60 asked the home for an account with no devices here;
-        // SIP-81 asks it for every account that lives elsewhere. A
+        // SIP-60 §Whose list asks it for every account that lives elsewhere. A
         // former home's own registry is the devices the account had
         // when it left -- one revoked since still listed, one linked
         // since not, and after a handover the new key's nowhere -- and
         // every key sealed from it went to a device in a drawer. Its
         // own list is answered only where the home cannot be asked.
-        // SIP-81 §Saying whose list it is: asked with the newer type byte, the answer says which
+        // SIP-60 §Saying whose list it is: asked with the newer type byte, the answer says which
         // of the three it is, so a client sealing a key to a stale one
         // can wait instead.
         ("POST", "/device/list") => match body.first() {
@@ -3574,7 +3574,7 @@ async fn route(
                 },
             }
         }
-        // SIP-71: the folded log of a direct message this exchange ended,
+        // SIP-60 §Reading the folded log: the folded log of a direct message this exchange ended,
         // to either of its members, as a fetch would have answered it.
         ("POST", "/channel/folded") => match (account, ByChannel::decode(body, CH_FOLDED)) {
             (None, _) => no_identity("reading a folded log"),
@@ -3588,7 +3588,7 @@ async fn route(
             (None, _) => no_identity("asking where a channel lives"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(req)) => {
-                // SIP-71: a folded identifier points at the conversation,
+                // SIP-60 §What a fold record does: a folded identifier points at the conversation,
                 // to the two it was between and to nobody else.
                 if let Some((into, domain, first, second)) =
                     server.channels.folded_into(&req.channel)
@@ -4347,7 +4347,7 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-68: the account's home collects its waiting mail here -- the
+        // SIP-59 §Collecting mail: the account's home collects its waiting mail here -- the
         // home by the account's own Move, and nobody else: an operator's
         // `for` list confers no mailbox. Nothing is removed by asking;
         // `/peer/mailbox/took` names what the home stored.
@@ -4390,7 +4390,7 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-68 §Collecting the backup: the account's home collects its backup here, gated as the
+        // SIP-59 §Collecting the backup: the account's home collects its backup here, gated as the
         // mailbox is: the home by the account's own Move, and nobody else.
         // `Held` is what `/backup/read` would answer the account; nothing
         // is removed by asking, and `/peer/backup/took` names the
@@ -4442,7 +4442,7 @@ async fn route(
                 {
                     Ok(true) => tracing::info!(
                         account = %req.account, home = %who, generation = req.generation,
-                        "released an account's backup to its home (SIP-68)"
+                        "released an account's backup to its home (SIP-59 §Collecting the backup)"
                     ),
                     Ok(false) => {}
                     Err(e) => return refused(e),
@@ -4455,7 +4455,7 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-68 §Collecting wakes: the account's home copies its wake registrations, gated
+        // SIP-59 §Collecting wakes: the account's home copies its wake registrations, gated
         // as the mailbox is. Nothing is removed: a former home goes on
         // waking for the channels it still orders.
         ("POST", "/peer/wakes") => match (peer.identity, PullWakes::decode(body)) {
@@ -4500,7 +4500,7 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-71: the home of a direct message's lower key says the channel
+        // SIP-60 §The home learns of a stray: the home of a direct message's lower key says the channel
         // of that identifier ordered here is a stray. Verified in the
         // document's order -- ordered here, a direct message with that
         // lower key, the caller is that key's home by its own signed Move,
@@ -5124,7 +5124,7 @@ async fn route(
             _ => peering_refused(),
         },
 
-        // SIP-52: what a device that has been away needs, in one answer
+        // SIP-47 §Catching up in one round trip: what a device that has been away needs, in one answer
         // composed from the routes around it. See `crate::catchup`.
         ("POST", "/channel/catchup") => {
             match (account, device, sqex_proto::catchup::Catchup::decode(body)) {
@@ -5429,7 +5429,7 @@ async fn route(
             }
         },
 
-        // SIP-46: the exchanges this one federates with, for anyone to read.
+        // SIP-39 §The peer directory: the exchanges this one federates with, for anyone to read.
         // The runtime peer list and nothing else; a peer's label is its
         // domain when the label is a DNS name, and empty otherwise -- an
         // operator's note is not a place to be reached.
@@ -5482,7 +5482,7 @@ impl Server {
             // SIP-5 §Durability: a memory-only deployment says so here, since a client
             // cannot tell and should not have to.
             "mailbox_durable": self.mailbox.durable(),
-            // SIP-78: what each origin last refused this exchange, and
+            // SIP-35 §Passing a limit through: what each origin last refused this exchange, and
             // whether writes to it are held.
             "origins": self.origins_value(),
             "sessions": self.sessions.len(),

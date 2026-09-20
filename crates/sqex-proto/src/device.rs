@@ -18,15 +18,15 @@ pub const TYPE_REVOKE: u8 = 0x02;
 pub const TYPE_LIST: u8 = 0x03;
 /// SIP-24: ask to be admitted to a whitelisted exchange.
 pub const TYPE_ADMISSION: u8 = 0x04;
-/// SIP-81 §Saying whose list it is: list an account's devices and say whose list it is.
+/// SIP-60 §Saying whose list it is: list an account's devices and say whose list it is.
 pub const TYPE_LIST_FROM: u8 = 0x05;
 
-/// SIP-81 §Saying whose list it is `DevicesFrom::from`: this exchange's own registry -- the
+/// SIP-60 §Saying whose list it is `DevicesFrom::from`: this exchange's own registry -- the
 /// account's home is here, or nowhere on record.
 pub const FROM_HERE: u8 = 0x00;
-/// SIP-81 §Saying whose list it is: the home's answer, fresh or kept within SIP-81's `DEVICES_TTL`.
+/// SIP-60 §Saying whose list it is: the home's answer, fresh or kept within SIP-60 §Caching's `DEVICES_TTL`.
 pub const FROM_HOME: u8 = 0x01;
-/// SIP-81 §Saying whose list it is: this exchange's own registry for an account that lives
+/// SIP-60 §Saying whose list it is: this exchange's own registry for an account that lives
 /// elsewhere, because the home could not be asked. A snapshot from before
 /// the account left: not a list to seal a key to.
 pub const FROM_STALE: u8 = 0x02;
@@ -191,7 +191,7 @@ impl ListDevices {
     }
 }
 
-/// SIP-81 §Saying whose list it is: `POST /device/list` with `| type = 0x05 | account[32] |`,
+/// SIP-60 §Saying whose list it is: `POST /device/list` with `| type = 0x05 | account[32] |`,
 /// answered with [`DevicesFrom`]. The same route as [`ListDevices`],
 /// dispatched on the type byte; an exchange from before sqex 0.100.0 refuses it
 /// as malformed and a client falls back.
@@ -221,7 +221,7 @@ impl ListDevicesFrom {
     }
 }
 
-/// SIP-81 §Saying whose list it is: `| from: u8 | Devices |` -- whose list this is, then SIP-22's
+/// SIP-60 §Saying whose list it is: `| from: u8 | Devices |` -- whose list this is, then SIP-22's
 /// list exactly as `ListDevices` would have been answered. A new answer
 /// type rather than a field on `Devices`, as SIP-34 requires: `Devices`
 /// refuses trailing bytes, and so does this.
