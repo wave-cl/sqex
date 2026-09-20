@@ -269,8 +269,10 @@ pub enum HomeSaid {
     /// This exchange already records the account's home.
     OnRecord,
     /// This store is filed under another exchange: the account lives at
-    /// `home`, and this client is a visitor here. Nothing was presented.
-    Visitor { home: PubKey },
+    /// `home`, and this client is a visitor here. No Move naming this
+    /// exchange was presented; `told` is whether one naming `home` was,
+    /// because this exchange still recorded itself as the home.
+    Visitor { home: PubKey, told: bool },
     /// This client does not hold the account key, or this exchange has no
     /// chat: not its to say.
     NotMine,
@@ -2334,20 +2336,37 @@ impl Chat {
             return Ok(HomeSaid::NotMine);
         }
         let me = self.me;
-        let on_record = match self.account_home(&me).await {
-            Ok(h) => h.since != 0,
+        let record = match self.account_home(&me).await {
+            Ok(h) => (h.since != 0).then_some(h.home),
             Err(ChatError::NoChatHere(_)) => return Ok(HomeSaid::NotMine),
-            Err(ChatError::Refused(404, _)) => false,
+            Err(ChatError::Refused(404, _)) => None,
             Err(e) => return Err(e),
         };
-        if on_record {
-            return Ok(HomeSaid::OnRecord);
-        }
         let exchange = self.exchange;
         if let Some(home) = self.store.filed_under()?
             && home != exchange
         {
-            return Ok(HomeSaid::Visitor { home });
+            // SIP-82: a visitor. Where this exchange records *itself* as
+            // the home -- the residue of a Move made here by accident,
+            // never displaced because nothing told it of the later one --
+            // say where the account lives: a Move naming the store's home,
+            // presented here, which names nowhere the account is not.
+            let told = if record == Some(exchange) {
+                let mv = self.sign_move(&home)?;
+                self.present_move(&sqex_proto::home::Moving {
+                    mv,
+                    domain: String::new(),
+                    origins: Vec::new(),
+                })
+                .await
+                .is_ok()
+            } else {
+                false
+            };
+            return Ok(HomeSaid::Visitor { home, told });
+        }
+        if record.is_some() {
+            return Ok(HomeSaid::OnRecord);
         }
         let mv = self.sign_move(&exchange)?;
         let domain = self.domain.clone().unwrap_or_default();

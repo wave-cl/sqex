@@ -252,7 +252,10 @@ async fn a_client_pointed_at_another_exchange_does_not_move_there() {
     at_b.set_domain(Some("b.test".into()));
     assert_eq!(
         at_b.ensure_home().await.unwrap(),
-        HomeSaid::Visitor { home: a_key },
+        HomeSaid::Visitor {
+            home: a_key,
+            told: false
+        },
         "a visitor was not told it was one"
     );
     // B records nothing, and A is still home.
@@ -268,6 +271,34 @@ async fn a_client_pointed_at_another_exchange_does_not_move_there() {
     let mut at_a = Chat::new(client, seed, carol, PubKey::new(a_pub), store);
     assert_eq!(at_a.account_home(&carol).await.unwrap().home, a_key);
     assert_eq!(at_a.ensure_home().await.unwrap(), HomeSaid::OnRecord);
+
+    // The residue of a Move by accident: B records itself as home (as a
+    // client from before SIP-82 would have made it), and nothing told A.
+    // A visit cleans it: the client tells B the account lives at A.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let by_accident = at_b.sign_move(&b_key).unwrap();
+    at_b.present_move(&sqex_proto::home::Moving {
+        mv: by_accident,
+        domain: "b.test".into(),
+        origins: vec![],
+    })
+    .await
+    .unwrap();
+    assert_eq!(at_b.account_home(&carol).await.unwrap().home, b_key);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    assert_eq!(
+        at_b.ensure_home().await.unwrap(),
+        HomeSaid::Visitor {
+            home: a_key,
+            told: true
+        },
+        "the residue was not cleaned"
+    );
+    assert_eq!(
+        at_b.account_home(&carol).await.unwrap().home,
+        a_key,
+        "B still thinks it is home"
+    );
 
     // Told to move, she moves: an explicit act, naming A as an origin.
     // A second later: a Move's `issued` is whole seconds, and one no later
