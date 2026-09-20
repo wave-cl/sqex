@@ -167,3 +167,73 @@ async fn a_client_through_its_home_comes_back_with_a_fresh_tunnel() {
         "B saw the fresh tunnel's socket"
     );
 }
+
+/// The failure the user saw: the interface's request timed out while the
+/// tunnel still stood, and the client dialled the same carrier again with
+/// the old endpoint still retransmitting into it. Now a redial through a
+/// home is a fresh tunnel, the old one closed first: A carries one tunnel
+/// with a new socket, B answers, and nothing was dropped as stray.
+#[tokio::test]
+async fn a_redial_through_a_standing_tunnel_opens_a_fresh_one() {
+    let b = exchange(false, "b.test", &[]).await;
+    let a = exchange(true, "a.test", &[("b.test", PubKey::new(b.key), b.addr)]).await;
+    let (seed, me) = identity(86);
+    let mut at_a = Client::connect_as(a.addr, &a.key, &seed).await.unwrap();
+    let (code, _) = at_a
+        .post(
+            "/account/move",
+            Moving {
+                mv: Move::sign(&seed, &PubKey::new(a.key), now()),
+                domain: "a.test".into(),
+                origins: vec![],
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    let carrier = Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    let local = carrier.local_addr();
+    let client = Client::connect_as(local, &b.key, &seed).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&seed, Some(&dir.path().join("chat.db"))).unwrap();
+    let mut chat = Chat::new(client, seed, me, PubKey::new(b.key), store);
+    chat.dials(local, b.key);
+    chat.via((a.addr, a.key), b.key, "b.test".into(), carrier);
+    chat.top_up_prekeys().await.unwrap();
+    assert!(chat.mine().await.is_ok());
+    let first = a.server.tunnel_sockets()[0];
+
+    // The tunnel stands; only the interface's own request failed.
+    chat.link_lost();
+    assert_ne!(chat.link(), Link::Up);
+    settle(&mut chat).await;
+    assert_eq!(
+        chat.link(),
+        Link::Up,
+        "never came back: a redial into the old tunnel"
+    );
+    assert!(chat.mine().await.is_ok(), "reconnected, and nothing works");
+    for _ in 0..50 {
+        if a.server.tunnels_open() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        a.server.tunnels_open(),
+        1,
+        "the old tunnel was closed, one fresh one stands"
+    );
+    let second = a.server.tunnel_sockets()[0];
+    assert_ne!(first, second, "a fresh tunnel has its own socket");
+    assert_eq!(
+        b.server.last_peer_addr().map(|p| p.port()),
+        Some(second.port()),
+        "B saw the fresh tunnel's socket"
+    );
+    assert_eq!(b.server.last_peer_identity(), Some(me));
+}

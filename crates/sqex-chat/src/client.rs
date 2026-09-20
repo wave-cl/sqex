@@ -1707,6 +1707,15 @@ impl Chat {
         };
     }
 
+    /// The interface saw the connection fail -- a request of its own that
+    /// timed out -- and says so, so the next [`keep_alive`](Self::keep_alive)
+    /// redials rather than waiting for this side to notice.
+    pub fn link_lost(&mut self) {
+        if self.link == Link::Up {
+            self.down();
+        }
+    }
+
     /// Try again now, whatever the backoff had planned.
     ///
     /// What `/reconnect` is for: `Gone` should have an answer that is not
@@ -1747,12 +1756,18 @@ impl Chat {
                 return;
             }
             let seed = self.seed;
-            // SIP-85: through a home, a tunnel that is gone is re-opened
-            // first and the dial goes to the new carrier's socket; one that
-            // still stands is dialled again as it is.
-            let reopen = self.via.as_ref().and_then(|v| {
-                let gone = v.carrier.as_ref().is_none_or(|c| c.closed());
-                gone.then(|| (v.home, v.target_key, v.target_domain.clone()))
+            // SIP-85: through a home, **every redial is a fresh tunnel**. A
+            // carrier carries one connection: its pump routes replies to the
+            // one port it heard from first, so dialling its socket again --
+            // while the old endpoint is still retransmitting into it -- put
+            // two connections on one pump, and both saw seconds of delay and
+            // died within the minute, on repeat. The old carrier is closed
+            // here, before the dial, so the old endpoint's packets stop.
+            let reopen = self.via.as_mut().map(|v| {
+                if let Some(old) = v.carrier.take() {
+                    old.close();
+                }
+                (v.home, v.target_key, v.target_domain.clone())
             });
             self.dialing = Some(Box::pin(async move {
                 match reopen {

@@ -146,7 +146,10 @@ async fn a_member_reaches_the_target_through_its_home() {
     assert_eq!(status["tunnels"], 0, "B carries nothing; A does");
     // One connection at B: the tunnelled one. A dial that reached B some
     // other way as well would count twice.
-    assert_eq!(status["connections"], 1, "B accepted more than the tunnelled connection");
+    assert_eq!(
+        status["connections"], 1,
+        "B accepted more than the tunnelled connection"
+    );
     let (up, down) = carrier.bytes();
     assert!(
         up > 0 && down > 0,
@@ -345,4 +348,38 @@ async fn packets_go_through_the_tunnel_and_nowhere_else() {
         ),
         "the same dial through a live tunnel connects"
     );
+}
+
+/// A carrier carries one connection. A second dial of the same carrier's
+/// socket is a second endpoint on one pump -- the replies have one port to
+/// go to -- so the pump pins the first dialler and drops the second: the
+/// first connection keeps working, the second never connects, and the
+/// carrier counts what it dropped.
+#[tokio::test]
+async fn a_second_dial_through_one_carrier_is_dropped_not_multiplexed() {
+    let (a, b) = pair(true, 4, None).await;
+    let (seed, _) = identity(0x57);
+    home_at(&a, &seed).await;
+    let carrier = Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    let mut first = Client::connect_as(carrier.local_addr(), &b.key, &seed)
+        .await
+        .expect("the first connection through the carrier");
+    assert_eq!(carrier.stray(), 0);
+
+    let (other, _) = identity(0x58);
+    let second = Client::connect_as(carrier.local_addr(), &b.key, &other);
+    let outcome = tokio::time::timeout(Duration::from_secs(8), second).await;
+    assert!(
+        !matches!(outcome, Ok(Ok(_))),
+        "a second endpoint through one carrier must not connect"
+    );
+    assert!(
+        carrier.stray() > 0,
+        "the second dialler's packets were dropped and counted"
+    );
+    // And the first is untouched by the attempt.
+    let (code, _) = first.get("/status").await.expect("the first still answers");
+    assert_eq!(code, 200);
 }

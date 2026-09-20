@@ -202,6 +202,9 @@ pub struct Meter {
     pub up: AtomicU64,
     /// Bytes the target sent towards the member.
     pub down: AtomicU64,
+    /// Packets from a second local sender, dropped: somebody dialled this
+    /// carrier's socket twice.
+    pub stray: AtomicU64,
     pub closed: AtomicBool,
 }
 
@@ -211,6 +214,16 @@ pub struct Meter {
 /// Dial the target with `local_addr()` as the address and the target's key
 /// as the pin; the packets go up the stream, out of the home's socket, and
 /// back. Dropping the carrier closes the connection and with it the tunnel.
+///
+/// **One connection per carrier.** The home copies bytes and cannot tell two
+/// inner connections apart, and neither can this end: replies come down one
+/// stream with nothing to route them by but the port that last sent. So the
+/// pump binds itself to the **first** dialler it hears from and drops packets
+/// from any other; a client that redials opens a fresh carrier (and closes
+/// this one) rather than dialling this socket again. Sigil once did the
+/// latter -- a second endpoint through the same pump while the first still
+/// retransmitted -- and every connection through the tunnel saw seconds of
+/// delay and died within a minute, for as long as the app ran.
 pub struct Carrier {
     _conn: quinn::Connection,
     local: SocketAddr,
@@ -288,8 +301,11 @@ impl Carrier {
         let socket = Arc::new(socket);
         let meter = Arc::new(Meter::default());
 
-        // The dialler's own port is learned from its first packet, and every
-        // packet from the target goes back to it. One dialler per carrier.
+        // The dialler's own port is learned from its first packet and every
+        // packet from the target goes back to it. **Pinned**: a packet from
+        // any other port is a second connection trying to share the tunnel,
+        // which cannot work (see the type's doc), and is dropped and counted
+        // rather than allowed to hijack the replies.
         let dialler: Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
             Arc::new(tokio::sync::Mutex::new(None));
 
@@ -306,7 +322,17 @@ impl Carrier {
                     if n > MAX_PACKET {
                         continue;
                     }
-                    *dialler.lock().await = Some(from);
+                    {
+                        let mut pinned = dialler.lock().await;
+                        match *pinned {
+                            None => *pinned = Some(from),
+                            Some(first) if first != from => {
+                                meter.stray.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            Some(_) => {}
+                        }
+                    }
                     if send.write_all(&packet(&buf[..n])).await.is_err() {
                         break;
                     }
@@ -365,6 +391,13 @@ impl Carrier {
             p.abort();
         }
         self.meter.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Packets dropped because they came from a second local sender -- a
+    /// client that dialled this socket again instead of opening a fresh
+    /// carrier. Anything but zero is that bug.
+    pub fn stray(&self) -> u64 {
+        self.meter.stray.load(Ordering::Relaxed)
     }
 
     /// Bytes carried so far, `(up, down)`.
