@@ -2835,6 +2835,16 @@ impl Chat {
         known: [u8; 32],
         admins: &[PubKey],
     ) {
+        // **Once.** A client that polled in the gap between the fold and the
+        // home's copy arriving has already archived this incarnation from
+        // the folded log (`folded_away`), and its reset took the cursor with
+        // it -- so a second reading here would find every entry "unread",
+        // fold the whole log into the store again, and the reset that
+        // follows would archive the same stray twice. CI saw two copies
+        // where the laptop, whose pull lands before the next poll, saw one.
+        if self.store.archived(channel, &known).unwrap_or(false) {
+            return;
+        }
         let Ok(Some(folded)) = self.folded_entries(channel).await else {
             return;
         };

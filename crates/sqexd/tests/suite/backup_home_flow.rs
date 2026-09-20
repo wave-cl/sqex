@@ -526,12 +526,22 @@ async fn a_backup_written_at_the_new_home_stands_over_the_former_homes() {
         released.generation, 0,
         "X kept a copy the account had superseded"
     );
-    let at_h = held(&mut alice_at_h, &alice).await;
+    let mut at_h = held(&mut alice_at_h, &alice).await;
     assert_eq!(
         (at_h.generation, at_h.sealed.clone()),
         (1, mine.sealed),
         "H replaced her newest backup with an older one"
     );
+    // H's collect may still be letting go of X's copy -- fetched, compared,
+    // found older -- when X has already released it: the quota counts a
+    // blob for the moment between the two. Settled is what is asserted.
+    for _ in 0..40 {
+        if at_h.used == 9 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        at_h = held(&mut alice_at_h, &alice).await;
+    }
     assert_eq!(at_h.used, 9, "H holds blobs it did not need");
 }
 

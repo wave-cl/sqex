@@ -25,6 +25,43 @@ async fn exchange_in(
     peers: &[PubKey],
     found: &[(&str, PubKey, SocketAddr)],
 ) -> (SocketAddr, [u8; 32]) {
+    exchange_pulling(dir, listen, domain, peers, found, 1).await
+}
+
+/// The same, pulling for its homed accounts every `home_secs`.
+async fn exchange_pulling(
+    dir: &Path,
+    listen: SocketAddr,
+    domain: &str,
+    peers: &[PubKey],
+    found: &[(&str, PubKey, SocketAddr)],
+    home_secs: u64,
+) -> (SocketAddr, [u8; 32]) {
+    let map = found
+        .iter()
+        .map(|(d, k, a)| ((*d).to_string(), (*k, *a)))
+        .collect();
+    exchange_finding(
+        dir,
+        listen,
+        domain,
+        peers,
+        sqexd::relay::Find::Fixed(map),
+        home_secs,
+    )
+    .await
+}
+
+/// The same, finding peers however `find` says -- `Find::Live` lets a test
+/// move a domain while the exchange runs.
+async fn exchange_finding(
+    dir: &Path,
+    listen: SocketAddr,
+    domain: &str,
+    peers: &[PubKey],
+    find: sqexd::relay::Find,
+    home_secs: u64,
+) -> (SocketAddr, [u8; 32]) {
     let list = peers
         .iter()
         .map(|p| format!("{:?}", p.to_string()))
@@ -34,7 +71,7 @@ async fn exchange_in(
     let config_toml = format!(
         "listen = {:?}\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
          welcome_channel = \"\"\ndomain = {domain:?}\nreplication_peers = [{list}]\n\
-         seed_relay_peers = [{list}]\nhome_secs = 1\n",
+         seed_relay_peers = [{list}]\nhome_secs = {home_secs}\n",
         listen.to_string(),
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
@@ -43,11 +80,7 @@ async fn exchange_in(
     let config = file.resolve().unwrap();
     let (signing_key, _pub) =
         squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
-    let map = found
-        .iter()
-        .map(|(d, k, a)| ((*d).to_string(), (*k, *a)))
-        .collect();
-    let bound = sqexd::bind_with(config, None, signing_key, sqexd::relay::Find::Fixed(map))
+    let bound = sqexd::bind_with(config, None, signing_key, find)
         .await
         .unwrap();
     let addr = bound.local_addr;
@@ -250,4 +283,117 @@ async fn a_folded_direct_message_keeps_what_was_read_and_continues() {
     // second stray: the identifier at B is the copy.
     assert_eq!(bob_at_b.open_dm(&alice).await.unwrap(), dm);
     assert_eq!(bob_at_b.home(&dm).await.unwrap().origin, a_key);
+}
+
+/// The race CI found in the test above: Bob's client polls in the gap
+/// between B folding the stray and B holding Alice's copy. B no longer
+/// serves the channel, so the client keeps what it read from the folded
+/// log as an earlier copy then; when the copy arrives the incarnation
+/// changes again, and the folded log must not be read a second time --
+/// that archived the same stray twice. The gap is held open here: B is
+/// told where A is only after the poll has landed in it.
+#[tokio::test]
+async fn a_client_that_polls_between_the_fold_and_the_copy_keeps_the_stray_once() {
+    // Alice holds the lower key, so the conversation lives at her home A.
+    let (mut a, mut b) = (0x71u8, 0x72u8);
+    if identity(a).1.as_bytes() > identity(b).1.as_bytes() {
+        std::mem::swap(&mut a, &mut b);
+    }
+    let (_, alice) = identity(a);
+    let (_, bob) = identity(b);
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let a_key = key_in(a_dir.path());
+    let b_key = key_in(b_dir.path());
+    let (a_at, b_at) = (free_port(), free_port());
+    let (a_addr, a_pub) = exchange_in(
+        a_dir.path(),
+        a_at,
+        "a.test",
+        &[b_key],
+        &[("b.test", b_key, b_at)],
+    )
+    .await;
+    // B believes A is at a port nothing listens on: it can be told of A's
+    // copy (A dials B) and fold, but cannot fetch the copy until the map
+    // below is corrected.
+    let dead = free_port();
+    let map = std::sync::Arc::new(std::sync::RwLock::new(
+        [("a.test".to_string(), (a_key, dead))]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>(),
+    ));
+    let (b_addr, b_pub) = exchange_finding(
+        b_dir.path(),
+        b_at,
+        "b.test",
+        &[a_key],
+        sqexd::relay::Find::Live(std::sync::Arc::clone(&map)),
+        1,
+    )
+    .await;
+
+    let alice_at_b = chat_at(b_addr, b_pub, "b.test", a, &b_dir.path().join("alice.db")).await;
+    drop(alice_at_b);
+    let mut bob_at_b = chat_at(b_addr, b_pub, "b.test", b, &b_dir.path().join("bob.db")).await;
+    let mut alice_at_a = chat_at(a_addr, a_pub, "a.test", a, &a_dir.path().join("alice.db")).await;
+
+    let dm = bob_at_b.open_dm(&alice).await.unwrap();
+    bob_at_b.send(&dm, "stray one").await.unwrap();
+    bob_at_b.send(&dm, "stray two").await.unwrap();
+    let mut tb = Timeline::new();
+    assert!(until(&mut bob_at_b, &dm, &mut tb, &["stray one", "stray two"]).await);
+
+    alice_at_a.locate(&format!("{bob}@b.test")).await.unwrap();
+    assert_eq!(alice_at_a.open_dm(&bob).await.unwrap(), dm);
+    alice_at_a.send(&dm, "conv one").await.unwrap();
+    let mut ta = Timeline::new();
+    assert!(until(&mut alice_at_a, &dm, &mut ta, &["conv one"]).await);
+
+    let mv = alice_at_a.sign_move(&a_key).unwrap();
+    let mv = sqex_proto::home::Move::sign(&identity(a).0, &a_key, mv.issued.max(now()) + 1);
+    alice_at_a
+        .present_move(&Moving {
+            mv,
+            domain: "a.test".into(),
+            origins: vec![(b_key, "b.test".into())],
+        })
+        .await
+        .unwrap();
+
+    // In the gap: B has folded and holds nothing under the identifier, and
+    // cannot fetch the copy. Bob's client keeps the stray as an earlier
+    // copy from the folded log.
+    let mut in_gap = false;
+    let mut seen = Vec::new();
+    for _ in 0..80 {
+        let r = bob_at_b.poll(&dm, &mut tb, 0).await;
+        let n = bob_at_b.earlier(&dm, &[alice, bob]).unwrap().len();
+        seen.push(format!(
+            "{n} {:?} {}",
+            said(&tb),
+            if r.is_ok() { "ok" } else { "err" }
+        ));
+        if n == 1 {
+            in_gap = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        in_gap,
+        "the poll never landed between the fold and the copy: {seen:?}"
+    );
+    assert!(
+        !said(&tb).iter().any(|s| s == "conv one"),
+        "the copy arrived before B could have fetched it: {:?}",
+        said(&tb)
+    );
+
+    // Now B finds A, pulls the copy, and the stray is still one earlier copy.
+    map.write().unwrap().insert("a.test".into(), (a_key, a_at));
+    assert!(until(&mut bob_at_b, &dm, &mut tb, &["conv one"]).await);
+    let earlier = bob_at_b.earlier(&dm, &[alice, bob]).unwrap();
+    assert_eq!(earlier.len(), 1, "the stray was archived twice");
+    assert_eq!(said(&earlier[0]), ["stray one", "stray two"]);
 }

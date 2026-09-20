@@ -2815,6 +2815,22 @@ impl Store {
         Ok(())
     }
 
+    /// SIP-60 §The client keeps what it read: whether `instance` of `channel` is already in history
+    /// -- archived by an earlier reset -- so a folded log is read into the
+    /// store once and not again by the next reset that finds it.
+    pub fn archived(&self, channel: &[u8; 32], instance: &[u8; 32]) -> Result<bool> {
+        let n: i64 = self
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM generation
+                 WHERE channel = ?1 AND exchange = ?2 AND instance = ?3",
+                params![&channel[..], self.scope()?, &instance[..]],
+                |r| r.get(0),
+            )
+            .map_err(storage("look for an archived incarnation"))?;
+        Ok(n > 0)
+    }
+
     /// SIP-60 §The client keeps what it read: the archived incarnations of a channel, oldest first, each
     /// in the shape `messages` answers.
     #[allow(clippy::type_complexity)]
