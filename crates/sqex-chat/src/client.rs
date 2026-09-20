@@ -4951,15 +4951,11 @@ impl Chat {
         let mut there = Client::connect_as(addr, home.as_bytes(), &self.seed)
             .await
             .map_err(|e| ChatError::Transport(format!("could not reach {domain}: {e}")))?;
-        if let Some(credential) = self.credential() {
-            let (code, body) = there
-                .post("/device/register", Register { credential }.encode())
-                .await
-                .map_err(|e| ChatError::Transport(e.to_string()))?;
-            if code != 200 {
-                return Err(classify("/device/register", code, &body));
-            }
-        }
+        // The Move first, then the device: a home the account is moving
+        // *back* to is its former home until the Move is presented, and a
+        // former home refuses a device's registration with `moved`
+        // (SIP-81). The Move needs no registration -- its signature is
+        // the authority.
         let moving = sqex_proto::home::Moving {
             mv,
             domain: domain.to_string(),
@@ -4974,16 +4970,38 @@ impl Chat {
         }
         let at_home = sqex_proto::home::Moved::decode(&body)
             .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        if let Some(credential) = self.credential() {
+            let (code, body) = there
+                .post("/device/register", Register { credential }.encode())
+                .await
+                .map_err(|e| ChatError::Transport(e.to_string()))?;
+            if code != 200 {
+                return Err(classify("/device/register", code, &body));
+            }
+        }
 
         // Told here too, so the gate opens before the home's first pull
         // rather than after its carry; the home carries it on to the rest.
-        let here = self
+        // The home's carry can win the race -- it is poked the moment the
+        // Move lands -- and this exchange then already holds this very
+        // Move and refuses it as stale. That is the same telling, done.
+        let here = match self
             .present_move(&sqex_proto::home::Moving {
                 mv,
                 domain: domain.to_string(),
                 origins: Vec::new(),
             })
-            .await?;
+            .await
+        {
+            Ok(here) => here,
+            Err(ChatError::Refused(409, r)) if r.code == RefusalCode::StaleGeneration => {
+                sqex_proto::home::Moved {
+                    now: at_home.now,
+                    peered: true,
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let from = self.exchange;
         let refiled = self.store.move_home(&from, home)?;

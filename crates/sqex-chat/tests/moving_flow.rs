@@ -55,6 +55,50 @@ async fn exchange_in(
     (addr, server_pub)
 }
 
+/// `exchange_in`, listening where told, so another exchange can be told
+/// where to find it before it is up.
+async fn exchange_at(
+    dir: &Path,
+    listen: SocketAddr,
+    peers: &[PubKey],
+    found: &[(&str, PubKey, SocketAddr)],
+) -> (SocketAddr, [u8; 32]) {
+    let list = peers
+        .iter()
+        .map(|p| format!("{:?}", p.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_path = dir.join("host_key");
+    if !key_path.exists() {
+        let (server_sk, _) = squic::generate_keypair();
+        std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    }
+    let config_toml = format!(
+        "listen = {:?}\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\nreplication_peers = [{list}]\nhome_secs = 1\n",
+        listen.to_string(),
+        key_path.to_string_lossy(),
+        dir.join("sqex.state").to_string_lossy(),
+    );
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let map = found
+        .iter()
+        .map(|(d, k, a)| ((*d).to_string(), (*k, *a)))
+        .collect();
+    let bound = sqexd::bind_with(config, None, signing_key, sqexd::relay::Find::Fixed(map))
+        .await
+        .unwrap();
+    let addr = bound.local_addr;
+    let server_pub = bound.public_key.to_bytes();
+    tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+    (addr, server_pub)
+}
+
 fn key_in(dir: &Path) -> PubKey {
     let (server_sk, _) = squic::generate_keypair();
     std::fs::write(dir.join("host_key"), hex::encode(server_sk.to_bytes())).unwrap();
@@ -221,4 +265,64 @@ async fn a_moved_client_reads_its_sealed_history_at_the_new_home_and_is_heard_fr
     assert_eq!(at_b.home, b_key);
     let bob_home = bob_at_x.account_home(&bob).await.unwrap();
     assert_eq!(bob_home.home, x_key);
+}
+
+/// SIP-81 made a former home refuse a device's registration with `moved`;
+/// a client moving *back* to a former home presents the Move first, so
+/// the registration that follows lands at a home again.
+#[tokio::test]
+async fn a_client_can_move_back_to_a_former_home() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let x_key = key_in(x_dir.path());
+    let b_key = key_in(b_dir.path());
+    let (x_at, b_at): (SocketAddr, SocketAddr) = (
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+    );
+    let (x_addr, x_pub) =
+        exchange_at(x_dir.path(), x_at, &[b_key], &[("b.test", b_key, b_at)]).await;
+    let (b_addr, b_pub) =
+        exchange_at(b_dir.path(), b_at, &[x_key], &[("x.test", x_key, x_addr)]).await;
+    let (seed, _) = identity(77);
+    let store_path = x_dir.path().join("dana.db");
+    let mut dana = chat_at(x_addr, x_pub, "x.test", 77, &store_path).await;
+    dana.ensure_home().await.unwrap();
+    // She registers herself as her own device, as a client does.
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let me = dana.me;
+    let cred = sqex_proto::credential::Credential::issue(
+        &seed,
+        &me,
+        sqex_proto::credential::SCOPE_CHAT,
+        n - 1,
+        n + 3600,
+    )
+    .unwrap();
+    dana.register_self(&cred).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    dana.move_home(b_addr, &b_key, "b.test", None)
+        .await
+        .unwrap();
+
+    // And back. X is her former home until the Move lands there.
+    let client = Client::connect_as(b_addr, &b_pub, &seed).await.unwrap();
+    let store = Store::open(&seed, Some(&store_path)).unwrap();
+    let mut dana_at_b = Chat::new(client, seed, dana.me, PubKey::new(b_pub), store);
+    dana_at_b.set_domain(Some("b.test".into()));
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let back = dana_at_b.move_home(x_addr, &x_key, "x.test", None).await;
+    assert!(
+        back.is_ok(),
+        "could not move back to a former home: {back:?}"
+    );
 }
