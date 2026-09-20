@@ -341,9 +341,9 @@ pub struct Found {
     pub name: String,
     pub topic: String,
     pub members: u16,
-    /// SIP-55: where the channel lives, as a domain -- empty at home.
+    /// SIP-16 §What a client does with a search row: where the channel lives, as a domain -- empty at home.
     pub at: String,
-    /// SIP-55: whether it can be joined through this exchange.
+    /// SIP-16 §What a client does with a search row: whether it can be joined through this exchange.
     pub here: bool,
 }
 
@@ -2043,7 +2043,7 @@ fn directory(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(palette::MUTED),
             ),
         ];
-        // SIP-55: a room elsewhere says so, and whether /join works from here
+        // SIP-16 §What a client does with a search row: a room elsewhere says so, and whether /join works from here
         // or the person has to go there.
         if !c.at.is_empty() {
             spans.push(Span::styled(

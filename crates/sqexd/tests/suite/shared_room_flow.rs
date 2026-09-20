@@ -1,4 +1,4 @@
-//! SIP-49: a room spans two peered exchanges. A member at each joins at
+//! SIP-39 §Sharing on the relay link: a room spans two peered exchanges. A member at each joins at
 //! its own, names the other, and the rosters cross the relay link with each
 //! member's home; the pair then meets through a bridge nobody rang for.
 

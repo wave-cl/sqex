@@ -70,7 +70,7 @@ struct BridgeRec {
     /// The caller device (A).
     caller: PubKey,
     caller_eph: [u8; 32],
-    /// SIP-49: the invite addressed this one device, and only its open
+    /// SIP-39 §Pairs across exchanges: the invite addressed this one device, and only its open
     /// answers. `None` is SIP-39's account, answered by whichever device.
     device_only: Option<PubKey>,
     /// The answering device (B's), once known.
@@ -308,7 +308,7 @@ fn forget_link(server: &Server, peer: PubKey, id: usize) {
     inner.links.remove(&peer);
     inner.domains.retain(|_, k| *k != peer);
     drop(inner);
-    // SIP-49: what the peer shared was soft state on the link.
+    // SIP-39 §Sharing on the relay link: what the peer shared was soft state on the link.
     server.rooms.forget_peer(&peer);
 }
 
@@ -408,7 +408,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     // *key*, and discovery is what produces one — so the order is fixed by what
     // each step knows, not by preference (SIP-39).
     //
-    // SIP-49: a base58 exchange key in place of the domain names a relay
+    // SIP-39 §Pairs across exchanges: a base58 exchange key in place of the domain names a relay
     // peer directly -- a room member's home, known from the roster and not
     // from any directory -- and is answered from the link already up with
     // it, or from the domain the peer list records for it.
@@ -476,7 +476,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     // SIP-65 §Dialling: over a link to an exchange nobody listed, the
     // caller's account and the callee must already share a conversation
     // held here, and the caller is under the calls limit. A device invite
-    // (SIP-49, by key) has no word to stand on and stays with the list.
+    // (SIP-39 §Pairs across exchanges, by key) has no word to stand on and stays with the list.
     if !listed && !room_vouched {
         let Some(word) = &word else {
             return CallAck::rejected(relay::REASON_REFUSED, now);
@@ -534,7 +534,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
         },
     );
     inner.caller_index.insert((caller, target.clone()), bridge);
-    // SIP-49: a peer named by key is a room member's home, and the target
+    // SIP-39 §Pairs across exchanges: a peer named by key is a room member's home, and the target
     // is that one device; nobody is rung for it.
     let invite = if by_key.is_some() {
         Control::InviteDevice {
@@ -576,7 +576,7 @@ pub fn try_answer(
     let account = server.account_of(&device);
     let mut inner = server.relay.inner.lock().unwrap();
     let bridge = *inner.callee_index.get(&(caller, account))?;
-    // SIP-49: a bridge addressed to one device is nobody else's to answer.
+    // SIP-39 §Pairs across exchanges: a bridge addressed to one device is nobody else's to answer.
     if inner
         .bridges
         .get(&bridge)?
@@ -898,7 +898,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             // Ring the account's devices (SIP-30, per device).
             server.ring_crosscall(account, bridge, caller);
         }
-        // SIP-49: an invite addressed to one device, which both sides know
+        // SIP-39 §Pairs across exchanges: an invite addressed to one device, which both sides know
         // from a shared room. Never rung: the device opens toward the caller
         // by itself, or already has -- in which case the bridge is answered
         // on the spot.
@@ -908,7 +908,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             caller_eph,
             device,
         } => {
-            // SIP-65 §The member's word: over a link to a listed peer as SIP-49 has it; over
+            // SIP-65 §The member's word: over a link to a listed peer as SIP-39 §Sharing on the relay link has it; over
             // an unlisted one, only for a device in a room whose share
             // from that peer was admitted on a member's word and names the
             // caller among its members.
@@ -1023,7 +1023,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             let mut inner = server.relay.inner.lock().unwrap();
             drop_bridge(&mut inner, &bridge);
         }
-        // SIP-49: a peer's view of a room. Reciprocal: the first share of a
+        // SIP-39 §Sharing on the relay link: a peer's view of a room. Reciprocal: the first share of a
         // room from a peer is answered with this exchange's view of it.
         Control::RoomShare { handle, members } => {
             // SIP-65 §The member's word: a plain share over an unlisted link is dropped; the
@@ -1065,7 +1065,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
     }
 }
 
-/// SIP-49: tell every peer a room is shared with what this exchange sees of
+/// SIP-39 §Sharing on the relay link: tell every peer a room is shared with what this exchange sees of
 /// it. A link is brought up where none is, by the domain the peer list
 /// records for the key; a peer with no link and no domain is not told.
 pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
@@ -1087,7 +1087,7 @@ pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
     }
 }
 
-/// SIP-49, SIP-65 §The member's word: the share to send `peer`: plain to a listed peer, on a
+/// SIP-39 §Sharing on the relay link, SIP-65 §The member's word: the share to send `peer`: plain to a listed peer, on a
 /// member's word to one that is not.
 fn share_control(
     handle: [u8; 32],
@@ -1106,7 +1106,7 @@ fn share_control(
     }
 }
 
-/// SIP-49: answer a peer's first share of a room with this exchange's
+/// SIP-39 §Sharing on the relay link: answer a peer's first share of a room with this exchange's
 /// view -- SIP-65 §The member's word, over an unlisted link, only where a local member gave a
 /// word naming that peer, and with nothing otherwise.
 fn share_back(server: &Server, peer: &PubKey, handle: [u8; 32]) {

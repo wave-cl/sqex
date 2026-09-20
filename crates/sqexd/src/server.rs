@@ -427,9 +427,9 @@ pub struct Server {
     pub(crate) rehome_away_secs: u64,
     /// SIP-56: the rate limits, per account.
     pub(crate) limiter: crate::limits::Limiter,
-    /// SIP-55: the peers' public directories as last read.
+    /// SIP-16 §Federated directory: the peers' public directories as last read.
     pub(crate) directories: crate::directory::Directories,
-    /// SIP-55: how often they are read.
+    /// SIP-16 §Federated directory: how often they are read.
     pub(crate) directory_secs: u64,
     /// SIP-59: seconds between pulls for the accounts homed here.
     pub(crate) home_secs: u64,
@@ -1875,7 +1875,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
         ));
     }
 
-    // SIP-55: the peers' directories, read on an interval for searches.
+    // SIP-16 §Searching the federation: the peers' directories, read on an interval for searches.
     tokio::spawn(crate::directory::run(
         Arc::clone(&server),
         server.exchange_seed,
@@ -3808,7 +3808,7 @@ async fn route(
                 Err(e) => refused(e),
             },
         },
-        // SIP-55: this exchange's directory and its peers', each row with
+        // SIP-16 §Searching the federation: this exchange's directory and its peers', each row with
         // its home. Answerable to anybody, as the directory is.
         ("POST", "/channel/search") => match sqex_proto::channel::Search::decode(body) {
             Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -5157,7 +5157,7 @@ async fn route(
         },
 
         // SIP-65 §The member's word: a shared join naming each exchange with a domain and the
-        // member's word for it. Listed peers as SIP-49; an unlisted one
+        // member's word for it. Listed peers as SIP-39 §Sharing on the relay link; an unlisted one
         // only where calls are open, and every word verified under the
         // joining device for its room and the exchange it names.
         ("POST", "/room/join")
@@ -5217,7 +5217,7 @@ async fn route(
                 }
             }
         }
-        // SIP-49: a join that names relay peers is answered with homes, and
+        // SIP-39 §Sharing on the relay link: a join that names relay peers is answered with homes, and
         // the room is shared with those peers from then on. The plain join
         // is SIP-13's, answered as it always was.
         ("POST", "/room/join") if body.first() == Some(&sqex_proto::room::TYPE_JOIN_SHARED) => {
@@ -5265,7 +5265,7 @@ async fn route(
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
             (Some(me), Ok(leave)) => {
                 let was_there = server.rooms.leave(&leave.handle, &me);
-                // SIP-49: the peers are told a leave at once rather than a
+                // SIP-39 §Sharing on the relay link: the peers are told a leave at once rather than a
                 // TTL later.
                 if was_there && server.rooms.is_shared(&leave.handle) {
                     let server = Arc::clone(server);

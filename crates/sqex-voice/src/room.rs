@@ -82,12 +82,12 @@ pub enum Event {
     /// Still in the room, but nothing has arrived from them for a long time.
     /// The session was thrown away and is being built again.
     Restarted(PubKey),
-    /// SIP-49: in the room at another exchange our exchange will not bridge
+    /// SIP-39 §Pairs across exchanges: in the room at another exchange our exchange will not bridge
     /// to. Present, and not heard.
     Unreachable(PubKey),
 }
 
-/// SIP-49: how one attempt at a bridge came out.
+/// SIP-39 §Pairs across exchanges: how one attempt at a bridge came out.
 enum Bridged {
     Peer(Box<Peer>),
     Waiting,
@@ -131,19 +131,19 @@ pub struct Membership {
     /// Names we have already complained about, so a forged member produces one
     /// line rather than one every two seconds.
     rejected: std::collections::HashSet<PubKey>,
-    /// SIP-49: the relay peers to ask our exchange to share the room with --
+    /// SIP-39 §Sharing on the relay link: the relay peers to ask our exchange to share the room with --
     /// the channel's origin, for a member at a copy. Empty for a member at
     /// the origin, who still asks the shared way so as to be told homes.
     share: Vec<(PubKey, String)>,
-    /// SIP-49: where each remote member is. A member not here is local.
+    /// SIP-39 §Group calls across exchanges: where each remote member is. A member not here is local.
     homes: HashMap<PubKey, PubKey>,
-    /// SIP-49: the exchange refused the shared join as malformed -- it is
-    /// from before SIP-49 -- so the plain join is used from then on.
+    /// SIP-39 §Sharing on the relay link: the exchange refused the shared join as malformed -- it is
+    /// from before sqex 0.69.0 (SIP-39 §Joining with a share) -- so the plain join is used from then on.
     unshared: bool,
     /// SIP-65 §The member's word: the exchange refused the join with words as malformed -- it
-    /// is from before 0.91.0 (SIP-65 §The member's word) -- so SIP-49's join is used from then on.
+    /// is from before 0.91.0 (SIP-65 §The member's word) -- so the shared join (SIP-39 §Joining with a share) is used from then on.
     unworded: bool,
-    /// SIP-49: members whose home is not a peer of our exchange, or whose
+    /// SIP-39 §Sharing on the relay link: members whose home is not a peer of our exchange, or whose
     /// bridge the exchange refused: in the call and not heard.
     pub unreachable: std::collections::HashSet<PubKey>,
 }
@@ -183,14 +183,14 @@ impl Membership {
         }
     }
 
-    /// SIP-49: ask the exchange to share the room with these relay peers,
+    /// SIP-39 §Sharing on the relay link: ask the exchange to share the room with these relay peers,
     /// each with the domain it is found by where known (SIP-65 §The member's word).
     pub fn with_share(mut self, share: Vec<(PubKey, String)>) -> Membership {
         self.share = share;
         self
     }
 
-    /// SIP-49: where `id` is, if not here.
+    /// SIP-39 §Group calls across exchanges: where `id` is, if not here.
     pub fn home_of(&self, id: &PubKey) -> Option<PubKey> {
         self.homes.get(id).copied()
     }
@@ -354,7 +354,7 @@ impl Membership {
             .collect();
         let (seed, depth, rate, me) = (self.seed, self.depth, self.rate, self.me);
         for (id, eph) in waiting {
-            // SIP-49: toward a member elsewhere, the lower of the two places
+            // SIP-39 §Pairs across exchanges: toward a member elsewhere, the lower of the two places
             // the bridge and the higher opens as for anybody local.
             let bridge_to = self
                 .homes
@@ -394,8 +394,8 @@ impl Membership {
         Ok(events)
     }
 
-    /// SIP-49: the shared join. `None` when the exchange does not know it,
-    /// which is an exchange from before SIP-49 and not an error.
+    /// SIP-39 §Sharing on the relay link: the shared join. `None` when the exchange does not know it,
+    /// which is an exchange from before sqex 0.69.0 (SIP-39 §Group calls across exchanges) and not an error.
     async fn heartbeat_shared(
         room: RoomId,
         me: PubKey,
@@ -455,7 +455,7 @@ impl Membership {
         }
     }
 
-    /// SIP-49: one attempt at a bridged session with `id`, at `home`, placed
+    /// SIP-39 §Pairs across exchanges: one attempt at a bridged session with `id`, at `home`, placed
     /// by our exchange.
     #[allow(clippy::too_many_arguments)]
     async fn try_bridge(
@@ -467,7 +467,7 @@ impl Membership {
         id: PubKey,
         home: PubKey,
     ) -> Result<Bridged, String> {
-        // SIP-49's device invite stays with the relay peer list, so the
+        // The device invite of SIP-39 §Pairs across exchanges stays with the relay peer list, so the
         // open is the plain one (SIP-65 §Device invites).
         let open = CallOpen {
             ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),

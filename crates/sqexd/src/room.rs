@@ -54,18 +54,18 @@ struct Presence {
     last_seen: u64,
 }
 
-/// SIP-49: shares to one peer are at least this far apart while nothing
+/// SIP-39 §Sharing on the relay link: shares to one peer are at least this far apart while nothing
 /// changes; a change is shared at once.
 pub const SHARE_SECS: u64 = 10;
 
-/// SIP-49: what one relay peer last said about a room, with its home
+/// SIP-39 §Sharing on the relay link: what one relay peer last said about a room, with its home
 /// filled in -- a member the peer sent as its own is homed at the peer.
 struct Remote {
     members: Vec<HomedMember>,
     at: u64,
 }
 
-/// SIP-49: a room's federation state -- the peers it is shared with, what
+/// SIP-39 §Sharing on the relay link: a room's federation state -- the peers it is shared with, what
 /// each last shared, and when this exchange last shared its own view.
 #[derive(Default)]
 struct Shared {
@@ -86,7 +86,7 @@ struct Shared {
 pub struct Rooms {
     /// handle -> identity -> presence
     rooms: Mutex<HashMap<[u8; 32], HashMap<PubKey, Presence>>>,
-    /// SIP-49: handle -> what is shared, and with whom. Held apart from the
+    /// SIP-39 §Sharing on the relay link: handle -> what is shared, and with whom. Held apart from the
     /// members so that a peer's share cannot fill a local room.
     shared: Mutex<HashMap<[u8; 32], Shared>>,
 }
@@ -161,7 +161,7 @@ impl Rooms {
         was_there
     }
 
-    /// SIP-49: join as [`Rooms::join`] does, and ask that the room be
+    /// SIP-39 §Joining with a share: join as [`Rooms::join`] does, and ask that the room be
     /// shared with `share`. Answers the roster with homes -- every member
     /// here and every member a peer has shared -- and whether a share to
     /// the peers is now due: something changed, or `SHARE_SECS` passed.
@@ -342,7 +342,7 @@ impl Rooms {
         })
     }
 
-    /// SIP-49: what `peer` said about `handle`. A member the peer sent as
+    /// SIP-39 §Sharing on the relay link: what `peer` said about `handle`. A member the peer sent as
     /// its own is homed at the peer. Returns whether this is the first the
     /// room has been shared with that peer -- which makes the sharing
     /// reciprocal from here.
@@ -362,7 +362,7 @@ impl Rooms {
         fresh
     }
 
-    /// SIP-49: the peers `handle` is shared with, if any.
+    /// SIP-39 §Sharing on the relay link: the peers `handle` is shared with, if any.
     pub fn peers_of(&self, handle: &[u8; 32]) -> Vec<PubKey> {
         self.shared
             .lock()
@@ -372,7 +372,7 @@ impl Rooms {
             .unwrap_or_default()
     }
 
-    /// SIP-49: this exchange's view of `handle` as told to `peer` -- its
+    /// SIP-39 §Sharing on the relay link: this exchange's view of `handle` as told to `peer` -- its
     /// own members, and what other peers shared, less what came from
     /// `peer` itself. At most `MAX_MEMBERS`, which is what one share may
     /// carry. Notes the share as made.
@@ -419,7 +419,7 @@ impl Rooms {
         out
     }
 
-    /// SIP-49: whether `handle` is shared at all -- a leave from it is
+    /// SIP-39 §Sharing on the relay link: whether `handle` is shared at all -- a leave from it is
     /// worth telling the peers.
     pub fn is_shared(&self, handle: &[u8; 32]) -> bool {
         self.shared
@@ -429,7 +429,7 @@ impl Rooms {
             .is_some_and(|s| !s.peers.is_empty())
     }
 
-    /// SIP-49: a peer's link went; what it shared goes with it.
+    /// SIP-39 §Sharing on the relay link: a peer's link went; what it shared goes with it.
     pub fn forget_peer(&self, peer: &PubKey) {
         let mut shared = self.shared.lock().unwrap();
         for s in shared.values_mut() {

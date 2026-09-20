@@ -213,7 +213,7 @@ enum Cmd {
         #[arg(long)]
         seconds: Option<u64>,
 
-        /// SIP-49, SIP-65 §The member's word: an exchange, by base58 key or `key@domain`, to ask yours to share the
+        /// SIP-39 §Pairs across exchanges, SIP-65 §The member's word: an exchange, by base58 key or `key@domain`, to ask yours to share the
         /// room with -- the channel's origin, when the call is in a channel
         /// you read through a copy. Members there see you, and you them.
         #[arg(long = "share")]

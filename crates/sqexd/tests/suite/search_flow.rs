@@ -1,4 +1,4 @@
-//! SIP-55: a search at one exchange lists its own rooms and its peers',
+//! SIP-16 §Searching the federation: a search at one exchange lists its own rooms and its peers',
 //! each row saying where the room lives and whether it is joinable here.
 
 use std::net::SocketAddr;

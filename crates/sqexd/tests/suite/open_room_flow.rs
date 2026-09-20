@@ -89,7 +89,7 @@ async fn a_room_is_shared_across_two_exchanges_that_list_nobody() {
         .unwrap();
     let room = RoomId::generate();
 
-    // Controls. A plain shared join naming a stranger is refused as SIP-49
+    // Controls. A plain shared join naming a stranger is refused as SIP-39 §Sharing on the relay link
     // refuses it; a word signed for the wrong exchange is malformed and
     // nothing is joined.
     let (code, body) = a

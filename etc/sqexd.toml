@@ -109,7 +109,7 @@ challenge_ttl_secs = 30
 # verified here, not the far exchange's; a stranger exchange can carry a
 # call and cannot invent one. Independent of open_peering: a copy costs
 # storage a member was entitled to, a ring costs a person's attention.
-# Rooms (SIP-49) stay with the relay peer list.
+# Rooms (SIP-39 §Sharing on the relay link) stay with the relay peer list.
 # open_calls = false
 
 # ---------------------------------------------------------------------------

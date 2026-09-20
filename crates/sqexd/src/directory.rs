@@ -1,4 +1,4 @@
-//! SIP-55: the federated directory.
+//! SIP-16 §Federated directory: the federated directory.
 //!
 //! An exchange reads each labelled peer's public directory on an interval,
 //! as any identified client could, and answers a search with its own

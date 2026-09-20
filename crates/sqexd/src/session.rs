@@ -221,7 +221,7 @@ impl Sessions {
         OpenAck::waiting(now)
     }
 
-    /// SIP-49: the ephemeral `me` is offering `peer` in an open still
+    /// SIP-39 §Pairs across exchanges: the ephemeral `me` is offering `peer` in an open still
     /// waiting, if any. Read, not taken: the device keeps polling the same
     /// open, and the bridge that matched it answers those polls.
     pub fn pending_from(&self, me: &PubKey, peer: &PubKey) -> Option<[u8; 32]> {

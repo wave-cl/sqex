@@ -3644,9 +3644,9 @@ impl Chat {
     }
 
     /// Search the public directory. An empty query returns everything.
-    /// SIP-55: the directory across this exchange and its peers, each row
+    /// SIP-16 §Searching the federation: the directory across this exchange and its peers, each row
     /// naming where the channel lives and whether it is joinable here.
-    /// An exchange from before SIP-55 answers with its own directory only,
+    /// An exchange from before sqex 0.72.0 (SIP-16 §Federated directory) answers with its own directory only,
     /// every row at home.
     pub async fn search(&mut self, query: &str, offset: u32) -> Result<Found> {
         match self

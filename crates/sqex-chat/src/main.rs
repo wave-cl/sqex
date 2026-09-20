@@ -2479,7 +2479,7 @@ async fn handle_key(
                     return;
                 }
                 Command::Find(query) => {
-                    // SIP-55: across this exchange and its peers; an older
+                    // SIP-16 §Federated directory: across this exchange and its peers; an older
                     // exchange answers with its own directory.
                     match chat.search(query, 0).await {
                         Ok(found) => {

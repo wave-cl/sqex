@@ -240,7 +240,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/channel/report", Chat("/report"), Member),
     ("POST", "/channel/reports", Chat("/reports"), ChannelAdmin),
     ("POST", "/channel/dismiss", Chat("/dismiss"), ChannelAdmin),
-    // SIP-55: the same directory, this exchange's and its peers'.
+    // SIP-16 §Federated directory: the same directory, this exchange's and its peers'.
     ("POST", "/channel/search", Chat("Chat::search"), Anyone),
     ("POST", "/channel/invite", Chat("/invite"), ChannelAdmin),
     ("POST", "/channel/remove", Chat("/kick"), ChannelAdmin),

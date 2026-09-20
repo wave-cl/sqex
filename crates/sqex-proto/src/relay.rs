@@ -50,9 +50,9 @@ pub const TYPE_RINGING: u8 = 0x02;
 pub const TYPE_REJECT: u8 = 0x03;
 pub const TYPE_ACCEPT: u8 = 0x04;
 pub const TYPE_CLOSE: u8 = 0x05;
-/// SIP-49: one exchange's view of a shared room.
+/// SIP-39 §Sharing on the relay link: one exchange's view of a shared room.
 pub const TYPE_ROOM_SHARE: u8 = 0x06;
-/// SIP-49: an invite addressed to one device, never rung.
+/// SIP-39 §Pairs across exchanges: an invite addressed to one device, never rung.
 pub const TYPE_INVITE_DEVICE: u8 = 0x07;
 /// SIP-65: an invite carrying the caller's own signed word, which is what
 /// an exchange nobody listed rings on.
@@ -117,7 +117,7 @@ pub enum Control {
     },
     /// Either → the other: the bridged session is torn down, for `reason`.
     Close { bridge: Bridge, reason: u8 },
-    /// SIP-49, X → Y: `caller` wishes to open a session with the one
+    /// SIP-39 §Pairs across exchanges, X → Y: `caller` wishes to open a session with the one
     /// device `device`, which both already know from a shared room. Y
     /// rings nobody: it waits for that device's own open, or answers at
     /// once if the open is already waiting.
@@ -127,7 +127,7 @@ pub enum Control {
         caller_eph: [u8; 32],
         device: PubKey,
     },
-    /// SIP-49, either → the other: everyone the sender knows to be in the
+    /// SIP-39 §Group calls across exchanges, either → the other: everyone the sender knows to be in the
     /// room `handle`, each with the exchange they joined at (zero for the
     /// sender itself). Soft state, replaced by the next share.
     RoomShare {

@@ -45,12 +45,12 @@ pub const TYPE_JOIN: u8 = 0x01;
 pub const TYPE_LEAVE: u8 = 0x02;
 /// The answer to a leave.
 pub const TYPE_LEFT: u8 = 0x03;
-/// SIP-49: a join that also names the relay peers to share the room with.
+/// SIP-39 §Joining with a share: a join that also names the relay peers to share the room with.
 pub const TYPE_JOIN_SHARED: u8 = 0x04;
 /// SIP-65 §The member's word: a shared join naming each exchange with a domain and the
 /// member's word for it.
 pub const TYPE_JOIN_SHARED_WORD: u8 = 0x05;
-/// SIP-49: exchanges one join may name.
+/// SIP-39 §Joining with a share: exchanges one join may name.
 pub const MAX_SHARE: usize = 4;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -249,7 +249,7 @@ impl Left {
     }
 }
 
-/// SIP-49: a join naming the relay peers the room is to be shared with.
+/// SIP-39 §Joining with a share: a join naming the relay peers the room is to be shared with.
 ///
 /// `| type: u8 = 0x04 | handle[32] | proof[32] | count: u8 | count × exchange[32] |`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,7 +370,7 @@ impl JoinSharedWord {
     }
 }
 
-/// SIP-49: a member with the exchange it joined at -- zero for "here".
+/// SIP-39 §Joining with a share: a member with the exchange it joined at -- zero for "here".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HomedMember {
     pub identity: PubKey,
@@ -384,7 +384,7 @@ impl HomedMember {
     }
 }
 
-/// SIP-49: the roster with homes, answered to a `JoinShared`.
+/// SIP-39 §Joining with a share: the roster with homes, answered to a `JoinShared`.
 ///
 /// `| now: u64 | count: u16 | (identity[32] proof[32] home[32]) * count |`
 #[derive(Debug, Clone, PartialEq, Eq)]

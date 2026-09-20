@@ -91,7 +91,7 @@ pub const TYPE_HOME: u8 = 0x18;
 pub const TYPE_REHOME: u8 = 0x19;
 /// SIP-53: what of one's own an exchange stranded past a rehome.
 pub const TYPE_STRANDED: u8 = 0x1b;
-/// SIP-55: a directory search across this exchange and its peers.
+/// SIP-16 §Searching the federation: a directory search across this exchange and its peers.
 pub const TYPE_SEARCH: u8 = 0x1c;
 /// SIP-56: a member reports an entry to the channel's admins.
 pub const TYPE_REPORT: u8 = 0x1d;
@@ -1182,7 +1182,7 @@ impl Rehomed {
     }
 }
 
-/// SIP-55: `POST /channel/search`. The same query as `List`, answered
+/// SIP-16 §Searching the federation: `POST /channel/search`. The same query as `List`, answered
 /// with `Found`: this exchange's directory and its peers', each row with
 /// its home.
 ///
@@ -1219,7 +1219,7 @@ impl Search {
     }
 }
 
-/// SIP-55: one channel found, and where it lives.
+/// SIP-16 §What a client does with a search row: one channel found, and where it lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub channel: [u8; 32],
@@ -1236,7 +1236,7 @@ pub struct Row {
     pub topic: String,
 }
 
-/// SIP-55: the answer to a search.
+/// SIP-16 §Searching the federation: the answer to a search.
 ///
 /// `| now: u64 | total: u32 | count: u16 | count × Row |`
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

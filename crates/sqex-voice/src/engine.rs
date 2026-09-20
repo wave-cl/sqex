@@ -761,7 +761,7 @@ pub struct CallOpts {
     pub seconds: Option<u64>,
     pub rtt: bool,
     pub dtx: bool,
-    /// SIP-49: the relay peers to ask the exchange to share a room with --
+    /// SIP-39 §Sharing on the relay link: the relay peers to ask the exchange to share a room with --
     /// the channel's origin, for a call joined through a copy. Ignored on a
     /// two-party call.
     pub share: Vec<(PubKey, String)>,

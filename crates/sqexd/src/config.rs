@@ -232,7 +232,7 @@ pub struct FileConfig {
     /// as a replica, takes a channel's rehome to itself. Default 300.
     #[serde(default)]
     pub rehome_away_secs: Option<u64>,
-    /// SIP-55: seconds between reads of each peer's public directory.
+    /// SIP-16 §Federated directory: seconds between reads of each peer's public directory.
     /// Default 60.
     #[serde(default)]
     pub directory_secs: Option<u64>,
@@ -410,7 +410,7 @@ pub struct Config {
     pub backup_quota: u64,
     /// SIP-53: seconds before an unreachable origin counts as gone.
     pub rehome_away_secs: u64,
-    /// SIP-55: seconds between reads of each peer's directory.
+    /// SIP-16 §Federated directory: seconds between reads of each peer's directory.
     pub directory_secs: u64,
     /// SIP-59: seconds between pulls for the accounts homed here.
     pub home_secs: u64,
