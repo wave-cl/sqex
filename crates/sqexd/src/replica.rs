@@ -1554,7 +1554,19 @@ pub async fn run(
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
-                tracing::warn!(origin = %origin.key, error = %e, "cannot reach the origin");
+                // SIP-80: a configured origin that takes no connection is
+                // left alone for a hold that doubles with each miss, from
+                // one interval to an hour, and said so once per hold; a
+                // poke -- a member's act -- still ends the pause early.
+                tracing::debug!(origin = %origin.key, error = %e, "cannot reach the origin");
+                let hold = server.note_unfound(
+                    &origin.key,
+                    "",
+                    crate::server::UnfoundWhy::Unreachable,
+                    origin.interval.as_secs(),
+                );
+                pause(std::time::Duration::from_secs(hold)).await;
+                continue;
             }
             Ok(mut client) => {
                 // One connection, many pulls: a fresh handshake per pull would
