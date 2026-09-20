@@ -55,7 +55,8 @@ use sqex_proto::channel::{
 };
 use sqex_proto::channel_key::{Get as KeyGet, Put as KeyPut, TYPE_MISSING as CH_MISSING};
 use sqex_proto::device::{
-    AdmissionRequest, ListDevices, Register as DeviceRegister, Revoke as DeviceRevoke,
+    AdmissionRequest, DevicesFrom, FROM_HERE, FROM_HOME, FROM_STALE, ListDevices, ListDevicesFrom,
+    Register as DeviceRegister, Revoke as DeviceRevoke, TYPE_LIST_FROM,
 };
 use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
 use sqex_proto::home::Moving;
@@ -1015,6 +1016,24 @@ impl Server {
             .unwrap()
             .insert(*account, (now, theirs.clone()));
         Some(theirs)
+    }
+
+    /// SIP-81/83: an account's devices and whose list it is: this
+    /// exchange's own (`FROM_HERE`) where the account lives here or
+    /// nowhere on record; the home's (`FROM_HOME`) where it lives
+    /// elsewhere and the home answered; this exchange's own for an
+    /// account that lives elsewhere (`FROM_STALE`) where it did not.
+    pub(crate) async fn devices_from(
+        self: &Arc<Self>,
+        account: &PubKey,
+    ) -> std::result::Result<(u8, sqex_proto::device::Devices), crate::device::DeviceError> {
+        if let Some((home, _)) = self.devices.where_is(account, &self.public_key) {
+            if let Some(theirs) = self.devices_at_home(&home, account).await {
+                return Ok((FROM_HOME, theirs));
+            }
+            return Ok((FROM_STALE, self.devices.list(account)?));
+        }
+        Ok((FROM_HERE, self.devices.list(account)?))
     }
 
     /// SIP-80: forget unfound origins not in `keep` -- the ones no account
@@ -3036,26 +3055,35 @@ async fn route(
                 .encode(),
             ),
         },
-        ("POST", "/device/list") => match ListDevices::decode(body) {
-            Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
-            // SIP-60 asked the home for an account with no devices here;
-            // SIP-81 asks it for every account that lives elsewhere. A
-            // former home's own registry is the devices the account had
-            // when it left -- one revoked since still listed, one linked
-            // since not, and after a handover the new key's nowhere -- and
-            // every key sealed from it went to a device in a drawer. Its
-            // own list is answered only where the home cannot be asked.
-            Ok(req) => {
-                if let Some((home, _)) = server.devices.where_is(&req.account, &server.public_key)
-                    && let Some(theirs) = server.devices_at_home(&home, &req.account).await
-                {
-                    return (200, "application/octet-stream", theirs.encode());
-                }
-                match server.devices.list(&req.account) {
-                    Ok(list) => (200, "application/octet-stream", list.encode()),
+        // SIP-60 asked the home for an account with no devices here;
+        // SIP-81 asks it for every account that lives elsewhere. A
+        // former home's own registry is the devices the account had
+        // when it left -- one revoked since still listed, one linked
+        // since not, and after a handover the new key's nowhere -- and
+        // every key sealed from it went to a device in a drawer. Its
+        // own list is answered only where the home cannot be asked.
+        // SIP-83: asked with the newer type byte, the answer says which
+        // of the three it is, so a client sealing a key to a stale one
+        // can wait instead.
+        ("POST", "/device/list") => match body.first() {
+            Some(&TYPE_LIST_FROM) => match ListDevicesFrom::decode(body) {
+                Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                Ok(req) => match server.devices_from(&req.account).await {
+                    Ok((from, devices)) => (
+                        200,
+                        "application/octet-stream",
+                        DevicesFrom { from, devices }.encode(),
+                    ),
                     Err(e) => refuse(e.status(), e.code(), None),
-                }
-            }
+                },
+            },
+            _ => match ListDevices::decode(body) {
+                Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                Ok(req) => match server.devices_from(&req.account).await {
+                    Ok((_, devices)) => (200, "application/octet-stream", devices.encode()),
+                    Err(e) => refuse(e.status(), e.code(), None),
+                },
+            },
         },
 
         // SIP-38 names. A name binds to an **account**, so the account's devices

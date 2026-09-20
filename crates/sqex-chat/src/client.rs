@@ -24,7 +24,10 @@ use sqex_proto::channel_key::{
     open_envelope, seal_envelope, sign_envelope, verify_envelope,
 };
 use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
-use sqex_proto::device::{AdmissionRequest, Device, Devices, ListDevices, Register, Revoke};
+use sqex_proto::device::{
+    AdmissionRequest, Device, Devices, DevicesFrom, FROM_STALE, ListDevices, ListDevicesFrom,
+    Register, Revoke,
+};
 use sqex_proto::entry_sig::{
     ActionTerms, EntryTerms, GENESIS, Place, link, sign_action, sign_entry, verify_entry,
     verify_entry_hashed,
@@ -254,6 +257,11 @@ pub enum ChatError {
     /// its key, and the domain it is reached by where the refusing exchange
     /// knew one. This exchange hands the key's services off there.
     Moved(Option<PubKey>, String),
+    /// SIP-83: this account lives at another exchange this one could not
+    /// ask, and the device list here is from before it left -- a device
+    /// revoked since may be on it and one linked since is not. No key was
+    /// sealed to it; the epoch stays where it is until the home answers.
+    DevicesStale(PubKey),
     /// SIP-70: a mail item this device fetched is sealed to a key it does
     /// not hold -- its account's, on a device that was not entrusted with
     /// it -- and must not be deleted from here.
@@ -428,6 +436,12 @@ impl std::fmt::Display for ChatError {
                     "that account moved to {at}; this exchange hands its services off there"
                 )
             }
+            ChatError::DevicesStale(who) => write!(
+                f,
+                "{who} lives at another exchange this one could not ask, and its device list \
+                 here is from before it left; no new key was sealed -- try again when its home \
+                 can be reached"
+            ),
             ChatError::NotReady(who) => write!(
                 f,
                 "{who} has not started their client yet, so there is nowhere to send a \
@@ -483,10 +497,7 @@ impl Chat {
     async fn devices_of(&mut self, members: &[PubKey]) -> Result<Vec<PubKey>> {
         let mut out = Vec::new();
         for account in members {
-            let body = self
-                .post("/device/list", ListDevices { account: *account }.encode())
-                .await?;
-            let listed = Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+            let listed = self.devices_to_seal_to(account).await?;
             if listed.devices.is_empty() {
                 out.push(*account);
             } else {
@@ -494,6 +505,40 @@ impl Chat {
             }
         }
         Ok(out)
+    }
+
+    /// SIP-83: an account's devices as a list a key may be sealed to.
+    /// Asked with the newer type byte, which says whose list it is; a
+    /// stale one -- this exchange's own registry for an account that lives
+    /// elsewhere, because the home could not be asked -- is refused as
+    /// [`ChatError::DevicesStale`], so the epoch stays where it is rather
+    /// than reaching a device the account may have revoked. An exchange
+    /// from before SIP-83 refuses the type byte as malformed, and is asked
+    /// the old way, which is what this client did before.
+    async fn devices_to_seal_to(&mut self, account: &PubKey) -> Result<Devices> {
+        match self
+            .post(
+                "/device/list",
+                ListDevicesFrom { account: *account }.encode(),
+            )
+            .await
+        {
+            Ok(body) => {
+                let got =
+                    DevicesFrom::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                if got.from == FROM_STALE {
+                    return Err(ChatError::DevicesStale(*account));
+                }
+                Ok(got.devices)
+            }
+            Err(ChatError::Refused(400, r)) if r.code == RefusalCode::Malformed => {
+                let body = self
+                    .post("/device/list", ListDevices { account: *account }.encode())
+                    .await?;
+                Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

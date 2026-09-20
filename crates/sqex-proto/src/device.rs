@@ -18,6 +18,18 @@ pub const TYPE_REVOKE: u8 = 0x02;
 pub const TYPE_LIST: u8 = 0x03;
 /// SIP-24: ask to be admitted to a whitelisted exchange.
 pub const TYPE_ADMISSION: u8 = 0x04;
+/// SIP-83: list an account's devices and say whose list it is.
+pub const TYPE_LIST_FROM: u8 = 0x05;
+
+/// SIP-83 `DevicesFrom::from`: this exchange's own registry -- the
+/// account's home is here, or nowhere on record.
+pub const FROM_HERE: u8 = 0x00;
+/// SIP-83: the home's answer, fresh or kept within SIP-81's `DEVICES_TTL`.
+pub const FROM_HOME: u8 = 0x01;
+/// SIP-83: this exchange's own registry for an account that lives
+/// elsewhere, because the home could not be asked. A snapshot from before
+/// the account left: not a list to seal a key to.
+pub const FROM_STALE: u8 = 0x02;
 
 /// Devices one account may have registered.
 ///
@@ -175,6 +187,70 @@ impl ListDevices {
         }
         Ok(ListDevices {
             account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-83: `POST /device/list` with `| type = 0x05 | account[32] |`,
+/// answered with [`DevicesFrom`]. The same route as [`ListDevices`],
+/// dispatched on the type byte; an exchange from before SIP-83 refuses it
+/// as malformed and a client falls back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListDevicesFrom {
+    pub account: PubKey,
+}
+
+impl ListDevicesFrom {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_LIST_FROM);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ListDevicesFrom> {
+        if b.len() != 33 || b[0] != TYPE_LIST_FROM {
+            return Err(Error::Malformed(format!(
+                "list-from is {} bytes, want 33",
+                b.len()
+            )));
+        }
+        Ok(ListDevicesFrom {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-83: `| from: u8 | Devices |` -- whose list this is, then SIP-22's
+/// list exactly as `ListDevices` would have been answered. A new answer
+/// type rather than a field on `Devices`, as SIP-34 requires: `Devices`
+/// refuses trailing bytes, and so does this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicesFrom {
+    pub from: u8,
+    pub devices: Devices,
+}
+
+impl DevicesFrom {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 10 + self.devices.devices.len() * 200);
+        out.push(self.from);
+        out.extend_from_slice(&self.devices.encode());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<DevicesFrom> {
+        let Some(&from) = b.first() else {
+            return Err(Error::Malformed("devices-from is empty".into()));
+        };
+        if from > FROM_STALE {
+            return Err(Error::Malformed(format!(
+                "devices-from {from} is not a kind of list"
+            )));
+        }
+        Ok(DevicesFrom {
+            from,
+            devices: Devices::decode(&b[1..])?,
         })
     }
 }
@@ -337,6 +413,51 @@ mod tests {
 
         let l = ListDevices { account: device };
         assert_eq!(ListDevices::decode(&l.encode()).unwrap(), l);
+    }
+
+    #[test]
+    fn a_list_from_says_whose_it_is() {
+        let (_, a) = identity(3);
+        let ask = ListDevicesFrom { account: a };
+        assert_eq!(ListDevicesFrom::decode(&ask.encode()).unwrap(), ask);
+        // One type byte does not read as the other.
+        assert!(ListDevices::decode(&ask.encode()).is_err());
+        assert!(ListDevicesFrom::decode(&ListDevices { account: a }.encode()).is_err());
+
+        let list = Devices {
+            now: 5,
+            devices: vec![Device {
+                device: a,
+                added: 1,
+                not_after: 9,
+                credential: None,
+            }],
+        };
+        for from in [FROM_HERE, FROM_HOME, FROM_STALE] {
+            let d = DevicesFrom {
+                from,
+                devices: list.clone(),
+            };
+            assert_eq!(DevicesFrom::decode(&d.encode()).unwrap(), d);
+        }
+        let mut bad = DevicesFrom {
+            from: FROM_STALE,
+            devices: list.clone(),
+        }
+        .encode();
+        bad[0] = 3;
+        assert!(DevicesFrom::decode(&bad).is_err());
+        assert!(DevicesFrom::decode(&[]).is_err());
+        let mut long = DevicesFrom {
+            from: FROM_HOME,
+            devices: list,
+        }
+        .encode();
+        long.push(0);
+        assert!(
+            DevicesFrom::decode(&long).is_err(),
+            "trailing bytes were admitted"
+        );
     }
 
     #[test]

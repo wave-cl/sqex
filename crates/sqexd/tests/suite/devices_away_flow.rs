@@ -2,12 +2,16 @@
 //! a laptop at X, then moved to H, where she revoked the phone and linked
 //! a tablet. X still holds phone and laptop in its own registry; asked
 //! for Alice's devices, it answers what H lists -- laptop and tablet --
-//! and its own stale pair only when H cannot be asked.
+//! and its own stale pair only when H cannot be asked. SIP-83: asked with
+//! the newer type byte, it says which of the three lists it gave.
 
 use std::net::SocketAddr;
 
 use sqex_proto::credential::{Credential, SCOPE_CHAT};
-use sqex_proto::device::{Devices, ListDevices, Register, Revoke};
+use sqex_proto::device::{
+    Devices, DevicesFrom, FROM_HERE, FROM_HOME, FROM_STALE, ListDevices, ListDevicesFrom, Register,
+    Revoke,
+};
 use sqex_proto::home::{Move, Moving};
 use sqnr::Client;
 use sqnr_core::PubKey;
@@ -47,6 +51,22 @@ async fn listed(c: &mut Client, account: &PubKey) -> Vec<PubKey> {
         .collect();
     out.sort_by_key(|k| k.to_string());
     out
+}
+
+/// SIP-83: the list and whose it is.
+async fn listed_from(c: &mut Client, account: &PubKey) -> (u8, Vec<PubKey>) {
+    let (code, body) = c
+        .post(
+            "/device/list",
+            ListDevicesFrom { account: *account }.encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let got = DevicesFrom::decode(&body).unwrap();
+    let mut out: Vec<PubKey> = got.devices.devices.into_iter().map(|d| d.device).collect();
+    out.sort_by_key(|k| k.to_string());
+    (got.from, out)
 }
 
 async fn move_to(c: &mut Client, seed: &[u8; 32], home: &PubKey, domain: &str, issued: u64) {
@@ -117,6 +137,11 @@ async fn a_former_home_lists_the_devices_the_home_lists() {
         listed(&mut bob_at_x, &alice).await,
         sorted(vec![phone, laptop])
     );
+    assert_eq!(
+        listed_from(&mut bob_at_x, &alice).await,
+        (FROM_HERE, sorted(vec![phone, laptop])),
+        "the account lives here: its own registry"
+    );
 
     // Alice moves to H; the laptop and a new tablet register there, and
     // the phone, lost, is revoked there.
@@ -160,6 +185,20 @@ async fn a_former_home_lists_the_devices_the_home_lists() {
         sorted(vec![laptop, tablet]),
         "a former home listed the devices the account had when it left"
     );
+    assert_eq!(
+        listed_from(&mut bob_at_x, &alice).await,
+        (FROM_HOME, sorted(vec![laptop, tablet])),
+        "the home's list was not said to be the home's"
+    );
+    assert_eq!(
+        listed_from(&mut alice_at_h, &alice).await,
+        (FROM_HERE, sorted(vec![laptop, tablet]))
+    );
+    // A 0x05 body of the wrong length is malformed, not a 0x03 body.
+    let mut bad = ListDevicesFrom { account: alice }.encode();
+    bad.push(0);
+    let (code, _) = bob_at_x.post("/device/list", bad).await.unwrap();
+    assert_eq!(code, 400);
     let _ = tablet_seed;
 }
 
@@ -201,4 +240,10 @@ async fn a_former_home_that_cannot_ask_the_home_answers_its_own_registry() {
     // X answers what it held when she left, rather than nothing or a
     // refusal: reading goes on through an outage.
     assert_eq!(listed(&mut watch_at_x, &carol).await, vec![watch]);
+    // SIP-83: and says so, to a caller that asks.
+    assert_eq!(
+        listed_from(&mut watch_at_x, &carol).await,
+        (FROM_STALE, vec![watch]),
+        "a stale list was not said to be stale"
+    );
 }
