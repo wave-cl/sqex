@@ -158,7 +158,11 @@ pub async fn read_packet(recv: &mut quinn::RecvStream) -> Result<Option<Vec<u8>>
     let mut len = [0u8; 2];
     match recv.read_exact(&mut len).await {
         Ok(()) => {}
-        Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
+        // A clean finish, or a stream and connection that are simply gone:
+        // the tunnel ended, and nobody framed anything wrongly.
+        Err(quinn::ReadExactError::FinishedEarly(0)) | Err(quinn::ReadExactError::ReadError(_)) => {
+            return Ok(None);
+        }
         Err(e) => return Err(Error::Malformed(format!("tunnel packet: {e}"))),
     }
     let n = u16::from_be_bytes(len) as usize;

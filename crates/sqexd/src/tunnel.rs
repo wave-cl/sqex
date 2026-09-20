@@ -266,7 +266,7 @@ async fn carry(
                         }
                         up_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     }
-                    Ok(None) => return "member finished",
+                    Ok(None) => return "member gone",
                     Err(_) => return "member sent a bad packet",
                 }
             }
