@@ -1151,6 +1151,24 @@ impl Store {
         self.exchange
     }
 
+    /// SIP-82: the exchange this store is **filed under** -- the account's
+    /// home as this client last knew it, claimed on first use and re-filed
+    /// by every Move made from here -- as distinct from the exchange it is
+    /// currently reading at. `None` for a store that has claimed none yet.
+    pub fn filed_under(&self) -> Result<Option<PubKey>> {
+        let recorded: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT value FROM meta WHERE key = 'exchange'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(storage("read the store's home"))?;
+        Ok(recorded
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .filter(|b| b != &Store::UNCLAIMED)
+            .map(PubKey::new))
+    }
+
     /// The exchange, as a query parameter. Every scoped row goes through this.
     ///
     /// **Refuses rather than defaulting.** A store that has not been told

@@ -260,6 +260,22 @@ pub enum ChatError {
     MailSealedElsewhere(u64),
 }
 
+/// SIP-82: what [`Chat::ensure_home`] found on connecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeSaid {
+    /// This exchange had no record and this store lives here (or nowhere
+    /// yet): a Move naming it was presented.
+    Presented,
+    /// This exchange already records the account's home.
+    OnRecord,
+    /// This store is filed under another exchange: the account lives at
+    /// `home`, and this client is a visitor here. Nothing was presented.
+    Visitor { home: PubKey },
+    /// This client does not hold the account key, or this exchange has no
+    /// chat: not its to say.
+    NotMine,
+}
+
 /// SIP-59: what a move did.
 #[derive(Debug, Clone)]
 pub struct Moved {
@@ -2304,31 +2320,45 @@ impl Chat {
     /// no Move on record for it, sign one naming this exchange and present
     /// it -- which is what lets the home act when an origin tells it of a
     /// channel. Only a client holding the account key; a linked device
-    /// leaves it to the account. Returns whether one was presented.
-    pub async fn ensure_home(&mut self) -> Result<bool> {
+    /// leaves it to the account.
+    ///
+    /// SIP-82: and only where this store is filed under this exchange, or
+    /// under none yet. Pointed at an exchange the account has never used,
+    /// SIP-60's rule moved the account there on the way in -- a wrong
+    /// `--server-host`, a probe -- with no origins, so the real home was
+    /// never told. Here the client is a [`HomeSaid::Visitor`] and presents
+    /// nothing. A Move it does present names the home it leaves, as
+    /// `move` does.
+    pub async fn ensure_home(&mut self) -> Result<HomeSaid> {
         if self.account_seed().is_none() {
-            return Ok(false);
+            return Ok(HomeSaid::NotMine);
         }
         let me = self.me;
         let on_record = match self.account_home(&me).await {
             Ok(h) => h.since != 0,
-            Err(ChatError::NoChatHere(_)) => return Ok(false),
+            Err(ChatError::NoChatHere(_)) => return Ok(HomeSaid::NotMine),
             Err(ChatError::Refused(404, _)) => false,
             Err(e) => return Err(e),
         };
         if on_record {
-            return Ok(false);
+            return Ok(HomeSaid::OnRecord);
         }
         let exchange = self.exchange;
+        if let Some(home) = self.store.filed_under()?
+            && home != exchange
+        {
+            return Ok(HomeSaid::Visitor { home });
+        }
         let mv = self.sign_move(&exchange)?;
         let domain = self.domain.clone().unwrap_or_default();
+        let origins = self.origins_of_mine().await.unwrap_or_default();
         self.present_move(&sqex_proto::home::Moving {
             mv,
             domain,
-            origins: Vec::new(),
+            origins,
         })
         .await?;
-        Ok(true)
+        Ok(HomeSaid::Presented)
     }
 
     /// Make sure the channel has an epoch and that we hold its key.

@@ -357,8 +357,14 @@ async fn run(cli: Cli) -> Result<(), String> {
     // SIP-60: say where this account lives, once, so its exchange can act
     // for it when another exchange puts it in a channel. Not fatal: an
     // exchange from before SIP-59 has no such record to keep.
-    if let Err(e) = chat.ensure_home().await {
-        eprintln!("note: could not record this exchange as home: {e}");
+    match chat.ensure_home().await {
+        // SIP-82: pointed at an exchange this account does not live at.
+        // Said, not acted on: a Move is the person's to make.
+        Ok(sqex_chat::client::HomeSaid::Visitor { home }) => eprintln!(
+            "note: this account lives at {home}; you are a visitor here -- `sqex-chat move` to move it"
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("note: could not record this exchange as home: {e}"),
     }
 
     // The rest of `device` needs the exchange.

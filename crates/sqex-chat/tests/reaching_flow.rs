@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_chat::client::Chat;
+use sqex_chat::client::{Chat, HomeSaid};
 use sqex_chat::store::Store;
 use sqex_proto::timeline::Timeline;
 use sqexd::config::FileConfig;
@@ -87,9 +87,14 @@ async fn chat_at(
     let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.set_domain(Some(domain.to_string()));
     chat.top_up_prekeys().await.unwrap();
-    assert!(chat.ensure_home().await.unwrap(), "no move was presented");
-    assert!(
-        !chat.ensure_home().await.unwrap(),
+    assert_eq!(
+        chat.ensure_home().await.unwrap(),
+        HomeSaid::Presented,
+        "no move was presented"
+    );
+    assert_eq!(
+        chat.ensure_home().await.unwrap(),
+        HomeSaid::OnRecord,
         "a second move was presented"
     );
     chat
@@ -203,4 +208,79 @@ async fn a_direct_message_with_a_lower_key_here_lives_here() {
     // Alice holds the lower key: the message lives at A, and B is told.
     let (origin, a_key, _b_key) = conversation(a, b).await;
     assert_eq!(origin, a_key);
+}
+
+/// SIP-82: a client whose store is filed under A, pointed at B, is a
+/// visitor there: it presents no Move, B records nothing, and A goes on
+/// being home. Told to move, it moves, and B then records it.
+#[tokio::test]
+async fn a_client_pointed_at_another_exchange_does_not_move_there() {
+    let a_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let a_key = key_in(a_dir.path());
+    let b_key = key_in(b_dir.path());
+    let (a_at, b_at) = (free_port(), free_port());
+    let (a_addr, a_pub) = exchange_in(
+        a_dir.path(),
+        a_at,
+        "a.test",
+        &[b_key],
+        &[("b.test", b_key, b_at)],
+    )
+    .await;
+    let (b_addr, b_pub) = exchange_in(
+        b_dir.path(),
+        b_at,
+        "b.test",
+        &[a_key],
+        &[("a.test", a_key, a_at)],
+    )
+    .await;
+    let store_path = a_dir.path().join("carol.db");
+    let (seed, carol) = identity(71);
+
+    // Carol's first run, at A: her home, said once.
+    let mut at_a = chat_at(a_addr, a_pub, "a.test", 71, &store_path).await;
+    assert_eq!(at_a.account_home(&carol).await.unwrap().home, a_key);
+    drop(at_a);
+
+    // The same store, pointed at B -- a wrong --server-host, a probe. Under
+    // SIP-60's rule alone this moved her to B on the way in.
+    let client = Client::connect_as(b_addr, &b_pub, &seed).await.unwrap();
+    let store = Store::open(&seed, Some(&store_path)).unwrap();
+    let mut at_b = Chat::new(client, seed, carol, PubKey::new(b_pub), store);
+    at_b.set_domain(Some("b.test".into()));
+    assert_eq!(
+        at_b.ensure_home().await.unwrap(),
+        HomeSaid::Visitor { home: a_key },
+        "a visitor was not told it was one"
+    );
+    // B records nothing, and A is still home.
+    // B has no record: it answers itself with `since = 0`, which is how
+    // SIP-59 says "nothing signed" without a refusal.
+    let at_b_says = at_b.account_home(&carol).await.unwrap();
+    assert_eq!(
+        at_b_says.since, 0,
+        "B recorded a home for a visitor: {at_b_says:?}"
+    );
+    let client = Client::connect_as(a_addr, &a_pub, &seed).await.unwrap();
+    let store = Store::open(&seed, Some(&store_path)).unwrap();
+    let mut at_a = Chat::new(client, seed, carol, PubKey::new(a_pub), store);
+    assert_eq!(at_a.account_home(&carol).await.unwrap().home, a_key);
+    assert_eq!(at_a.ensure_home().await.unwrap(), HomeSaid::OnRecord);
+
+    // Told to move, she moves: an explicit act, naming A as an origin.
+    // A second later: a Move's `issued` is whole seconds, and one no later
+    // than the record's is stale.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let moved = at_a
+        .move_home(b_addr, &b_key, "b.test", None)
+        .await
+        .unwrap();
+    assert!(moved.peered_at_home);
+    let client = Client::connect_as(b_addr, &b_pub, &seed).await.unwrap();
+    let store = Store::open(&seed, Some(&store_path)).unwrap();
+    let mut at_b = Chat::new(client, seed, carol, PubKey::new(b_pub), store);
+    assert_eq!(at_b.ensure_home().await.unwrap(), HomeSaid::OnRecord);
+    assert_eq!(at_b.account_home(&carol).await.unwrap().home, b_key);
 }

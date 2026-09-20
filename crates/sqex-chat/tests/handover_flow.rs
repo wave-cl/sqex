@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use ed25519_dalek::SigningKey;
-use sqex_chat::client::Chat;
+use sqex_chat::client::{Chat, HomeSaid};
 use sqex_chat::store::Store;
 use sqex_proto::timeline::Timeline;
 use sqexd::config::FileConfig;
@@ -183,8 +183,9 @@ async fn a_client_hands_its_account_over_and_the_conversation_keeps_its_channel(
     let mut again = Chat::new(client, seed, alice, PubKey::new(server_pub), store);
     again.set_domain(Some("x.test".into()));
     assert_eq!(again.me, new);
-    assert!(
+    assert_eq!(
         again.ensure_home().await.unwrap(),
+        HomeSaid::Presented,
         "no fresh Move was signed after the handover"
     );
     assert_ne!(again.account_home(&new).await.unwrap().since, 0);
@@ -320,7 +321,7 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
     );
     // Without the key it signs no Move.
     assert!(!phone.holds_account_key());
-    assert!(!phone.ensure_home().await.unwrap());
+    assert_eq!(phone.ensure_home().await.unwrap(), HomeSaid::NotMine);
 
     // A plain sync gives no key.
     let ((mut ll, sl), (mut lp, sp)) = meet(&laptop, &phone).await;
@@ -401,8 +402,9 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
     assert!(xp.entrusted);
     assert!(phone.holds_account_key());
     assert_eq!(phone.account_seed(), Some(seed));
-    assert!(
+    assert_eq!(
         phone.ensure_home().await.unwrap(),
+        HomeSaid::Presented,
         "the entrusted phone signed no Move"
     );
     // SIP-70: and, entrusted, it opens what is sealed to the account.
@@ -443,7 +445,7 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
         !laptop.holds_account_key(),
         "a retired account's seed still counted"
     );
-    assert!(!laptop.ensure_home().await.unwrap());
+    assert_ne!(laptop.ensure_home().await.unwrap(), HomeSaid::Presented);
     assert!(phone.holds_account_key());
 
     // A key for another account ends the session on the phone's side.
