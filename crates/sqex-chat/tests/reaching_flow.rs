@@ -254,7 +254,8 @@ async fn a_client_pointed_at_another_exchange_does_not_move_there() {
         at_b.ensure_home().await.unwrap(),
         HomeSaid::Visitor {
             home: a_key,
-            told: false
+            told: false,
+            behind: false
         },
         "a visitor was not told it was one"
     );
@@ -274,7 +275,6 @@ async fn a_client_pointed_at_another_exchange_does_not_move_there() {
 
     // The residue of a Move by accident: B records itself as home (as a
     // client from before SIP-82 would have made it), and nothing told A.
-    // A visit cleans it: the client tells B the account lives at A.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let by_accident = at_b.sign_move(&b_key).unwrap();
     at_b.present_move(&sqex_proto::home::Moving {
@@ -285,12 +285,38 @@ async fn a_client_pointed_at_another_exchange_does_not_move_there() {
     .await
     .unwrap();
     assert_eq!(at_b.account_home(&carol).await.unwrap().home, b_key);
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // B's record is later than the store's own Move, so the store cannot
+    // show B is wrong -- another device may have moved the account here.
+    // Nothing is done, and the client says the store may be behind.
     assert_eq!(
         at_b.ensure_home().await.unwrap(),
         HomeSaid::Visitor {
             home: a_key,
-            told: true
+            told: false,
+            behind: true
+        },
+        "a store that cannot show the exchange is behind acted anyway"
+    );
+    assert_eq!(at_b.account_home(&carol).await.unwrap().home, b_key);
+    // The store's home is confirmed later than B's record -- a Move at A
+    // after the accident, as `move` would leave it -- and the next visit
+    // can show it: B is told the account lives at A.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let confirmed = at_a.sign_move(&a_key).unwrap();
+    at_a.store().record_home_issued(confirmed.issued).unwrap();
+    at_a.present_move(&sqex_proto::home::Moving {
+        mv: confirmed,
+        domain: "a.test".into(),
+        origins: vec![],
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        at_b.ensure_home().await.unwrap(),
+        HomeSaid::Visitor {
+            home: a_key,
+            told: true,
+            behind: false
         },
         "the residue was not cleaned"
     );

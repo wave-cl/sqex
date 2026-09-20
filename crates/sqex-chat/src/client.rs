@@ -279,8 +279,15 @@ pub enum HomeSaid {
     /// This store is filed under another exchange: the account lives at
     /// `home`, and this client is a visitor here. No Move naming this
     /// exchange was presented; `told` is whether one naming `home` was,
-    /// because this exchange still recorded itself as the home.
-    Visitor { home: PubKey, told: bool },
+    /// because this exchange recorded itself as the home from before the
+    /// store's own Move; `behind` is the other case -- this exchange
+    /// records itself as the home and the store cannot show it is wrong,
+    /// so the account may have been moved here from another device.
+    Visitor {
+        home: PubKey,
+        told: bool,
+        behind: bool,
+    },
     /// This client does not hold the account key, or this exchange has no
     /// chat: not its to say.
     NotMine,
@@ -2382,7 +2389,7 @@ impl Chat {
         }
         let me = self.me;
         let record = match self.account_home(&me).await {
-            Ok(h) => (h.since != 0).then_some(h.home),
+            Ok(h) => (h.since != 0).then_some((h.home, h.since)),
             Err(ChatError::NoChatHere(_)) => return Ok(HomeSaid::NotMine),
             Err(ChatError::Refused(404, _)) => None,
             Err(e) => return Err(e),
@@ -2392,23 +2399,29 @@ impl Chat {
             && home != exchange
         {
             // SIP-82: a visitor. Where this exchange records *itself* as
-            // the home -- the residue of a Move made here by accident,
-            // never displaced because nothing told it of the later one --
-            // say where the account lives: a Move naming the store's home,
-            // presented here, which names nowhere the account is not.
-            let told = if record == Some(exchange) {
-                let mv = self.sign_move(&home)?;
-                self.present_move(&sqex_proto::home::Moving {
-                    mv,
-                    domain: String::new(),
-                    origins: Vec::new(),
-                })
-                .await
-                .is_ok()
-            } else {
-                false
+            // the home, one of two parties is behind: this exchange (a
+            // Move made here by accident, never displaced) or this store
+            // (another device moved the account here since). Only the
+            // first is told, and only where the store can show it -- the
+            // Move that filed the store is later than this record. A store
+            // that cannot show it acts on nothing and says so; acting
+            // would move the account back over the other device's Move.
+            let told = match (record, self.store.home_issued()?) {
+                (Some((at, since)), Some(issued)) if at == exchange && issued > since => {
+                    let mv = self.sign_move(&home)?;
+                    self.store.record_home_issued(mv.issued)?;
+                    self.present_move(&sqex_proto::home::Moving {
+                        mv,
+                        domain: String::new(),
+                        origins: Vec::new(),
+                    })
+                    .await
+                    .is_ok()
+                }
+                _ => false,
             };
-            return Ok(HomeSaid::Visitor { home, told });
+            let behind = matches!(record, Some((at, _)) if at == exchange) && !told;
+            return Ok(HomeSaid::Visitor { home, told, behind });
         }
         if record.is_some() {
             return Ok(HomeSaid::OnRecord);
@@ -2416,6 +2429,7 @@ impl Chat {
         let mv = self.sign_move(&exchange)?;
         let domain = self.domain.clone().unwrap_or_default();
         let origins = self.origins_of_mine().await.unwrap_or_default();
+        self.store.record_home_issued(mv.issued)?;
         self.present_move(&sqex_proto::home::Moving {
             mv,
             domain,
@@ -4973,6 +4987,7 @@ impl Chat {
 
         let from = self.exchange;
         let refiled = self.store.move_home(&from, home)?;
+        self.store.record_home_issued(mv.issued)?;
         Ok(Moved {
             mv,
             peered_here: here.peered,

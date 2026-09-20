@@ -1151,6 +1151,38 @@ impl Store {
         self.exchange
     }
 
+    /// SIP-82: when the Move that filed this store under its home was
+    /// issued -- recorded by the client on every Move it makes or presents
+    /// -- so a home that records itself can be told apart from a store
+    /// that is behind another device's Move. `None` for a store from
+    /// before this was kept, which reads as "behind" and acts on nothing.
+    pub fn home_issued(&self) -> Result<Option<u64>> {
+        let v: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'home_issued'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read when the store's home was issued"))?;
+        Ok(v.and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_be_bytes))
+    }
+
+    /// SIP-82: note the `issued` of the Move that made or confirmed this
+    /// store's home.
+    pub fn record_home_issued(&self, issued: u64) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('home_issued', ?1)
+                 ON CONFLICT (key) DO UPDATE SET value = ?1",
+                params![&issued.to_be_bytes()[..]],
+            )
+            .map_err(storage("record when the store's home was issued"))?;
+        Ok(())
+    }
+
     /// SIP-82: the exchange this store is **filed under** -- the account's
     /// home as this client last knew it, claimed on first use and re-filed
     /// by every Move made from here -- as distinct from the exchange it is

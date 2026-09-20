@@ -360,10 +360,13 @@ async fn run(cli: Cli) -> Result<(), String> {
     match chat.ensure_home().await {
         // SIP-82: pointed at an exchange this account does not live at.
         // Said, not acted on: a Move is the person's to make.
-        Ok(sqex_chat::client::HomeSaid::Visitor { home, told }) => eprintln!(
-            "note: this account lives at {home}; you are a visitor here{} -- `sqex-chat move` to move it",
+        Ok(sqex_chat::client::HomeSaid::Visitor { home, told, behind }) => eprintln!(
+            "note: this store lives at {home}; you are a visitor here{} -- `sqex-chat move` to move it",
             if told {
                 " (this exchange thought it was home, and has now been told)"
+            } else if behind {
+                " (this exchange records itself as home since after this store's last move: \
+                 if the account was moved here from another device, this store is behind)"
             } else {
                 ""
             }
