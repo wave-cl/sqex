@@ -17,7 +17,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # No release from a red main. A tag does not wait for CI, and four releases
+  # went out on 2026-09-20 while the snapshot job had been failing since the
+  # first of them. This waits for the tagged commit's CI run and refuses to
+  # build unless it succeeded -- so a broken main costs a tag, not a release.
+  # ---------------------------------------------------------------------------
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)"
+          echo "tag ${REF} is ${sha}"
+          for i in $(seq 1 60); do
+            state="$(gh run list --repo "${GITHUB_REPOSITORY}" --workflow ci.yml --commit "${sha}" \
+                       --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion)"' || true)"
+            case "${state}" in
+              "completed success") echo "CI succeeded for ${sha}"; exit 0 ;;
+              "completed "*) echo "::error::CI concluded '${state#completed }' for ${sha}; not releasing" >&2; exit 1 ;;
+              "") echo "no CI run for ${sha} yet (${i})" ;;
+              *) echo "CI is ${state} (${i})" ;;
+            esac
+            sleep 20
+          done
+          echo "::error::CI did not finish for ${sha} within 20 minutes" >&2
+          exit 1
+
   build:
+    needs: gate
     strategy:
       matrix:
         include:
