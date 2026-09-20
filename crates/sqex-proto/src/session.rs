@@ -176,13 +176,13 @@ impl CallWord {
     }
 }
 
-/// SIP-73: the context a room word is signed under.
+/// SIP-65 §The member's word: the context a room word is signed under.
 pub const ROOM_CONTEXT: &[u8] = b"sqex-room-v1";
-/// SIP-73: how far from the receiving exchange's clock a room word may be
+/// SIP-65 §The member's word: how far from the receiving exchange's clock a room word may be
 /// issued, on the first share of a room over a link.
 pub const ROOM_WORD_SECS: u64 = 120;
 
-/// SIP-73: a member's word that its exchange may share a room with the
+/// SIP-65 §The member's word: a member's word that its exchange may share a room with the
 /// exchange named -- `CallWord`'s shape over `ROOM_CONTEXT || handle ||
 /// peer || issued`, signed by the member's device.
 #[derive(Debug, Clone, PartialEq, Eq)]

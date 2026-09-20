@@ -174,7 +174,7 @@ async fn a_stray_direct_message_is_folded_into_the_conversation() {
         .await
         .unwrap();
     assert_eq!(code, 200);
-    // SIP-75: a file in the stray, attached to it.
+    // SIP-71 §Folded attachments: a file in the stray, attached to it.
     let (_, sealed, blob) = seal_file(b"a photograph in the stray", 4096);
     assert!(upload(&mut bob_at_b, dm, &sealed, blob, 25, 0).await);
     assert!(can_fetch(&mut bob_at_b, blob).await);
@@ -311,7 +311,7 @@ async fn a_stray_direct_message_is_folded_into_the_conversation() {
         404,
         "A answered a folded log it never had"
     );
-    // SIP-75: the stray's file is kept with its log, for the pair and
+    // SIP-71 §Folded attachments: the stray's file is kept with its log, for the pair and
     // nobody else.
     assert!(
         can_fetch(&mut bob_at_b, blob).await,

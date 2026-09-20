@@ -428,7 +428,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_mail"),
         ReplicationPeer,
     ),
-    // SIP-79: the account's home collects its backup here, on the Move.
+    // SIP-68 §Collecting the backup: the account's home collects its backup here, on the Move.
     (
         "POST",
         "/peer/backup",
@@ -447,7 +447,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Peer("replica::collect_backup"),
         ReplicationPeer,
     ),
-    // SIP-84: the account's home copies its wake registrations, on the Move.
+    // SIP-68 §Collecting wakes: the account's home copies its wake registrations, on the Move.
     (
         "POST",
         "/peer/wakes",
@@ -576,9 +576,9 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     // SIP-64: a client asks with GET, a replica -- whose H3 client only
     // posts -- with an empty POST. Public: every link was in a zone once.
     ("GET", "/exchange/lineage", Cli("sqex lineage"), Anyone),
-    // SIP-67: a client asks whose device it is before it signs anything.
+    // SIP-62 §Which account a device is: a client asks whose device it is before it signs anything.
     ("GET", "/device/account", Chat("Chat::whose"), Identity),
-    // SIP-76: a device tells its home which origin to pull from.
+    // SIP-60 §A device hints its home: a device tells its home which origin to pull from.
     ("POST", "/account/hint", Chat("Chat::hint_home"), Identity),
     (
         "POST",

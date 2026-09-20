@@ -213,7 +213,7 @@ impl Moved {
     }
 }
 
-/// SIP-76: a device tells its home which origin to pull its channels
+/// SIP-60 §A device hints its home: a device tells its home which origin to pull its channels
 /// from -- `| origin[32] | dom_len: u8 | domain |` at `POST /account/hint`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hint {
@@ -247,7 +247,7 @@ impl Hint {
     }
 }
 
-/// SIP-76: `| now: u64 | pulling: u8 |` -- whether the home took the hint
+/// SIP-60 §A device hints its home: `| now: u64 | pulling: u8 |` -- whether the home took the hint
 /// and woke its task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hinted {
@@ -327,7 +327,7 @@ impl Homed {
 mod tests {
     use super::*;
 
-    /// SIP-76: a hint round-trips, with and without a domain, and a short
+    /// SIP-60 §A device hints its home: a hint round-trips, with and without a domain, and a short
     /// one is refused.
     #[test]
     fn a_hint_round_trips() {

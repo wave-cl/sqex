@@ -2,7 +2,7 @@
 //! a laptop at X, then moved to H, where she revoked the phone and linked
 //! a tablet. X still holds phone and laptop in its own registry; asked
 //! for Alice's devices, it answers what H lists -- laptop and tablet --
-//! and its own stale pair only when H cannot be asked. SIP-83: asked with
+//! and its own stale pair only when H cannot be asked. SIP-81 §Saying whose list it is: asked with
 //! the newer type byte, it says which of the three lists it gave.
 
 use std::net::SocketAddr;
@@ -53,7 +53,7 @@ async fn listed(c: &mut Client, account: &PubKey) -> Vec<PubKey> {
     out
 }
 
-/// SIP-83: the list and whose it is.
+/// SIP-81 §Saying whose list it is: the list and whose it is.
 async fn listed_from(c: &mut Client, account: &PubKey) -> (u8, Vec<PubKey>) {
     let (code, body) = c
         .post(
@@ -254,7 +254,7 @@ async fn a_former_home_that_cannot_ask_the_home_answers_its_own_registry() {
     // X answers what it held when she left, rather than nothing or a
     // refusal: reading goes on through an outage.
     assert_eq!(listed(&mut watch_at_x, &carol).await, vec![watch]);
-    // SIP-83: and says so, to a caller that asks.
+    // SIP-81 §Saying whose list it is: and says so, to a caller that asks.
     assert_eq!(
         listed_from(&mut watch_at_x, &carol).await,
         (FROM_STALE, vec![watch]),

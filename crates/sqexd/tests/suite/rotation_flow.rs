@@ -1,4 +1,4 @@
-//! SIP-66: a home follows an origin's rotation, and an origin follows a
+//! SIP-64 §Following: a home follows an origin's rotation, and an origin follows a
 //! home's. Each holds the other's key for a domain; when the domain is
 //! found naming another key, the successor is taken on the retiring key's
 //! own signed word -- here its lineage (SIP-64), the window long closed --

@@ -140,8 +140,8 @@ pub struct Membership {
     /// SIP-49: the exchange refused the shared join as malformed -- it is
     /// from before SIP-49 -- so the plain join is used from then on.
     unshared: bool,
-    /// SIP-73: the exchange refused the join with words as malformed -- it
-    /// is from before SIP-73 -- so SIP-49's join is used from then on.
+    /// SIP-65 §The member's word: the exchange refused the join with words as malformed -- it
+    /// is from before 0.91.0 (SIP-65 §The member's word) -- so SIP-49's join is used from then on.
     unworded: bool,
     /// SIP-49: members whose home is not a peer of our exchange, or whose
     /// bridge the exchange refused: in the call and not heard.
@@ -184,7 +184,7 @@ impl Membership {
     }
 
     /// SIP-49: ask the exchange to share the room with these relay peers,
-    /// each with the domain it is found by where known (SIP-73).
+    /// each with the domain it is found by where known (SIP-65 §The member's word).
     pub fn with_share(mut self, share: Vec<(PubKey, String)>) -> Membership {
         self.share = share;
         self
@@ -256,7 +256,7 @@ impl Membership {
                         .filter(|m| !m.is_local())
                         .map(|m| (m.identity, m.home))
                         .collect();
-                    // SIP-73: a member homed at an exchange we have not
+                    // SIP-65 §The member's word: a member homed at an exchange we have not
                     // named is named from now on, with a word: that is how
                     // the second side of an unlisted pair comes to hold a
                     // word to share back with. The exchange already holds
@@ -409,7 +409,7 @@ impl Membership {
         Self::homed_answer(code, body)
     }
 
-    /// SIP-73: the shared join with a word per exchange named, signed by
+    /// SIP-65 §The member's word: the shared join with a word per exchange named, signed by
     /// this device now. `None` when the exchange does not know it.
     async fn heartbeat_worded(
         room: RoomId,
@@ -468,7 +468,7 @@ impl Membership {
         home: PubKey,
     ) -> Result<Bridged, String> {
         // SIP-49's device invite stays with the relay peer list, so the
-        // open is the plain one (SIP-65 §What stays listed).
+        // open is the plain one (SIP-65 §Device invites).
         let open = CallOpen {
             ephemeral: x25519_dalek::PublicKey::from(&eph).to_bytes(),
             target: format!("{id}@{home}"),

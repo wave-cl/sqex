@@ -57,7 +57,7 @@ pub const TYPE_INVITE_DEVICE: u8 = 0x07;
 /// SIP-65: an invite carrying the caller's own signed word, which is what
 /// an exchange nobody listed rings on.
 pub const TYPE_INVITE_SIGNED: u8 = 0x08;
-/// SIP-73: a room share standing on a member's word, sent over a link to
+/// SIP-65 §The member's word: a room share standing on a member's word, sent over a link to
 /// an exchange the sender does not list.
 pub const TYPE_ROOM_SHARE_SIGNED: u8 = 0x0a;
 
@@ -134,7 +134,7 @@ pub enum Control {
         handle: [u8; 32],
         members: Vec<crate::room::HomedMember>,
     },
-    /// SIP-73: `RoomShare` with the local member whose word it stands on,
+    /// SIP-65 §The member's word: `RoomShare` with the local member whose word it stands on,
     /// and the word -- signed for the room and the receiving exchange.
     RoomShareSigned {
         handle: [u8; 32],
@@ -477,7 +477,7 @@ mod tests {
         PubKey::new([n; 32])
     }
 
-    /// SIP-73: a signed share round-trips and a plain one still does.
+    /// SIP-65 §The member's word: a signed share round-trips and a plain one still does.
     #[test]
     fn a_signed_room_share_round_trips() {
         let members = vec![crate::room::HomedMember {

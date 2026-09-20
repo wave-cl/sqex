@@ -264,7 +264,7 @@ pub const HOLD_DEFAULT_SECS: u64 = 60;
 /// SIP-78: the most a stated wait holds this exchange off for.
 pub const MAX_HOLD_SECS: u64 = 3600;
 
-/// SIP-80: an origin the home task could not find or reach, and when it
+/// SIP-78 §Backing off: an origin the home task could not find or reach, and when it
 /// will try again. Cleared by the first answer from it, on any path.
 #[derive(Debug, Clone)]
 pub struct Unfound {
@@ -274,7 +274,7 @@ pub struct Unfound {
     pub why: UnfoundWhy,
 }
 
-/// SIP-80: why an origin was not found on the last attempt.
+/// SIP-78 §Backing off: why an origin was not found on the last attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnfoundWhy {
     /// No address for its key or hinted domain.
@@ -292,7 +292,7 @@ impl UnfoundWhy {
     }
 }
 
-/// SIP-80: the longest a home holds off from an origin it cannot find.
+/// SIP-78 §Backing off: the longest a home holds off from an origin it cannot find.
 pub const MAX_UNFOUND_SECS: u64 = MAX_HOLD_SECS;
 /// SIP-81: how long the home's device list for an away account is served
 /// again before it is asked for afresh.
@@ -414,7 +414,7 @@ pub struct Server {
     /// where the origin's peering limit spoke, until when writes to it are
     /// held. Kept until replaced: a refusal is a thing to have seen.
     origin_refusals: Mutex<HashMap<PubKey, OriginRefusal>>,
-    /// SIP-80: origins the home task could not find or reach.
+    /// SIP-78 §Backing off: origins the home task could not find or reach.
     origin_unfound: Mutex<HashMap<PubKey, Unfound>>,
     /// SIP-81: the home's device list for an account that lives elsewhere,
     /// kept `DEVICES_TTL` so a poll's sixty asks are one round trip each.
@@ -570,7 +570,7 @@ impl Server {
             .or_insert_with(|| Arc::new(crate::replica::Forwarder::new(origin, addr, domain)));
     }
 
-    /// SIP-66: drop the way to `origin`, so the next reach resolves anew.
+    /// SIP-64 §Following: drop the way to `origin`, so the next reach resolves anew.
     pub(crate) fn forget_forwarder(&self, origin: &PubKey) {
         self.origins.write().unwrap().remove(origin);
     }
@@ -681,7 +681,7 @@ impl Server {
             })?;
         let (found, moved_from, addr) = crate::relay::find_peer_moved(self, &domain).await.ok()?;
         if found != *key {
-            // SIP-66: the domain names another key. Its successor, on the
+            // SIP-64 §Recognising a rotation: the domain names another key. Its successor, on the
             // retiring key's own word -- a handover the pin followed, or the
             // successor's lineage naming the key held -- and never on the
             // zone's word alone.
@@ -707,7 +707,7 @@ impl Server {
         Some((addr, domain))
     }
 
-    /// SIP-66: whether `successor`, reached at `addr` for `domain`, serves a
+    /// SIP-64 §Recognising a rotation: whether `successor`, reached at `addr` for `domain`, serves a
     /// lineage that verifies for it and names `held` among its earlier keys.
     async fn lineage_names(
         &self,
@@ -737,7 +737,7 @@ impl Server {
         }
     }
 
-    /// SIP-66: re-key every holding of `from` to `to` -- the registry's
+    /// SIP-64 §Following: re-key every holding of `from` to `to` -- the registry's
     /// homes and hints, the channel store's copies and lineage, the way
     /// there -- and learn `to`'s lineage, so what `from` receipted goes on
     /// verifying. Logged once: the one time an operator sees it happen.
@@ -754,7 +754,7 @@ impl Server {
         self.add_forwarder(*to, addr, domain.to_string());
         tracing::info!(
             %domain, from = %from, to = %to, registry, copies,
-            "an exchange rotated its key; every holding of it followed (SIP-66)"
+            "an exchange rotated its key; every holding of it followed (SIP-64)"
         );
         // Asked now rather than on the next pull, since the copies' past
         // is under the old key and the next pull is what verifies it.
@@ -902,7 +902,7 @@ impl Server {
         let refusals = self.origin_refusals.lock().unwrap();
         let unfound = self.origin_unfound.lock().unwrap();
         let forwarders = self.origins.read().unwrap();
-        // SIP-80: and every origin an account homed here hinted at -- the
+        // SIP-78 §Saying so: and every origin an account homed here hinted at -- the
         // reason the home task is trying at all, and the row an operator
         // needed for an origin that never answered.
         let hinted: HashMap<PubKey, String> = self
@@ -952,14 +952,14 @@ impl Server {
         json!(rows)
     }
 
-    /// SIP-53: note that `origin` answered just now. SIP-80: and so is
+    /// SIP-53: note that `origin` answered just now. SIP-78 §Backing off: and so is
     /// no longer unfound.
     pub(crate) fn reached(&self, origin: &PubKey) {
         self.contacts.lock().unwrap().insert(*origin, now_unix());
         self.origin_unfound.lock().unwrap().remove(origin);
     }
 
-    /// SIP-80: a home-task cycle could not find or reach `origin`. Holds
+    /// SIP-78 §Backing off: a home-task cycle could not find or reach `origin`. Holds
     /// off from it for `interval << (tries - 1)`, at most
     /// `MAX_UNFOUND_SECS`, and says so once per hold. Returns the hold.
     pub(crate) fn note_unfound(
@@ -990,7 +990,7 @@ impl Server {
         );
         tracing::warn!(
             %origin, domain, why = why.as_str(), tries, next_in = hold,
-            "cannot find an account's origin; holding off (SIP-80)"
+            "cannot find an account's origin; holding off (SIP-78)"
         );
         hold
     }
@@ -1036,13 +1036,13 @@ impl Server {
         Ok((FROM_HERE, self.devices.list(account)?))
     }
 
-    /// SIP-84: whether this exchange would post to `endpoint` -- its own
+    /// SIP-68 §What the home does with wakes: whether this exchange would post to `endpoint` -- its own
     /// policy, applied to a registration collected from a former home.
     pub(crate) fn wake_endpoint_ok(&self, endpoint: &str) -> bool {
         sqex_proto::wake::acceptable(endpoint, self.wake_loopback)
     }
 
-    /// SIP-80: forget unfound origins not in `keep` -- the ones no account
+    /// SIP-78 §Saying so: forget unfound origins not in `keep` -- the ones no account
     /// hints at any more. Nothing will try them, so nothing would ever
     /// clear them, and a row for an origin nobody has a reason to contact
     /// is not a readout.
@@ -1053,7 +1053,7 @@ impl Server {
             .retain(|k, _| keep.contains(k));
     }
 
-    /// SIP-80: whether the home task is holding off from `origin`, and
+    /// SIP-78 §Backing off: whether the home task is holding off from `origin`, and
     /// until when.
     pub(crate) fn origin_unfound_until(&self, origin: &PubKey) -> Option<u64> {
         let now = now_unix();
@@ -1215,7 +1215,7 @@ impl Server {
         self.account_behind_credential(caller, word.credential.as_ref(), now)
     }
 
-    /// SIP-65 ringing rule 4, SIP-73 rule 3: the account a device speaks
+    /// SIP-65 ringing rule 4 and honouring rule 3: the account a device speaks
     /// for -- itself with no credential, or the one a verifying credential
     /// naming it as delegate names.
     pub(crate) fn account_behind_credential(
@@ -1750,7 +1750,7 @@ pub async fn bind_with(
         connections: AtomicU64::new(0),
         requests: AtomicU64::new(0),
     });
-    // SIP-66: what this exchange held for its own earlier keys is its own
+    // SIP-64 §Following: what this exchange held for its own earlier keys is its own
     // now -- an account's Move naming the key it rotated from, an origin
     // hint, a learned home -- with the Move's signature cleared, as at any
     // other holder. Done at every start, so a store from before the
@@ -1758,7 +1758,7 @@ pub async fn bind_with(
     for earlier in &own_predecessors {
         let n = server.devices.follow_exchange(earlier, &public_key);
         if n > 0 {
-            tracing::info!(from = %earlier, rows = n, "holdings of this exchange's earlier key followed to it (SIP-66)");
+            tracing::info!(from = %earlier, rows = n, "holdings of this exchange's earlier key followed to it (SIP-64)");
         }
     }
     // The front door, made once and found by name thereafter. An exchange
@@ -2633,7 +2633,7 @@ async fn route(
                 {
                     Ok(answer) => {
                         if answer.status == 200 {
-                            // SIP-76: this exchange knew the origin before
+                            // SIP-60 §The home hints itself: this exchange knew the origin before
                             // the origin could tell it. The creator's home
                             // hints itself, and the task pulls at once.
                             if server.devices.add_home_origin(
@@ -2652,7 +2652,7 @@ async fn route(
                 }
             }
         },
-        // SIP-76: a device tells its home which origin to pull from. For
+        // SIP-60 §A device hints its home: a device tells its home which origin to pull from. For
         // the caller's own account as the registry has it, and only where
         // that account's Move names this exchange.
         ("POST", "/account/hint") => match (peer.identity, sqex_proto::home::Hint::decode(body)) {
@@ -3053,7 +3053,7 @@ async fn route(
         // every credential carries both keys in the clear to whoever verifies
         // one. Pretending otherwise would protect something already published
         // while making a member list impossible to render.
-        // SIP-67: whose device the caller is, from the registry -- the one
+        // SIP-62 §Which account a device is: whose device the caller is, from the registry -- the one
         // party that knows after a handover moved it. Its own key twice
         // where it is registered to nobody: every key is an account until
         // the registry says otherwise (SIP-22).
@@ -3076,7 +3076,7 @@ async fn route(
         // since not, and after a handover the new key's nowhere -- and
         // every key sealed from it went to a device in a drawer. Its
         // own list is answered only where the home cannot be asked.
-        // SIP-83: asked with the newer type byte, the answer says which
+        // SIP-81 §Saying whose list it is: asked with the newer type byte, the answer says which
         // of the three it is, so a client sealing a key to a stale one
         // can wait instead.
         ("POST", "/device/list") => match body.first() {
@@ -4390,7 +4390,7 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-79: the account's home collects its backup here, gated as the
+        // SIP-68 §Collecting the backup: the account's home collects its backup here, gated as the
         // mailbox is: the home by the account's own Move, and nobody else.
         // `Held` is what `/backup/read` would answer the account; nothing
         // is removed by asking, and `/peer/backup/took` names the
@@ -4442,7 +4442,7 @@ async fn route(
                 {
                     Ok(true) => tracing::info!(
                         account = %req.account, home = %who, generation = req.generation,
-                        "released an account's backup to its home (SIP-79)"
+                        "released an account's backup to its home (SIP-68)"
                     ),
                     Ok(false) => {}
                     Err(e) => return refused(e),
@@ -4455,7 +4455,7 @@ async fn route(
             }
             _ => peering_refused(),
         },
-        // SIP-84: the account's home copies its wake registrations, gated
+        // SIP-68 §Collecting wakes: the account's home copies its wake registrations, gated
         // as the mailbox is. Nothing is removed: a former home goes on
         // waking for the channels it still orders.
         ("POST", "/peer/wakes") => match (peer.identity, PullWakes::decode(body)) {
@@ -5156,7 +5156,7 @@ async fn route(
             }
         },
 
-        // SIP-73: a shared join naming each exchange with a domain and the
+        // SIP-65 §The member's word: a shared join naming each exchange with a domain and the
         // member's word for it. Listed peers as SIP-49; an unlisted one
         // only where calls are open, and every word verified under the
         // joining device for its room and the exchange it names.

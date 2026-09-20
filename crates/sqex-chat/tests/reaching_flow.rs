@@ -210,7 +210,7 @@ async fn a_direct_message_with_a_lower_key_here_lives_here() {
     assert_eq!(origin, a_key);
 }
 
-/// SIP-82: a client whose store is filed under A, pointed at B, is a
+/// SIP-60 §When a client presents a Move unasked: a client whose store is filed under A, pointed at B, is a
 /// visitor there: it presents no Move, B records nothing, and A goes on
 /// being home. Told to move, it moves, and B then records it.
 #[tokio::test]
@@ -274,7 +274,7 @@ async fn a_client_pointed_at_another_exchange_does_not_move_there() {
     assert_eq!(at_a.ensure_home().await.unwrap(), HomeSaid::OnRecord);
 
     // The residue of a Move by accident: B records itself as home (as a
-    // client from before SIP-82 would have made it), and nothing told A.
+    // client from before 0.99.1 would have made it), and nothing told A.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let by_accident = at_b.sign_move(&b_key).unwrap();
     at_b.present_move(&sqex_proto::home::Moving {

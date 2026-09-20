@@ -107,7 +107,7 @@ pub enum Find {
     /// discovery replaced.
     Fixed(HashMap<String, (PubKey, SocketAddr)>),
     /// As `Fixed`, but shared with the test, which changes what a domain
-    /// names -- a rotation (SIP-66) is a domain naming another key.
+    /// names -- a rotation (SIP-64 §Recognising a rotation) is a domain naming another key.
     Live(Arc<std::sync::RwLock<HashMap<String, (PubKey, SocketAddr)>>>),
 }
 
@@ -442,7 +442,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
         }
         Err(_) => return CallAck::rejected(relay::REASON_REFUSED, now),
     };
-    // SIP-73: a device invite to an unlisted peer stands on the share that
+    // SIP-65 §Device invites: a device invite to an unlisted peer stands on the share that
     // peer sent and this exchange admitted on a member's word -- the
     // device among its members, the caller in the room here.
     let room_vouched = by_key.is_some()
@@ -908,7 +908,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             caller_eph,
             device,
         } => {
-            // SIP-73: over a link to a listed peer as SIP-49 has it; over
+            // SIP-65 §The member's word: over a link to a listed peer as SIP-49 has it; over
             // an unlisted one, only for a device in a room whose share
             // from that peer was admitted on a member's word and names the
             // caller among its members.
@@ -1026,7 +1026,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
         // SIP-49: a peer's view of a room. Reciprocal: the first share of a
         // room from a peer is answered with this exchange's view of it.
         Control::RoomShare { handle, members } => {
-            // SIP-73: a plain share over an unlisted link is dropped; the
+            // SIP-65 §The member's word: a plain share over an unlisted link is dropped; the
             // signed form below is what such a link carries.
             if !server.peers_with(&peer) {
                 return;
@@ -1036,7 +1036,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
                 share_back(server, &peer, handle);
             }
         }
-        // SIP-73: a share standing on a member's word. Verified whether or
+        // SIP-65 §The member's word: a share standing on a member's word. Verified whether or
         // not the peer is listed -- a peer that can sign should not send a
         // word that does not verify -- and kept only on the document's
         // terms; dropped without answer otherwise, as any share is.
@@ -1071,7 +1071,7 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
 pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
     for peer in server.rooms.peers_of(&handle) {
         let listed = server.peers_with(&peer);
-        // SIP-73: an unlisted peer is shared with on a member's word, and
+        // SIP-65 §The member's word: an unlisted peer is shared with on a member's word, and
         // reached by the domain the member named it by.
         let word = server.rooms.word_for(&handle, &peer);
         if !listed && (!server.open_calls() || word.is_none()) {
@@ -1087,7 +1087,7 @@ pub async fn share_room(server: &Arc<Server>, handle: [u8; 32]) {
     }
 }
 
-/// SIP-49, SIP-73: the share to send `peer`: plain to a listed peer, on a
+/// SIP-49, SIP-65 §The member's word: the share to send `peer`: plain to a listed peer, on a
 /// member's word to one that is not.
 fn share_control(
     handle: [u8; 32],
@@ -1107,7 +1107,7 @@ fn share_control(
 }
 
 /// SIP-49: answer a peer's first share of a room with this exchange's
-/// view -- SIP-73, over an unlisted link, only where a local member gave a
+/// view -- SIP-65 §The member's word, over an unlisted link, only where a local member gave a
 /// word naming that peer, and with nothing otherwise.
 fn share_back(server: &Server, peer: &PubKey, handle: [u8; 32]) {
     let listed = server.peers_with(peer);
@@ -1120,7 +1120,7 @@ fn share_back(server: &Server, peer: &PubKey, handle: [u8; 32]) {
     send_control(&inner, peer, share_control(handle, view, listed, word));
 }
 
-/// SIP-73 §Honouring a share: whether a signed share from `peer` stands.
+/// SIP-65 §Honouring a share: whether a signed share from `peer` stands.
 /// Rules 2 to 5 of the document, in order; rule 1 is the caller's.
 fn word_shares(
     server: &Server,
@@ -1175,7 +1175,7 @@ pub async fn find_by_domain(
     find_peer(server, domain).await
 }
 
-/// SIP-66: [`find_peer`], also saying which key the pin moved from on this
+/// SIP-64 §Recognising a rotation: [`find_peer`], also saying which key the pin moved from on this
 /// lookup, when SIP-40 moved it.
 pub(crate) async fn find_peer_moved(
     server: &Arc<Server>,
@@ -1205,7 +1205,7 @@ pub(crate) async fn find_peer_moved(
 /// peer list records for it where there is none. `None` when the key is
 /// not a peer, has no domain on record, or cannot be reached.
 async fn link_to_key(server: &Arc<Server>, key: PubKey) -> Option<SocketAddr> {
-    // SIP-73: an unlisted exchange may be linked to when calls are open,
+    // SIP-65 §Device invites: an unlisted exchange may be linked to when calls are open,
     // by the domain a member named it by.
     if !server.may_link(&key) {
         return None;

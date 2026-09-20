@@ -644,7 +644,7 @@ CREATE TABLE IF NOT EXISTS folded (
     second   BLOB NOT NULL,
     at       INTEGER NOT NULL
 );
--- SIP-75: the stray's attachments, kept with its folded log for the same
+-- SIP-71 §Folded attachments: the stray's attachments, kept with its folded log for the same
 -- window and the same two members. A blob lives while any attachment or
 -- folded attachment names it.
 CREATE TABLE IF NOT EXISTS folded_attachment (
@@ -2488,7 +2488,7 @@ impl Channels {
 
         let _ = expire_uploads(&tx, now);
         // SIP-71: a fold record and its log outlive their window by nothing.
-        // SIP-75: nor do its attachments; a blob nothing else names goes.
+        // SIP-71 §Folded attachments: nor do its attachments; a blob nothing else names goes.
         let expired_blobs: Vec<[u8; 32]> = tx
             .prepare("SELECT blob FROM folded_attachment WHERE at + ?1 <= ?2")
             .ok()
@@ -3913,7 +3913,7 @@ impl Channels {
 
     /// SIP-53: every exchange that has ordered `channel`, for verifying
     /// entries from before a move. The creator where the history has none.
-    /// SIP-66: an origin this store copies from rotated. Every copy of
+    /// SIP-64 §Following: an origin this store copies from rotated. Every copy of
     /// `from` becomes a copy of `to`, with `from` in the channel's origin
     /// history so what it receipted goes on verifying; the lineage held
     /// for `from` is dropped, to be learned again for `to`. How many
@@ -4255,7 +4255,7 @@ impl Channels {
             params![&channel[..], &own[..]],
         )
         .map_err(storage("retire folded instance"))?;
-        // SIP-75: the attachments are kept with the log, for the pair and the
+        // SIP-71 §Folded attachments: the attachments are kept with the log, for the pair and the
         // window; a blob is not collected while a folded attachment names it.
         tx.execute(
             "DELETE FROM folded_attachment WHERE channel = ?1",
@@ -5732,7 +5732,7 @@ impl Channels {
         Ok(())
     }
 
-    /// SIP-79: one chunk of a blob `account` holds as its backup (attached
+    /// SIP-68 §Collecting the backup: one chunk of a blob `account` holds as its backup (attached
     /// to the account itself, SIP-48), for the account's home to collect.
     /// `BLOB_LIST` answers the one blob's `(id, size, chunks)` row, so the
     /// home knows how many chunks to ask for; the manifest is the list.
@@ -5775,7 +5775,7 @@ impl Channels {
         })
     }
 
-    /// SIP-79: whether `account` holds `blob` here, so a collection that was
+    /// SIP-68 §Collecting the backup: whether `account` holds `blob` here, so a collection that was
     /// interrupted does not fetch twice.
     pub fn holds_backup_blob(&self, account: &PubKey, blob: &[u8; 32]) -> bool {
         let db = self.db.lock().unwrap();
@@ -5790,7 +5790,7 @@ impl Channels {
         .is_some()
     }
 
-    /// SIP-79: store a blob collected for `account`'s backup, held by the
+    /// SIP-68 §Collecting the backup: store a blob collected for `account`'s backup, held by the
     /// account as a device's upload would be and counted against the same
     /// quota. The chunks have been checked against the id by the caller.
     pub fn store_backup_blob(
@@ -5829,7 +5829,7 @@ impl Channels {
         Ok(())
     }
 
-    /// SIP-79: store a manifest the account's former home served, as the
+    /// SIP-68 §Collecting the backup: store a manifest the account's former home served, as the
     /// device wrote it, once every blob it names is held here. `false` when
     /// the account already holds a backup here, of any generation: written
     /// after the Move, by the account's own act, and the newer for it.
@@ -5885,7 +5885,7 @@ impl Channels {
         Ok(true)
     }
 
-    /// SIP-79: the generation of the backup `account` holds here, 0 for none.
+    /// SIP-68 §Collecting the backup: the generation of the backup `account` holds here, 0 for none.
     pub fn backup_generation(&self, account: &PubKey) -> u64 {
         let db = self.db.lock().unwrap();
         db.query_row(
@@ -5899,7 +5899,7 @@ impl Channels {
         .unwrap_or(0) as u64
     }
 
-    /// SIP-79: release what `account` holds, as `Drop` would, if the manifest
+    /// SIP-68 §Collecting the backup: release what `account` holds, as `Drop` would, if the manifest
     /// here is of `generation` -- the one the account's home says it stored.
     /// Any other generation releases nothing: `false`.
     pub fn release_backup_if(
@@ -5959,7 +5959,7 @@ impl Channels {
                 member = true;
             }
         }
-        // SIP-75: a blob a folded attachment names, to the two members of
+        // SIP-71 §Folded attachments: a blob a folded attachment names, to the two members of
         // the folded direct message, while the fold record stands. Counted
         // as private: it is never what lets a blob be fetched publicly.
         if !member {
@@ -6991,7 +6991,7 @@ fn succeeded_by(db: &Connection, account: &[u8; 32]) -> Option<PubKey> {
 /// survives; that is SIP-18's rule and it is why closing one channel does not
 /// take a photograph out of another.
 fn collect_blob(db: &Connection, blob: &[u8; 32]) -> Result<(), ChannelError> {
-    // SIP-75: a folded attachment holds a blob alive as any attachment does.
+    // SIP-71 §Folded attachments: a folded attachment holds a blob alive as any attachment does.
     let remaining: i64 = db
         .query_row(
             "SELECT (SELECT COUNT(*) FROM attachment WHERE blob = ?1)

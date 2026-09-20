@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS lodged (
 );
 -- SIP-45: where each device asked to be woken, until when, and when it last
 -- was. Served to one party only -- the account's home, on its Move
--- (SIP-84) -- and otherwise a place to post to and nothing else.
+-- (SIP-68 §Collecting wakes) -- and otherwise a place to post to and nothing else.
 CREATE TABLE IF NOT EXISTS wake (
     device   BLOB PRIMARY KEY,
     endpoint TEXT NOT NULL,
@@ -203,7 +203,7 @@ CREATE INDEX IF NOT EXISTS home_by_home ON home (home);
 /// key it withdrew.
 pub const REVOCATION_SKEW: u64 = 5 * 60;
 
-/// SIP-76: origin hints kept per account; the oldest go past this.
+/// SIP-60 §A device hints its home: origin hints kept per account; the oldest go past this.
 pub const MAX_HINTS: usize = 32;
 
 pub struct Registry {
@@ -238,14 +238,14 @@ impl Registry {
             "mail_collected",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        // SIP-79: whether the account's backup at this origin was collected.
+        // SIP-68 §Collecting the backup: whether the account's backup at this origin was collected.
         add_column(
             &db,
             "home_origin",
             "backup_collected",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        // SIP-84: whether the account's wake registrations at this origin
+        // SIP-68 §Collecting wakes: whether the account's wake registrations at this origin
         // were collected, and which account a collected registration is
         // held for -- a device that registered at the former home and has
         // not connected here is in no `device` row of ours.
@@ -696,7 +696,7 @@ impl Registry {
         let _ = follow_succession(&db, account, successor);
     }
 
-    /// SIP-66: an exchange this registry holds a key for rotated. Every
+    /// SIP-64 §Following: an exchange this registry holds a key for rotated. Every
     /// holding of `from` becomes one of `to`: an account's signed home
     /// **with its signature cleared** (the account named `from`; SIP-62's
     /// shape for a record the exchange acts on and does not vouch for),
@@ -817,7 +817,7 @@ impl Registry {
                 out.push((*d, endpoint, woken as u64));
             }
         }
-        // SIP-84: and the registrations held for the account -- collected
+        // SIP-68 §Waking: and the registrations held for the account -- collected
         // from its former home for devices that have not connected here.
         if let Ok(mut st) = db.prepare(
             "SELECT device, endpoint, woken FROM wake WHERE account = ?1 AND expires >= ?2",
@@ -840,7 +840,7 @@ impl Registry {
         out
     }
 
-    /// SIP-84: the live registrations of `account`'s devices and of the
+    /// SIP-68 §Collecting wakes: the live registrations of `account`'s devices and of the
     /// account key itself, for its home to copy.
     pub fn wakes_of(&self, account: &PubKey) -> Vec<(PubKey, String, u64)> {
         let now = now_unix();
@@ -879,7 +879,7 @@ impl Registry {
         out
     }
 
-    /// SIP-84: hold a registration collected from the account's former home.
+    /// SIP-68 §Collecting wakes: hold a registration collected from the account's former home.
     /// A registration the device already made here stands: `false`.
     pub fn import_wake(
         &self,
@@ -1191,7 +1191,7 @@ impl Registry {
 
     /// SIP-60: an origin told this home it put one of its accounts in a
     /// channel; remember the origin so the home task pulls from it. Only
-    /// for an account whose Move names this exchange. SIP-76: also what a
+    /// for an account whose Move names this exchange. SIP-60 §A device hints its home: also what a
     /// device's own hint, and a `create_at` this exchange carried, record.
     pub fn add_home_origin(
         &self,
@@ -1211,7 +1211,7 @@ impl Registry {
                 params![account.as_bytes(), origin.as_bytes(), domain],
             )
             .is_ok();
-        // SIP-76: bounded per account, the oldest dropped -- a device may
+        // SIP-60 §A device hints its home: bounded per account, the oldest dropped -- a device may
         // hint as it likes, and a home should not be made to ask everywhere.
         let _ = db.execute(
             "DELETE FROM home_origin WHERE account = ?1 AND rowid NOT IN
@@ -1265,7 +1265,7 @@ impl Registry {
         );
     }
 
-    /// SIP-79: the (account, origin) hints of accounts homed here whose
+    /// SIP-68 §Collecting the backup: the (account, origin) hints of accounts homed here whose
     /// backup at that origin has not been collected yet.
     pub fn backup_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey)> {
         let db = self.db.lock().unwrap();
@@ -1294,7 +1294,7 @@ impl Registry {
         .unwrap_or_default()
     }
 
-    /// SIP-79: the account's backup at `origin` has been collected, or the
+    /// SIP-68 §Collecting the backup: the account's backup at `origin` has been collected, or the
     /// origin holds none, or the home gave up on it (over quota).
     pub fn mark_backup_collected(&self, account: &PubKey, origin: &PubKey) {
         let db = self.db.lock().unwrap();
@@ -1304,7 +1304,7 @@ impl Registry {
         );
     }
 
-    /// SIP-84: the (account, origin) hints of accounts homed here whose wake
+    /// SIP-68 §Collecting wakes: the (account, origin) hints of accounts homed here whose wake
     /// registrations at that origin have not been collected yet.
     pub fn wakes_pending(&self, me: &PubKey) -> Vec<(PubKey, PubKey)> {
         let db = self.db.lock().unwrap();
@@ -1333,7 +1333,7 @@ impl Registry {
         .unwrap_or_default()
     }
 
-    /// SIP-84: the account's wake registrations at `origin` were collected,
+    /// SIP-68 §Collecting wakes: the account's wake registrations at `origin` were collected,
     /// or the origin answered it holds none.
     pub fn mark_wakes_collected(&self, account: &PubKey, origin: &PubKey) {
         let db = self.db.lock().unwrap();

@@ -35,7 +35,7 @@ pub const TYPE_ENTRIES: u8 = 0x04;
 pub const TYPE_KEYS: u8 = 0x05;
 pub const TYPE_BLOB: u8 = 0x06;
 pub const TYPE_DONE: u8 = 0x07;
-/// SIP-67: the account's key, entrusted to a sibling.
+/// SIP-62 §Entrusting the key: the account's key, entrusted to a sibling.
 pub const TYPE_KEY: u8 = 0x08;
 /// SIP-72: the ended incarnations this side keeps, offered before `Have`.
 pub const TYPE_EARLIER: u8 = 0x09;
@@ -90,7 +90,7 @@ pub enum Message {
         bytes: Vec<u8>,
     },
     Done,
-    /// SIP-67: the account's Ed25519 seed, given to a sibling the person
+    /// SIP-62 §Entrusting the key: the account's Ed25519 seed, given to a sibling the person
     /// named on the device that holds it. In the clear inside the sealed
     /// frame, as the epoch keys are.
     Key([u8; 32]),
@@ -462,12 +462,12 @@ pub struct Sync {
     got_have: bool,
     got_want: bool,
     sent_done: bool,
-    /// SIP-67: the account key to give this sibling once admitted, because
+    /// SIP-62 §Entrusting the key: the account key to give this sibling once admitted, because
     /// the person said so on this device. Taken when sent.
     entrust: Option<[u8; 32]>,
-    /// SIP-67: whether this side was given the key this session.
+    /// SIP-62 §Entrusting the key: whether this side was given the key this session.
     pub entrusted: bool,
-    /// SIP-67: whether this side gave the key this session -- sent once the
+    /// SIP-62 §Entrusting the key: whether this side gave the key this session -- sent once the
     /// sibling was admitted, whatever the history trade did afterwards.
     pub gave_key: bool,
     got_done: bool,
@@ -514,7 +514,7 @@ impl Sync {
         self.phase
     }
 
-    /// SIP-67: give this sibling the account key, once its `Hello` has
+    /// SIP-62 §Entrusting the key: give this sibling the account key, once its `Hello` has
     /// been verified. The person asked for it on this device; a sibling
     /// cannot ask.
     pub fn entrusting(mut self, seed: [u8; 32]) -> Sync {
@@ -686,7 +686,7 @@ impl Sync {
                     }
                 }
                 // Admitted: say what we hold -- and, where the person said
-                // so here, give them the key (SIP-67).
+                // so here, give them the key (SIP-62 §Entrusting the key).
                 if let Some(seed) = self.entrust.take() {
                     self.queue(&Message::Key(seed))?;
                     self.gave_key = true;
@@ -951,7 +951,7 @@ impl Sync {
             Message::Done => {
                 self.got_done = true;
             }
-            // SIP-67: the account key from a verified sibling. Kept only
+            // SIP-62 §Entrusting the key: the account key from a verified sibling. Kept only
             // where it is this account's; anything else ends the session.
             Message::Key(seed) => {
                 let public = PubKey::new(

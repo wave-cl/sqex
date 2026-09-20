@@ -1151,7 +1151,7 @@ impl Store {
         self.exchange
     }
 
-    /// SIP-82: when the Move that filed this store under its home was
+    /// SIP-60 §The residue of a Move by accident: when the Move that filed this store under its home was
     /// issued -- recorded by the client on every Move it makes or presents
     /// -- so a home that records itself can be told apart from a store
     /// that is behind another device's Move. `None` for a store from
@@ -1170,7 +1170,7 @@ impl Store {
             .map(u64::from_be_bytes))
     }
 
-    /// SIP-82: note the `issued` of the Move that made or confirmed this
+    /// SIP-60 §The residue of a Move by accident: note the `issued` of the Move that made or confirmed this
     /// store's home.
     pub fn record_home_issued(&self, issued: u64) -> Result<()> {
         self.db
@@ -1183,7 +1183,7 @@ impl Store {
         Ok(())
     }
 
-    /// SIP-82: the exchange this store is **filed under** -- the account's
+    /// SIP-60 §When a client presents a Move unasked: the exchange this store is **filed under** -- the account's
     /// home as this client last knew it, claimed on first use and re-filed
     /// by every Move made from here -- as distinct from the exchange it is
     /// currently reading at. `None` for a store that has claimed none yet.

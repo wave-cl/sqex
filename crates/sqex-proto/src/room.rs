@@ -47,7 +47,7 @@ pub const TYPE_LEAVE: u8 = 0x02;
 pub const TYPE_LEFT: u8 = 0x03;
 /// SIP-49: a join that also names the relay peers to share the room with.
 pub const TYPE_JOIN_SHARED: u8 = 0x04;
-/// SIP-73: a shared join naming each exchange with a domain and the
+/// SIP-65 §The member's word: a shared join naming each exchange with a domain and the
 /// member's word for it.
 pub const TYPE_JOIN_SHARED_WORD: u8 = 0x05;
 /// SIP-49: exchanges one join may name.
@@ -304,7 +304,7 @@ impl JoinShared {
     }
 }
 
-/// SIP-73: `JoinShared` with, per exchange named, where to find it and the
+/// SIP-65 §The member's word: `JoinShared` with, per exchange named, where to find it and the
 /// member's word that the room may be shared with it.
 ///
 /// `| type = 0x05 | handle[32] | proof[32] | count: u8 | count × (exchange[32] | dom_len: u8 | domain | RoomWord) |`
@@ -512,7 +512,7 @@ mod tests {
         PubKey::new(sk.verifying_key().to_bytes())
     }
 
-    /// SIP-73: a join with words round-trips, the word verifies for the
+    /// SIP-65 §The member's word: a join with words round-trips, the word verifies for the
     /// exchange it names and for no other, and a short one is refused.
     #[test]
     fn a_shared_join_with_words_round_trips() {

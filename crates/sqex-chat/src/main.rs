@@ -252,7 +252,7 @@ enum DeviceCmd {
         #[arg(long, default_value_t = 60)]
         wait: u64,
     },
-    /// Give one other device of this account the account key (SIP-67),
+    /// Give one other device of this account the account key (SIP-62 §Entrusting the key),
     /// over the same session `device sync` uses, once it has proved
     /// itself. That device can then sign what only the account may -- a
     /// Move, a will, a handover -- and **cannot be put out of the account
@@ -344,7 +344,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     chat.top_up_prekeys()
         .await
         .map_err(|e| format!("publishing prekeys: {e}"))?;
-    // SIP-67: whose device this is, before anything is signed -- a handover
+    // SIP-62 §Which account a device is: whose device this is, before anything is signed -- a handover
     // presented from a sibling moves this device to the successor, and the
     // registry is what says so.
     match chat.follow_account().await {
@@ -358,7 +358,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     // for it when another exchange puts it in a channel. Not fatal: an
     // exchange from before SIP-59 has no such record to keep.
     match chat.ensure_home().await {
-        // SIP-82: pointed at an exchange this account does not live at.
+        // SIP-60 §When a client presents a Move unasked: pointed at an exchange this account does not live at.
         // Said, not acted on: a Move is the person's to make.
         Ok(sqex_chat::client::HomeSaid::Visitor { home, told, behind }) => eprintln!(
             "note: this store lives at {home}; you are a visitor here{} -- `sqex-chat move` to move it",
@@ -890,7 +890,7 @@ async fn device_command(chat: &mut Chat, cmd: &DeviceCmd) -> Result<(), String> 
                 let p = &sync.progress;
                 if sync.entrusted {
                     println!(
-                        "{sibling}  gave this device the account key (SIP-67): this device is the \
+                        "{sibling}  gave this device the account key (SIP-62 §Entrusting the key): this device is the \
                          account now, and revoking it would not put it out. If it is lost, hand \
                          the account over from another device that holds the key."
                     );
@@ -3193,7 +3193,7 @@ enum Command {
     Send(String),
     File(std::path::PathBuf),
     Save(u64, std::path::PathBuf),
-    /// SIP-75: a file of a message in an earlier copy (SIP-71), by copy
+    /// SIP-71 §Folded attachments: a file of a message in an earlier copy (SIP-71), by copy
     /// number (from 1, oldest first) and message number.
     SaveEarlier(usize, u64, std::path::PathBuf),
     /// `/new <name>` — a private group, which you can then invite people into.
@@ -3325,7 +3325,7 @@ impl Command {
             "/file" => Command::Unknown("/file needs a path".into()),
             "/save" => {
                 let path = rest[first.len()..].trim();
-                // SIP-75: `e<n>.<seq>` names a message in the n-th earlier
+                // SIP-71 §Folded attachments: `e<n>.<seq>` names a message in the n-th earlier
                 // copy of this conversation (SIP-71), whose files are kept.
                 let earlier = first
                     .strip_prefix('e')

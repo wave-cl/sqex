@@ -257,7 +257,7 @@ pub enum ChatError {
     /// its key, and the domain it is reached by where the refusing exchange
     /// knew one. This exchange hands the key's services off there.
     Moved(Option<PubKey>, String),
-    /// SIP-83: this account lives at another exchange this one could not
+    /// SIP-81 §Sealing to a list: this account lives at another exchange this one could not
     /// ask, and the device list here is from before it left -- a device
     /// revoked since may be on it and one linked since is not. No key was
     /// sealed to it; the epoch stays where it is until the home answers.
@@ -268,7 +268,7 @@ pub enum ChatError {
     MailSealedElsewhere(u64),
 }
 
-/// SIP-82: what [`Chat::ensure_home`] found on connecting.
+/// SIP-60 §When a client presents a Move unasked: what [`Chat::ensure_home`] found on connecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeSaid {
     /// This exchange had no record and this store lives here (or nowhere
@@ -514,13 +514,13 @@ impl Chat {
         Ok(out)
     }
 
-    /// SIP-83: an account's devices as a list a key may be sealed to.
+    /// SIP-81 §Sealing to a list: an account's devices as a list a key may be sealed to.
     /// Asked with the newer type byte, which says whose list it is; a
     /// stale one -- this exchange's own registry for an account that lives
     /// elsewhere, because the home could not be asked -- is refused as
     /// [`ChatError::DevicesStale`], so the epoch stays where it is rather
     /// than reaching a device the account may have revoked. An exchange
-    /// from before SIP-83 refuses the type byte as malformed, and is asked
+    /// from before sqex 0.100.0 refuses the type byte as malformed, and is asked
     /// the old way, which is what this client did before.
     async fn devices_to_seal_to(&mut self, account: &PubKey) -> Result<Devices> {
         match self
@@ -848,7 +848,7 @@ pub struct Chat {
     /// this client knows -- the first sign, for a client whose cursor is
     /// above a fork, that the origin changed. Its home is asked again.
     reask_home: HashSet<[u8; 32]>,
-    /// SIP-76: origins this client has hinted its home at this run.
+    /// SIP-60 §A device hints its home: origins this client has hinted its home at this run.
     hinted: HashSet<PubKey>,
     /// SIP-40: the keys each exchange held before its current one, as the
     /// pin store remembers them, newest first. What was signed under them
@@ -1330,7 +1330,7 @@ impl Chat {
                         .encode(),
                     )
                     .await?;
-                // SIP-76: the home knows the origin now, and a home from
+                // SIP-60 §A device hints its home: the home knows the origin now, and a home from
                 // before it does not hint itself.
                 let domain = self
                     .homes
@@ -2376,7 +2376,7 @@ impl Chat {
     /// channel. Only a client holding the account key; a linked device
     /// leaves it to the account.
     ///
-    /// SIP-82: and only where this store is filed under this exchange, or
+    /// SIP-60 §When a client presents a Move unasked: and only where this store is filed under this exchange, or
     /// under none yet. Pointed at an exchange the account has never used,
     /// SIP-60's rule moved the account there on the way in -- a wrong
     /// `--server-host`, a probe -- with no origins, so the real home was
@@ -2398,7 +2398,7 @@ impl Chat {
         if let Some(home) = self.store.filed_under()?
             && home != exchange
         {
-            // SIP-82: a visitor. Where this exchange records *itself* as
+            // SIP-60 §When a client presents a Move unasked: a visitor. Where this exchange records *itself* as
             // the home, one of two parties is behind: this exchange (a
             // Move made here by accident, never displaced) or this store
             // (another device moved the account here since). Only the
@@ -2916,7 +2916,7 @@ impl Chat {
     }
 
     /// SIP-70: fetch and open one item with every key this device holds --
-    /// its own, then the account's (SIP-62, SIP-67). `Ok(None)` where
+    /// its own, then the account's (SIP-62 §Which account a device is). `Ok(None)` where
     /// there is no such item; `Err(MailSealedElsewhere)` where it is for a
     /// key this device does not hold, which it must then not delete.
     pub async fn mail_read(&mut self, id: u64) -> Result<Option<(PubKey, Vec<u8>)>> {
@@ -2965,7 +2965,7 @@ impl Chat {
         Ok(body.first().copied().unwrap_or(0) != 0)
     }
 
-    /// SIP-67: whose device this is, as the registry has it -- the one party
+    /// SIP-62 §Which account a device is: whose device this is, as the registry has it -- the one party
     /// that knows after a handover moved it.
     pub async fn whose(&mut self) -> Result<sqex_proto::device::Whose> {
         if self.offline() {
@@ -2996,7 +2996,7 @@ impl Chat {
         sqex_proto::device::Whose::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
-    /// SIP-67: follow this device's own account as the registry has it.
+    /// SIP-62 §Which account a device is: follow this device's own account as the registry has it.
     /// Where the account answered is not the one the store names -- a
     /// handover (SIP-62) presented from a sibling moved this device -- the
     /// store's account, its credential and its direct messages follow, as
@@ -3004,7 +3004,7 @@ impl Chat {
     pub async fn follow_account(&mut self) -> Result<Option<PubKey>> {
         let whose = match self.whose().await {
             Ok(w) => w,
-            // An exchange from before SIP-67 has no such answer; the store
+            // An exchange from before 0.84.0 has no such answer; the store
             // stands.
             Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -4281,7 +4281,7 @@ impl Chat {
             .entry(home.origin)
             .or_insert_with(|| predecessors_of(&home.origin));
         self.homes.insert(*channel, home.clone());
-        // SIP-76: a channel of this account's that lives elsewhere is one
+        // SIP-60 §A device hints its home: a channel of this account's that lives elsewhere is one
         // its home should be pulling; said once per origin.
         if home.origin != self.exchange {
             let (origin, domain) = (home.origin, home.domain.clone());
@@ -4596,7 +4596,7 @@ impl Chat {
         Ok(self.store.drop_stranded(channel, seq)?)
     }
 
-    /// SIP-76: tell this client's home to pull the account's channels from
+    /// SIP-60 §A device hints its home: tell this client's home to pull the account's channels from
     /// `origin`, reached by `domain` where the home does not know it. Once
     /// per origin per run; `Ok(false)` where the exchange is not this
     /// account's home, or predates the route.
@@ -4852,13 +4852,13 @@ impl Chat {
     /// account held elsewhere.
     /// The account's seed, where this device holds it: its own where it
     /// is the account, the one it made (SIP-62) or was entrusted with
-    /// (SIP-67) otherwise.
+    /// (SIP-62 §Entrusting the key) otherwise.
     pub fn account_seed(&self) -> Option<[u8; 32]> {
         if self.me == self.device {
             return Some(self.seed);
         }
         // Only the key of the account this device is *now*: a seed kept
-        // from before a handover another device presented (SIP-67) would
+        // from before a handover another device presented (SIP-62 §Entrusting the key) would
         // sign as a retired account, and every verifier would take it.
         self.store.account_seed().ok().flatten().filter(|seed| {
             PubKey::new(
@@ -4869,13 +4869,13 @@ impl Chat {
         })
     }
 
-    /// SIP-67: keep an account seed a sibling entrusted to this device.
+    /// SIP-62 §Entrusting the key: keep an account seed a sibling entrusted to this device.
     /// The store keeps it sealed; the caller checked it is this account's.
     pub fn take_account_seed(&mut self, seed: [u8; 32]) {
         let _ = self.store.set_account_seed(&seed);
     }
 
-    /// SIP-67: whether this device holds the account key.
+    /// SIP-62 §Entrusting the key: whether this device holds the account key.
     pub fn holds_account_key(&self) -> bool {
         self.account_seed().is_some()
     }
@@ -5839,7 +5839,7 @@ impl Chat {
     ) -> Result<Conversation> {
         let got = match self.ask(channel, wait_secs).await {
             Ok(got) => got,
-            // SIP-71, SIP-75: a channel this client read that its exchange no
+            // SIP-71 §The client keeps what it read: a channel this client read that its exchange no
             // longer serves may have been folded there -- the conversation
             // lives at the lower key's home now, and this exchange may not
             // hold a copy yet, or ever. What was read is kept as an earlier

@@ -1,4 +1,4 @@
-//! SIP-79: a backup follows the account home. What Alice wrote at X before
+//! SIP-68 §Collecting the backup: a backup follows the account home. What Alice wrote at X before
 //! she moved to H is collected by H -- the manifest as X held it and every
 //! blob it names, over the peering link, once -- and read at H exactly as
 //! it was; X releases its copy. A backup Alice writes at H after the Move

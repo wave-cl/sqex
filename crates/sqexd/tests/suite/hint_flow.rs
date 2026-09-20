@@ -1,4 +1,4 @@
-//! SIP-76: a member tells its own home. B cannot find A (its finder does
+//! SIP-60 §A device hints its home: a member tells its own home. B cannot find A (its finder does
 //! not know `a.test`), so SIP-60's telling from B to A never lands. A
 //! direct message Alice opens at B through A still reaches A, because A
 //! hinted itself on the create it carried; a group Bob makes at B with

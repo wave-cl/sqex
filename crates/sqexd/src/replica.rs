@@ -687,7 +687,7 @@ async fn collect_mail(
     }
 }
 
-/// SIP-79: collect `account`'s backup at `origin` -- its former home --
+/// SIP-68 §Collecting the backup: collect `account`'s backup at `origin` -- its former home --
 /// into this exchange's store, as the device wrote it, and tell the origin
 /// the generation stored so it releases its copy. A backup the account
 /// already holds here, of any generation, was written after the Move and
@@ -733,7 +733,7 @@ async fn collect_backup(
         let _ = client.post("/peer/backup/took", took.encode()).await;
         server.devices.mark_backup_collected(account, origin);
         tracing::info!(%origin, %account, generation = held.generation,
-            "an account's backup at its former home was superseded by one written here (SIP-79)");
+            "an account's backup at its former home was superseded by one written here (SIP-68)");
         return;
     }
     for id in &held.blobs {
@@ -781,7 +781,7 @@ async fn collect_backup(
                 let _ = store.drop_backup(account);
                 server.devices.mark_backup_collected(account, origin);
                 tracing::warn!(%origin, %account, generation = held.generation,
-                    "an account's backup at its former home exceeds the backup quota here and was not collected (SIP-79)");
+                    "an account's backup at its former home exceeds the backup quota here and was not collected (SIP-68)");
                 return;
             }
             Err(e) => {
@@ -795,7 +795,7 @@ async fn collect_backup(
             let _ = client.post("/peer/backup/took", took.encode()).await;
             server.devices.mark_backup_collected(account, origin);
             tracing::info!(%origin, %account, generation = held.generation, blobs = held.blobs.len(),
-                "collected an account's backup from its former home (SIP-79)");
+                "collected an account's backup from its former home (SIP-68)");
         }
         // Written here while the blobs were coming: the account's own act
         // stands, as above.
@@ -809,7 +809,7 @@ async fn collect_backup(
     }
 }
 
-/// SIP-84: copy `account`'s wake registrations from `origin` -- its former
+/// SIP-68 §Collecting wakes: copy `account`'s wake registrations from `origin` -- its former
 /// home -- so that what arrives here wakes its devices. Held for the
 /// account, since a device that registered there may never have connected
 /// here; a registration the device has made here since stands. Nothing is
@@ -868,7 +868,7 @@ async fn collect_wakes(
     }
     server.devices.mark_wakes_collected(account, origin);
     if stored > 0 {
-        tracing::info!(%origin, %account, stored, "collected an account's wake registrations from its former home (SIP-84)");
+        tracing::info!(%origin, %account, stored, "collected an account's wake registrations from its former home (SIP-68)");
     }
 }
 
@@ -1554,7 +1554,7 @@ pub async fn run(
     loop {
         match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
             Err(e) => {
-                // SIP-80: a configured origin that takes no connection is
+                // SIP-78 §Backing off: a configured origin that takes no connection is
                 // left alone for a hold that doubles with each miss, from
                 // one interval to an hour, and said so once per hold; a
                 // poke -- a member's act -- still ends the pause early.
@@ -1704,10 +1704,10 @@ pub async fn run_homed(
             .into_iter()
             .map(|(a, o, _)| (a, o))
             .collect();
-        // SIP-79: likewise the account's backup, once per hinted origin.
+        // SIP-68 §Collecting the backup: likewise the account's backup, once per hinted origin.
         let pending_backup: std::collections::HashSet<(PubKey, PubKey)> =
             server.devices.backup_pending(&me).into_iter().collect();
-        // SIP-84: and its wake registrations, copied once per hinted origin.
+        // SIP-68 §Collecting wakes: and its wake registrations, copied once per hinted origin.
         let pending_wakes: std::collections::HashSet<(PubKey, PubKey)> =
             server.devices.wakes_pending(&me).into_iter().collect();
         // SIP-71: a fold record points a member homed here at the
@@ -1735,14 +1735,14 @@ pub async fn run_homed(
                 None => by_origin.push((into, domain, homed)),
             }
         }
-        // SIP-80: an unfound record outlives its hint otherwise, since
+        // SIP-78 §Backing off: an unfound record outlives its hint otherwise, since
         // nothing would try the origin again to clear it.
         server.retain_unfound(&by_origin.iter().map(|(o, _, _)| *o).collect());
         for (origin, domain, accounts) in by_origin {
             if origin == me {
                 continue;
             }
-            // SIP-80: an origin this home could not find or reach is left
+            // SIP-78 §Backing off: an origin this home could not find or reach is left
             // alone for a hold that doubles with each miss, from one cycle
             // to an hour. A stale hint cost one DNS lookup every cycle for
             // two days before this; a member's own act still goes out
@@ -1772,7 +1772,7 @@ pub async fn run_homed(
                         crate::server::UnfoundWhy::Unreachable,
                         interval.as_secs(),
                     );
-                    // SIP-66: the way there is forgotten, so the next cycle
+                    // SIP-64 §Following: the way there is forgotten, so the next cycle
                     // resolves the domain again -- which is how a rotation
                     // is noticed when the address stayed the same.
                     server.forget_forwarder(&origin);
@@ -1879,11 +1879,11 @@ pub async fn run_homed(
                 if pending_mail.contains(&(*account, origin)) {
                     collect_mail(&mut client, &server, &origin, account).await;
                 }
-                // SIP-79: and its backup, once.
+                // SIP-68 §Collecting the backup: and its backup, once.
                 if pending_backup.contains(&(*account, origin)) {
                     collect_backup(&mut client, &server, &origin, account).await;
                 }
-                // SIP-84: and where its devices asked to be woken, once.
+                // SIP-68 §Collecting wakes: and where its devices asked to be woken, once.
                 if pending_wakes.contains(&(*account, origin)) {
                     collect_wakes(&mut client, &server, &origin, account).await;
                 }

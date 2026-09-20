@@ -1,4 +1,4 @@
-//! SIP-73: a room shared across two exchanges that list nobody, on a
+//! SIP-65 §The member's word: a room shared across two exchanges that list nobody, on a
 //! member's word. Alice at X and Bob at Y share a private channel (the
 //! consent SIP-65 reads); Alice joins a room at X naming Y with her word,
 //! Bob joins at Y and, on seeing her homed at X, names X with his; each

@@ -203,7 +203,7 @@ async fn a_client_hands_its_account_over_and_the_conversation_keeps_its_channel(
     );
 }
 
-/// SIP-67. Alice's phone (a linked device) holds a stale store after she
+/// SIP-62 §Which account a device is. Alice's phone (a linked device) holds a stale store after she
 /// hands over from the laptop: on its next start it asks whose device it
 /// is, follows the successor -- account, credential, the direct message
 /// with Bob -- and reads and posts as the new account. It holds no key

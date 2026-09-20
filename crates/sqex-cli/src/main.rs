@@ -2944,7 +2944,7 @@ async fn status(cli: &Cli, cfg: &Config) -> Result<(), String> {
                     )
                 })
                 .unwrap_or_default();
-            // SIP-80: an origin the home task could not find or reach,
+            // SIP-78 §Saying so: an origin the home task could not find or reach,
             // how many cycles in a row, and when it will look again.
             let unfound = o["unfound"]
                 .as_object()

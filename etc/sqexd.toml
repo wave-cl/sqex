@@ -164,7 +164,7 @@ seed_relay_peers = [
 
 # SIP-48: bytes one account may hold at this exchange as its sealed backup
 # (history and keys the exchange cannot read, kept past its own retention).
-# Omit for the reference default of 512 MiB. SIP-79: a backup collected
+# Omit for the reference default of 512 MiB. SIP-68: a backup collected
 # from an account's former home on its Move counts against the same
 # quota; one that would not fit is left where it was and said in the log.
 # backup_quota = 536870912
@@ -184,33 +184,33 @@ seed_relay_peers = [
 # SIP-78: an origin that answers a peering write with its limit holds this
 # exchange's writes to it for the seconds it gave; a member whose act was
 # carried there is answered the origin's limit, or origin_refused where it
-# said no, and origin_away only where it did not answer. What each origin
-# last refused is under `origins` in GET /status. Nothing to configure.
-#
-# SIP-80: an origin the home task cannot find or reach is left alone for a
-# hold that doubles with each miss, from home_secs to an hour, and cleared
-# by its first answer. Every origin an account here hinted at is listed
-# under `origins`, an unfound one with its count and next try; `sqex
-# status` prints them. A hint that stays unfound for hundreds of tries is
-# the account's to withdraw (a Move with no origins). Nothing to configure.
+# said no, and origin_away only where it did not answer. An origin the home
+# task cannot find or reach at all is left alone for a hold that doubles
+# with each miss, from home_secs to an hour, and cleared by its first
+# answer. Every origin this exchange forwards to, reached, was refused by,
+# or an account here hinted at is listed under `origins` in GET /status --
+# what it last refused, or that it is unfound, with its count and next try;
+# `sqex status` prints them. A hint that stays unfound for hundreds of
+# tries is the account's to withdraw (a Move with no origins). Nothing to
+# configure.
 #
 # SIP-81: /device/list for an account that lives at another exchange answers
 # what its home lists -- whether or not devices of it registered here before
 # it moved -- kept a minute; this exchange's own registry only where the
 # home cannot be asked. Nothing to configure.
 #
-# SIP-84: on an account's Move here, its wake registrations (SIP-45) at each
+# SIP-68: on an account's Move here, its wake registrations (SIP-45) at each
 # hinted origin are copied and held for the account, so what arrives here
 # wakes its devices before they next connect; an endpoint this exchange's
 # own policy (wake_loopback) would refuse is not held. The former home
 # keeps its own and goes on waking for the channels it orders.
 
-# SIP-76: a device may tell this exchange, as its home, which origin to
+# SIP-60: a device may tell this exchange, as its home, which origin to
 # pull its account's channels from (/account/hint) -- and a create this
 # exchange carries elsewhere for an account homed here records the origin
 # by itself. Hints are kept 32 per account. Nothing to configure.
 
-# SIP-73: with calls open, a room is shared with an exchange this one does
+# SIP-65 §The member's word: with calls open, a room is shared with an exchange this one does
 # not list on a member's word -- the member names the exchange (and its
 # domain) in the join and signs for it -- and a share from such an exchange
 # is kept when its signer already shares a private channel with a member of
