@@ -144,6 +144,9 @@ async fn a_member_reaches_the_target_through_its_home() {
     assert_eq!(code, 200);
     let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(status["tunnels"], 0, "B carries nothing; A does");
+    // One connection at B: the tunnelled one. A dial that reached B some
+    // other way as well would count twice.
+    assert_eq!(status["connections"], 1, "B accepted more than the tunnelled connection");
     let (up, down) = carrier.bytes();
     assert!(
         up > 0 && down > 0,
