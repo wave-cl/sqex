@@ -396,10 +396,12 @@ pub struct Server {
     pub(crate) tunnels_per_member: usize,
     pub(crate) tunnel_bytes_per_sec: u64,
     pub(crate) tunnels: Mutex<HashMap<PubKey, Vec<crate::tunnel::Open>>>,
-    /// The address the last accepted connection came from -- what the
-    /// "connection ended" line prints -- so a test can read what a target
-    /// exchange observed of a tunnelled client without parsing a log.
-    last_peer: Mutex<Option<std::net::SocketAddr>>,
+    /// The last accepted connection as the transport saw it -- where it
+    /// came from, the MAC1-verified transport key, the carried identity;
+    /// what the "connection ended" line prints -- so a test can read what a
+    /// target exchange observed of a tunnelled member without parsing a
+    /// log: the home's address, and the member's own keys.
+    last_peer: Mutex<Option<Peer>>,
     /// SIP-65: the `(caller, eph)` pairs rung on lately, so a word is
     /// honoured once within `CALL_WORD_SECS`. Value: when it was seen.
     call_words: Mutex<HashMap<(PubKey, [u8; 32]), u64>>,
@@ -550,7 +552,21 @@ impl Server {
 
     /// Where the last accepted connection came from.
     pub fn last_peer_addr(&self) -> Option<std::net::SocketAddr> {
-        *self.last_peer.lock().unwrap()
+        self.last_peer.lock().unwrap().as_ref().map(|p| p.addr)
+    }
+
+    /// The MAC1-verified transport key (SIP-2) of the last accepted connection.
+    pub fn last_peer_key(&self) -> Option<[u8; 32]> {
+        self.last_peer.lock().unwrap().as_ref().and_then(|p| p.key)
+    }
+
+    /// The identity (SIP-3) the last accepted connection carried.
+    pub fn last_peer_identity(&self) -> Option<PubKey> {
+        self.last_peer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|p| p.identity)
     }
 
     fn sync_transport(&self, state: &State) {
@@ -1998,7 +2014,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 addr: incoming.remote_address(),
             };
             let server = Arc::clone(&server);
-            *server.last_peer.lock().unwrap() = Some(peer.addr);
+            *server.last_peer.lock().unwrap() = Some(peer);
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
@@ -2013,6 +2029,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
                         } else if alpn.as_deref() == Some(sqex_proto::tunnel::ALPN) {
                             crate::tunnel::serve(&server, conn, peer).await;
                         } else {
+                            let identity = peer.identity;
                             let ended = serve_h3(server, conn.clone(), peer).await;
                             // **The transport, in numbers, once per
                             // connection.** A slow download looked identical
@@ -2026,6 +2043,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
                             let s = conn.stats();
                             tracing::info!(
                                 peer = %conn.remote_address(),
+                                identity = %identity.map(|k| k.to_string()).unwrap_or_default(),
                                 rtt_ms = s.path.rtt.as_millis() as u64,
                                 cwnd = s.path.cwnd,
                                 mtu = s.path.current_mtu,

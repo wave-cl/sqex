@@ -136,6 +136,9 @@ async fn a_client_through_its_home_comes_back_with_a_fresh_tunnel() {
         b.server.last_peer_addr().map(|p| p.port()),
         Some(first.port())
     );
+    // Transparent: B authenticated the member's own identity, carried
+    // through the home, not anything of the home's.
+    assert_eq!(b.server.last_peer_identity(), Some(me));
 
     // Starting over closes the tunnel held, and the next dial opens
     // another before it dials: a new socket at A, and B answers again.

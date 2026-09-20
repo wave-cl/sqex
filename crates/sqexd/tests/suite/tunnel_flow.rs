@@ -164,11 +164,33 @@ async fn a_member_reaches_the_target_through_its_home() {
     );
     assert_ne!(seen, carrier.local_addr(), "B never saw the member's side");
 
-    // B authenticated the member, not the home: an identified route knows
-    // who asked.
+    // **And whose connection it was.** The home only carried it: B's
+    // transport key for this connection is the member's own (SIP-2, the
+    // X25519 derivation of the identity) and the identity carried is the
+    // member's (SIP-3) -- not the home's, which never handshook with B.
+    assert_eq!(
+        b.server.last_peer_identity(),
+        Some(me),
+        "B authenticated somebody other than the member"
+    );
+    let x_of = |k: &[u8; 32]| {
+        squic::crypto::ed25519_public_to_x25519(k)
+            .unwrap()
+            .to_bytes()
+    };
+    assert_eq!(
+        b.server.last_peer_key(),
+        Some(x_of(me.as_bytes())),
+        "B's transport key for the connection is not the member's"
+    );
+    assert_ne!(
+        b.server.last_peer_key(),
+        Some(x_of(&a.key)),
+        "B saw the home's key"
+    );
+    assert_ne!(b.server.last_peer_identity(), Some(PubKey::new(a.key)));
     let (code, body) = through.get("/exchange/ping").await.unwrap();
     assert_eq!(code, 200, "{}", common::said(&body));
-    let _ = me;
 
     // A's own status counts it, and stops counting when the member goes.
     let mut at_a = Client::connect_as(a.addr, &a.key, &seed).await.unwrap();
