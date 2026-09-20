@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Cut a release: bump the workspace version, lock, commit, push main, tag,
+# push the tag, and watch the release run to the end.
+#
+#   scripts/release 0.1.39
+#
+# What it refuses, because each has cost a release: a dirty tree (the tag
+# would not be what was tested); a version that is not greater than the
+# current one; a tag that already exists; a main that is behind origin.
+# The branch is pushed *before* the tag -- a tag push succeeds even when the
+# branch push is rejected, and the release then builds a commit main never
+# had.
+set -euo pipefail
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+new="${1:-}"
+[[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/release X.Y.Z" >&2; exit 2; }
+name="$(basename "$repo")"
+
+[[ -z "$(git status --porcelain)" ]] || { echo "refusing: the tree is not clean" >&2; git status --short >&2; exit 1; }
+[[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || { echo "refusing: not on main" >&2; exit 1; }
+git fetch -q origin main
+[[ "$(git rev-parse HEAD)" == "$(git merge-base HEAD origin/main)" || "$(git rev-parse origin/main)" == "$(git merge-base HEAD origin/main)" ]] \
+    || { echo "refusing: main and origin/main have diverged" >&2; exit 1; }
+! git rev-parse -q --verify "refs/tags/v${new}" >/dev/null || { echo "refusing: v${new} already exists" >&2; exit 1; }
+
+# The workspace version line, and only that one: the first `version =` at
+# the top of Cargo.toml. Re-read rather than assumed.
+line="$(grep -n '^version = "' Cargo.toml | head -1 | cut -d: -f1)"
+current="$(sed -n "${line}s/^version = \"\(.*\)\"/\1/p" Cargo.toml)"
+[[ "$(printf '%s\n%s\n' "$current" "$new" | sort -V | tail -1)" == "$new" && "$current" != "$new" ]] \
+    || { echo "refusing: $new is not newer than the current $current" >&2; exit 1; }
+
+echo "$name $current -> $new"
+sed -i '' "${line}s/^version = \"${current}\"/version = \"${new}\"/" Cargo.toml
+cargo update -q -w
+git add Cargo.toml Cargo.lock
+git commit -q -m "$name $new"
+git push -q origin main
+git tag "v${new}"
+git push -q origin "v${new}"
+echo "pushed main and v${new} at $(date -u +%H:%M:%S)"
+
+# Watch the run the tag started. It can take a moment to appear.
+for _ in $(seq 1 30); do
+    id="$(gh run list --workflow release.yml --limit 5 --json databaseId,headBranch \
+          --jq ".[] | select(.headBranch == \"v${new}\") | .databaseId" | head -1)"
+    [[ -n "$id" ]] && break
+    sleep 5
+done
+[[ -n "${id:-}" ]] || { echo "no release run appeared for v${new}; dispatch it: gh workflow run release.yml -f tag=v${new}" >&2; exit 1; }
+echo "release run $id"
+gh run watch "$id" --exit-status
+gh release view "v${new}" --json publishedAt,assets --jq '"published \(.publishedAt), \(.assets | length) assets"'
