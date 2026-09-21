@@ -78,6 +78,16 @@ pub async fn serve(server: &Arc<Server>, conn: Connection, peer: Peer) {
         return;
     };
     tracing::info!(member = %who, from = %peer.addr, "tunnel connection");
+    // SIP-85 §Closing: "when the member is no longer admitted". The door
+    // closes the connections of a key it stops allowing by walking the
+    // registry the HTTP/3 connections are in -- and a tunnel connection was
+    // not in it, so a member removed from the list kept every tunnel it had
+    // open (found by the test that removed one, 2026-09-21). Registered
+    // under its transport key like any other, and taken out on every
+    // ending, by its own id.
+    if let Some(key) = peer.key {
+        server.live_conns.add_keyed(key, conn.clone());
+    }
     while let Ok((send, recv)) = conn.accept_bi().await {
         let server = Arc::clone(server);
         tokio::spawn(async move {
@@ -86,6 +96,7 @@ pub async fn serve(server: &Arc<Server>, conn: Connection, peer: Peer) {
     }
     // The connection ended; every tunnel on it ends with its stream, and
     // its stream's task takes the registry entry out as it goes.
+    server.live_conns.remove_keyed(&conn);
     tracing::info!(member = %who, "tunnel connection ended");
 }
 
@@ -244,7 +255,7 @@ async fn carry(
     let down_bytes = Arc::new(AtomicU64::new(0));
     let last = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
-    let idle = Duration::from_secs(tunnel::IDLE_SECS);
+    let idle = Duration::from_secs(server.tunnel_idle_secs);
     let stamp =
         move |last: &AtomicU64| last.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
 
@@ -253,18 +264,24 @@ async fn carry(
         let up_bytes = Arc::clone(&up_bytes);
         let last = Arc::clone(&last);
         let mut bucket = Bucket::new(server.tunnel_bytes_per_sec);
+        let server = Arc::clone(&server);
         tokio::spawn(async move {
             loop {
                 match tunnel::read_packet(&mut recv).await {
                     Ok(Some(bytes)) => {
                         stamp(&last);
                         if !bucket.take(bytes.len()) {
+                            server.tunnel_dropped.0.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         if socket.send(&bytes).await.is_err() {
                             return "socket send failed";
                         }
                         up_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        server
+                            .tunnel_forwarded
+                            .0
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     }
                     Ok(None) => return "member gone",
                     Err(_) => return "member sent a bad packet",
@@ -277,6 +294,7 @@ async fn carry(
         let down_bytes = Arc::clone(&down_bytes);
         let last = Arc::clone(&last);
         let mut bucket = Bucket::new(server.tunnel_bytes_per_sec);
+        let server = Arc::clone(&server);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
@@ -285,12 +303,17 @@ async fn carry(
                 };
                 stamp(&last);
                 if n > tunnel::MAX_PACKET || !bucket.take(n) {
+                    server.tunnel_dropped.1.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 if send.write_all(&tunnel::packet(&buf[..n])).await.is_err() {
                     return "member gone";
                 }
                 down_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                server
+                    .tunnel_forwarded
+                    .1
+                    .fetch_add(n as u64, Ordering::Relaxed);
             }
         })
     };
@@ -318,6 +341,7 @@ async fn carry(
     // Whichever ended it, the rest is aborted with it: the socket closes
     // with its last holder, the stream with its task.
     give_back(&server);
+    server.tunnel_closes.lock().unwrap().push(why);
     tracing::info!(
         member = %who,
         target = %target,

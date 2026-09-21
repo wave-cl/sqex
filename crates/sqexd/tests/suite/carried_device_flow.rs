@@ -40,7 +40,7 @@ fn identity(b: u8) -> ([u8; 32], PubKey) {
     (sk.to_bytes(), PubKey::new(sk.verifying_key().to_bytes()))
 }
 
-async fn admin(
+pub(crate) async fn admin(
     addr: SocketAddr,
     server_pub: [u8; 32],
     admin_seed: [u8; 32],

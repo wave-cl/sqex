@@ -179,7 +179,7 @@ pub struct Peer {
 /// identity may hold several connections at once; a datagram goes to all of
 /// them, and the peer's session keys mean only the intended one can open it.
 #[derive(Default)]
-struct Connections {
+pub(crate) struct Connections {
     by_identity: Mutex<HashMap<PubKey, Vec<quinn::Connection>>>,
     /// Every connection with a verified transport key, whether or not it
     /// advertised an identity -- the whitelist is a set of transport keys,
@@ -189,11 +189,11 @@ struct Connections {
 }
 
 impl Connections {
-    fn add_keyed(&self, key: [u8; 32], conn: quinn::Connection) {
+    pub(crate) fn add_keyed(&self, key: [u8; 32], conn: quinn::Connection) {
         self.by_key.lock().unwrap().push((key, conn));
     }
 
-    fn remove_keyed(&self, conn: &quinn::Connection) {
+    pub(crate) fn remove_keyed(&self, conn: &quinn::Connection) {
         self.by_key
             .lock()
             .unwrap()
@@ -333,7 +333,7 @@ pub struct Server {
     profiles: Profiles,
     admissions: Admissions,
     pub(crate) sessions: Sessions,
-    live_conns: Connections,
+    pub(crate) live_conns: Connections,
     /// SIP-39: cross-exchange call relay — the peer allowlist, the bridge
     /// ceiling, and the live links and bridges.
     pub(crate) relay: crate::relay::Relay,
@@ -394,7 +394,16 @@ pub struct Server {
     pub(crate) tunnel: bool,
     pub(crate) tunnels_per_member: usize,
     pub(crate) tunnel_bytes_per_sec: u64,
+    pub(crate) tunnel_idle_secs: u64,
     pub(crate) tunnels: Mutex<HashMap<PubKey, Vec<crate::tunnel::Open>>>,
+    /// Why each tunnel closed, in order, and the packets the byte buckets
+    /// dropped (up, down) over every tunnel -- what the "tunnel closed"
+    /// line says, readable by a test without the log.
+    pub(crate) tunnel_closes: Mutex<Vec<&'static str>>,
+    pub(crate) tunnel_dropped: (AtomicU64, AtomicU64),
+    /// Bytes actually carried on (up, down), over every tunnel: what the
+    /// buckets let through, as against what the member sent.
+    pub(crate) tunnel_forwarded: (AtomicU64, AtomicU64),
     /// The last accepted connection as the transport saw it -- where it
     /// came from, the MAC1-verified transport key, the carried identity;
     /// what the "connection ended" line prints -- so a test can read what a
@@ -557,6 +566,30 @@ impl Server {
     /// The MAC1-verified transport key (SIP-2) of the last accepted connection.
     pub fn last_peer_key(&self) -> Option<[u8; 32]> {
         self.last_peer.lock().unwrap().as_ref().and_then(|p| p.key)
+    }
+
+    /// SIP-85: why each tunnel this exchange carried has closed, oldest
+    /// first -- the `why` of the "tunnel closed" line.
+    pub fn tunnel_closes(&self) -> Vec<&'static str> {
+        self.tunnel_closes.lock().unwrap().clone()
+    }
+
+    /// SIP-85 §Limits: packets the byte buckets dropped, (up, down), over
+    /// every tunnel this exchange has carried.
+    pub fn tunnel_dropped(&self) -> (u64, u64) {
+        (
+            self.tunnel_dropped.0.load(Ordering::Relaxed),
+            self.tunnel_dropped.1.load(Ordering::Relaxed),
+        )
+    }
+
+    /// SIP-85 §Limits: bytes carried on, (up, down), over every tunnel --
+    /// what the buckets let through.
+    pub fn tunnel_forwarded(&self) -> (u64, u64) {
+        (
+            self.tunnel_forwarded.0.load(Ordering::Relaxed),
+            self.tunnel_forwarded.1.load(Ordering::Relaxed),
+        )
     }
 
     /// The identity (SIP-3) the last accepted connection carried.
@@ -1713,6 +1746,10 @@ pub async fn bind_with(
         tunnel: config.tunnel,
         tunnels_per_member: config.tunnels_per_member,
         tunnel_bytes_per_sec: config.tunnel_bytes_per_sec,
+        tunnel_idle_secs: config.tunnel_idle_secs,
+        tunnel_closes: Mutex::new(Vec::new()),
+        tunnel_dropped: (AtomicU64::new(0), AtomicU64::new(0)),
+        tunnel_forwarded: (AtomicU64::new(0), AtomicU64::new(0)),
         tunnels: Mutex::new(HashMap::new()),
         last_peer: Mutex::new(None),
         call_words: Mutex::new(HashMap::new()),
@@ -1916,8 +1953,8 @@ pub async fn serve(bound: Bound) -> Result<()> {
         calls = if server.open_calls { "open" } else { "listed" },
         tunnel = %if server.tunnel {
             format!(
-                "on ({} per member, {} bytes/s)",
-                server.tunnels_per_member, server.tunnel_bytes_per_sec
+                "on ({} per member, {} bytes/s, idle {} s)",
+                server.tunnels_per_member, server.tunnel_bytes_per_sec, server.tunnel_idle_secs
             )
         } else {
             "off".to_string()

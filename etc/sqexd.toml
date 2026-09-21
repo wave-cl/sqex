@@ -142,6 +142,7 @@ challenge_ttl_secs = 30
 # tunnel = false
 # tunnels_per_member = 4          # open at once, per member
 # tunnel_bytes_per_sec = 2097152  # each direction, per tunnel; over it, packets drop
+# tunnel_idle_secs = 60           # nothing carried either way for this long: closed
 
 # ---------------------------------------------------------------------------
 # SIP-39: cross-exchange calls.

@@ -270,6 +270,11 @@ pub struct FileConfig {
     /// direction; a packet over budget is dropped. Default 2 MiB.
     #[serde(default)]
     pub tunnel_bytes_per_sec: Option<u64>,
+    /// SIP-85 §Limits: seconds a tunnel may carry nothing in either
+    /// direction before the home closes it. Default 60, the SIP's
+    /// reference value; zero is refused at load.
+    #[serde(default)]
+    pub tunnel_idle_secs: Option<u64>,
     /// SIP-56: rate limits, per account. Each is `[n, seconds]`: n in any
     /// window of that many seconds, refilling steadily; `[0, 0]` is
     /// unlimited. Omitted ones take SIP-56's defaults.
@@ -440,6 +445,8 @@ pub struct Config {
     pub tunnels_per_member: usize,
     /// SIP-85 §Limits: bytes per second per tunnel, each direction.
     pub tunnel_bytes_per_sec: u64,
+    /// SIP-85 §Limits: the idle span after which a tunnel is closed.
+    pub tunnel_idle_secs: u64,
     /// SIP-56: the rate limits.
     pub limits: crate::limits::Limits,
 }
@@ -664,6 +671,20 @@ impl FileConfig {
             tunnel: self.tunnel,
             tunnels_per_member: self.tunnels_per_member.unwrap_or(4).max(1) as usize,
             tunnel_bytes_per_sec: self.tunnel_bytes_per_sec.unwrap_or(2 << 20).max(1),
+            tunnel_idle_secs: match self.tunnel_idle_secs {
+                // A zero span would close every tunnel at its first quiet
+                // tick; unlimited is not on offer either -- a tunnel nobody
+                // uses holds a socket. Refuse rather than clamp, so the
+                // operator hears it.
+                Some(0) => {
+                    return Err(Error::Malformed(
+                        "tunnel_idle_secs must be a positive number of seconds (default 60)"
+                            .into(),
+                    ));
+                }
+                Some(s) => s,
+                None => sqex_proto::tunnel::IDLE_SECS,
+            },
             limits: self.limits.resolve(),
         })
     }

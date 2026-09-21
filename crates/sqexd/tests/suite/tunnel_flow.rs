@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sqex_proto::Op;
 use sqex_proto::home::{Move, Moving};
 use sqex_proto::tunnel::Carrier;
 use sqexd::config::FileConfig;
@@ -18,6 +19,7 @@ use sqexd::server::Server;
 use sqnr::Client;
 use sqnr_core::PubKey;
 
+use crate::carried_device_flow::admin;
 use crate::common;
 use crate::open_calls_flow::{identity, now};
 
@@ -28,6 +30,17 @@ struct Exchange {
     _dir: tempfile::TempDir,
 }
 
+/// What an exchange is started with, beyond carrying or not.
+#[derive(Default)]
+struct Opts {
+    per_member: u32,
+    /// SIP-85 §Limits: `tunnel_idle_secs`; the default (60) when None.
+    idle_secs: Option<u64>,
+    /// SIP-85 §Limits: `tunnel_bytes_per_sec`; the default (2 MiB) when None.
+    bytes_per_sec: Option<u64>,
+    admins: Vec<PubKey>,
+}
+
 /// An exchange on loopback, carrying connections or not, finding `found`
 /// without DNS.
 async fn exchange(
@@ -36,13 +49,46 @@ async fn exchange(
     domain: &str,
     found: &[(&str, PubKey, SocketAddr)],
 ) -> Exchange {
+    exchange_with(
+        tunnel,
+        Opts {
+            per_member,
+            ..Default::default()
+        },
+        domain,
+        found,
+    )
+    .await
+}
+
+async fn exchange_with(
+    tunnel: bool,
+    opts: Opts,
+    domain: &str,
+    found: &[(&str, PubKey, SocketAddr)],
+) -> Exchange {
+    let per_member = opts.per_member;
+    let admins = opts
+        .admins
+        .iter()
+        .map(|k| format!("{:?}", k.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let idle = opts
+        .idle_secs
+        .map(|s| format!("tunnel_idle_secs = {s}\n"))
+        .unwrap_or_default();
+    let bytes = opts
+        .bytes_per_sec
+        .map(|b| format!("tunnel_bytes_per_sec = {b}\n"))
+        .unwrap_or_default();
     for _ in 0..5 {
         let dir = tempfile::tempdir().unwrap();
         let listen = free_port();
         let config_toml = format!(
-            "listen = {:?}\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+            "listen = {:?}\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{admins}]\n\
              welcome_channel = \"\"\ndomain = {domain:?}\nopen_peering = true\n\
-             tunnel = {tunnel}\ntunnels_per_member = {per_member}\nhome_secs = 1\n",
+             tunnel = {tunnel}\ntunnels_per_member = {per_member}\nhome_secs = 1\n{idle}{bytes}",
             listen.to_string(),
             dir.path().join("host_key").to_string_lossy(),
             dir.path().join("sqex.state").to_string_lossy(),
@@ -382,4 +428,303 @@ async fn a_second_dial_through_one_carrier_is_dropped_not_multiplexed() {
     // And the first is untouched by the attempt.
     let (code, _) = first.get("/status").await.expect("the first still answers");
     assert_eq!(code, 200);
+}
+
+/// A whitelisted exchange. `member` is on the list; nobody has presented a
+/// Move. Returns A (carrying, with `admin` as its administrator) and B.
+async fn listed_pair(admin_key: PubKey) -> (Exchange, Exchange) {
+    let b = exchange(false, 4, "b.test", &[]).await;
+    let a = exchange_with(
+        true,
+        Opts {
+            per_member: 4,
+            admins: vec![admin_key],
+            ..Default::default()
+        },
+        "a.test",
+        &[("b.test", PubKey::new(b.key), b.addr)],
+    )
+    .await;
+    (a, b)
+}
+
+async fn settle(a: &Exchange, open: usize) -> bool {
+    for _ in 0..60 {
+        if a.server.tunnels_open() == open {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// SIP-85 §Opening a tunnel, the whitelist branch: with the list on, a
+/// listed key is a member A carries for -- no Move presented, no account
+/// homed here -- and it stops being one the moment it is removed: the
+/// door closes its connections, the tunnel among them, and the next open
+/// is dropped at the handshake.
+#[tokio::test]
+async fn a_listed_key_is_carried_for_without_a_move() {
+    let (admin_seed, admin_key) = identity(0x61);
+    let (a, b) = listed_pair(admin_key).await;
+    let (seed, me) = identity(0x62);
+    let v = admin(
+        a.addr,
+        a.key,
+        admin_seed,
+        vec![
+            Op::WhitelistEnable,
+            Op::WhitelistAdd {
+                key: me,
+                label: Some("member".into()),
+            },
+        ],
+    )
+    .await;
+    assert_eq!(v["results"][1]["ok"], true);
+    // No Move: A has no home on record for the member, so the list is
+    // what admits it. (Asked as the member would ask.)
+    let mut at_a = Client::connect_as(a.addr, &a.key, &seed).await.unwrap();
+    let (_, homed) = at_a
+        .post("/account/home", me.as_bytes().to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqex_proto::home::Homed::decode(&homed).unwrap().since,
+        0,
+        "the member is homed here; the list is not what admits it"
+    );
+    drop(at_a);
+
+    let carrier = Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test")
+        .await
+        .expect("a listed key's tunnel opens");
+    let mut through = Client::connect_as(carrier.local_addr(), &b.key, &seed)
+        .await
+        .expect("B answers through the tunnel");
+    let (code, _) = through.get("/status").await.unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(b.server.last_peer_identity(), Some(me));
+    assert_eq!(a.server.tunnels_open(), 1);
+
+    // Removed from the list: no longer admitted, no longer carried for.
+    let v = admin(a.addr, a.key, admin_seed, vec![Op::WhitelistRemove(me)]).await;
+    assert_eq!(v["results"][0]["changed"], true);
+    assert!(
+        settle(&a, 0).await,
+        "the tunnel outlived the member's admission: {:?}",
+        a.server.tunnel_closes()
+    );
+    assert!(carrier.closed(), "the member did not see its tunnel end");
+    assert_eq!(
+        a.server.tunnel_closes().last(),
+        Some(&"member gone"),
+        "closed with the member's connection, which the door closed"
+    );
+    // The next open is dropped at the door -- the transport's silence, not
+    // a refusal: a timeout, and nothing at A to show for it.
+    let again = tokio::time::timeout(
+        Duration::from_secs(4),
+        Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test"),
+    )
+    .await;
+    assert!(
+        !matches!(again, Ok(Ok(_))),
+        "a removed key opened a tunnel"
+    );
+    assert_eq!(a.server.tunnels_open(), 0);
+}
+
+/// A list that is off admits nobody to a tunnel on its account: the keys on
+/// it are inert, the door is open, and only an account homed here is
+/// carried for. The stranger's refusal, then the homed branch on the same
+/// exchange.
+#[tokio::test]
+async fn a_list_that_is_off_admits_nobody_to_a_tunnel() {
+    let (admin_seed, admin_key) = identity(0x63);
+    let (a, b) = listed_pair(admin_key).await;
+    let (seed, me) = identity(0x64);
+    let v = admin(
+        a.addr,
+        a.key,
+        admin_seed,
+        vec![
+            Op::WhitelistAdd {
+                key: me,
+                label: Some("listed but the list is off".into()),
+            },
+            Op::WhitelistDisable,
+        ],
+    )
+    .await;
+    assert_eq!(v["results"][0]["ok"], true);
+    // The door is open: the member connects and is served.
+    let mut at_a = Client::connect_as(a.addr, &a.key, &seed).await.unwrap();
+    let (code, _) = at_a.get("/status").await.unwrap();
+    assert_eq!(code, 200);
+    // And is not carried for.
+    let e = Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test")
+        .await
+        .expect_err("a key on a list that is off is a stranger to the tunnel");
+    assert!(e.contains("refused"), "{e}");
+    assert_eq!(a.server.tunnels_open(), 0);
+    // Homed here, it is a member whatever the list says.
+    home_at(&a, &seed).await;
+    let carrier = Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test")
+        .await
+        .expect("the homed branch admits with the list off");
+    let mut through = Client::connect_as(carrier.local_addr(), &b.key, &seed)
+        .await
+        .unwrap();
+    let (code, _) = through.get("/status").await.unwrap();
+    assert_eq!(code, 200);
+    assert_eq!(b.server.last_peer_identity(), Some(me));
+}
+
+/// SIP-85 §Closing: a tunnel that carries nothing either way for
+/// `tunnel_idle_secs` is closed by the home, and the member sees its stream
+/// end; one that carries something is not. Three readings side by side:
+/// idle at 2 s closes, busy at 2 s stays, idle at the default stays.
+#[tokio::test]
+async fn an_idle_tunnel_closes_and_a_busy_one_does_not() {
+    let b = exchange(false, 4, "b.test", &[]).await;
+    let quick = exchange_with(
+        true,
+        Opts {
+            per_member: 4,
+            idle_secs: Some(2),
+            ..Default::default()
+        },
+        "a.test",
+        &[("b.test", PubKey::new(b.key), b.addr)],
+    )
+    .await;
+    let (seed, _) = identity(0x65);
+    home_at(&quick, &seed).await;
+
+    // Idle: opened, and nothing sent through it.
+    let idle = Carrier::open(quick.addr, &quick.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    assert!(
+        settle(&quick, 0).await,
+        "an idle tunnel stayed open past 6 s: {:?}",
+        quick.server.tunnel_closes()
+    );
+    assert_eq!(quick.server.tunnel_closes(), vec!["idle"]);
+    assert!(idle.closed(), "the member did not see the idle close");
+
+    // Busy: a dial through it, asked something every half second for 5 s,
+    // which is two and a half idle spans.
+    let busy = Carrier::open(quick.addr, &quick.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    let mut through = Client::connect_as(busy.local_addr(), &b.key, &seed)
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        let (code, _) = through.get("/status").await.expect("the busy tunnel carries");
+        assert_eq!(code, 200);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(quick.server.tunnels_open(), 1, "the busy tunnel was closed");
+    assert_eq!(
+        quick.server.tunnel_closes(),
+        vec!["idle"],
+        "a second close happened while the tunnel was busy"
+    );
+    assert!(!busy.closed());
+
+    // The control: the same idle tunnel under the default span is still
+    // open when the 2 s one had long closed.
+    let slow = exchange(true, 4, "a2.test", &[("b.test", PubKey::new(b.key), b.addr)]).await;
+    home_at(&slow, &seed).await;
+    let idle = Carrier::open(slow.addr, &slow.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(slow.server.tunnels_open(), 1, "closed under the 60 s default");
+    assert!(slow.server.tunnel_closes().is_empty());
+    assert!(!idle.closed());
+}
+
+/// SIP-85 §Limits: over its byte budget a tunnel drops packets, as UDP
+/// drops -- it does not queue them -- and the member's connection, which is
+/// QUIC, recovers. Ten 60 KB posts through a 64 KB/s tunnel: every one
+/// completes, packets were dropped, and what went up is bounded by the
+/// budget plus one second's burst. The control, the same posts through an
+/// unbudgeted home: nothing dropped.
+#[tokio::test]
+async fn a_tunnel_over_its_byte_budget_drops_and_the_connection_survives() {
+    const RATE: u64 = 64 * 1024;
+    let b = exchange(false, 4, "b.test", &[]).await;
+    let tight = exchange_with(
+        true,
+        Opts {
+            per_member: 4,
+            bytes_per_sec: Some(RATE),
+            ..Default::default()
+        },
+        "a.test",
+        &[("b.test", PubKey::new(b.key), b.addr)],
+    )
+    .await;
+    let (seed, _) = identity(0x66);
+    home_at(&tight, &seed).await;
+    let body = vec![0x5au8; 60 * 1024];
+
+    let carrier = Carrier::open(tight.addr, &tight.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    let mut through = Client::connect_as(carrier.local_addr(), &b.key, &seed)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    for i in 0..10 {
+        let posted = tokio::time::timeout(
+            Duration::from_secs(60),
+            through.post("/exchange/ping", body.clone()),
+        )
+        .await;
+        assert!(
+            matches!(posted, Ok(Ok(_))),
+            "post {i} did not complete through the budgeted tunnel: {posted:?}"
+        );
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let (sent, _) = carrier.bytes();
+    let (forwarded, _) = tight.server.tunnel_forwarded();
+    let (dropped_up, _) = tight.server.tunnel_dropped();
+    assert!(dropped_up > 0, "nothing was dropped: the bucket never engaged");
+    // What A carried on is bounded by the budget plus one second's burst,
+    // whatever the machine's speed; what the member sent is more, by the
+    // drops and QUIC's retransmissions of them.
+    let bound = (RATE as f64) * (elapsed + 1.0);
+    assert!(
+        (forwarded as f64) <= bound,
+        "{forwarded} bytes carried on in {elapsed:.1} s, over the budget's {bound:.0}"
+    );
+    assert!(
+        forwarded >= 10 * 60 * 1024,
+        "less was carried on than was posted: {forwarded}"
+    );
+    assert!(sent > forwarded, "the member sent {sent}, A carried {forwarded}: nothing dropped?");
+
+    // The control.
+    let loose = exchange(true, 4, "a2.test", &[("b.test", PubKey::new(b.key), b.addr)]).await;
+    home_at(&loose, &seed).await;
+    let carrier = Carrier::open(loose.addr, &loose.key, &seed, &b.key, "b.test")
+        .await
+        .unwrap();
+    let mut through = Client::connect_as(carrier.local_addr(), &b.key, &seed)
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        through.post("/exchange/ping", body.clone()).await.unwrap();
+    }
+    assert_eq!(
+        loose.server.tunnel_dropped(),
+        (0, 0),
+        "the unbudgeted home dropped packets"
+    );
 }
