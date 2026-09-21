@@ -31,10 +31,6 @@ fn default_name_registration() -> String {
     "off".to_string()
 }
 
-fn default_max_names_per_account() -> u64 {
-    4
-}
-
 fn default_name_lease_secs() -> u64 {
     30 * 24 * 3600 // 30 days
 }
@@ -124,10 +120,11 @@ pub struct FileConfig {
     /// outward-facing surface here — an operator turns it on deliberately.
     #[serde(default = "default_name_registration")]
     pub name_registration: String,
-    /// SIP-38: how many names one account may self-claim (open mode). Bounds a
-    /// land-grab; an administrator's assignments are not counted against it.
-    #[serde(default = "default_max_names_per_account")]
-    pub max_names_per_account: u64,
+    /// Retired 2026-09-21: SIP-38 gives an account one name at an exchange,
+    /// and the cap that let an operator allow more is refused at load so a
+    /// file that still sets it is heard, not silently ignored.
+    #[serde(default)]
+    pub max_names_per_account: Option<u64>,
     /// SIP-38: how long a self-claimed name survives without renewal, in
     /// seconds. A beat (SIP-4), a re-claim, or a SIP-28 publish renews it. Long
     /// by default (30 days) — a name is not an address.
@@ -411,7 +408,6 @@ pub struct Config {
     pub max_connections: Option<u64>,
     pub congestion: Option<squic::CongestionController>,
     pub name_registration: NameMode,
-    pub max_names_per_account: usize,
     pub name_lease_secs: u64,
     pub max_names: Option<u64>,
     pub replication_peers: Vec<ReplicationPeer>,
@@ -603,10 +599,15 @@ impl FileConfig {
                 )));
             }
         };
-        // A per-account cap of zero would refuse every self-claim in silence.
-        if self.max_names_per_account == 0 {
+        // SIP-38 (2026-09-21): one name per account at an exchange is the
+        // rule, not a setting. Refuse the old key rather than read it as
+        // nothing, so the operator learns the model changed.
+        if self.max_names_per_account.is_some() {
             return Err(Error::Malformed(
-                "max_names_per_account must be a positive value".into(),
+                "`max_names_per_account` is gone: since sqexd 0.103 an account holds one name \
+                 at an exchange (SIP-38), and an administrator's assignments are the override. \
+                 Remove the key; names already held are kept."
+                    .into(),
             ));
         }
         // A global cap of zero would refuse every claim — unlimited is None
@@ -641,7 +642,6 @@ impl FileConfig {
             congestion,
             name_registration,
             max_names: self.max_names,
-            max_names_per_account: self.max_names_per_account as usize,
             name_lease_secs: self.name_lease_secs,
             replication_peers,
             replicate,
@@ -878,11 +878,10 @@ mod tests {
 
     #[test]
     fn name_registration_parses_and_defaults_off() {
-        // Default: off, cap 4, a long lease, no global cap.
+        // Default: off, a long lease, no global cap.
         let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
         let cfg = cfg.resolve().unwrap();
         assert_eq!(cfg.name_registration, NameMode::Off);
-        assert_eq!(cfg.max_names_per_account, 4);
         assert_eq!(cfg.name_lease_secs, 30 * 24 * 3600);
         assert_eq!(cfg.max_names, None);
         // A global cap passes through; zero is refused at load.
@@ -890,14 +889,13 @@ mod tests {
         assert_eq!(cfg.resolve().unwrap().max_names, Some(5000));
         let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_names = 0\n").unwrap();
         assert!(cfg.resolve().is_err());
-        // Open, with an operator-set cap and lease.
+        // Open, with an operator-set lease.
         let cfg: FileConfig = toml::from_str(
-            "key_file = \"/x\"\nname_registration = \"open\"\nmax_names_per_account = 2\nname_lease_secs = 3600\n",
+            "key_file = \"/x\"\nname_registration = \"open\"\nname_lease_secs = 3600\n",
         )
         .unwrap();
         let cfg = cfg.resolve().unwrap();
         assert_eq!(cfg.name_registration, NameMode::Open);
-        assert_eq!(cfg.max_names_per_account, 2);
         assert_eq!(cfg.name_lease_secs, 3600);
         // Closed is accepted; case and whitespace do not matter.
         let cfg: FileConfig =
@@ -907,10 +905,15 @@ mod tests {
         let cfg: FileConfig =
             toml::from_str("key_file = \"/x\"\nname_registration = \"maybe\"\n").unwrap();
         assert!(cfg.resolve().is_err());
-        // A zero cap is refused.
-        let cfg: FileConfig =
-            toml::from_str("key_file = \"/x\"\nmax_names_per_account = 0\n").unwrap();
-        assert!(cfg.resolve().is_err());
+        // The retired per-account cap is refused at load, whatever its value
+        // (SIP-38: one name per account at an exchange), in words that say so.
+        for v in ["0", "1", "4"] {
+            let cfg: FileConfig =
+                toml::from_str(&format!("key_file = \"/x\"\nmax_names_per_account = {v}\n"))
+                    .unwrap();
+            let err = cfg.resolve().unwrap_err().to_string();
+            assert!(err.contains("one name"), "{v}: {err}");
+        }
     }
 
     #[test]

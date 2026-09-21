@@ -107,9 +107,10 @@ impl Names {
     ///
     /// Idempotent for the caller's own name (refreshes its lease). Reclaims a
     /// lapsed name held by another account. Refuses one held live by another,
-    /// one that would exceed the per-account cap, or a caller over the hourly
-    /// rate.
-    pub fn claim(&self, name: &str, account: &PubKey, max_per_account: usize) -> u8 {
+    /// a caller that already holds a name here (SIP-38, 2026-09-21: one name
+    /// per account at an exchange -- `AT_CAPACITY`, and the release is the
+    /// person's step), or a caller over the hourly rate.
+    pub fn claim(&self, name: &str, account: &PubKey) -> u8 {
         let now = now_unix();
         let mut db = self.db.lock().unwrap();
         let tx = match db.transaction() {
@@ -145,8 +146,10 @@ impl Names {
             // else: lapsed and held by another — fall through and reclaim it.
         }
 
-        // Free or reclaimable. Cap first (so a capacity refusal does not spend
-        // rate budget), then the hourly rate.
+        // Free or reclaimable. The one-name rule first (so a refusal does not
+        // spend rate budget), then the hourly rate. An account that already
+        // holds two from before the rule keeps them and is refused a third
+        // the same way.
         let count: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM name WHERE account = ?1",
@@ -156,7 +159,7 @@ impl Names {
             .unwrap_or(0);
         // A reclaim of another account's name is a new holding for the caller,
         // so the count (which does not include this name) is the right basis.
-        if count as usize >= max_per_account {
+        if count >= 1 {
             return CLAIM_AT_CAPACITY;
         }
         // Global cap (operator's `max_names`): only a brand-new row grows the
@@ -420,16 +423,16 @@ mod tests {
     #[test]
     fn the_global_cap_bounds_the_whole_directory() {
         let n = names_capped(3600, 2);
-        assert_eq!(n.claim("a", &pk(1), 100), CLAIM_GRANTED);
-        assert_eq!(n.claim("b", &pk(2), 100), CLAIM_GRANTED); // different account
+        assert_eq!(n.claim("a", &pk(1)), CLAIM_GRANTED);
+        assert_eq!(n.claim("b", &pk(2)), CLAIM_GRANTED); // different account
         // Full: a third distinct account cannot add a new row, even with room
         // under its own per-account cap.
-        assert_eq!(n.claim("c", &pk(3), 100), CLAIM_FULL);
+        assert_eq!(n.claim("c", &pk(3)), CLAIM_FULL);
         // A holder may still renew its own name at the cap (no new row).
-        assert_eq!(n.claim("a", &pk(1), 100), CLAIM_GRANTED);
+        assert_eq!(n.claim("a", &pk(1)), CLAIM_GRANTED);
         // And releasing frees a slot.
         assert!(n.release("a", &pk(1)));
-        assert_eq!(n.claim("c", &pk(3), 100), CLAIM_GRANTED);
+        assert_eq!(n.claim("c", &pk(3)), CLAIM_GRANTED);
     }
 
     /// Reclaiming another account's lapsed name is an UPDATE, not a new row, so
@@ -438,10 +441,10 @@ mod tests {
     #[test]
     fn reclaim_is_exempt_from_the_global_cap() {
         let n = names_capped(0, 1); // zero lease: names are stale at once
-        assert_eq!(n.claim("x", &pk(1), 100), CLAIM_GRANTED);
+        assert_eq!(n.claim("x", &pk(1)), CLAIM_GRANTED);
         // Full (1 row), but pk(2) may reclaim x from pk(1) — no new row.
-        assert_eq!(n.claim("y", &pk(2), 100), CLAIM_FULL);
-        assert_eq!(n.claim("x", &pk(2), 100), CLAIM_GRANTED);
+        assert_eq!(n.claim("y", &pk(2)), CLAIM_FULL);
+        assert_eq!(n.claim("x", &pk(2)), CLAIM_GRANTED);
         assert_eq!(n.resolve("x").account, pk(2));
     }
 
@@ -451,7 +454,7 @@ mod tests {
     fn the_rate_limiter_map_is_swept() {
         let n = names(3600);
         for i in 0..5u8 {
-            assert_eq!(n.claim(&format!("n{i}"), &pk(i), 100), CLAIM_GRANTED);
+            assert_eq!(n.claim(&format!("n{i}"), &pk(i)), CLAIM_GRANTED);
         }
         assert_eq!(n.claims.lock().unwrap().len(), 5, "one entry per claimer");
         // Far in the future, every timestamp is stale → all entries evicted.
@@ -465,7 +468,7 @@ mod tests {
     #[test]
     fn a_free_name_is_granted_and_resolves() {
         let n = names(3600);
-        assert_eq!(n.claim("colin", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(1)), CLAIM_GRANTED);
         let r = n.resolve("colin");
         assert!(r.found && !r.stale);
         assert_eq!(r.account, pk(1));
@@ -475,43 +478,52 @@ mod tests {
     #[test]
     fn a_taken_name_is_refused_but_the_owner_is_idempotent() {
         let n = names(3600);
-        assert_eq!(n.claim("colin", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(1)), CLAIM_GRANTED);
         // Another account cannot take it.
-        assert_eq!(n.claim("colin", &pk(2), 4), CLAIM_TAKEN);
+        assert_eq!(n.claim("colin", &pk(2)), CLAIM_TAKEN);
         // The owner re-claiming is granted (a renewal).
-        assert_eq!(n.claim("colin", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(1)), CLAIM_GRANTED);
     }
 
+    /// SIP-38 (2026-09-21): one name per account at an exchange. A second
+    /// claim is refused while the first is held; renewing the first is not
+    /// a second; releasing it makes room; another account is untouched.
     #[test]
-    fn the_per_account_cap_is_enforced() {
+    fn one_name_per_account() {
         let n = names(3600);
-        for i in 0..3 {
-            assert_eq!(n.claim(&format!("n{i}"), &pk(1), 3), CLAIM_GRANTED);
-        }
-        assert_eq!(n.claim("n3", &pk(1), 3), CLAIM_AT_CAPACITY);
-        // A different account still has room.
-        assert_eq!(n.claim("n3", &pk(2), 3), CLAIM_GRANTED);
+        assert_eq!(n.claim("n0", &pk(1)), CLAIM_GRANTED);
+        assert_eq!(n.claim("n1", &pk(1)), CLAIM_AT_CAPACITY);
+        assert_eq!(n.claim("n0", &pk(1)), CLAIM_GRANTED, "a renewal is not a second name");
+        assert_eq!(n.names_for(&pk(1)), vec!["n0"], "the refusal changed nothing");
+        assert_eq!(n.claim("n1", &pk(2)), CLAIM_GRANTED);
+        assert!(n.release("n0", &pk(1)));
+        assert_eq!(n.claim("n2", &pk(1)), CLAIM_GRANTED);
+        // An administrator's assignment is the override, and a holder of two
+        // from before the rule is refused a third the same way.
+        assert!(n.assign("extra", &pk(1)));
+        assert_eq!(n.names_for(&pk(1)).len(), 2);
+        assert_eq!(n.claim("n3", &pk(1)), CLAIM_AT_CAPACITY);
     }
 
     #[test]
     fn a_lapsed_name_goes_stale_then_is_reclaimable() {
         // Zero lease: a claim is immediately past its lease.
         let n = names(0);
-        assert_eq!(n.claim("colin", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(1)), CLAIM_GRANTED);
         let r = n.resolve("colin");
         assert!(
             r.found && r.stale,
             "a lapsed open name still resolves, flagged"
         );
         // Another account may now take it.
-        assert_eq!(n.claim("colin", &pk(2), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(2)), CLAIM_GRANTED);
         assert_eq!(n.resolve("colin").account, pk(2));
     }
 
     #[test]
     fn renew_keeps_a_name_live() {
         let n = names(0);
-        assert!(n.claim("colin", &pk(1), 4) == CLAIM_GRANTED);
+        assert!(n.claim("colin", &pk(1)) == CLAIM_GRANTED);
         // With a zero lease it is stale immediately; but the owner reclaiming
         // (or renew) refreshes it, and the owner is always granted.
         n.renew(&pk(1));
@@ -522,7 +534,7 @@ mod tests {
     #[test]
     fn admin_assign_overrides_and_does_not_expire() {
         let n = names(0);
-        assert_eq!(n.claim("colin", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(1)), CLAIM_GRANTED);
         // Admin reassigns to another account.
         assert!(n.assign("colin", &pk(9)));
         let r = n.resolve("colin");
@@ -531,13 +543,13 @@ mod tests {
         assert_eq!(r.expires_at, 0);
         // And an admin-held name is not reclaimable by a self-claim, even with
         // a zero lease.
-        assert_eq!(n.claim("colin", &pk(2), 4), CLAIM_TAKEN);
+        assert_eq!(n.claim("colin", &pk(2)), CLAIM_TAKEN);
     }
 
     #[test]
     fn release_frees_a_name_for_its_owner_only() {
         let n = names(3600);
-        assert_eq!(n.claim("colin", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("colin", &pk(1)), CLAIM_GRANTED);
         assert!(!n.release("colin", &pk(2)), "not the owner: no-op");
         assert!(n.resolve("colin").found);
         assert!(n.release("colin", &pk(1)));
@@ -547,8 +559,9 @@ mod tests {
     #[test]
     fn reverse_lists_an_accounts_names_oldest_first() {
         let n = names(3600);
+        // Several names for one account: assigned, since a claim allows one.
         for name in ["carl", "colin", "c"] {
-            assert_eq!(n.claim(name, &pk(1), 8), CLAIM_GRANTED);
+            assert!(n.assign(name, &pk(1)));
         }
         // Oldest first, ties broken by name — here all three register in the
         // same second, so the order is alphabetical and deterministic.
@@ -559,18 +572,21 @@ mod tests {
     #[test]
     fn the_hourly_rate_limit_bounds_a_land_grab() {
         let n = names(3600);
+        // Claim and release, since an account holds one name at a time; a
+        // release spends no claim budget, a grant does.
         for i in 0..CLAIM_RATE_PER_HOUR {
-            assert_eq!(n.claim(&format!("n{i}"), &pk(1), 1000), CLAIM_GRANTED);
+            assert_eq!(n.claim(&format!("n{i}"), &pk(1)), CLAIM_GRANTED);
+            assert!(n.release(&format!("n{i}"), &pk(1)));
         }
-        assert_eq!(n.claim("one-more", &pk(1), 1000), CLAIM_RATE_LIMITED);
+        assert_eq!(n.claim("one-more", &pk(1)), CLAIM_RATE_LIMITED);
         // A different account is unaffected.
-        assert_eq!(n.claim("theirs", &pk(2), 1000), CLAIM_GRANTED);
+        assert_eq!(n.claim("theirs", &pk(2)), CLAIM_GRANTED);
     }
 
     #[test]
     fn sweep_drops_only_long_abandoned_open_names() {
         let n = names(100);
-        assert_eq!(n.claim("live", &pk(1), 4), CLAIM_GRANTED);
+        assert_eq!(n.claim("live", &pk(1)), CLAIM_GRANTED);
         assert!(n.assign("kept", &pk(2)));
         // Nothing is abandoned yet.
         assert_eq!(n.sweep(now_unix()), 0);

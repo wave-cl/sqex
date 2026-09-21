@@ -74,13 +74,25 @@ fn write(identity: &Path, handles: &[String]) -> Result<(), String> {
 
 /// Add a handle (normalised), keeping order and dropping duplicates. A no-op if
 /// already present. Returns the normalised handle and whether it was new.
+///
+/// One handle per domain (SIP-38, 2026-09-21: an account holds one name at an
+/// exchange): a handle at a domain already recorded takes that line's place,
+/// primary or not, since the exchange has already released the old one --
+/// a claim there is refused while it is held.
 pub fn add(identity: &Path, handle: &str) -> Result<(String, bool), String> {
     let handle = normalise(handle)?;
     let mut handles = load(identity);
     if handles.iter().any(|h| h == &handle) {
         return Ok((handle, false));
     }
-    handles.push(handle.clone());
+    let domain = handle.split_once('@').map(|(_, d)| d).unwrap_or("");
+    match handles
+        .iter()
+        .position(|h| h.split_once('@').is_some_and(|(_, d)| d.eq_ignore_ascii_case(domain)))
+    {
+        Some(i) => handles[i] = handle.clone(),
+        None => handles.push(handle.clone()),
+    }
     write(identity, &handles)?;
     Ok((handle, true))
 }
@@ -118,6 +130,19 @@ mod tests {
     }
 
     #[test]
+    fn one_handle_per_domain_replaces_in_place() {
+        let id = temp("one-per-domain");
+        add(&id, "alice@a.test").unwrap();
+        add(&id, "alice@b.test").unwrap();
+        // A new name at a.test takes alice@a.test's line -- still primary.
+        let (h, new) = add(&id, "Alicia@A.test").unwrap();
+        assert_eq!((h.as_str(), new), ("alicia@A.test", true));
+        assert_eq!(load(&id), vec!["alicia@A.test", "alice@b.test"]);
+        assert_eq!(primary_domain(&id).as_deref(), Some("A.test"));
+        cleanup(&id);
+    }
+
+    #[test]
     fn path_appends_rather_than_replacing() {
         assert_eq!(
             path_for(Path::new("/home/c/.sqnr/identity")),
@@ -151,12 +176,12 @@ mod tests {
         );
         assert_eq!(primary(&id).as_deref(), Some("colin@squic.org"));
         assert_eq!(primary_domain(&id).as_deref(), Some("squic.org"));
-        // A second is an alias, appended.
-        assert!(add(&id, "c@squic.org").unwrap().1);
-        assert_eq!(load(&id), vec!["colin@squic.org", "c@squic.org"]);
+        // A second, at another domain, is an alias, appended.
+        assert!(add(&id, "c@other.org").unwrap().1);
+        assert_eq!(load(&id), vec!["colin@squic.org", "c@other.org"]);
         // Re-adding is a no-op and does not reorder.
         assert!(!add(&id, "colin@squic.org").unwrap().1);
-        assert_eq!(load(&id), vec!["colin@squic.org", "c@squic.org"]);
+        assert_eq!(load(&id), vec!["colin@squic.org", "c@other.org"]);
         cleanup(&id);
     }
 
@@ -166,13 +191,13 @@ mod tests {
         cleanup(&id);
         add(&id, "colin@squic.org").unwrap();
         add(&id, "colin@other.org").unwrap();
-        add(&id, "carl@squic.org").unwrap();
+        add(&id, "carl@third.org").unwrap();
         // Exact handle removes only that one.
         assert!(remove(&id, "colin@squic.org").unwrap());
-        assert_eq!(load(&id), vec!["colin@other.org", "carl@squic.org"]);
+        assert_eq!(load(&id), vec!["colin@other.org", "carl@third.org"]);
         // A bare name forgets it at every domain (and folds case).
         assert!(remove(&id, "Colin").unwrap());
-        assert_eq!(load(&id), vec!["carl@squic.org"]);
+        assert_eq!(load(&id), vec!["carl@third.org"]);
         // Removing what is not there is a no-op.
         assert!(!remove(&id, "nobody").unwrap());
         cleanup(&id);

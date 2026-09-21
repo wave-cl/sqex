@@ -330,7 +330,6 @@ pub struct Server {
     /// administrator-assigned, or the route is off entirely.
     name_registration: NameMode,
     /// SIP-38: how many names one account may self-claim (open mode).
-    max_names_per_account: usize,
     profiles: Profiles,
     admissions: Admissions,
     pub(crate) sessions: Sessions,
@@ -1810,7 +1809,6 @@ pub async fn bind_with(
         names: Names::open(name_db.as_deref(), config.name_lease_secs, config.max_names)
             .map_err(|e| Error::Malformed(format!("cannot open the name directory: {e}")))?,
         name_registration: config.name_registration,
-        max_names_per_account: config.max_names_per_account,
         profiles: Profiles::open(profile_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open profiles: {e}")))?,
         // In memory: a pending request is a question somebody asked once, and
@@ -3212,7 +3210,7 @@ async fn route(
                 NameMode::Open => {
                     let outcome = server
                         .names
-                        .claim(&req.name, &me, server.max_names_per_account);
+                        .claim(&req.name, &me);
                     (
                         200,
                         "application/octet-stream",

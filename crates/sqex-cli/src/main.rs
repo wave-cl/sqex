@@ -1616,8 +1616,33 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
                     }
                 }
                 name::CLAIM_TAKEN => println!("{name} is held by another account"),
+                // SIP-38 (2026-09-21): one name per account at an exchange.
+                // Say which, so the release is a deliberate step and not a
+                // guess.
                 name::CLAIM_AT_CAPACITY => {
-                    println!("refused: you already hold the maximum number of names")
+                    let held = client
+                        .post(
+                            "/name/reverse",
+                            name::Reverse {
+                                account: PubKey::new(signer.public()),
+                            }
+                            .encode(),
+                        )
+                        .await
+                        .ok()
+                        .filter(|(code, _)| *code == 200)
+                        .and_then(|(_, body)| name::Names::decode(&body).ok())
+                        .map(|n| n.names)
+                        .unwrap_or_default();
+                    let at = domain.as_deref().unwrap_or("this exchange");
+                    match held.first() {
+                        Some(h) => println!(
+                            "refused: you already hold {h} at {at} (one name per exchange);                              `sqex name release {h}` frees it first"
+                        ),
+                        None => println!(
+                            "refused: you already hold a name at {at} (one name per exchange)"
+                        ),
+                    }
                 }
                 name::CLAIM_CLOSED => println!(
                     "this exchange does not allow self-claimed names \
@@ -1769,6 +1794,13 @@ async fn whoami(
     // Reads the public-key line only — no passphrase, even for an encrypted key.
     let me = own_identity(cli, cfg)?;
     println!("identity {me}");
+    // SIP-59: where the account lives, as the person recorded it beside the
+    // identity (a move or `sqex-chat home claim` writes it). The exchange's
+    // record is the authority; this is what every start dials first.
+    match sqex_proto::home_file::load(&id) {
+        Some(h) => println!("  home     {}", h.describe()),
+        None => println!("  home     (none recorded -- `sqex-chat home claim` at the exchange it lives at)"),
+    }
     let hs = handles::load(&id);
     if hs.is_empty() {
         println!("  no handles recorded — claim one, or `sqex whoami --add name@domain`");

@@ -41,6 +41,20 @@ challenge_ttl_secs = 30
 # ("connection ended"), which is where to look before changing this.
 # congestion = "bbr"
 
+# SIP-38: names. "off" (the default) does not offer the name routes; "open"
+# lets any identity claim a free or lapsed name for its account, reachable as
+# name@<domain>; "closed" answers claims with CLOSED and leaves naming to an
+# administrator's signed assignment. **An account holds one name at an
+# exchange** (SIP-38, 2026-09-21): a second claim is refused while the first
+# is held, and a release is the person's step; an administrator's assignment
+# is the override. `max_names_per_account`, which once let an operator allow
+# more, is refused at load. Names are leased: a beat, a re-claim or a
+# publish renews one; `max_names` bounds the whole directory against a
+# mint-flood of identities (omit for unlimited).
+# name_registration = "off"
+# name_lease_secs = 2592000
+# max_names = 100000
+
 # ---------------------------------------------------------------------------
 # SIP-35: replication.
 # ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ async fn spawn_server(
     let config_toml = format!(
         "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\n\
          welcome_channel = \"\"\nname_registration = \"{mode}\"\n\
-         max_names_per_account = 2\nname_lease_secs = 100000\n{cap}{admins}",
+         name_lease_secs = 100000\n{cap}{admins}",
         key_path.to_string_lossy(),
         dir.path().join("sqex.state").to_string_lossy(),
     );
@@ -200,9 +200,10 @@ async fn open_registration_claim_resolve_release() {
     assert_eq!(bob.claim("colin").await.outcome, CLAIM_TAKEN);
     assert_eq!(alice.claim("colin").await.outcome, CLAIM_GRANTED);
 
-    // The per-account cap (2) is enforced against self-claims.
-    assert_eq!(alice.claim("c").await.outcome, CLAIM_GRANTED);
-    assert_eq!(alice.claim("colin2").await.outcome, CLAIM_AT_CAPACITY);
+    // SIP-38 (2026-09-21): one name per account at an exchange. A second
+    // self-claim is refused while the first is held, and nothing changes.
+    assert_eq!(alice.claim("c").await.outcome, CLAIM_AT_CAPACITY);
+    assert_eq!(alice.reverse(a).await.names, vec!["colin".to_string()]);
 
     // A releases the name; it is then free for B.
     let (code, _) = alice
