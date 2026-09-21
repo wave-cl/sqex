@@ -87,8 +87,10 @@ async fn chat_at(
     let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.set_domain(Some(domain.to_string()));
     chat.top_up_prekeys().await.unwrap();
+    // A new store presents nothing by itself; the person claims, once.
+    assert_eq!(chat.ensure_home().await.unwrap(), HomeSaid::Unclaimed);
     assert_eq!(
-        chat.ensure_home().await.unwrap(),
+        chat.claim_home().await.unwrap(),
         HomeSaid::Presented,
         "no move was presented"
     );

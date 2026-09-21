@@ -284,9 +284,15 @@ pub enum ChatError {
 /// SIP-60 §When a client presents a Move unasked: what [`Chat::ensure_home`] found on connecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HomeSaid {
-    /// This exchange had no record and this store lives here (or nowhere
-    /// yet): a Move naming it was presented.
+    /// This exchange had no record and this store's own home has lost it:
+    /// a Move naming it was presented again.
     Presented,
+    /// This exchange has no record and this store has never made or
+    /// presented a Move: a new store, at an exchange somebody pointed it
+    /// at. Nothing was presented -- the first "this is my home" is the
+    /// person's ([`Chat::claim_home`]), and until then the client is a
+    /// visitor here.
+    Unclaimed,
     /// This exchange already records the account's home.
     OnRecord,
     /// This store is filed under another exchange: the account lives at
@@ -2504,6 +2510,55 @@ impl Chat {
         if record.is_some() {
             return Ok(HomeSaid::OnRecord);
         }
+        // SIP-60 §When a client presents a Move unasked (2026-09-21): a store
+        // that has never made or presented a Move is a new one, filed under
+        // this exchange by nothing but its first connection. Its first Move
+        // is the person's to make, not this client's to guess: a probe
+        // pointed at the wrong exchange moved a live account this way.
+        if self.store.home_issued()?.is_none() {
+            return Ok(HomeSaid::Unclaimed);
+        }
+        self.present_first_move().await?;
+        Ok(HomeSaid::Presented)
+    }
+
+    /// The account's first "this is my home", or its home again: present a
+    /// Move naming the exchange this client is connected to. The person's
+    /// act -- a client that found [`HomeSaid::Unclaimed`] calls this only
+    /// where the person named this exchange as the home. Refused where the
+    /// store is filed under another exchange (that is a move, `move_home`)
+    /// or this exchange already records the account's home elsewhere.
+    pub async fn claim_home(&mut self) -> Result<HomeSaid> {
+        if self.account_seed().is_none() {
+            return Ok(HomeSaid::NotMine);
+        }
+        let exchange = self.exchange;
+        if let Some(home) = self.store.filed_under()?
+            && home != exchange
+        {
+            return Err(ChatError::Protocol(format!(
+                "this store lives at {home}; moving it is `move`, not a claim"
+            )));
+        }
+        let me = self.me;
+        match self.account_home(&me).await {
+            Ok(h) if h.since != 0 && h.home != exchange => {
+                return Err(ChatError::Protocol(format!(
+                    "this exchange records the account's home as {}; move there, or from there",
+                    h.home
+                )));
+            }
+            Ok(h) if h.since != 0 => return Ok(HomeSaid::OnRecord),
+            Ok(_) | Err(ChatError::Refused(404, _)) => {}
+            Err(ChatError::NoChatHere(_)) => return Ok(HomeSaid::NotMine),
+            Err(e) => return Err(e),
+        }
+        self.present_first_move().await?;
+        Ok(HomeSaid::Presented)
+    }
+
+    async fn present_first_move(&mut self) -> Result<()> {
+        let exchange = self.exchange;
         let mv = self.sign_move(&exchange)?;
         let domain = self.domain.clone().unwrap_or_default();
         let origins = self.origins_of_mine().await.unwrap_or_default();
@@ -2514,7 +2569,7 @@ impl Chat {
             origins,
         })
         .await?;
-        Ok(HomeSaid::Presented)
+        Ok(())
     }
 
     /// Make sure the channel has an epoch and that we hold its key.

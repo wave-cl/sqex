@@ -293,7 +293,7 @@ async fn a_client_can_move_back_to_a_former_home() {
     let (seed, _) = identity(77);
     let store_path = x_dir.path().join("dana.db");
     let mut dana = chat_at(x_addr, x_pub, "x.test", 77, &store_path).await;
-    dana.ensure_home().await.unwrap();
+    dana.claim_home().await.unwrap();
     // She registers herself as her own device, as a client does.
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

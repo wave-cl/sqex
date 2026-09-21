@@ -2170,6 +2170,17 @@ fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
             host: env_nonempty("SQEX_SERVER_HOST"),
             key: env_nonempty("SQEX_SERVER_KEY"),
         },
+        // SIP-59: where this identity's account lives, as the person recorded
+        // it beside the identity (`<identity>.home`, written by a move or a
+        // claim). Above the config, which is one pointer for every identity;
+        // below anything said for this run.
+        {
+            let home = identity_path(cli, cfg)
+                .ok()
+                .and_then(|id| sqex_proto::home_file::load(&id))
+                .unwrap_or_default();
+            sqex_discovery::Layer::for_home(home.domain, home.key)
+        },
         // The config is `sqnr`'s type and has no `server_host`, so the pairing
         // rule is read off the two fields it does have.
         match (&cfg.server, &cfg.server_key) {

@@ -47,6 +47,36 @@ impl Layer {
     }
 }
 
+impl Layer {
+    /// The layer for a home recorded beside an identity (SIP-59, the
+    /// `<identity>.home` sidecar): its domain to discover, or -- a home with
+    /// no name, recorded by key alone -- the address this client last
+    /// reached that key at. A key nowhere in `known_servers` says nothing,
+    /// and the layers below decide.
+    pub fn for_home(domain: Option<String>, key: Option<sqnr_core::PubKey>) -> Layer {
+        if let Some(d) = domain {
+            return Layer {
+                server: Some(d),
+                ..Default::default()
+            };
+        }
+        let Some(key) = key else {
+            return Layer::default();
+        };
+        let host = crate::Known::load(&crate::known::path())
+            .ok()
+            .and_then(|k| k.address_of(&key));
+        match host {
+            Some(addr) => Layer {
+                host: Some(addr.to_string()),
+                key: Some(key.to_string()),
+                ..Default::default()
+            },
+            None => Layer::default(),
+        }
+    }
+}
+
 /// Resolve the first layer that says anything, and take everything from it.
 ///
 /// Layers are given most-specific first — command line, environment, config.

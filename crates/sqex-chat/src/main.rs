@@ -172,7 +172,10 @@ enum Cmd {
         credentials: Vec<String>,
     },
     /// Where an account lives, as this exchange has it (SIP-59).
+    #[command(args_conflicts_with_subcommands = true)]
     Home {
+        #[command(subcommand)]
+        cmd: Option<HomeCmd>,
         /// The account, base58, or a name here. Yours if omitted.
         who: Option<String>,
     },
@@ -183,6 +186,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MailCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum HomeCmd {
+    /// Make the exchange this client is connected to this account's home:
+    /// record it beside the identity (`<identity>.home`, where every start
+    /// reads it) and present the Move (SIP-60). A new store presents its
+    /// first Move nowhere else -- pointed at another exchange it is a
+    /// visitor there -- so this is the one step a new account takes once.
+    /// A store that already lives elsewhere moves with `move` instead.
+    Claim,
+    /// Forget the recorded home. The exchange's record is untouched.
+    Forget,
 }
 
 #[derive(Subcommand)]
@@ -373,7 +389,40 @@ async fn run(cli: Cli) -> Result<(), String> {
     // SIP-60: say where this account lives, once, so its exchange can act
     // for it when another exchange puts it in a channel. Not fatal: an
     // exchange from before SIP-59 has no such record to keep.
+    let identity = identity_path(&cli, &cfg).ok();
     match chat.ensure_home().await {
+        // SIP-60 §When a client presents a Move unasked (2026-09-21): a new
+        // store. Its first Move goes to the exchange the person recorded as
+        // the home beside the identity, and to no other: pointed anywhere
+        // else, this client is a visitor until told otherwise.
+        Ok(sqex_chat::client::HomeSaid::Unclaimed) => {
+            let recorded = identity.as_deref().and_then(sqex_proto::home_file::load);
+            let named = recorded
+                .as_ref()
+                .is_some_and(|h| h.names(&chat.exchange_key(), domain.as_deref()));
+            if matches!(cli.cmd, Some(Cmd::Home { cmd: Some(HomeCmd::Claim), .. })) {
+                // The claim below does it, and says so.
+            } else if named {
+                match chat.claim_home().await {
+                    Ok(sqex_chat::client::HomeSaid::Presented) => eprintln!(
+                        "{} is now on record here as this account's home",
+                        domain.as_deref().unwrap_or("this exchange")
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("note: could not record this exchange as home: {e}"),
+                }
+            } else {
+                let here = domain.clone().unwrap_or_else(|| chat.exchange_key().to_string());
+                eprintln!(
+                    "note: this store is new and {here} has no home on record for {}; you are                      a visitor here{}. If this is where the account lives: `sqex-chat home claim`",
+                    chat.me,
+                    match &recorded {
+                        Some(h) => format!(" (the identity records its home as {})", h.describe()),
+                        None => String::new(),
+                    }
+                );
+            }
+        }
         // SIP-60 §When a client presents a Move unasked: pointed at an exchange this account does not live at.
         // Said, not acted on: a Move is the person's to make.
         Ok(sqex_chat::client::HomeSaid::Visitor { home, told, behind }) => eprintln!(
@@ -404,7 +453,14 @@ async fn run(cli: Cli) -> Result<(), String> {
         signed,
     }) = &cli.cmd
     {
-        return move_command(&mut chat, home, home_key.as_deref(), signed.as_deref()).await;
+        return move_command(
+            &mut chat,
+            home,
+            home_key.as_deref(),
+            signed.as_deref(),
+            identity.as_deref(),
+        )
+        .await;
     }
     if let Some(Cmd::Handover {
         signed,
@@ -481,7 +537,50 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         return Ok(());
     }
-    if let Some(Cmd::Home { who }) = &cli.cmd {
+    if let Some(Cmd::Home { cmd: Some(hc), .. }) = &cli.cmd {
+        let id = identity.ok_or("no identity file to record the home beside")?;
+        match hc {
+            HomeCmd::Claim => {
+                let said = chat.claim_home().await.map_err(|e| e.to_string())?;
+                let home = sqex_proto::home_file::Home {
+                    domain: domain.clone(),
+                    key: Some(chat.exchange_key()),
+                };
+                sqex_proto::home_file::set(&id, &home)?;
+                let here = domain.clone().unwrap_or_else(|| chat.exchange_key().to_string());
+                println!(
+                    "{}",
+                    match said {
+                        sqex_chat::client::HomeSaid::Presented => format!(
+                            "{here} is this account's home: recorded in {} and presented",
+                            sqex_proto::home_file::path_for(&id).display()
+                        ),
+                        sqex_chat::client::HomeSaid::OnRecord => format!(
+                            "{here} already records this account as living here; recorded in {}",
+                            sqex_proto::home_file::path_for(&id).display()
+                        ),
+                        sqex_chat::client::HomeSaid::NotMine => {
+                            "this is a linked device; the account's own client claims a home".into()
+                        }
+                        other => format!("{other:?}"),
+                    }
+                );
+            }
+            HomeCmd::Forget => {
+                let was = sqex_proto::home_file::load(&id);
+                if sqex_proto::home_file::clear(&id)? {
+                    println!(
+                        "forgot {}; the exchange's record is untouched",
+                        was.map(|h| h.describe()).unwrap_or_default()
+                    );
+                } else {
+                    println!("no home was recorded for this identity");
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let Some(Cmd::Home { who, .. }) = &cli.cmd {
         let account = match who {
             None => chat.me,
             Some(w) => match w.parse::<PubKey>() {
@@ -636,6 +735,7 @@ async fn move_command(
     home: &str,
     home_key: Option<&str>,
     signed: Option<&str>,
+    identity: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let (addr, key, domain) = match home_key {
         Some(k) => {
@@ -682,6 +782,22 @@ async fn move_command(
         "moved: {} lives at {new_name} from {}",
         done.mv.account, done.mv.issued
     );
+    // The person's word, beside the identity: every start from now reads
+    // it as the default exchange, and a new store presents its first Move
+    // there and nowhere else.
+    if let Some(id) = identity {
+        let recorded = sqex_proto::home_file::Home {
+            domain: (!domain.is_empty()).then(|| domain.clone()),
+            key: Some(key),
+        };
+        match sqex_proto::home_file::set(id, &recorded) {
+            Ok(()) => println!(
+                "recorded in {}",
+                sqex_proto::home_file::path_for(id).display()
+            ),
+            Err(e) => eprintln!("note: could not record the home beside the identity: {e}"),
+        }
+    }
     println!(
         "{} store row(s) now filed under the new home{}",
         done.refiled,
@@ -4717,6 +4833,17 @@ fn layers(cli: &Cli, cfg: &Config) -> Vec<sqex_discovery::Layer> {
             server: env_nonempty("SQEX_SERVER"),
             host: env_nonempty("SQEX_SERVER_HOST"),
             key: env_nonempty("SQEX_SERVER_KEY"),
+        },
+        // SIP-59: where this identity's account lives, as the person recorded
+        // it beside the identity (`<identity>.home`, written by a move or a
+        // claim). Above the config, which is one pointer for every identity;
+        // below anything said for this run.
+        {
+            let home = identity_path(cli, cfg)
+                .ok()
+                .and_then(|id| sqex_proto::home_file::load(&id))
+                .unwrap_or_default();
+            sqex_discovery::Layer::for_home(home.domain, home.key)
         },
         // The config has no `server_host`: it is `sqnr`'s type, in another repo.
         // A `server` there with a key beside it is a literal address, and

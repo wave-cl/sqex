@@ -55,7 +55,8 @@ async fn chat_at(addr: SocketAddr, server_pub: [u8; 32], b: u8, store_path: &Pat
     let mut chat = Chat::new(client, seed, me, PubKey::new(server_pub), store);
     chat.set_domain(Some("x.test".into()));
     chat.top_up_prekeys().await.unwrap();
-    chat.ensure_home().await.unwrap();
+    // The person's claim: a new store presents no Move by itself.
+    chat.claim_home().await.unwrap();
     chat
 }
 
@@ -402,6 +403,10 @@ async fn a_linked_device_follows_the_handover_and_is_entrusted_the_key() {
     assert!(xp.entrusted);
     assert!(phone.holds_account_key());
     assert_eq!(phone.account_seed(), Some(seed));
+    // Entrusted, the phone signs the account's Move. Its store is not a
+    // new one -- it claimed a home as its own account before it was linked
+    // -- so ensure_home presents by itself; a fresh store would say
+    // Unclaimed and wait for the person (unclaimed_flow).
     assert_eq!(
         phone.ensure_home().await.unwrap(),
         HomeSaid::Presented,

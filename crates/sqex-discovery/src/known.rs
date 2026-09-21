@@ -345,6 +345,16 @@ impl Known {
         self.entries.len() != before
     }
 
+    /// The address a key was last reached at, whichever domain pinned it --
+    /// for a home recorded by key alone (`sqex_proto::home_file`), which has
+    /// no name to discover.
+    pub fn address_of(&self, key: &PubKey) -> Option<SocketAddr> {
+        self.entries
+            .iter()
+            .find(|e| &e.key == key)
+            .and_then(|e| e.addrs.first().copied())
+    }
+
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
