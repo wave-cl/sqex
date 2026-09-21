@@ -3208,9 +3208,7 @@ async fn route(
             // off does not offer the route at all.
             (Some(me), Ok(req)) => match server.name_registration {
                 NameMode::Open => {
-                    let outcome = server
-                        .names
-                        .claim(&req.name, &me);
+                    let outcome = server.names.claim(&req.name, &me);
                     (
                         200,
                         "application/octet-stream",

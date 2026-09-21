@@ -1799,7 +1799,9 @@ async fn whoami(
     // record is the authority; this is what every start dials first.
     match sqex_proto::home_file::load(&id) {
         Some(h) => println!("  home     {}", h.describe()),
-        None => println!("  home     (none recorded -- `sqex-chat home claim` at the exchange it lives at)"),
+        None => println!(
+            "  home     (none recorded -- `sqex-chat home claim` at the exchange it lives at)"
+        ),
     }
     let hs = handles::load(&id);
     if hs.is_empty() {

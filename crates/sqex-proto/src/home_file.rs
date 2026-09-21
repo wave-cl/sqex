@@ -184,12 +184,18 @@ mod tests {
             key: Some(key(1)),
         };
         assert!(both.names(&key(1), None));
-        assert!(!both.names(&key(2), Some("squic.org")), "the key outranks the domain");
+        assert!(
+            !both.names(&key(2), Some("squic.org")),
+            "the key outranks the domain"
+        );
         let by_name = Home {
             domain: Some("squic.org".into()),
             ..Default::default()
         };
         assert!(by_name.names(&key(9), Some("SQUIC.ORG.")));
-        assert!(!by_name.names(&key(9), None), "reached by address, a domain cannot say");
+        assert!(
+            !by_name.names(&key(9), None),
+            "reached by address, a domain cannot say"
+        );
     }
 }

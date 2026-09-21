@@ -86,10 +86,10 @@ pub fn add(identity: &Path, handle: &str) -> Result<(String, bool), String> {
         return Ok((handle, false));
     }
     let domain = handle.split_once('@').map(|(_, d)| d).unwrap_or("");
-    match handles
-        .iter()
-        .position(|h| h.split_once('@').is_some_and(|(_, d)| d.eq_ignore_ascii_case(domain)))
-    {
+    match handles.iter().position(|h| {
+        h.split_once('@')
+            .is_some_and(|(_, d)| d.eq_ignore_ascii_case(domain))
+    }) {
         Some(i) => handles[i] = handle.clone(),
         None => handles.push(handle.clone()),
     }

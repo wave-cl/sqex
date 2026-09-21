@@ -400,7 +400,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             let named = recorded
                 .as_ref()
                 .is_some_and(|h| h.names(&chat.exchange_key(), domain.as_deref()));
-            if matches!(cli.cmd, Some(Cmd::Home { cmd: Some(HomeCmd::Claim), .. })) {
+            if matches!(
+                cli.cmd,
+                Some(Cmd::Home {
+                    cmd: Some(HomeCmd::Claim),
+                    ..
+                })
+            ) {
                 // The claim below does it, and says so.
             } else if named {
                 match chat.claim_home().await {
@@ -412,7 +418,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                     Err(e) => eprintln!("note: could not record this exchange as home: {e}"),
                 }
             } else {
-                let here = domain.clone().unwrap_or_else(|| chat.exchange_key().to_string());
+                let here = domain
+                    .clone()
+                    .unwrap_or_else(|| chat.exchange_key().to_string());
                 eprintln!(
                     "note: this store is new and {here} has no home on record for {}; you are                      a visitor here{}. If this is where the account lives: `sqex-chat home claim`",
                     chat.me,
@@ -547,7 +555,9 @@ async fn run(cli: Cli) -> Result<(), String> {
                     key: Some(chat.exchange_key()),
                 };
                 sqex_proto::home_file::set(&id, &home)?;
-                let here = domain.clone().unwrap_or_else(|| chat.exchange_key().to_string());
+                let here = domain
+                    .clone()
+                    .unwrap_or_else(|| chat.exchange_key().to_string());
                 println!(
                     "{}",
                     match said {

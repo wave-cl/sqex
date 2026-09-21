@@ -493,8 +493,16 @@ mod tests {
         let n = names(3600);
         assert_eq!(n.claim("n0", &pk(1)), CLAIM_GRANTED);
         assert_eq!(n.claim("n1", &pk(1)), CLAIM_AT_CAPACITY);
-        assert_eq!(n.claim("n0", &pk(1)), CLAIM_GRANTED, "a renewal is not a second name");
-        assert_eq!(n.names_for(&pk(1)), vec!["n0"], "the refusal changed nothing");
+        assert_eq!(
+            n.claim("n0", &pk(1)),
+            CLAIM_GRANTED,
+            "a renewal is not a second name"
+        );
+        assert_eq!(
+            n.names_for(&pk(1)),
+            vec!["n0"],
+            "the refusal changed nothing"
+        );
         assert_eq!(n.claim("n1", &pk(2)), CLAIM_GRANTED);
         assert!(n.release("n0", &pk(1)));
         assert_eq!(n.claim("n2", &pk(1)), CLAIM_GRANTED);
