@@ -132,6 +132,22 @@ async fn a_store_comes_back_from_the_exchange_after_the_exchange_forgot_it() {
     // The right words: the history and the key it opens with, and the
     // contact, verified as she left it.
     let r = fresh.restore(&key, None).await.unwrap();
+    // SIP-60: a backup lives at the home, so a restore records the exchange
+    // it was read from beside the identity -- what the CLI and sigil do
+    // after `restore`, with the identity file they hold.
+    let identity = dir.path().join("identity-alice");
+    std::fs::write(&identity, "x").unwrap();
+    assert_eq!(sqex_proto::home_file::load(&identity), None);
+    let recorded = fresh.record_home_beside(&identity).await.unwrap();
+    assert_eq!(
+        recorded.as_ref().and_then(|h| h.key),
+        Some(PubKey::new(server_pub)),
+        "the restore did not record its exchange as the home"
+    );
+    assert_eq!(
+        sqex_proto::home_file::load(&identity).and_then(|h| h.key),
+        Some(PubKey::new(server_pub))
+    );
     assert_eq!(r.generation, 2);
     assert_eq!(r.channels, 1, "{r:?}");
     assert!(r.entries >= 2, "{r:?}");

@@ -454,7 +454,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         return device_command(&mut chat, cmd).await;
     }
     if let Some(Cmd::Backup { cmd }) = &cli.cmd {
-        return backup_command(&mut chat, cmd).await;
+        return backup_command(&mut chat, cmd, identity.as_deref()).await;
     }
     if let Some(Cmd::Move {
         home,
@@ -551,11 +551,9 @@ async fn run(cli: Cli) -> Result<(), String> {
         match hc {
             HomeCmd::Claim => {
                 let said = chat.claim_home().await.map_err(|e| e.to_string())?;
-                let home = sqex_proto::home_file::Home {
-                    domain: domain.clone(),
-                    key: Some(chat.exchange_key()),
-                };
-                sqex_proto::home_file::set(&id, &home)?;
+                chat.record_home_beside(&id)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let here = domain
                     .clone()
                     .unwrap_or_else(|| chat.exchange_key().to_string());
@@ -656,7 +654,11 @@ async fn run(cli: Cli) -> Result<(), String> {
     interface(chat, pinned_notice).await
 }
 
-async fn backup_command(chat: &mut Chat, cmd: &BackupCmd) -> Result<(), String> {
+async fn backup_command(
+    chat: &mut Chat,
+    cmd: &BackupCmd,
+    identity: Option<&std::path::Path>,
+) -> Result<(), String> {
     use sqex_proto::backup::from_words;
     match cmd {
         BackupCmd::Key => {
@@ -728,6 +730,20 @@ async fn backup_command(chat: &mut Chat, cmd: &BackupCmd) -> Result<(), String> 
             // Ours to keep, from now on.
             if from.is_none() {
                 chat.set_backup_key(&key).map_err(|e| e.to_string())?;
+                // SIP-60: a backup lives at the home, so the exchange this
+                // was restored from is where the account lives -- recorded
+                // beside the identity, as a claim would record it.
+                if let Some(id) = identity {
+                    match chat.record_home_beside(id).await {
+                        Ok(Some(h)) => println!(
+                            "recorded {} as this account's home in {}",
+                            h.describe(),
+                            sqex_proto::home_file::path_for(id).display()
+                        ),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("note: could not record the home: {e}"),
+                    }
+                }
             }
             Ok(())
         }

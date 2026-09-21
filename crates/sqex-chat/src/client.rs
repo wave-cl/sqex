@@ -2557,6 +2557,38 @@ impl Chat {
         Ok(HomeSaid::Presented)
     }
 
+    /// SIP-60 §When a client presents a Move unasked (2026-09-21): record
+    /// the exchange this client is connected to as the account's home,
+    /// beside the identity (`<identity>.home`), where every start reads it
+    /// as the default exchange -- unless this exchange records the account
+    /// as living elsewhere, in which case nothing is written and `None` is
+    /// returned. What a claim, a reach-out from the home session and a
+    /// restore (a backup lives at the home) all record; idempotent when the
+    /// sidecar already names this exchange. A linked device records its
+    /// account's home the same way.
+    pub async fn record_home_beside(
+        &mut self,
+        identity: &std::path::Path,
+    ) -> Result<Option<sqex_proto::home_file::Home>> {
+        let me = self.me;
+        let exchange = self.exchange;
+        match self.account_home(&me).await {
+            Ok(h) if h.since != 0 && h.home != exchange => return Ok(None),
+            Ok(_) | Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let home = sqex_proto::home_file::Home {
+            domain: self.domain.clone(),
+            key: Some(exchange),
+        };
+        if !sqex_proto::home_file::load(identity)
+            .is_some_and(|h| h.names(&exchange, self.domain.as_deref()))
+        {
+            sqex_proto::home_file::set(identity, &home).map_err(ChatError::Protocol)?;
+        }
+        Ok(Some(home))
+    }
+
     async fn present_first_move(&mut self) -> Result<()> {
         let exchange = self.exchange;
         let mv = self.sign_move(&exchange)?;

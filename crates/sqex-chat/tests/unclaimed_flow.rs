@@ -129,4 +129,52 @@ async fn a_new_store_presents_no_move_until_the_person_claims() {
         0,
         "the refusal moved her"
     );
+
+    // Recording the home beside the identity (what a restore does): at E,
+    // which has the record, it is written; at F, once F is told the account
+    // lives at E, nothing is -- the guard against recording a stranger.
+    let identity = e_dir.path().join("identity-carol");
+    std::fs::write(&identity, "x").unwrap();
+    e_store_at_f
+        .present_move(&sqex_proto::home::Moving {
+            mv: sqex_proto::home::Move::sign(&seed, &PubKey::new(e_pub), now()),
+            domain: "e.test".into(),
+            origins: vec![],
+        })
+        .await
+        .expect("F did not take the word that carol lives at E");
+    assert_eq!(
+        e_store_at_f.record_home_beside(&identity).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        sqex_proto::home_file::load(&identity),
+        None,
+        "F was recorded as the home"
+    );
+    let client = Client::connect_as(e_addr, &e_pub, &seed).await.unwrap();
+    let store = Store::open(&seed, Some(&store_e)).unwrap();
+    let mut back_at_e = Chat::new(client, seed, carol, PubKey::new(e_pub), store);
+    back_at_e.set_domain(Some("e.test".into()));
+    let h = back_at_e
+        .record_home_beside(&identity)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (h.domain.as_deref(), h.key),
+        (Some("e.test"), Some(PubKey::new(e_pub)))
+    );
+    assert!(
+        sqex_proto::home_file::load(&identity)
+            .unwrap()
+            .names(&PubKey::new(e_pub), Some("e.test"))
+    );
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
