@@ -678,8 +678,7 @@ impl FileConfig {
                 // operator hears it.
                 Some(0) => {
                     return Err(Error::Malformed(
-                        "tunnel_idle_secs must be a positive number of seconds (default 60)"
-                            .into(),
+                        "tunnel_idle_secs must be a positive number of seconds (default 60)".into(),
                     ));
                 }
                 Some(s) => s,
@@ -895,6 +894,20 @@ mod tests {
         // Zero is refused at load rather than silently refusing every caller.
         let cfg: FileConfig = toml::from_str("key_file = \"/x\"\nmax_connections = 0\n").unwrap();
         assert!(cfg.resolve().is_err());
+    }
+
+    /// SIP-85 §Limits: the idle span defaults to the SIP's 60 s, takes an
+    /// operator's value, and refuses zero rather than closing every tunnel
+    /// at its first quiet tick.
+    #[test]
+    fn the_tunnel_idle_span_defaults_and_refuses_zero() {
+        let cfg: FileConfig = toml::from_str(r#"key_file = "/x""#).unwrap();
+        assert_eq!(cfg.resolve().unwrap().tunnel_idle_secs, 60);
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\ntunnel_idle_secs = 2\n").unwrap();
+        assert_eq!(cfg.resolve().unwrap().tunnel_idle_secs, 2);
+        let cfg: FileConfig = toml::from_str("key_file = \"/x\"\ntunnel_idle_secs = 0\n").unwrap();
+        let err = cfg.resolve().unwrap_err().to_string();
+        assert!(err.contains("tunnel_idle_secs"), "{err}");
     }
 
     #[test]

@@ -528,10 +528,7 @@ async fn a_listed_key_is_carried_for_without_a_move() {
         Carrier::open(a.addr, &a.key, &seed, &b.key, "b.test"),
     )
     .await;
-    assert!(
-        !matches!(again, Ok(Ok(_))),
-        "a removed key opened a tunnel"
-    );
+    assert!(!matches!(again, Ok(Ok(_))), "a removed key opened a tunnel");
     assert_eq!(a.server.tunnels_open(), 0);
 }
 
@@ -623,7 +620,10 @@ async fn an_idle_tunnel_closes_and_a_busy_one_does_not() {
         .await
         .unwrap();
     for _ in 0..10 {
-        let (code, _) = through.get("/status").await.expect("the busy tunnel carries");
+        let (code, _) = through
+            .get("/status")
+            .await
+            .expect("the busy tunnel carries");
         assert_eq!(code, 200);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -637,13 +637,23 @@ async fn an_idle_tunnel_closes_and_a_busy_one_does_not() {
 
     // The control: the same idle tunnel under the default span is still
     // open when the 2 s one had long closed.
-    let slow = exchange(true, 4, "a2.test", &[("b.test", PubKey::new(b.key), b.addr)]).await;
+    let slow = exchange(
+        true,
+        4,
+        "a2.test",
+        &[("b.test", PubKey::new(b.key), b.addr)],
+    )
+    .await;
     home_at(&slow, &seed).await;
     let idle = Carrier::open(slow.addr, &slow.key, &seed, &b.key, "b.test")
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
-    assert_eq!(slow.server.tunnels_open(), 1, "closed under the 60 s default");
+    assert_eq!(
+        slow.server.tunnels_open(),
+        1,
+        "closed under the 60 s default"
+    );
     assert!(slow.server.tunnel_closes().is_empty());
     assert!(!idle.closed());
 }
@@ -695,7 +705,10 @@ async fn a_tunnel_over_its_byte_budget_drops_and_the_connection_survives() {
     let (sent, _) = carrier.bytes();
     let (forwarded, _) = tight.server.tunnel_forwarded();
     let (dropped_up, _) = tight.server.tunnel_dropped();
-    assert!(dropped_up > 0, "nothing was dropped: the bucket never engaged");
+    assert!(
+        dropped_up > 0,
+        "nothing was dropped: the bucket never engaged"
+    );
     // What A carried on is bounded by the budget plus one second's burst,
     // whatever the machine's speed; what the member sent is more, by the
     // drops and QUIC's retransmissions of them.
@@ -708,10 +721,19 @@ async fn a_tunnel_over_its_byte_budget_drops_and_the_connection_survives() {
         forwarded >= 10 * 60 * 1024,
         "less was carried on than was posted: {forwarded}"
     );
-    assert!(sent > forwarded, "the member sent {sent}, A carried {forwarded}: nothing dropped?");
+    assert!(
+        sent > forwarded,
+        "the member sent {sent}, A carried {forwarded}: nothing dropped?"
+    );
 
     // The control.
-    let loose = exchange(true, 4, "a2.test", &[("b.test", PubKey::new(b.key), b.addr)]).await;
+    let loose = exchange(
+        true,
+        4,
+        "a2.test",
+        &[("b.test", PubKey::new(b.key), b.addr)],
+    )
+    .await;
     home_at(&loose, &seed).await;
     let carrier = Carrier::open(loose.addr, &loose.key, &seed, &b.key, "b.test")
         .await
