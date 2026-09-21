@@ -422,7 +422,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                     .clone()
                     .unwrap_or_else(|| chat.exchange_key().to_string());
                 eprintln!(
-                    "note: this store is new and {here} has no home on record for {}; you are                      a visitor here{}. If this is where the account lives: `sqex-chat home claim`",
+                    "note: this store is new and {here} has no home on record for {}; you are a \
+                     visitor here{}. If this is where the account lives: `sqex-chat home claim`",
                     chat.me,
                     match &recorded {
                         Some(h) => format!(" (the identity records its home as {})", h.describe()),

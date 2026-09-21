@@ -1637,7 +1637,8 @@ async fn names(cli: &Cli, cfg: &Config, cmd: &NameCmd) -> Result<(), String> {
                     let at = domain.as_deref().unwrap_or("this exchange");
                     match held.first() {
                         Some(h) => println!(
-                            "refused: you already hold {h} at {at} (one name per exchange);                              `sqex name release {h}` frees it first"
+                            "refused: you already hold {h} at {at} (one name per exchange); \
+                             `sqex name release {h}` frees it first"
                         ),
                         None => println!(
                             "refused: you already hold a name at {at} (one name per exchange)"
