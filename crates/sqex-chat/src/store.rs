@@ -35,10 +35,12 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha512};
-use sqex_proto::channel::KIND_MEMBER;
+use sqex_proto::channel::{KIND_MEMBER, KIND_SYSTEM, System, direct_message_id};
 use sqex_proto::channel_key::{ChannelKey, Replay};
 use sqex_proto::entry_sig::GENESIS;
+use sqex_proto::message::Body;
 use sqex_proto::prekey::{KIND_FALLBACK, KIND_ONE_TIME, Pool, PoolState};
+use sqex_proto::timeline::{Received, Standing, Timeline, Verdict};
 use sqnr_core::PubKey;
 
 /// Domain separator for the at-rest key. Distinct from every wire context in
@@ -1214,6 +1216,79 @@ impl Store {
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
             .filter(|b| b != &Store::UNCLAIMED)
             .map(PubKey::new))
+    }
+
+    /// Fold what this store holds of a channel into a timeline: what a client
+    /// draws before it has asked the exchange anything, and the only copy of
+    /// an epoch's plaintext there is. Store-side, so a client with no
+    /// connection yet can draw from the disc (sigil, 2026-09-22).
+    pub fn history(&self, channel: &[u8; 32], admins: &[PubKey]) -> Result<Timeline> {
+        let mut timeline = Timeline::new();
+        let held = self.messages(channel)?;
+        let mut with_body: Vec<u64> = Vec::new();
+        for (seq, account, posted, kind, plain) in held {
+            if plain.as_ref().is_some_and(|p| !p.is_empty()) {
+                with_body.push(seq);
+            }
+            timeline.apply(
+                &Received {
+                    seq,
+                    account,
+                    posted,
+                    kind,
+                    // What this client verified when the entry arrived. The
+                    // store keeps no signatures, so nothing can be re-checked
+                    // here — which is only honest because `poll` refuses to
+                    // write an entry that failed.
+                    verdict: Verdict::Valid,
+                    // Nor can a receipt be re-checked from the store, and
+                    // unlike the verdict this one is not safely defaulted to
+                    // the good case: a rebuilt timeline has no receipt in front
+                    // of it, and *unclaimed* is exactly what that is.
+                    tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
+                    standing: Standing::Unclaimed,
+                    // Two decoders, chosen by kind and never both: a system
+                    // entry carries SIP-16's own layout and a member entry a
+                    // SIP-19 body, and neither decoder would make sense of the
+                    // other's bytes.
+                    system: (kind == KIND_SYSTEM)
+                        .then(|| {
+                            plain
+                                .as_deref()
+                                .and_then(|p| System::decode(p).ok().flatten())
+                        })
+                        .flatten(),
+                    body: (kind == KIND_MEMBER)
+                        .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
+                        .flatten(),
+                },
+                admins,
+            );
+        }
+
+        // Anything the fold says was deleted, and whose words are still here.
+        //
+        // The poll path clears a body as the redaction arrives, but that only
+        // helps from now on: a message deleted before this client learned to
+        // do it kept its plaintext, and would have kept it for good. Folding
+        // is where we find out which those are, and it happens once per
+        // channel at startup rather than on every poll.
+        for seq in with_body {
+            if timeline.get(seq).is_some_and(|m| m.redacted) {
+                self.redact_message(channel, seq)?;
+            }
+        }
+        Ok(timeline)
+    }
+
+    /// The direct-message channel with `them`, as this store knows it: an
+    /// alias where one was recorded (SIP-60 §A direct message opened twice),
+    /// the derived id otherwise.
+    pub fn dm_with(&self, me: &PubKey, them: &PubKey) -> [u8; 32] {
+        if let Ok(Some(c)) = self.dm_alias(them) {
+            return c;
+        }
+        direct_message_id(me, them)
     }
 
     /// The exchange, as a query parameter. Every scoped row goes through this.

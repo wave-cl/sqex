@@ -2301,10 +2301,7 @@ impl Chat {
     /// SIP-44 §The handover: a conversation whose other party changed key keeps its
     /// channel, and is found here before anything is derived.
     pub fn dm_with(&self, them: &PubKey) -> [u8; 32] {
-        if let Ok(Some(c)) = self.store.dm_alias(them) {
-            return c;
-        }
-        direct_message_id(&self.me, them)
+        self.store.dm_with(&self.me, them)
     }
 
     /// Make sure the direct message with `them` exists and we hold its key.
@@ -3108,62 +3105,7 @@ impl Chat {
     /// redaction or a metadata change, and it is remembered from the last poll
     /// so that a client starting offline still folds correctly.
     pub fn history(&self, channel: &[u8; 32], admins: &[PubKey]) -> Result<Timeline> {
-        let mut timeline = Timeline::new();
-        let held = self.store.messages(channel)?;
-        let mut with_body: Vec<u64> = Vec::new();
-        for (seq, account, posted, kind, plain) in held {
-            if plain.as_ref().is_some_and(|p| !p.is_empty()) {
-                with_body.push(seq);
-            }
-            timeline.apply(
-                &Received {
-                    seq,
-                    account,
-                    posted,
-                    kind,
-                    // What this client verified when the entry arrived. The
-                    // store keeps no signatures, so nothing can be re-checked
-                    // here — which is only honest because `poll` refuses to
-                    // write an entry that failed.
-                    verdict: Verdict::Valid,
-                    // Nor can a receipt be re-checked from the store, and
-                    // unlike the verdict this one is not safely defaulted to
-                    // the good case: a rebuilt timeline has no receipt in front
-                    // of it, and *unclaimed* is exactly what that is.
-                    tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
-                    standing: Standing::Unclaimed,
-                    // Two decoders, chosen by kind and never both: a system
-                    // entry carries SIP-16's own layout and a member entry a
-                    // SIP-19 body, and neither decoder would make sense of the
-                    // other's bytes.
-                    system: (kind == KIND_SYSTEM)
-                        .then(|| {
-                            plain
-                                .as_deref()
-                                .and_then(|p| System::decode(p).ok().flatten())
-                        })
-                        .flatten(),
-                    body: (kind == KIND_MEMBER)
-                        .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
-                        .flatten(),
-                },
-                admins,
-            );
-        }
-
-        // Anything the fold says was deleted, and whose words are still here.
-        //
-        // The poll path clears a body as the redaction arrives, but that only
-        // helps from now on: a message deleted before this client learned to
-        // do it kept its plaintext, and would have kept it for good. Folding
-        // is where we find out which those are, and it happens once per
-        // channel at startup rather than on every poll.
-        for seq in with_body {
-            if timeline.get(seq).is_some_and(|m| m.redacted) {
-                self.store.redact_message(channel, seq)?;
-            }
-        }
-        Ok(timeline)
+        Ok(self.store.history(channel, admins)?)
     }
 
     // ---- devices (SIP-20 and SIP-22) ------------------------------------
