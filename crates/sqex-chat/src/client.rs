@@ -3308,6 +3308,42 @@ impl Chat {
         Ok(())
     }
 
+    /// SIP-47 §Pairing, step 2: register **another** device of this account,
+    /// from this one.
+    ///
+    /// The exchange takes a registration from "the delegate itself, or an
+    /// already-registered device of the same account" -- and only
+    /// [`register_self`](Self::register_self) existed, which is the first
+    /// kind. So the second kind had no producer anywhere: a phone showed its
+    /// key, a desktop wrote a credential for it, and the phone's
+    /// [`claim_listed`](Self::claim_listed) then looked for itself in the
+    /// account's list and was never there, because writing a credential is
+    /// not registering anything. The way that did work was carrying the
+    /// credential across by hand.
+    ///
+    /// This is the posting. It touches nothing local: the store's account,
+    /// credential and identity stay this device's own, since the credential
+    /// is somebody else's. The caller must be registered here itself
+    /// (`register_self` first, as `sigil` does), or the exchange refuses it as
+    /// not authorised -- an account acting as its own device has no
+    /// registration for the exchange to look up.
+    pub async fn register_device(&mut self, credential: &Credential) -> Result<()> {
+        if credential.delegate == self.device {
+            return Err(ChatError::Protocol(
+                "that credential names this device; use register_self".into(),
+            ));
+        }
+        self.post(
+            "/device/register",
+            Register {
+                credential: credential.clone(),
+            }
+            .encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// This device's own credential, if it has one: what it presents to a
     /// sibling (SIP-42). A device that is its own account has none.
     pub fn credential(&self) -> Option<Credential> {

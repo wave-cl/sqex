@@ -521,3 +521,57 @@ async fn run(
         xb.phase()
     );
 }
+
+/// **SIP-47 §Pairing: the sibling registers the phone, and the phone finds
+/// itself.**
+///
+/// The exchange takes a registration from "the delegate itself, or an
+/// already-registered device of the same account", and only the first kind
+/// had a client method. So the pairing somebody expects -- show the phone's
+/// key, scan it on the laptop, done -- could not complete: the laptop wrote
+/// a credential and stopped, and the phone's `claim_listed` never found
+/// itself in the list. This is the second kind, and the whole of the claim.
+#[tokio::test]
+async fn a_registered_device_registers_a_sibling_and_the_sibling_claims_its_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (_, alice) = identity(21);
+    let (_, phone_key) = identity(22);
+    let mut laptop = chat_at(addr, server_pub, 21, &dir.path().join("laptop.db")).await;
+    let mut phone = chat_at(addr, server_pub, 22, &dir.path().join("phone.db")).await;
+
+    // The phone, unregistered, cannot claim: the control. Its refusal is
+    // the exchange's list not having it, which is what the next call fixes.
+    assert!(
+        phone.claim_listed(&alice).await.is_err(),
+        "the phone claimed an account nobody has registered it to"
+    );
+
+    // The laptop registers itself, then the phone -- from the phone's key
+    // alone, which is what a QR carries.
+    let own = laptop.issue_credential(&alice, 90 * 24 * 60 * 60).unwrap();
+    laptop.register_self(&own).await.unwrap();
+    let for_phone = laptop
+        .issue_credential(&phone_key, 90 * 24 * 60 * 60)
+        .unwrap();
+    laptop.register_device(&for_phone).await.unwrap();
+    // The laptop is still itself: this touched nothing local.
+    assert_eq!(laptop.me, alice);
+    assert_eq!(
+        laptop.credential().map(|c| c.delegate),
+        Some(alice),
+        "registering a sibling changed the laptop's own credential"
+    );
+
+    // And the phone finds itself listed, takes the credential the laptop
+    // presented, and is Alice's device from here on.
+    let taken = phone.claim_listed(&alice).await.unwrap();
+    assert_eq!(taken.delegate, phone_key);
+    assert_eq!(taken.account, alice);
+    assert_eq!(phone.me, alice, "the phone is Alice's device");
+
+    // A credential for this very device is the other method's, and refused
+    // here in words rather than posted as a sibling of itself.
+    let for_laptop = laptop.issue_credential(&alice, 60).unwrap();
+    assert!(laptop.register_device(&for_laptop).await.is_err());
+}
