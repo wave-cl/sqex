@@ -3140,6 +3140,135 @@ impl Chat {
         Ok(body.first().copied().unwrap_or(0) != 0)
     }
 
+    // ---- SIP-44 succession: what to do before a key is lost, and after ----
+    //
+    // The CLI has had all of this since SIP-44 landed, posting the routes by
+    // hand; a graphical client had no way to reach any of it, so sigil's own
+    // documentation said "done from a terminal today". These are the same
+    // five acts with the same refusals, in the client where the account is.
+
+    /// SIP-44 §The will: sign that `successor` may take this account, to be
+    /// presented by that key when this one is gone.
+    ///
+    /// Only the account itself can write one -- a linked device holds the
+    /// account's credential and not its seed, and a will it signed would be
+    /// the device's, which nobody can succeed to. Refused in words there,
+    /// and for an account naming itself.
+    pub fn sign_will(&self, successor: &PubKey) -> Result<sqex_proto::succession::Will> {
+        if self.me != self.device {
+            return Err(ChatError::Protocol(
+                "only the account itself can write a will; this is one of its devices".into(),
+            ));
+        }
+        if *successor == self.me {
+            return Err(ChatError::Protocol(
+                "an account cannot succeed itself".into(),
+            ));
+        }
+        Ok(sqex_proto::succession::Will::sign(
+            &self.seed,
+            successor,
+            now_secs(),
+        ))
+    }
+
+    /// SIP-44 §Guardians: sign a policy naming who may name this account's
+    /// successor, and how many of them it takes. The account's own act, as
+    /// a will is; `Policy::sign` refuses one that could never be met.
+    pub fn sign_policy(
+        &self,
+        threshold: u8,
+        guardians: &[PubKey],
+    ) -> Result<sqex_proto::succession::Policy> {
+        if self.me != self.device {
+            return Err(ChatError::Protocol(
+                "only the account itself can name guardians; this is one of its devices".into(),
+            ));
+        }
+        sqex_proto::succession::Policy::sign(&self.seed, threshold, guardians, now_secs())
+            .map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// SIP-44 §Guardians: lodge a policy at the exchange, where the guardians
+    /// and the successor can find it when the account cannot be asked.
+    pub async fn lodge_policy(&mut self, policy: &sqex_proto::succession::Policy) -> Result<()> {
+        self.post("/account/lodge", policy.encode()).await?;
+        Ok(())
+    }
+
+    /// SIP-44 §Guardians: the policy lodged for `account`, if any.
+    pub async fn lodged_policy(
+        &mut self,
+        account: &PubKey,
+    ) -> Result<Option<sqex_proto::succession::Policy>> {
+        match self
+            .post("/account/lodged", sqex_proto::succession::ask(account))
+            .await
+        {
+            Ok(body) => Ok(Some(
+                sqex_proto::succession::Policy::decode(&body)
+                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
+            )),
+            // Not succeeded, or nothing lodged -- and an exchange from
+            // before the route says the same thing in the router's words.
+            Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// SIP-44 §Guardians: as a guardian, sign that `successor` succeeds
+    /// `account` -- your word, to be given to the successor to collect.
+    pub fn vouch(&self, account: &PubKey, successor: &PubKey) -> sqex_proto::succession::Vouch {
+        sqex_proto::succession::Vouch::sign(&self.seed, account, successor, now_secs())
+    }
+
+    /// SIP-44 §The successor: present a proof -- a will, or a policy with the
+    /// vouches that meet it -- and take the account it names.
+    ///
+    /// Checked here before it is sent, in the same words the CLI uses: the
+    /// proof has to name *this* key as successor, and has to prove it. The
+    /// exchange checks both again and moves the account's names, channels
+    /// and place in each to this key; its old devices are nobody's after.
+    pub async fn succeed(&mut self, proof: sqex_proto::succession::Proof) -> Result<()> {
+        if proof.successor() != Some(self.device) {
+            return Err(ChatError::Protocol(
+                "this proof names somebody else as successor".into(),
+            ));
+        }
+        if !proof.proves(&self.device) {
+            return Err(ChatError::Protocol(
+                "this proof does not prove it: a signature is wrong, or the quorum is short".into(),
+            ));
+        }
+        self.post(
+            "/account/succeed",
+            sqex_proto::succession::Claim { proof }.encode(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// SIP-44: what the exchange recorded of `account`'s succession, if it
+    /// was succeeded.
+    pub async fn succession_of(
+        &mut self,
+        account: &PubKey,
+    ) -> Result<Option<sqex_proto::succession::Succeeded>> {
+        match self
+            .post("/account/succession", sqex_proto::succession::ask(account))
+            .await
+        {
+            Ok(body) => Ok(Some(
+                sqex_proto::succession::Succeeded::decode(&body)
+                    .map_err(|e| ChatError::Protocol(e.to_string()))?,
+            )),
+            // Not succeeded, or nothing lodged -- and an exchange from
+            // before the route says the same thing in the router's words.
+            Err(ChatError::Refused(404, _)) | Err(ChatError::NoChatHere(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// SIP-44 §Which account a device is: whose device this is, as the registry has it -- the one party
     /// that knows after a handover moved it.
     pub async fn whose(&mut self) -> Result<sqex_proto::device::Whose> {

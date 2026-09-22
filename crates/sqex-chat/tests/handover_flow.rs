@@ -575,3 +575,115 @@ async fn a_registered_device_registers_a_sibling_and_the_sibling_claims_its_acco
     let for_laptop = laptop.issue_credential(&alice, 60).unwrap();
     assert!(laptop.register_device(&for_laptop).await.is_err());
 }
+
+/// **SIP-44 succession, from the client.** A will, written by the account;
+/// the successor presents it and takes the account; the exchange records it
+/// and says so to anybody who asks. And the guardians' way: a policy lodged,
+/// two of three vouch, the successor collects the vouches and claims.
+///
+/// The CLI has posted these routes by hand since SIP-44 landed and no
+/// graphical client could reach them. These are the same acts with the same
+/// refusals: a device cannot write its account's will, a proof naming
+/// somebody else is refused before it is sent, and a quorum one short does
+/// not prove.
+#[tokio::test]
+async fn an_account_names_its_successor_and_the_successor_takes_it() {
+    use sqex_proto::succession::Proof;
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (_, alice) = identity(31);
+    let (_, heir) = identity(32);
+    let mut alice_at = chat_at(addr, server_pub, 31, &dir.path().join("alice.db")).await;
+    let mut heir_at = chat_at(addr, server_pub, 32, &dir.path().join("heir.db")).await;
+
+    assert!(
+        alice_at.succession_of(&alice).await.unwrap().is_none(),
+        "succeeded before anybody claimed anything"
+    );
+    assert!(
+        alice_at.sign_will(&alice).is_err(),
+        "an account succeeded itself"
+    );
+
+    // The will, kept apart from the heir's secret; here it is handed over.
+    let will = alice_at.sign_will(&heir).unwrap();
+    assert!(will.verify());
+
+    // Somebody else cannot use it: the proof names the heir.
+    let (_, stranger_key) = identity(33);
+    let mut stranger = chat_at(addr, server_pub, 33, &dir.path().join("stranger.db")).await;
+    let _ = stranger_key;
+    assert!(
+        stranger.succeed(Proof::Will(will)).await.is_err(),
+        "a will was accepted from a key it does not name"
+    );
+
+    heir_at.succeed(Proof::Will(will)).await.unwrap();
+    let recorded = heir_at
+        .succession_of(&alice)
+        .await
+        .unwrap()
+        .expect("the exchange recorded the succession");
+    assert_eq!(recorded.successor, heir);
+    assert!(recorded.proof.proves(&heir));
+}
+
+#[tokio::test]
+async fn guardians_name_a_successor_when_the_account_cannot() {
+    use sqex_proto::succession::Proof;
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (_, bob) = identity(41);
+    let (_, heir) = identity(42);
+    let (_, g1) = identity(43);
+    let (_, g2) = identity(44);
+    let (_, g3) = identity(45);
+    let mut bob_at = chat_at(addr, server_pub, 41, &dir.path().join("bob.db")).await;
+    let mut heir_at = chat_at(addr, server_pub, 42, &dir.path().join("heir.db")).await;
+    let g1_at = chat_at(addr, server_pub, 43, &dir.path().join("g1.db")).await;
+    let g2_at = chat_at(addr, server_pub, 44, &dir.path().join("g2.db")).await;
+
+    // Bob names three guardians, any two of whom may name his successor, and
+    // lodges it where they can find it when he cannot be asked.
+    assert!(
+        bob_at.sign_policy(4, &[g1, g2, g3]).is_err(),
+        "a policy nobody could meet was signed"
+    );
+    let policy = bob_at.sign_policy(2, &[g1, g2, g3]).unwrap();
+    bob_at.lodge_policy(&policy).await.unwrap();
+    let lodged = heir_at
+        .lodged_policy(&bob)
+        .await
+        .unwrap()
+        .expect("the policy is lodged");
+    assert_eq!(lodged.threshold, 2);
+    assert!(
+        heir_at.lodged_policy(&heir).await.unwrap().is_none(),
+        "a policy is lodged for an account that never lodged one"
+    );
+
+    // One guardian's word is not enough; two is.
+    let v1 = g1_at.vouch(&bob, &heir);
+    let short = Proof::Guardians {
+        policy: lodged.clone(),
+        vouches: vec![v1],
+    };
+    assert!(
+        heir_at.succeed(short).await.is_err(),
+        "one of two guardians was enough"
+    );
+    let v2 = g2_at.vouch(&bob, &heir);
+    heir_at
+        .succeed(Proof::Guardians {
+            policy: lodged,
+            vouches: vec![v1, v2],
+        })
+        .await
+        .unwrap();
+    let recorded = heir_at
+        .succession_of(&bob)
+        .await
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(recorded.successor, heir);
+}
