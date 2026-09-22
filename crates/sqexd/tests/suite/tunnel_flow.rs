@@ -683,13 +683,21 @@ async fn a_tunnel_over_its_byte_budget_drops_and_the_connection_survives() {
     home_at(&tight, &seed).await;
     let body = vec![0x5au8; 60 * 1024];
 
+    // **The clock starts where the bucket does.** The bucket is made full,
+    // with one second's tokens, when the tunnel opens, and refills from
+    // then -- so what it may carry is bounded by its own life, not by the
+    // ten posts'. This clock started after `Carrier::open` and after the
+    // inner handshake through it, and on a slow runner those took long
+    // enough that the bucket had earned 156 bytes more than the bound
+    // allowed: a release refused over a test that measured a different
+    // span from the one the rule acts on.
+    let started = std::time::Instant::now();
     let carrier = Carrier::open(tight.addr, &tight.key, &seed, &b.key, "b.test")
         .await
         .unwrap();
     let mut through = Client::connect_as(carrier.local_addr(), &b.key, &seed)
         .await
         .unwrap();
-    let started = std::time::Instant::now();
     for i in 0..10 {
         let posted = tokio::time::timeout(
             Duration::from_secs(60),
