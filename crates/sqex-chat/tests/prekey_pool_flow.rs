@@ -105,14 +105,34 @@ async fn a_moved_account_mints_nothing_and_drops_what_the_exchange_refuses() {
             held, 0,
             "round {round}: the store keeps prekeys the exchange refuses ({held})"
         );
-        if round == 0 {
-            assert_eq!(
-                at_f.wiped_prekeys(),
-                before,
-                "the refused pool was not dropped"
-            );
-        }
     }
+
+    // And a pool F did take, left behind by the move: dropped on the first
+    // start that is told, since F serves none of it any more.
+    let (seed2, _) = identity(0x94);
+    let store2 = f_dir.path().join("erin-f.db");
+    let mut erin = chat_at(f_addr, f_pub, 0x94, &store2).await;
+    erin.top_up_prekeys().await.unwrap();
+    assert_eq!(erin.store().one_time_held().unwrap(), POOL as u64);
+    erin.present_move(&sqex_proto::home::Moving {
+        mv: sqex_proto::home::Move::sign(&seed2, &PubKey::new(e_pub), now()),
+        domain: "e.test".into(),
+        origins: vec![],
+    })
+    .await
+    .unwrap();
+    drop(erin);
+    let mut erin = chat_at(f_addr, f_pub, 0x94, &store2).await;
+    assert!(matches!(
+        erin.top_up_prekeys().await.unwrap_err(),
+        ChatError::Moved(..)
+    ));
+    assert_eq!(
+        erin.wiped_prekeys(),
+        POOL as u64,
+        "the pool F no longer serves was kept"
+    );
+    assert_eq!(erin.store().one_time_held().unwrap(), 0);
 }
 
 /// A pool that ran away before the rule -- hundreds of unspent rows the
