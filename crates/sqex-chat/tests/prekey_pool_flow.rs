@@ -80,11 +80,10 @@ async fn a_moved_account_mints_nothing_and_drops_what_the_exchange_refuses() {
     let (seed, _carol) = identity(0x91);
     let store = f_dir.path().join("carol-f.db");
 
-    // A working pool at F first, then the account leaves for E.
+    // The account leaves F for E before this client ever published a pool
+    // at F -- the shape the runaway had: F holds nothing for it, and every
+    // start asks F for a count of zero.
     let mut at_f = chat_at(f_addr, f_pub, 0x91, &store).await;
-    at_f.top_up_prekeys().await.unwrap();
-    let before = at_f.store().one_time_held().unwrap();
-    assert_eq!(before, POOL as u64, "a fresh pool is POOL one-time prekeys");
     at_f.present_move(&sqex_proto::home::Moving {
         mv: sqex_proto::home::Move::sign(&seed, &PubKey::new(e_pub), now()),
         domain: "e.test".into(),
