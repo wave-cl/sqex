@@ -792,6 +792,11 @@ pub struct Redacted {
 pub struct Chat {
     client: Client,
     pub(crate) seed: [u8; 32],
+    /// SIP-23 §Publishing after a refusal: one-time prekeys this client has
+    /// dropped because the exchange refused them or the pool had run away.
+    /// Counted rather than logged -- this crate has no logger -- so a caller
+    /// or a test can say what happened.
+    wiped_prekeys: u64,
     /// Where to dial to get back. `None` when nobody said — a `Chat` that
     /// cannot reconnect must not pretend to be reconnecting, and must not
     /// short-circuit its own requests either, so it keeps the behaviour it had
@@ -953,6 +958,7 @@ impl Chat {
         Chat {
             client,
             seed,
+            wiped_prekeys: 0,
             exchange,
             predecessors,
             receipts: AtomicBool::new(true),
@@ -2062,57 +2068,146 @@ impl Chat {
     ///
     /// SIP-23 asks a device to keep `POOL` published and top up below
     /// `LOW_WATER`. Called on startup, and again whenever we spend one.
+    ///
+    /// `RUNAWAY` one-time prekeys held is more than any honest pool: the
+    /// pool is cleared and started again. `WIPE_VACUUM` rows dropped is worth
+    /// giving the space back.
     pub async fn top_up_prekeys(&mut self) -> Result<()> {
+        const RUNAWAY: u64 = 4 * POOL as u64;
+        const WIPE_VACUUM: u64 = 10_000;
+        // SIP-23 §Publishing after a refusal (2026-09-22). What the
+        // **exchange** holds, not what we remember publishing, and asked
+        // before anything is minted: an exchange that refuses to serve this
+        // account -- it moved (SIP-59), it was succeeded (SIP-44), it is not
+        // ours to use -- is answered here and nothing is minted for it. The
+        // first version minted sixty-five prekeys, saved them, and then heard
+        // the refusal; called on every start, it left 1.5 million secrets in
+        // one store and made every start slower than the last.
+        //
+        // A transport error is not a refusal: the count is unknown, and the
+        // pool is topped up to satisfy whichever of the two counts is short.
+        let served = match self.post("/prekey/count", vec![TYPE_COUNT]).await {
+            Ok(body) => Some(
+                Counts::decode(&body)
+                    .map_err(|e| ChatError::Protocol(e.to_string()))?
+                    .one_time,
+            ),
+            Err(e @ ChatError::Refused(..))
+            | Err(e @ ChatError::Moved(..))
+            | Err(e @ ChatError::Succeeded(..)) => {
+                // A pool this exchange refuses is no pool: whatever it holds
+                // from before this rule was never published there, and a
+                // store keeping it grows without bound. The fallback stays.
+                let wiped = self.store.wipe_one_time()?;
+                self.wiped_prekeys += wiped;
+                if wiped > WIPE_VACUUM {
+                    let _ = self.store.vacuum();
+                }
+                return Err(e);
+            }
+            Err(_) => None,
+        };
+        // A pool many times its own size is one that ran away before this
+        // rule -- minted on every start, never taken -- and is not worth
+        // opening row by row. `Clear` at the exchange discards what it holds
+        // for us (a peer then gets `found: 0` and declines, which is the
+        // right answer until the new pool is published), the rows go, and
+        // the pool starts fresh above every id the exchange has seen.
+        let held = self.store.one_time_held()?;
+        if held > RUNAWAY {
+            let fresh = self.restart_pool(Pool::new(&self.seed)).await?;
+            let wiped = self.store.wipe_one_time()?;
+            self.wiped_prekeys += wiped;
+            self.store.save_pool(&fresh)?;
+            if wiped > WIPE_VACUUM {
+                let _ = self.store.vacuum();
+            }
+        }
         let mut pool = self.store.pool(&self.seed)?;
         if pool.one_time_left() == 0 && pool.fallback_id() == 0 {
             pool = self.restart_pool(pool).await?;
         }
-        // What the **exchange** holds, not what we remember publishing. They
-        // can differ, and the difference is invisible from here: an exchange
-        // restored from a backup, or one that lost its pool, leaves a client
-        // whose own count looks healthy with nothing published and no reason to
-        // notice. The failure that produces is silent and total — every seal to
-        // this device is refused, so no channel key reaches it.
-        //
         // Our own count still matters and is not redundant: a secret we no
         // longer hold is useless however many the exchange is serving, so the
-        // pool is topped up to satisfy whichever of the two is short.
-        let served = match self.post("/prekey/count", vec![TYPE_COUNT]).await {
-            Ok(body) => Counts::decode(&body)
-                .map(|c| c.one_time)
-                .unwrap_or(pool.one_time_left()),
-            Err(_) => pool.one_time_left(),
+        // pool is topped up to satisfy whichever of the two is short. Only
+        // what the exchange acknowledged counts as held; what it has not yet
+        // taken is published first, and minted around, never on top of.
+        let have = match served {
+            Some(s) => pool.published_left().min(s),
+            None => pool.published_left(),
         };
-        let have = pool.one_time_left().min(served);
-
-        let mut publish = Vec::new();
-        if have < LOW_WATER {
-            publish.extend(pool.mint_one_time(POOL - have));
-        }
-        // A fallback after every batch, not only the first: its id is the only
-        // thing `Count` reports, so it is what a future client with a lost
-        // store will have to start above.
-        if pool.fallback_id() == 0 || !publish.is_empty() {
-            publish.push(pool.mint_fallback());
-        }
-        if publish.is_empty() {
-            return Ok(());
+        let mut publish = pool.unpublished_prekeys();
+        if have + pool.unpublished_count() < LOW_WATER {
+            let short = POOL.saturating_sub(have + pool.unpublished_count());
+            publish.extend(pool.mint_one_time(short));
         }
         // Persist before publishing. The other order loses the secret for a
         // prekey the exchange is already handing out, which is an envelope
         // nobody can open.
         self.store.save_pool(&pool)?;
-        for batch in publish.chunks(sqex_proto::prekey::MAX_PUBLISH) {
+        if !publish.is_empty() {
+            let ids: Vec<u32> = publish.iter().map(|p| p.id).collect();
+            for batch in publish.chunks(sqex_proto::prekey::MAX_PUBLISH) {
+                match self
+                    .post(
+                        "/prekey/publish",
+                        Publish {
+                            prekeys: batch.to_vec(),
+                        }
+                        .encode(),
+                    )
+                    .await
+                {
+                    Ok(_) => pool.mark_published(batch.iter().map(|p| p.id)),
+                    // Refused on purpose: the exchange took none of these and
+                    // never will, so the secrets go. Not on a transport
+                    // error, where the exchange may hold them: those stay
+                    // unpublished and are offered again next time.
+                    Err(e @ ChatError::Refused(..))
+                    | Err(e @ ChatError::Moved(..))
+                    | Err(e @ ChatError::Succeeded(..)) => {
+                        pool.discard_unpublished(ids.iter().copied());
+                        self.store.save_pool(&pool)?;
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        self.store.save_pool(&pool)?;
+                        return Err(e);
+                    }
+                }
+            }
+            self.store.save_pool(&pool)?;
+        }
+        // A fallback after every batch, not only the first: its id is the only
+        // thing `Count` reports, so it is what a future client with a lost
+        // store will have to start above. Minted only once the batch is in,
+        // because minting one retires the fallback the exchange still serves.
+        if pool.fallback_id() == 0 || !publish.is_empty() {
+            let fallback = pool.mint_fallback();
+            self.store.save_pool(&pool)?;
             self.post(
                 "/prekey/publish",
                 Publish {
-                    prekeys: batch.to_vec(),
+                    prekeys: vec![fallback],
                 }
                 .encode(),
             )
             .await?;
         }
         Ok(())
+    }
+
+    /// SIP-23 §Publishing after a refusal: how many one-time prekeys this
+    /// client has dropped, over its life, because an exchange refused them or
+    /// a pool had run away.
+    pub fn wiped_prekeys(&self) -> u64 {
+        self.wiped_prekeys
+    }
+
+    /// What the exchange holds for this device (SIP-23 `Count`).
+    pub async fn prekeys_served(&mut self) -> Result<Counts> {
+        let body = self.post("/prekey/count", vec![TYPE_COUNT]).await?;
+        Counts::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
     /// Discard whatever the exchange still holds for us, and resume above it.

@@ -101,21 +101,32 @@ impl Prekey {
         id: u32,
     ) -> (Prekey, x25519_dalek::StaticSecret) {
         let secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-        let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let prekey = Prekey::for_secret(device_seed, kind, id, &secret);
+        (prekey, secret)
+    }
+
+    /// The prekey for a secret the pool already holds: what a client publishes
+    /// again when the exchange never took the first publish (SIP-23 §Publishing
+    /// after a refusal). The public half is derived, the signature made fresh;
+    /// the id is the one the secret was minted under.
+    pub fn for_secret(
+        device_seed: &[u8; 32],
+        kind: u8,
+        id: u32,
+        secret: &x25519_dalek::StaticSecret,
+    ) -> Prekey {
+        let public = x25519_dalek::PublicKey::from(secret).to_bytes();
         let signing = SigningKey::from_bytes(device_seed);
         let device = PubKey::new(signing.verifying_key().to_bytes());
         let signature = signing
             .sign(&signing_input(&device, kind, id, &public))
             .to_bytes();
-        (
-            Prekey {
-                kind,
-                id,
-                public,
-                signature,
-            },
-            secret,
-        )
+        Prekey {
+            kind,
+            id,
+            public,
+            signature,
+        }
     }
 
     /// Check that `device` really published this.
@@ -351,6 +362,11 @@ pub struct Pool {
     one_time: std::collections::HashMap<u32, x25519_dalek::StaticSecret>,
     fallback: Option<(u32, x25519_dalek::StaticSecret)>,
     spent: std::collections::HashSet<u32>,
+    /// One-time ids minted here that no exchange has yet acknowledged
+    /// (SIP-23 §Publishing after a refusal). Published again before anything
+    /// new is minted, and discarded -- never spent, never reused -- when the
+    /// exchange refuses them.
+    unpublished: std::collections::HashSet<u32>,
 }
 
 /// Counts only. `StaticSecret` deliberately has no `Debug`, and a pool that
@@ -359,6 +375,7 @@ impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pool")
             .field("one_time", &self.one_time.len())
+            .field("unpublished", &self.unpublished.len())
             .field("fallback_id", &self.fallback_id())
             .field("spent", &self.spent.len())
             .finish()
@@ -375,11 +392,13 @@ impl Pool {
             one_time: std::collections::HashMap::new(),
             fallback: None,
             spent: std::collections::HashSet::new(),
+            unpublished: std::collections::HashSet::new(),
         }
     }
 
     /// Mint `n` one-time prekeys, keeping the secrets. The returned prekeys are
-    /// what goes in a `Publish`.
+    /// what goes in a `Publish`; until [`Pool::mark_published`] says the
+    /// exchange took them they are unpublished.
     pub fn mint_one_time(&mut self, n: u16) -> Vec<Prekey> {
         (0..n)
             .map(|_| {
@@ -387,9 +406,55 @@ impl Pool {
                 self.next_id += 1;
                 let (p, secret) = Prekey::generate(&self.seed, KIND_ONE_TIME, id);
                 self.one_time.insert(id, secret);
+                self.unpublished.insert(id);
                 p
             })
             .collect()
+    }
+
+    /// The one-time prekeys minted here that no exchange has acknowledged,
+    /// ready to publish (again). Lowest id first.
+    pub fn unpublished_prekeys(&self) -> Vec<Prekey> {
+        let mut ids: Vec<u32> = self.unpublished.iter().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| {
+                self.one_time
+                    .get(&id)
+                    .map(|s| Prekey::for_secret(&self.seed, KIND_ONE_TIME, id, s))
+            })
+            .collect()
+    }
+
+    /// How many one-time prekeys are waiting on an acknowledgement.
+    pub fn unpublished_count(&self) -> u16 {
+        self.unpublished.len() as u16
+    }
+
+    /// One-time prekeys the exchange holds, as far as this pool knows:
+    /// unspent and acknowledged.
+    pub fn published_left(&self) -> u16 {
+        (self.one_time.len() - self.unpublished.len()) as u16
+    }
+
+    /// The exchange took these: they can be sealed to from now on.
+    pub fn mark_published(&mut self, ids: impl IntoIterator<Item = u32>) {
+        for id in ids {
+            self.unpublished.remove(&id);
+        }
+    }
+
+    /// The exchange refused these: nothing can ever be sealed to them, so the
+    /// secrets go. The ids are not reused -- `next_id` has moved past them --
+    /// and not remembered as spent, since nothing was ever served under them.
+    pub fn discard_unpublished(&mut self, ids: impl IntoIterator<Item = u32>) -> usize {
+        let mut n = 0;
+        for id in ids {
+            if self.unpublished.remove(&id) && self.one_time.remove(&id).is_some() {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Mint a fallback, retiring the one it replaces.
@@ -466,23 +531,31 @@ impl Pool {
                 .collect(),
             fallback: self.fallback.as_ref().map(|(id, s)| (*id, s.to_bytes())),
             spent: self.spent.iter().copied().collect(),
+            unpublished: self.unpublished.iter().copied().collect(),
         }
     }
 
     /// Rebuild a pool from `save`.
     pub fn load(seed: &[u8; 32], state: PoolState) -> Pool {
+        let one_time: std::collections::HashMap<u32, x25519_dalek::StaticSecret> = state
+            .one_time
+            .into_iter()
+            .map(|(id, b)| (id, x25519_dalek::StaticSecret::from(b)))
+            .collect();
+        let unpublished = state
+            .unpublished
+            .into_iter()
+            .filter(|id| one_time.contains_key(id))
+            .collect();
         Pool {
             seed: *seed,
             next_id: state.next_id.max(1),
-            one_time: state
-                .one_time
-                .into_iter()
-                .map(|(id, b)| (id, x25519_dalek::StaticSecret::from(b)))
-                .collect(),
+            one_time,
             fallback: state
                 .fallback
                 .map(|(id, b)| (id, x25519_dalek::StaticSecret::from(b))),
             spent: state.spent.into_iter().collect(),
+            unpublished,
         }
     }
 }
@@ -497,6 +570,8 @@ pub struct PoolState {
     pub one_time: Vec<(u32, [u8; 32])>,
     pub fallback: Option<(u32, [u8; 32])>,
     pub spent: Vec<u32>,
+    /// Ids in `one_time` no exchange has acknowledged yet.
+    pub unpublished: Vec<u32>,
 }
 
 /// What `Clear` discarded, and where the device may resume.

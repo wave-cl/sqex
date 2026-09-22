@@ -106,6 +106,8 @@ CREATE TABLE IF NOT EXISTS prekey (
     kind   INTEGER NOT NULL,
     sealed BLOB,
     spent  INTEGER NOT NULL DEFAULT 0,
+    -- SIP-23 §Publishing after a refusal: 0 until the exchange took it.
+    published INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (exchange, id)
 );
 -- The conversation itself, decrypted once and kept.
@@ -1048,6 +1050,19 @@ impl Store {
         // is how a schema change reaches a user's machine and is ignored.
         migrate(&db)?;
         db.execute_batch(SCHEMA).map_err(storage("create schema"))?;
+        // SIP-23 §Publishing after a refusal (2026-09-22): whether the
+        // exchange acknowledged a prekey. Rows from before the column are
+        // taken as published -- at a working exchange they were, and a pool
+        // that ran away at one that refused them is bounded and wiped by
+        // `Chat::top_up_prekeys` on its next start.
+        let has_published: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('prekey') WHERE name = 'published'")
+            .and_then(|mut s| s.exists([]))
+            .map_err(storage("inspect the prekey table"))?;
+        if !has_published {
+            db.execute_batch("ALTER TABLE prekey ADD COLUMN published INTEGER NOT NULL DEFAULT 1")
+                .map_err(storage("add prekey.published"))?;
+        }
         let assets = match path {
             Some(p) => Some(assets_dir(p)?),
             None => None,
@@ -1612,7 +1627,7 @@ impl Store {
     pub fn pool(&self, seed: &[u8; 32]) -> Result<Pool> {
         let mut stmt = self
             .db
-            .prepare("SELECT id, kind, sealed, spent FROM prekey WHERE exchange = ?1")
+            .prepare("SELECT id, kind, sealed, spent, published FROM prekey WHERE exchange = ?1")
             .map_err(storage("prepare prekeys"))?;
         let rows = stmt
             .query_map(params![self.scope()?], |r| {
@@ -1621,6 +1636,7 @@ impl Store {
                     r.get::<_, i64>(1)? as u8,
                     r.get::<_, Option<Vec<u8>>>(2)?,
                     r.get::<_, i64>(3)? != 0,
+                    r.get::<_, i64>(4)? != 0,
                 ))
             })
             .map_err(storage("query prekeys"))?;
@@ -1630,9 +1646,10 @@ impl Store {
             one_time: Vec::new(),
             fallback: None,
             spent: Vec::new(),
+            unpublished: Vec::new(),
         };
         for row in rows {
-            let (id, kind, sealed, spent) = row.map_err(storage("read prekey"))?;
+            let (id, kind, sealed, spent, published) = row.map_err(storage("read prekey"))?;
             state.next_id = state.next_id.max(id + 1);
             if spent {
                 state.spent.push(id);
@@ -1644,6 +1661,9 @@ impl Store {
                 state.fallback = Some((id, secret));
             } else {
                 state.one_time.push((id, secret));
+                if !published {
+                    state.unpublished.push(id);
+                }
             }
         }
         if state.next_id == 0 {
@@ -1665,6 +1685,49 @@ impl Store {
         Ok(Pool::load(seed, state))
     }
 
+    /// How many unspent one-time prekeys this store holds for the exchange --
+    /// a count, without unsealing any of them. What `top_up_prekeys` reads
+    /// before it loads the pool, so a pool that ran away (1.5 million rows at
+    /// an exchange that refused every one, 2026-09-22) is wiped by a count
+    /// and not opened row by row.
+    pub fn one_time_held(&self) -> Result<u64> {
+        self.db
+            .query_row(
+                "SELECT COUNT(*) FROM prekey WHERE exchange = ?1 AND kind = ?2 AND spent = 0 \
+                 AND sealed IS NOT NULL",
+                params![self.scope()?, KIND_ONE_TIME as i64],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as u64)
+            .map_err(storage("count one-time prekeys"))
+    }
+
+    /// SIP-23 §Publishing after a refusal: drop every unspent one-time prekey
+    /// held for the exchange, secrets included. For a pool the exchange never
+    /// took (it refused them) or has been told to discard (`Clear`): nothing
+    /// can be sealed to them any more. Spent ids stay, so a replay is still
+    /// refused; the fallback stays. Returns how many went.
+    pub fn wipe_one_time(&mut self) -> Result<u64> {
+        let n = self
+            .db
+            .execute(
+                "DELETE FROM prekey WHERE exchange = ?1 AND kind = ?2 AND spent = 0",
+                params![self.scope()?, KIND_ONE_TIME as i64],
+            )
+            .map_err(storage("wipe one-time prekeys"))?;
+        Ok(n as u64)
+    }
+
+    /// Give the space back after a large wipe: VACUUM, and truncate the WAL.
+    /// Not inside any transaction; a store that has just dropped hundreds of
+    /// megabytes of rows is the only caller.
+    pub fn vacuum(&self) -> Result<()> {
+        self.db
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(storage("vacuum"))?;
+        Ok(())
+    }
+
     /// Write the pool back.
     ///
     /// A spent prekey keeps its row with `sealed` set to NULL: the id must be
@@ -1672,9 +1735,37 @@ impl Store {
     /// and those are two different requirements that this satisfies at once.
     pub fn save_pool(&mut self, pool: &Pool) -> Result<()> {
         let state = pool.save();
+        let unpublished: std::collections::HashSet<u32> =
+            state.unpublished.iter().copied().collect();
         // Taken before the transaction borrows `self.db` mutably.
         let scope = self.scope()?;
         let tx = self.db.transaction().map_err(storage("begin save pool"))?;
+        // A one-time row this pool no longer holds -- discarded after a
+        // refusal -- goes, sealed secret and all. Not marked spent: nothing
+        // was ever served under it.
+        {
+            let held: Vec<i64> = state.one_time.iter().map(|(id, _)| *id as i64).collect();
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM prekey WHERE exchange = ?1 AND kind = ?2 AND spent = 0 \
+                     AND sealed IS NOT NULL",
+                )
+                .map_err(storage("prepare the held prekeys"))?;
+            let stored: Vec<i64> = stmt
+                .query_map(params![&scope, KIND_ONE_TIME as i64], |r| r.get(0))
+                .map_err(storage("query the held prekeys"))?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+            let keep: std::collections::HashSet<i64> = held.into_iter().collect();
+            for id in stored.into_iter().filter(|id| !keep.contains(id)) {
+                tx.execute(
+                    "DELETE FROM prekey WHERE exchange = ?1 AND id = ?2",
+                    params![&scope, id],
+                )
+                .map_err(storage("drop a discarded prekey"))?;
+            }
+        }
         for (id, secret) in &state.one_time {
             let sealed = {
                 use rand_core::RngCore;
@@ -1689,11 +1780,18 @@ impl Store {
                 out.extend_from_slice(&ct);
                 out
             };
+            let published = !unpublished.contains(id);
             tx.execute(
-                "INSERT INTO prekey (id, kind, sealed, spent, exchange)
-                 VALUES (?1, ?2, ?3, 0, ?4)
-                 ON CONFLICT (exchange, id) DO UPDATE SET sealed = ?3, spent = 0",
-                params![*id as i64, KIND_ONE_TIME as i64, sealed, &scope],
+                "INSERT INTO prekey (id, kind, sealed, spent, exchange, published)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)
+                 ON CONFLICT (exchange, id) DO UPDATE SET sealed = ?3, spent = 0, published = ?5",
+                params![
+                    *id as i64,
+                    KIND_ONE_TIME as i64,
+                    sealed,
+                    &scope,
+                    published as i64
+                ],
             )
             .map_err(storage("store one-time prekey"))?;
         }

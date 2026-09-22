@@ -2458,6 +2458,13 @@ async fn route(
         && matches!(
             path,
             "/prekey/publish"
+                // SIP-23 §Publishing after a refusal (2026-09-22): the count
+                // and the clear are told too, so a client learns where its
+                // pool lives before it mints one -- the first version minted
+                // sixty-five prekeys on every start for a count of zero here
+                // and was refused at the publish, for a week.
+                | "/prekey/count"
+                | "/prekey/clear"
                 | "/wake/register"
                 | "/backup/write"
                 | "/resolve/publish"
