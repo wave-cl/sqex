@@ -2314,11 +2314,37 @@ impl Chat {
         // that is theirs and elsewhere, it is created there, from here,
         // signed under it; this exchange carries the create and pulls the
         // copy once their home has told it.
-        let origin = self
-            .located
-            .get(them)
-            .filter(|(home, _)| *home != self.exchange && them.as_bytes() < self.me.as_bytes())
-            .cloned();
+        // **Asked for, not merely remembered.** `located` is filled only by
+        // an explicit `/account/locate`, which happens when somebody is
+        // looked up by name. A direct message opened any other way -- one
+        // that arrived from their side, or was opened by key -- located
+        // nobody, so this was `None` and the conversation was taken to live
+        // here. Nothing ever revisited it, so a copy of a conversation
+        // whose origin is another exchange read as local for the life of
+        // the store: the client posted into the copy, and called into a
+        // room at the wrong exchange, which rang, was answered, and carried
+        // nothing. Diagnosed live, with both exchanges agreeing the origin
+        // was elsewhere while the client said `ordered_at=None`.
+        //
+        // `/account/home` answers the same question and needs no name, so
+        // the lower key's home is asked for when it is not already known.
+        // Only when it *is* lower: SIP-60's rule decides which of the two
+        // homes the conversation lives at, and asking cannot change that.
+        let mut known = self.located.get(them).cloned();
+        if known.is_none() && them.as_bytes() < self.me.as_bytes() {
+            // Kept whatever the domain: `homed_elsewhere` turns on the
+            // origin *key*, and a home reached by an address has no domain
+            // to give. Requiring one threw away the fact that decides
+            // where the conversation lives in order to keep the one that
+            // only decides how to name it -- which a test caught.
+            if let Ok(homed) = self.account_home(them).await {
+                self.located
+                    .insert(*them, (homed.home, homed.domain.clone()));
+                known = Some((homed.home, homed.domain));
+            }
+        }
+        let origin = known
+            .filter(|(home, _)| *home != self.exchange && them.as_bytes() < self.me.as_bytes());
         if let Some((home, domain)) = &origin {
             self.homes.insert(
                 channel,

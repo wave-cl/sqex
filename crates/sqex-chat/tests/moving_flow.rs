@@ -326,3 +326,81 @@ async fn a_client_can_move_back_to_a_former_home() {
         "could not move back to a former home: {back:?}"
     );
 }
+
+/// **A direct message finds out where it lives, rather than assuming here.**
+///
+/// SIP-60 puts a direct message at the home of the lower key. `open_dm`
+/// read that home out of `located`, which is filled only by an explicit
+/// `/account/locate` — so a conversation opened any other way (one that
+/// arrived from their side, or was opened by key) located nobody, recorded
+/// no home, and was taken to live at this exchange for the life of the
+/// store.
+///
+/// Nothing revisited it. The client then posted into its own copy and
+/// called into a room at the wrong exchange: it rang, it was answered, and
+/// it carried nothing. Diagnosed live, with both exchanges agreeing the
+/// origin was elsewhere while the client reported none at all.
+///
+/// `/account/home` answers the same question without needing a name. Both
+/// parties are at one exchange here, so the answer is "here" and nothing
+/// moves — what this pins is that the question is now *asked*, which is
+/// what was missing.
+#[tokio::test]
+async fn opening_a_direct_message_finds_out_where_the_lower_key_lives() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let b_key = key_in(b_dir.path());
+    let (x_addr, x_pub) = exchange_in(x_dir.path(), &[b_key], &[]).await;
+
+    let (_, one) = identity(1);
+    let (_, two) = identity(2);
+    let (lower, higher) = if one.as_bytes() < two.as_bytes() {
+        (1u8, 2u8)
+    } else {
+        (2u8, 1u8)
+    };
+    let (_, lower_key) = identity(lower);
+    let (_, higher_key) = identity(higher);
+
+    // The lower key opens the conversation from its side, which is what
+    // gives the exchange a membership to answer `/account/home` about. An
+    // exchange that has never heard of an account refuses, rightly, and
+    // that is a different case from the one this covers.
+    {
+        let mut at_x_lower = chat_at(
+            x_addr,
+            x_pub,
+            "x.test",
+            lower,
+            &x_dir.path().join("lower.db"),
+        )
+        .await;
+        at_x_lower.open_dm(&higher_key).await.unwrap();
+    }
+
+    // The higher key now opens it **without ever locating** the other.
+    let mut at_x = chat_at(
+        x_addr,
+        x_pub,
+        "x.test",
+        higher,
+        &x_dir.path().join("higher.db"),
+    )
+    .await;
+    assert!(
+        at_x.located_home(&lower_key).is_none(),
+        "the test must start with nobody located, or it proves nothing"
+    );
+
+    let channel = at_x.open_dm(&lower_key).await.unwrap();
+    assert!(
+        at_x.located_home(&lower_key).is_some(),
+        "opening a direct message never asked where the other party lives"
+    );
+    // Both are here, so it rightly does not live elsewhere. The bug was
+    // never knowing either way.
+    assert!(
+        at_x.homed_elsewhere(&channel).is_none(),
+        "both are at X, so the conversation does not live elsewhere"
+    );
+}
