@@ -5625,7 +5625,19 @@ impl Chat {
                 profile::MAX_TITLE
             )));
         }
-        let (name, title) = (profile.name.clone(), profile.title.clone());
+        // Refused here as well as on the wire, so a picture too big is a
+        // sentence rather than a malformed record the exchange rejects.
+        if profile.avatar.len() > profile::MAX_AVATAR {
+            return Err(ChatError::Protocol(format!(
+                "a picture is at most {} bytes",
+                profile::MAX_AVATAR
+            )));
+        }
+        let (name, title, avatar) = (
+            profile.name.clone(),
+            profile.title.clone(),
+            profile.avatar.clone(),
+        );
         // SIP-32: a signed record, ordered by a counter we keep. The serial
         // must climb past whatever the exchange already holds, or the record
         // loses to the one that is there — which is the property that makes an
@@ -5656,7 +5668,8 @@ impl Chat {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.store.put_profile(&self.me, &name, &title, at)?;
+        self.store
+            .put_profile(&self.me, &name, &title, &avatar, at)?;
         Ok(())
     }
 
@@ -5793,11 +5806,20 @@ impl Chat {
             // SIP-32: shown only if the subject signed it. A record that does
             // not verify is somebody else's assertion about this account, and a
             // profile is exactly the field a reader would act on.
-            let (name, title) = match got.record.as_ref().filter(|r| r.verify()) {
-                Some(r) if got.found => (r.profile.name.clone(), r.profile.title.clone()),
-                _ => (String::new(), String::new()),
+            // The picture is held to the same rule as the name: shown only
+            // if the subject signed it. An unverified record is somebody
+            // else's assertion about this account, and a face is exactly the
+            // kind of assertion a reader acts on without noticing.
+            let (name, title, avatar) = match got.record.as_ref().filter(|r| r.verify()) {
+                Some(r) if got.found => (
+                    r.profile.name.clone(),
+                    r.profile.title.clone(),
+                    r.profile.avatar.clone(),
+                ),
+                _ => (String::new(), String::new(), Vec::new()),
             };
-            self.store.put_profile(account, &name, &title, now)?;
+            self.store
+                .put_profile(account, &name, &title, &avatar, now)?;
             // SIP-38: the account's handle, on the same cadence and the same
             // "asked, told nothing" caching. The exchange's reverse-lookup is
             // its word — a display hint under the profile nickname, never an
@@ -5847,6 +5869,20 @@ impl Chat {
     pub fn title_of(&self, account: &PubKey) -> Option<String> {
         let (_, title, _) = self.store.profile(account).ok().flatten()?;
         (!title.is_empty()).then_some(title)
+    }
+
+    /// The picture an account published, as the bytes it published.
+    ///
+    /// SIP-21 sends these inline with the profile, so this costs no round
+    /// trip -- it is what the last fetch already held. Decoding is the
+    /// caller's, and so is caching it: these are kilobytes and this reads
+    /// them from the database every time it is asked.
+    ///
+    /// Carries the same warning as [`Chat::display_name`]: a picture is
+    /// chosen by its subject and is not evidence of anything. Two accounts
+    /// may publish the same face.
+    pub fn avatar_of(&self, account: &PubKey) -> Option<Vec<u8>> {
+        self.store.avatar(account).ok().flatten()
     }
 
     /// React to a message, or take a reaction back.

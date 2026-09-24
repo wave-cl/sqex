@@ -303,6 +303,11 @@ CREATE TABLE IF NOT EXISTS profile (
     account BLOB NOT NULL,
     name    TEXT    NOT NULL DEFAULT '',
     title   TEXT    NOT NULL DEFAULT '',
+    -- SIP-21 sends the picture as inline bytes, because a profile is in no
+    -- channel and a SIP-18 reference would need a lifetime rule of its own.
+    -- Kept here for the same reason the name is: a client that drops it
+    -- cannot show one, and every row is an identicon for ever.
+    avatar  BLOB    NOT NULL DEFAULT x'',
     fetched INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (exchange, account)
 );
@@ -1064,6 +1069,18 @@ impl Store {
         if !has_published {
             db.execute_batch("ALTER TABLE prekey ADD COLUMN published INTEGER NOT NULL DEFAULT 1")
                 .map_err(storage("add prekey.published"))?;
+        }
+        // SIP-21: the profile picture. Rows from before the column have no
+        // picture, which is also what an account that published none has --
+        // the two are the same fact to a reader, so an empty default needs
+        // no distinction drawn.
+        let has_avatar: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('profile') WHERE name = 'avatar'")
+            .and_then(|mut s| s.exists([]))
+            .map_err(storage("inspect the profile table"))?;
+        if !has_avatar {
+            db.execute_batch("ALTER TABLE profile ADD COLUMN avatar BLOB NOT NULL DEFAULT x''")
+                .map_err(storage("add profile.avatar"))?;
         }
         let assets = match path {
             Some(p) => Some(assets_dir(p)?),
@@ -2148,17 +2165,54 @@ impl Store {
     /// An account that publishes nothing, or withholds it, is stored as empty
     /// rather than left absent: "asked and told nothing" and "never asked" have
     /// to be different, or the client asks again on every poll forever.
-    pub fn put_profile(&self, account: &PubKey, name: &str, title: &str, now: u64) -> Result<()> {
+    pub fn put_profile(
+        &self,
+        account: &PubKey,
+        name: &str,
+        title: &str,
+        avatar: &[u8],
+        now: u64,
+    ) -> Result<()> {
         self.db
             .execute(
-                "INSERT INTO profile (account, name, title, fetched, exchange)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO profile (account, name, title, avatar, fetched, exchange)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (exchange, account)
-                 DO UPDATE SET name = ?2, title = ?3, fetched = ?4",
-                params![account.as_bytes(), name, title, now as i64, self.scope()?],
+                 DO UPDATE SET name = ?2, title = ?3, avatar = ?4, fetched = ?5",
+                params![
+                    account.as_bytes(),
+                    name,
+                    title,
+                    avatar,
+                    now as i64,
+                    self.scope()?
+                ],
             )
             .map_err(storage("store profile"))?;
         Ok(())
+    }
+
+    /// The picture an account published, if it published one.
+    ///
+    /// **Its own accessor rather than a fourth field on `profile`.** That
+    /// tuple is read on paths that want a name and nothing else, and a
+    /// picture is kilobytes: widening it would copy an image every time
+    /// somebody asked who wrote a message.
+    ///
+    /// Empty is `None`: an account that published no picture and one whose
+    /// profile is withheld are the same fact to a reader, and neither has
+    /// anything to draw.
+    pub fn avatar(&self, account: &PubKey) -> Result<Option<Vec<u8>>> {
+        let bytes: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT avatar FROM profile WHERE account = ?1 AND exchange = ?2",
+                params![account.as_bytes(), self.scope()?],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(storage("read avatar"))?;
+        Ok(bytes.filter(|b| !b.is_empty()))
     }
 
     /// The name and title we hold for an account, and when we asked.
@@ -4547,6 +4601,65 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
         assert_eq!(a.highest_epoch(&[7; 32]).unwrap(), 3);
     }
 
+    /// **SIP-21: a profile's picture survives being stored.**
+    ///
+    /// The bytes arrive inline with the profile — the SIP says so explicitly,
+    /// because a profile is in no channel and a SIP-18 reference would need
+    /// a lifetime rule of its own — and this store dropped them on the way
+    /// in. `put_profile` took a name, a title and a time, so every client
+    /// reading its own cache found a face it had already been given and
+    /// could not show, and drew an identicon instead.
+    #[test]
+    fn a_profiles_picture_is_kept_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let alice = PubKey::new([2; 32]);
+        let bob = PubKey::new([3; 32]);
+        let picture: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+
+        let mut a = Store::open(&seed(1), Some(&path)).unwrap();
+        a.scope_to(&PubKey::new([9; 32])).unwrap();
+        a.put_profile(&alice, "Alice", "a title", &picture, 100)
+            .unwrap();
+        assert_eq!(
+            a.avatar(&alice).unwrap().as_deref(),
+            Some(&picture[..]),
+            "the picture did not come back as it went in"
+        );
+
+        // **Published none and withheld are the same fact to a reader**, and
+        // neither has anything to draw — so empty is `None`, not an empty
+        // image somebody has to special-case at every call site.
+        a.put_profile(&bob, "Bob", "", &[], 100).unwrap();
+        assert_eq!(
+            a.avatar(&bob).unwrap(),
+            None,
+            "empty bytes read as a picture"
+        );
+
+        // And an account nobody has fetched has no row at all, which must
+        // answer the same way rather than failing.
+        assert_eq!(a.avatar(&PubKey::new([4; 32])).unwrap(), None);
+
+        // A later profile replaces the picture, the way it replaces the
+        // name: the row is upserted, not appended to.
+        a.put_profile(&alice, "Alice", "a title", &[], 200).unwrap();
+        assert_eq!(
+            a.avatar(&alice).unwrap(),
+            None,
+            "taking a picture down left the old one in the cache"
+        );
+
+        // It survives the store being closed and opened, which is the whole
+        // point of keeping it.
+        a.put_profile(&alice, "Alice", "a title", &picture, 300)
+            .unwrap();
+        drop(a);
+        let mut b = Store::open(&seed(1), Some(&path)).unwrap();
+        b.scope_to(&PubKey::new([9; 32])).unwrap();
+        assert_eq!(b.avatar(&alice).unwrap().as_deref(), Some(&picture[..]));
+    }
+
     /// SIP-40, and the shape the first live rotation left a real store in:
     /// the conversation's key and history under the old exchange key, and a
     /// client that had already connected under the new one and started
@@ -4565,7 +4678,8 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
         let mut a = Store::open(&seed(1), Some(&path)).unwrap();
         a.scope_to(&old).unwrap();
         a.put_key(&[7; 32], 3, &key).unwrap();
-        a.put_profile(&alice, "Alice", "old title", 100).unwrap();
+        a.put_profile(&alice, "Alice", "old title", &[], 100)
+            .unwrap();
         drop(a);
 
         // The client, already started over under the new key: no channel
@@ -4577,7 +4691,8 @@ CREATE TABLE handle (account BLOB PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
             0,
             "precondition: empty under the new key"
         );
-        b.put_profile(&alice, "Alice", "new title", 200).unwrap();
+        b.put_profile(&alice, "Alice", "new title", &[], 200)
+            .unwrap();
         assert!(b.holds_rows_for(&old).unwrap());
 
         let done = b.follow_handover(&old, &new).unwrap();
