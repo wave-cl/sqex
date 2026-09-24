@@ -514,6 +514,81 @@ async fn federated_pair(seed_base: u8) -> Pair {
     }
 }
 
+/// **A caller who gives up and rings again must not be handed the abandoned
+/// call's ephemeral.**
+///
+/// `place_call` answers a repeat from the same caller to the same target out
+/// of `caller_index`, because `establish_cross` *polls* that route every half
+/// second while it rings and every poll must report the same bridge. But a
+/// caller who hung up on a ringing call and dialled again sends a **new**
+/// ephemeral, and that one was dropped: the callee answered the abandoned
+/// bridge and agreed the key over the first ephemeral while the caller held
+/// the second. Both ends established, neither could open a frame the other
+/// sealed, and the call was silent with `recv 0` — which is how it was found,
+/// on a phone, one second after a cancelled call.
+///
+/// So the ephemeral is what separates a poll from a new call.
+#[tokio::test]
+async fn ringing_again_after_giving_up_agrees_on_the_new_ephemeral() {
+    let mut p = federated_pair(140).await;
+    let mut events = subscribe(&p.bob).await;
+    let target = format!("{}@y.test", p.b_id);
+
+    // Ring once, and give up while it is still ringing — no session ever came
+    // up, so there is nothing for the caller to close.
+    let (_abandoned, abandoned_pub) = ephemeral();
+    assert_eq!(
+        call(&mut p.alice, &target, abandoned_pub).await.state,
+        CallState::Ringing
+    );
+    let (first_bridge, _) = next_crosscall(&mut events).await;
+
+    // Ring again, with a fresh ephemeral, as a second call always does.
+    let (a_eph, a_eph_pub) = ephemeral();
+    assert_ne!(
+        abandoned_pub, a_eph_pub,
+        "a new call brings a new ephemeral"
+    );
+    assert_eq!(
+        call(&mut p.alice, &target, a_eph_pub).await.state,
+        CallState::Ringing
+    );
+
+    // It rings again rather than reviving the abandoned bridge, and the ring
+    // is a different one — the first is withdrawn, not answered.
+    let (second_bridge, caller) = next_crosscall(&mut events).await;
+    assert_ne!(
+        first_bridge, second_bridge,
+        "a new call rings on its own bridge"
+    );
+
+    let (b_eph, b_eph_pub) = ephemeral();
+    let b_ack = open(&mut p.bob, caller, b_eph_pub).await;
+    let a_ack = settle(&mut p.alice, &target, a_eph_pub).await;
+    assert_eq!(a_ack.state, CallState::Established);
+
+    // The callee agreed against the ephemeral of the call it is answering,
+    // not the one the caller abandoned — which is the whole of the bug.
+    assert_eq!(
+        b_ack.peer_ephemeral, a_eph_pub,
+        "the callee agrees against the ephemeral of the call it is answering"
+    );
+
+    // And so the two ends can hear each other.
+    let a_sess =
+        Session::derive(&identity(142).0, &a_eph, &a_ack.peer, &a_ack.peer_ephemeral).unwrap();
+    let b_sess = Session::derive(&identity(143).0, &b_eph, &caller, &b_ack.peer_ephemeral).unwrap();
+    let ct = a_sess.seal_datagram(0, b"the second call").unwrap();
+    assert_eq!(
+        b_sess.open(0, &ct).unwrap(),
+        b"the second call",
+        "a call placed after a cancelled one must not be silent"
+    );
+
+    p.handles.0.abort();
+    p.handles.1.abort();
+}
+
 /// A refused call says so, rather than leaving the caller to poll until it
 /// gives up — and the reason the callee gave travels back across the link.
 #[tokio::test]

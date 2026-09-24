@@ -362,9 +362,10 @@ fn expire(inner: &mut RelayInner, now: u64) {
 }
 
 /// Place, or re-poll, a cross-exchange call. Idempotent for a given
-/// `(caller, target)`: the first call resolves the far side and sends the
-/// invite; later ones report where it stands, so the client polls it like an
-/// [`crate::session::Sessions`] open.
+/// `(caller, target, ephemeral)`: the first call resolves the far side and
+/// sends the invite; later ones report where it stands, so the client polls it
+/// like an [`crate::session::Sessions`] open. A repeat bearing a *different*
+/// ephemeral is a new call, not a poll, and replaces the one before it.
 pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, now: u64) -> CallAck {
     let eph = open.ephemeral;
     let target = open.target.clone();
@@ -383,16 +384,41 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     // that carried the rejection stays indexed under `(caller, target)` and
     // every later call to the same peer answers with the old refusal — one
     // declined call would make that peer permanently uncallable.
+    //
+    // **And only a poll of the same call is reported.** `establish_cross`
+    // polls this route every half second with the ephemeral it already sent,
+    // which is what this branch is for; a caller who gave up on a ringing
+    // call and dialled the same target again sends a *new* one. Reporting the
+    // abandoned bridge for it agreed the key over the abandoned ephemeral
+    // while the caller held the new one — both ends established, neither able
+    // to open a frame the other sealed, and a call that connected and was
+    // silent with `recv 0`. So the ephemeral is what tells the two apart, and
+    // a new call replaces the one before it.
     {
         let mut inner = server.relay.inner.lock().unwrap();
         if let Some(bridge) = inner.caller_index.get(&(caller, target.clone())).copied()
             && let Some(rec) = inner.bridges.get(&bridge)
         {
-            let ack = caller_ack(rec, now);
-            if ack.state == CallState::Rejected {
-                drop_bridge(&mut inner, &bridge);
+            if rec.caller_eph == eph {
+                let ack = caller_ack(rec, now);
+                if ack.state == CallState::Rejected {
+                    drop_bridge(&mut inner, &bridge);
+                }
+                return ack;
             }
-            return ack;
+            // The far side is told, as `expire` tells it, so a phone still
+            // ringing for the call this replaces stops rather than answering
+            // a bridge nobody is on any more.
+            let peer = rec.peer;
+            send_control(
+                &inner,
+                &peer,
+                Control::Close {
+                    bridge,
+                    reason: relay::REASON_ENDED,
+                },
+            );
+            drop_bridge(&mut inner, &bridge);
         }
     }
 
@@ -505,11 +531,25 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
 
     let bridge = random_bridge();
     let mut inner = server.relay.inner.lock().unwrap();
-    // Lost a race with another poll while resolving? Report that one.
+    // Lost a race with another poll while resolving? Report that one — and on
+    // the same terms as the branch above: only a poll of *this* call, judged
+    // by the ephemeral, and a new one replaces what it finds.
     if let Some(b) = inner.caller_index.get(&(caller, target.clone())).copied()
         && let Some(rec) = inner.bridges.get(&b)
     {
-        return caller_ack(rec, now);
+        if rec.caller_eph == eph {
+            return caller_ack(rec, now);
+        }
+        let peer = rec.peer;
+        send_control(
+            &inner,
+            &peer,
+            Control::Close {
+                bridge: b,
+                reason: relay::REASON_ENDED,
+            },
+        );
+        drop_bridge(&mut inner, &b);
     }
     inner.bridges.insert(
         bridge,
