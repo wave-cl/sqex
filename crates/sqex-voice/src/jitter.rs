@@ -121,6 +121,12 @@ pub struct Stats {
     pub underruns: u64,
     /// Frames thrown away to shed accumulated delay.
     pub trimmed: u64,
+    /// Frames discarded before the first was ever played: whatever the peer
+    /// sent while this side was still ringing. Counted apart from
+    /// `trimmed` because nothing decodes them -- there is no decoder state
+    /// to keep warm before the first frame -- and because a large number
+    /// here is a long ring rather than a bad path.
+    pub stale: u64,
 }
 
 impl Stats {
@@ -272,7 +278,55 @@ impl Jitter {
             if (self.frames.len() as u64) <= self.depth {
                 return Playout::Idle;
             }
-            self.cursor = *self.frames.keys().next().expect("non-empty");
+            // **Start at the end of what is waiting, not the beginning.**
+            //
+            // The caller sends from the moment it places the call, and QUIC
+            // holds the datagrams this process has not read -- so answering
+            // delivers the whole ring at once (see `overfull`). Starting at
+            // the oldest frame opened the call playing audio from when it
+            // began ringing, and `trim` then shed one frame per 20 ms slot:
+            // one extra frame per slot played, so the backlog drained at one
+            // second per second. A 25-second ring cost 25 seconds of being
+            // behind. Reported by ear as "the first 20-30 seconds of the
+            // call is delayed"; the live stats agreed, trimming 142 frames
+            // across 36 seconds rather than settling.
+            //
+            // Nothing is lost by dropping it: it is audio from before
+            // anybody answered. `trim` decodes what it sheds because Opus
+            // carries state between frames, and that reason does not exist
+            // before the first frame is played.
+            // **Only when it is a backlog**, on the same threshold
+            // `overfull` uses and for the same reason: three times the
+            // nominal depth leaves room for ordinary jitter without
+            // mistaking it for a pile-up. A buffer merely fuller than
+            // nominal is healthy, and skipping in that case throws good
+            // audio away at the start of every call -- which is what a
+            // first attempt here did, and what seven tests caught.
+            if self.frames.len() as u64 > self.depth * 3 {
+                // **By count, not by timestamp arithmetic.** `newest -
+                // depth` looks equivalent and is not: one frame from far in
+                // the future -- reordering, or a peer whose clock jumped --
+                // would put the cursor past everything actually waiting.
+                // Counting what is held cannot do that.
+                self.cursor = self
+                    .frames
+                    .keys()
+                    .rev()
+                    .nth(self.depth as usize)
+                    .copied()
+                    .expect("more than `depth` frames, checked above");
+                // Dropped from the map, not merely stepped over: `overfull`
+                // counts what is *held*, so frames left behind the cursor
+                // would keep `trim` shedding live audio to make room for
+                // audio nobody will ever play. `split_off` leaves the part
+                // before the key behind and returns the rest, so after this
+                // `self.frames` is the backlog.
+                let keeping = self.frames.split_off(&self.cursor);
+                self.stats.stale += self.frames.len() as u64;
+                self.frames = keeping;
+            } else {
+                self.cursor = *self.frames.keys().next().expect("non-empty");
+            }
             self.playing = true;
         }
 
@@ -505,14 +559,22 @@ mod tests {
     #[test]
     fn a_backlog_is_shed_rather_than_carried_for_the_rest_of_the_call() {
         let mut j = Jitter::new(3);
-        // A burst: the peer was not listening, then read everything at once.
-        for i in 0..40 {
+        // **Mid-call, which is what `trim` is now for.** A burst waiting at
+        // the *first* pop is the ring, and is dropped outright rather than
+        // drained -- see the test below. This one is the case that remains:
+        // the path stalls once the call is up and delivers in a lump, where
+        // there is decoder state to keep warm and the frames are audio
+        // somebody is waiting to hear.
+        for i in 0..5 {
             j.push(i, (i) as u32, packet(i as u8));
         }
         assert!(matches!(j.pop(), Playout::Frame(_)), "starts playing");
+        for i in 5..40 {
+            j.push(i, (i) as u32, packet(i as u8));
+        }
         assert!(
             j.overfull(),
-            "36 frames is not a jitter buffer, it is a delay"
+            "a lump that arrived mid-call is not a jitter buffer, it is a delay"
         );
 
         // Each tick sheds one frame and plays one, so the excess drains at
@@ -526,6 +588,55 @@ mod tests {
         }
         assert!(j.depth_now() as u64 <= j.depth * 3);
         assert_eq!(j.stats.trimmed, ticks);
+    }
+
+    /// **A ring is not played back at the start of the call.**
+    ///
+    /// The caller sends from the moment it places the call and QUIC holds
+    /// what this process has not read, so answering delivers the whole ring
+    /// at once. Playout used to begin at the oldest of those frames — so a
+    /// call opened with audio from when it started ringing, and `trim` shed
+    /// one frame per slot, draining the backlog at one second per second.
+    /// A 25-second ring cost 25 seconds of being behind, which is what was
+    /// reported by ear.
+    ///
+    /// The assertion is on **how far behind the first played frame is**,
+    /// which is the thing somebody hears. Counting the drops instead would
+    /// pass for a buffer that dropped frames and still started at the back.
+    #[test]
+    fn a_backlog_from_the_ring_is_dropped_rather_than_played() {
+        // 25 seconds of ring at 20 ms a frame, then the answer.
+        const RING: u64 = 25 * 50;
+        let depth = 3;
+        let mut j = Jitter::new(depth);
+        for i in 0..RING {
+            j.push(i, i as u32, Body::Audio(vec![1, 2, 3]));
+        }
+        let newest = RING - 1;
+        let Playout::Frame(_) = j.pop() else {
+            panic!("a full buffer should play");
+        };
+        let (_, played) = j.last_played.expect("something was played");
+        let behind = newest - u64::from(played);
+        assert!(
+            behind <= depth,
+            "the call opened {behind} frames ({} ms) behind the newest \
+             audio, wanted at most {depth}",
+            behind * 20
+        );
+        // And the backlog is gone from the buffer, not merely stepped over:
+        // `overfull` counts what is held, so frames left behind the cursor
+        // would keep `trim` shedding live audio.
+        assert!(
+            (j.depth_now() as u64) <= depth + 1,
+            "the backlog is still held: {} frames",
+            j.depth_now()
+        );
+        assert_eq!(
+            j.stats.stale,
+            RING - depth - 1,
+            "the dropped frames were not accounted for"
+        );
     }
 
     #[test]

@@ -949,7 +949,7 @@ pub fn summary(buffer: &Jitter, rtt: &Rtt) -> String {
     let s = &buffer.stats;
     let mut line = format!(
         "sent {} · recv {} · loss {:.1}% · late {} · dup {} · concealed {} · \
-         trimmed {} · underruns {} · buffered {}",
+         trimmed {} · stale {} · underruns {} · buffered {}",
         s.sent,
         s.received,
         s.loss_pct(buffer.span()),
@@ -957,6 +957,10 @@ pub fn summary(buffer: &Jitter, rtt: &Rtt) -> String {
         s.duplicate,
         s.concealed,
         s.trimmed,
+        // What the ring cost: frames the peer sent before anybody here was
+        // listening, dropped at the first playout rather than drained in
+        // real time. A large number is a long ring, not a bad path.
+        s.stale,
         s.underruns,
         buffer.depth_now(),
     );

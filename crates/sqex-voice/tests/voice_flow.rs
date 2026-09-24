@@ -171,9 +171,16 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    // Collect until the far end has everything, or until it is clear the rest
-    // is not coming.
+    // Collect and play a slot per arrival, **the way the call loop does**:
+    // something reads the buffer while frames arrive, so it never becomes a
+    // backlog. Collecting the lot and only then draining made a whole
+    // second of audio look like what had piled up while nobody was
+    // listening -- which is a ring, and which `Jitter::pop` now drops
+    // rather than open a call that far behind.
     let mut buffer = Jitter::new(3);
+    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
+    let mut pcm = vec![0f32; FRAME_SAMPLES];
+    let mut played = Vec::new();
     let mut arrived = BTreeSet::new();
     while arrived.len() < expected.len() {
         let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
@@ -191,13 +198,14 @@ async fn relay(c: &mut Call, send: impl Fn(u64) -> bool) -> (Vec<Vec<f32>>, BTre
             .expect("a known type");
         arrived.insert(frame.seq);
         buffer.push(frame.seq, m.timestamp, m.body);
+        // One 20 ms slot per frame in, as a call plays while it listens.
+        let slot = buffer.pop();
+        if playback.render(&slot, &mut pcm) {
+            played.push(pcm.clone());
+        }
     }
 
-    // Drain the buffer the way the playout tick does, but without waiting out
-    // a real second to do it.
-    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
-    let mut pcm = vec![0f32; FRAME_SAMPLES];
-    let mut played = Vec::new();
+    // Then drain what is still buffered once the talking stops.
     loop {
         let slot = buffer.pop();
         if !playback.render(&slot, &mut pcm) {
@@ -348,7 +356,13 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
     }
 
     // The far end knows nothing of 16 kHz and decodes at its own rate.
+    // Played a slot per arrival, as a call does: a buffer nothing reads
+    // becomes a backlog, and `Jitter::pop` now drops one rather than open
+    // the call that far behind.
     let mut buffer = Jitter::new(3);
+    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
+    let mut pcm = vec![0f32; FRAME_SAMPLES];
+    let mut played: Vec<f32> = Vec::new();
     let mut arrived = 0;
     while arrived < FRAMES {
         let Ok(Ok(bytes)) = tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
@@ -361,12 +375,13 @@ async fn a_16k_caller_is_heard_by_a_48k_listener() {
             .expect("a known type");
         buffer.push(frame.seq, m.timestamp, m.body);
         arrived += 1;
+        let slot = buffer.pop();
+        if playback.render(&slot, &mut pcm) {
+            played.extend_from_slice(&pcm);
+        }
     }
     assert_eq!(arrived, FRAMES);
 
-    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
-    let mut pcm = vec![0f32; FRAME_SAMPLES];
-    let mut played: Vec<f32> = Vec::new();
     loop {
         let slot = buffer.pop();
         if !playback.render(&slot, &mut pcm) {
@@ -466,7 +481,18 @@ async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
         "a settled pause should cost about a packet a second, sent {in_settled}"
     );
 
+    // **A reader that keeps up**, which is what a call is: the playout tick
+    // runs every 20 ms whether or not a packet arrived, so the buffer never
+    // holds a second of audio. Collecting the lot and only then draining
+    // made it look like a backlog from a ring, which `Jitter::pop` now
+    // drops -- and this call's timeline is the whole point of the test.
+    // Popping once per *arrival* would not do: under SIP-14 the sender
+    // stops sending through a pause while the timeline runs on, so there
+    // are far fewer packets than slots.
     let mut buffer = Jitter::new(3);
+    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
+    let mut pcm = vec![0f32; FRAME_SAMPLES];
+    let mut played: Vec<Vec<f32>> = Vec::new();
     let mut got = 0;
     while got < on_the_wire {
         let Ok(Ok(b)) = tokio::time::timeout(Duration::from_secs(2), c.b.read_datagram()).await
@@ -479,12 +505,16 @@ async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
             .expect("a known type");
         buffer.push(frame.seq, m.timestamp, m.body);
         got += 1;
+        while buffer.depth_now() > 3 {
+            let slot = buffer.pop();
+            if !playback.render(&slot, &mut pcm) {
+                break;
+            }
+            played.push(pcm.clone());
+        }
     }
     assert_eq!(got, on_the_wire, "everything sent arrived");
 
-    let mut playback = Playback::new(SAMPLE_RATE).unwrap();
-    let mut pcm = vec![0f32; FRAME_SAMPLES];
-    let mut played: Vec<Vec<f32>> = Vec::new();
     loop {
         let slot = buffer.pop();
         if !playback.render(&slot, &mut pcm) {

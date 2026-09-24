@@ -147,9 +147,19 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    // Collect. Each member should receive FRAMES from each peer.
+    // Collect and play, a tick at a time, **the way the call loop does**:
+    // something reads the buffer while frames arrive, so it never becomes a
+    // backlog. Pushing all fifty frames and only then playing them made the
+    // whole stream look like audio that had piled up while nobody was
+    // listening -- which is what a ring is, and which `Jitter::pop` now
+    // drops rather than plays an entire call behind.
     let want = FRAMES * (members.len() - 1);
+    let per_tick = members.len() - 1;
+    let mut heard = HashMap::new();
     for m in members.iter_mut() {
+        let mut mixer = Mixer::new(FRAME_SAMPLES);
+        let mut pcm = vec![0f32; FRAME_SAMPLES];
+        let mut audio: Vec<f32> = Vec::new();
         let mut got = 0;
         while got < want {
             let Ok(Ok(bytes)) =
@@ -165,28 +175,34 @@ async fn converse(members: &mut [Member]) -> HashMap<PubKey, Vec<f32>> {
                 .session
                 .open(frame.seq, &frame.ciphertext)
                 .expect("a room peer's frames open");
-            let m = media::Frame::decode(&plaintext)
+            // Not `m`: that is the member, and shadowing it here is how the
+            // tick below first failed to compile.
+            let media = media::Frame::decode(&plaintext)
                 .expect("a media frame")
                 .expect("a known type");
-            peer.jitter.push(frame.seq, m.timestamp, m.body);
+            peer.jitter.push(frame.seq, media.timestamp, media.body);
             got += 1;
+            // One 20 ms slot per round of peer frames, as a call does.
+            if got % per_tick == 0 {
+                mixer.start();
+                for peer in m.room.peers.values_mut() {
+                    let slot = peer.jitter.pop();
+                    if peer.playback.render(&slot, &mut pcm) {
+                        mixer.add(&pcm);
+                    }
+                }
+                if mixer.active() > 0 {
+                    audio.extend_from_slice(mixer.finish());
+                }
+            }
         }
         assert_eq!(got, want, "{} did not hear everyone", m.identity);
-    }
-
-    // Play out and mix, the way the call loop does but without waiting a real
-    // second to do it.
-    let mut heard = HashMap::new();
-    for m in members.iter_mut() {
-        let mut mixer = Mixer::new(FRAME_SAMPLES);
-        let mut pcm = vec![0f32; FRAME_SAMPLES];
-        let mut audio: Vec<f32> = Vec::new();
+        // And drain what is still buffered once the talking stops.
         loop {
             mixer.start();
             for peer in m.room.peers.values_mut() {
                 let slot = peer.jitter.pop();
-                let decoded = peer.playback.render(&slot, &mut pcm);
-                if decoded {
+                if peer.playback.render(&slot, &mut pcm) {
                     mixer.add(&pcm);
                 }
             }
