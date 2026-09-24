@@ -191,12 +191,19 @@ async fn a_timed_message_goes_at_its_time_and_stays_out_of_a_backup() {
     let channel = alice.open_dm(&bob_key).await.unwrap();
     bob.open_dm(&alice_key).await.unwrap();
     alice.send(&channel, "for keeps").await.unwrap();
-    // Three seconds, not one. A timer is whole seconds against a whole-second
-    // clock, so `1` is up as soon as the clock ticks — which on a slow
-    // runner it did between the send and the poll below, and "gone soon"
-    // was gone before it had been seen. Three leaves two whole seconds in
-    // which it must still be there.
-    alice.set_timer(&channel, 3);
+    // Ten seconds, and this is the second widening: it was one, then three,
+    // and three still lost the message before the *first* poll on a loaded
+    // CI runner — the assertion that failed was the one before any backup,
+    // so the poll alone took longer than the timer.
+    //
+    // There is no clock to inject (`poll`'s third argument is a long-poll
+    // wait, not a now), so the margin is all there is. Everything between
+    // the send and the restore below — a poll, a backup, a fresh client, a
+    // restore — has to finish inside it, and on a runner that is doing
+    // something else that is seconds, not milliseconds. A longer timer
+    // costs only the sleep below and weakens nothing: a message is left out
+    // of a backup for *having* a timer, not for being near its end.
+    alice.set_timer(&channel, 10);
     alice.send(&channel, "gone soon").await.unwrap();
     alice.set_timer(&channel, 0);
     let mut t = Timeline::new();
@@ -216,7 +223,9 @@ async fn a_timed_message_goes_at_its_time_and_stays_out_of_a_backup() {
     );
 
     // And it goes, from the timeline and the store, once its time has come.
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    // Past the timer above, from the send rather than from here — the work
+    // in between has already spent some of it, so this is a ceiling.
+    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
     let got = alice.poll(&channel, &mut t, 0).await.unwrap();
     assert_eq!(
         said(&got.timeline),
