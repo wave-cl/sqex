@@ -450,6 +450,19 @@ async fn only_a_party_to_a_bridge_may_close_it() {
             .encode(),
         )
         .unwrap();
+    // **One thing does arrive, and only one.** A bridged call has no channel
+    // to record its ending in, so the exchange tells the far party on the
+    // path the call is already reading: a frame with a header and no body,
+    // which media never is.
+    let ending = tokio::time::timeout(std::time::Duration::from_secs(2), bob.read_datagram())
+        .await
+        .expect("the far side should be told the call ended")
+        .expect("a frame");
+    assert!(
+        DatagramFrame::decode(&ending).unwrap().is_ended(),
+        "the frame after a close should be the ending, not media"
+    );
+    // And then nothing: what Alice sent after hanging up does not cross.
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(2), bob.read_datagram())
             .await

@@ -925,6 +925,25 @@ pub async fn call<C: Carrier>(
                 if frame.session_id != id {
                     continue; // some other session on this connection
                 }
+                // **The other side is gone.** A bridged call has no channel
+                // to record its ending in, so the exchange says it here, on
+                // the path the call is already reading (SIP-39). Ended the
+                // way a source running out ends it: drain what is in
+                // flight, then close, so this side still posts its own
+                // `/session/close` rather than merely falling silent.
+                //
+                // Only in the two-party loop. A room's frames are dispatched
+                // per peer and one member leaving is not the call ending,
+                // which the roster already handles.
+                if frame.is_ended() {
+                    if hangup.is_none() {
+                        report.event(Event::Draining);
+                        hangup = Some(
+                            Instant::now() + Duration::from_millis(500 + opts.depth * FRAME_MS),
+                        );
+                    }
+                    continue;
+                }
                 match session.open(frame.seq, &frame.ciphertext) {
                     Ok(plaintext) => {
                         if opts.rtt {

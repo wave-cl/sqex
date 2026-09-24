@@ -905,6 +905,37 @@ impl DatagramFrame {
     /// Bytes of header before the ciphertext.
     pub const HEADER: usize = 16;
 
+    /// **The session is over**: a frame with a header and no body.
+    ///
+    /// Media is always sealed, so it always carries a body -- a MAC at the
+    /// very least. An empty one therefore says something media cannot, and
+    /// says it on the path a call is already reading.
+    ///
+    /// SIP-39 needs this and an ordinary call does not: a call in a channel
+    /// records its ending in the log, which both sides read, but a bridged
+    /// call has no channel to record it in. The exchange whose party hung
+    /// up tells the far exchange over the link, and the far exchange has
+    /// had no way to pass that on -- so the audio stopped and the call
+    /// stayed on the screen.
+    ///
+    /// Only a party to a session can be forwarded on it, so this can only
+    /// come from the exchange or from the other party, who are the two
+    /// entitled to end it. A client too old to know it counts one
+    /// unopenable frame and carries on, which is what it did before.
+    pub fn ended(session_id: u64) -> DatagramFrame {
+        DatagramFrame {
+            session_id,
+            seq: 0,
+            ciphertext: Vec::new(),
+        }
+    }
+
+    /// Whether this frame says the session is over rather than carrying
+    /// audio.
+    pub fn is_ended(&self) -> bool {
+        self.ciphertext.is_empty()
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::HEADER + self.ciphertext.len());
         out.extend_from_slice(&self.session_id.to_be_bytes());

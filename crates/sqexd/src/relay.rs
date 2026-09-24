@@ -1020,6 +1020,27 @@ fn on_control(server: &Server, peer: PubKey, ctrl: Control) {
             }
         }
         Control::Close { bridge, .. } => {
+            // **Tell the local party, then forget the bridge.** Dropping it
+            // silently is what left a call up on the screen after the other
+            // side hung up: the audio stopped, because nothing was being
+            // relayed any more, and nothing ever said why. A call in a
+            // channel records its ending in the log; a bridged one has no
+            // channel, so the only place left to say it is the path the
+            // call is already reading.
+            let told = {
+                let inner = server.relay.inner.lock().unwrap();
+                inner
+                    .bridges
+                    .get(&bridge)
+                    .filter(|rec| rec.session_id != 0)
+                    .map(|rec| (rec.session_id, rec.local))
+            };
+            if let Some((sid, local)) = told {
+                server.deliver_local_datagram(
+                    &local,
+                    Bytes::from(DatagramFrame::ended(sid).encode()),
+                );
+            }
             let mut inner = server.relay.inner.lock().unwrap();
             drop_bridge(&mut inner, &bridge);
         }

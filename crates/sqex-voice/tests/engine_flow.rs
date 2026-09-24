@@ -391,3 +391,88 @@ async fn a_room_reports_who_is_present_and_who_is_speaking() {
         );
     }
 }
+
+/// **An end frame ends the call, and ends it properly.**
+///
+/// A call in a channel records its ending in the log, which both sides
+/// read. A bridged call (SIP-39) has no channel, so when one party hangs
+/// up the far exchange had no way to pass that on: the audio stopped
+/// because nothing was being relayed any more, and the call stayed on the
+/// screen with nothing to say why. Reported from the field.
+///
+/// The exchange now says it on the path the call is already reading — a
+/// frame with a header and no body, which media never is. This drives that
+/// frame in directly and asserts the call **drains** rather than merely
+/// stopping: draining is what reaches the `/session/close` at the end of
+/// the loop, so this side tells its own exchange too.
+#[tokio::test]
+async fn a_frame_with_no_body_ends_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
+    let (a_signer, a_id) = signer(1);
+    let (b_signer, b_id) = signer(2);
+
+    // B is the one being told, so B is the one recorded.
+    let events = Collected::default();
+    let (mut a_report, mut b_report) = (Silent, events.handle());
+
+    // Sixty-second sources, so neither can end on its own inside the test:
+    // what ends B has to be the frame.
+    let a_dir = dir.path().to_path_buf();
+    let a_task = tokio::spawn(async move {
+        let mut report = Silent;
+        let (client, session, id) =
+            engine::establish(endpoint, &a_signer, b_id, 20, &mut report).await?;
+        // What the exchange sends when a bridge drops. Sent from here
+        // because a party to the session is the only thing a test can be,
+        // and the exchange forwards it to the counterpart either way —
+        // which is the path being tested.
+        let poke = client.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let _ = poke.send_datagram(sqex_proto::session::DatagramFrame::ended(id).encode());
+        });
+        engine::call(
+            client,
+            session,
+            id,
+            tone_call(&a_dir.join("a.wav"), 60),
+            &mut report,
+        )
+        .await
+    });
+    let _ = &mut a_report;
+
+    let b = async {
+        let (client, session, id) =
+            engine::establish(endpoint, &b_signer, a_id, 20, &mut b_report).await?;
+        engine::call(
+            client,
+            session,
+            id,
+            tone_call(&dir.path().join("b.wav"), 60),
+            &mut b_report,
+        )
+        .await
+    };
+    let done = tokio::time::timeout(std::time::Duration::from_secs(20), b).await;
+    a_task.abort();
+    assert!(
+        done.is_ok(),
+        "B never ended: a 60-second call outlived a 20-second wait, so the frame did nothing"
+    );
+    done.unwrap().expect("B's call");
+
+    // **Drained, not merely stopped.** Draining is what reaches the
+    // `/session/close` at the end of the loop, so this side tells its own
+    // exchange too rather than leaving a session for the TTL to reap.
+    let seen = events.events();
+    assert!(
+        seen.iter().any(|e| matches!(e, Event::Draining)),
+        "B stopped without draining, so it never closed its session: {seen:?}"
+    );
+}
