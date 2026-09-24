@@ -493,6 +493,9 @@ fn opts(
         rtt,
         dtx: !cli.no_dtx,
         share: Vec::new(),
+        // The CLI's calls end on their own: `seconds`, or the source
+        // running out. Nothing outside asks them to stop.
+        stop: None,
     }
 }
 

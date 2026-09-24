@@ -765,6 +765,41 @@ pub struct CallOpts {
     /// the channel's origin, for a call joined through a copy. Ignored on a
     /// two-party call.
     pub share: Vec<(PubKey, String)>,
+    /// Ask the call to end: send `true`, and it drains and closes the way
+    /// it does when its source runs out.
+    ///
+    /// **Without this the only way to end a call from outside was to drop
+    /// the task**, which cancels it at its next await and so never reaches
+    /// the `/session/close` at the end of the loop. On a dialled
+    /// connection that is survivable -- the connection closing is itself
+    /// the signal -- but a call placed on a *borrowed* connection (SIP-39
+    /// across exchanges, which rides the chat session) leaves the far side
+    /// with nothing at all: it goes on sending into a session this end has
+    /// forgotten. Seen live, for 24 minutes, and the frames were counted
+    /// and thrown away as `stale` at the other end's next call.
+    ///
+    /// `None` for a call that ends on its own, which is what `seconds`
+    /// and the CLI do.
+    #[allow(clippy::type_complexity)]
+    pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Resolves when the caller asks the call to stop, and never when nobody
+/// can ask. A `select!` arm needs a future either way.
+async fn asked_to_stop(stop: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match stop {
+        Some(rx) => {
+            while rx.changed().await.is_ok() {
+                if *rx.borrow() {
+                    return;
+                }
+            }
+            // The sender is gone, which is not an instruction to hang up:
+            // wait rather than ending a call because a handle was dropped.
+            std::future::pending::<()>().await
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 impl Default for CallOpts {
@@ -782,6 +817,7 @@ impl Default for CallOpts {
             rtt: false,
             dtx: true,
             share: Vec::new(),
+            stop: None,
         }
     }
 }
@@ -818,6 +854,7 @@ pub async fn call<C: Carrier>(
 
     let mut seq = 0u64;
     let mut hangup: Option<Instant> = None;
+    let mut stop = opts.stop.clone();
     let mut deaf = false;
     let mut outgoing = media::Sender::new(KEEPALIVE_FRAMES, opts.dtx);
 
@@ -859,6 +896,17 @@ pub async fn call<C: Carrier>(
                     );
                 }
             },
+
+            // Asked to end from outside: the same drain, so what is already
+            // in flight arrives and the loop still reaches the
+            // `/session/close` below. Dropping the task instead cancels it
+            // at its next await and never gets there.
+            _ = asked_to_stop(&mut stop), if hangup.is_none() => {
+                report.event(Event::Draining);
+                hangup = Some(
+                    Instant::now() + Duration::from_millis(500 + opts.depth * FRAME_MS),
+                );
+            }
 
             got = carrier.read_datagram() => {
                 // The path closing under the call is the call ending, not
@@ -1023,6 +1071,7 @@ pub async fn room_call(
     });
 
     let mut hangup: Option<Instant> = None;
+    let mut stop = opts.stop.clone();
     let mut outgoing = media::Sender::new(KEEPALIVE_FRAMES, opts.dtx);
     // **Frames that go nowhere, counted by the session they claimed.**
     //
@@ -1094,6 +1143,17 @@ pub async fn room_call(
                     );
                 }
             },
+
+            // Asked to end from outside: the same drain, so what is already
+            // in flight arrives and the loop still reaches the
+            // `/session/close` below. Dropping the task instead cancels it
+            // at its next await and never gets there.
+            _ = asked_to_stop(&mut stop), if hangup.is_none() => {
+                report.event(Event::Draining);
+                hangup = Some(
+                    Instant::now() + Duration::from_millis(500 + opts.depth * FRAME_MS),
+                );
+            }
 
             got = client.read_datagram() => {
                 let bytes = match got {
