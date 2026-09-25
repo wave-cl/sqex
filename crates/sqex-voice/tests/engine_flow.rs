@@ -98,6 +98,25 @@ fn tone_call(sink: &Path, seconds: u64) -> CallOpts {
 /// So this mutes A for well past the coast limit and asks B's own counters
 /// whether anything was *missing*. Concealment and underruns are what loss
 /// looks like; deliberate silence shows up as neither.
+///
+/// # It flakes under a loaded machine, and the obvious fix is wrong
+///
+/// Seen once in two `cargo test --workspace` runs, at `underruns`, passing
+/// alone every time. Both counters are decided at **B's playout** -- the
+/// buffer being empty when a frame is due -- and a parallel runner starves
+/// that thread for reasons A never caused. The margin is genuinely thin:
+/// `KEEPALIVE_FRAMES` is 50, one comfort frame per second, against a
+/// `COAST_LIMIT` of two seconds.
+///
+/// **Do not "fix" it by asserting a floor on `recv`.** That was tried and is
+/// based on a false model: a muted sender deliberately sends one keepalive
+/// per second rather than a frame every 20 ms, so a healthy muted call
+/// delivers about 31 frames where an unmuted one delivers 280. A floor high
+/// enough to catch a sender that stopped would fail every correct run.
+///
+/// If it becomes a nuisance, the honest lever is this test's jitter depth --
+/// harness, not mechanism -- rather than the assertions, which are measuring
+/// the right thing.
 #[tokio::test]
 async fn a_muted_peer_is_silent_and_not_missing() {
     let dir = tempfile::tempdir().unwrap();
