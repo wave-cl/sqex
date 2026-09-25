@@ -445,6 +445,45 @@ mod tests {
         PubKey::new([n; 32])
     }
 
+    /// SIP-35 §An operator may refuse a copy: the refusal outlives the rows
+    /// it dropped, which is the whole point -- a refusal that went with a
+    /// restart would let the next pull bring the copy back.
+    #[test]
+    fn a_refused_copy_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("sqexd-refused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("refused.state");
+        let channel = [9u8; 32];
+        {
+            let mut s = State::load(Some(path.clone()), &[], &[]).unwrap();
+            assert!(!s.refuses_copy(&channel));
+            assert!(s.refuse_copy(channel), "the first refusal changes the list");
+            assert!(!s.refuse_copy(channel), "the second changes nothing");
+            s.save().unwrap();
+        }
+        let mut s = State::load(Some(path.clone()), &[], &[]).unwrap();
+        assert!(s.refuses_copy(&channel), "the refusal did not survive");
+        assert_eq!(s.refused_copies(), vec![channel]);
+        assert!(s.allow_copy(&channel));
+        s.save().unwrap();
+        let s = State::load(Some(path), &[], &[]).unwrap();
+        assert!(!s.refuses_copy(&channel), "the withdrawal did not survive");
+        // A file written before this existed loads with an empty list.
+        let old = dir.join("old.state");
+        std::fs::write(
+            &old,
+            serde_json::json!({"enabled": false, "keys": []}).to_string(),
+        )
+        .unwrap();
+        assert!(
+            State::load(Some(old), &[], &[])
+                .unwrap()
+                .refused_copies()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The upgrade case, and the one that would have silently unpeered both
     /// live exchanges: a state file written before peers were managed has no
     /// `peers` member at all, so config still has to seed it. Both exchanges
