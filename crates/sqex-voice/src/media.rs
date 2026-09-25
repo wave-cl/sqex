@@ -392,6 +392,8 @@ pub struct Sender {
     /// describes the room rather than a moment of it.
     room: Option<(f32, f32)>,
     enabled: bool,
+    /// Nothing this microphone hears leaves this machine.
+    muted: bool,
 }
 
 impl Sender {
@@ -408,7 +410,33 @@ impl Sender {
             gate: Gate::new(15),
             room: None,
             enabled,
+            muted: false,
         }
+    }
+
+    /// Mute or unmute. Takes effect on the next slot offered.
+    ///
+    /// **A muted sender does not stop sending.** It keeps the keepalive going
+    /// and describes the room as digitally silent. One that simply went quiet
+    /// would empty the far end's buffer after `jitter::COAST_LIMIT` -- two
+    /// seconds -- and, in a room, go stale after `room::Membership::STALE` and
+    /// have its session torn down and rebuilt. "Muted" would arrive at the
+    /// other end as "gone" a few seconds in, which is a worse lie than the one
+    /// mute is for.
+    pub fn set_muted(&mut self, muted: bool) {
+        if muted && !self.muted {
+            // Nothing measured before the mute survives it: the level of this
+            // room is exactly what a mute is meant to stop sending. The first
+            // quiet frame after unmuting measures it again, and `offer`'s
+            // existing `unwrap_or` covers the gap until then.
+            self.room = None;
+        }
+        self.muted = muted;
+    }
+
+    /// Whether this sender is muted.
+    pub fn muted(&self) -> bool {
+        self.muted
     }
 
     /// Offer this slot's audio. Returns the frame to send, or `None` to stay
@@ -425,8 +453,21 @@ impl Sender {
         self.timestamp = self.timestamp.wrapping_add(1);
         self.since_sent += 1;
 
-        let speaking = !self.enabled || self.gate.is_speech(samples);
-        if !speaking {
+        // **Ahead of the gate, not folded into it.** `enabled` is DTX, and with
+        // DTX off `speaking` is unconditionally true -- which is how sigil's
+        // own call tests run. A mute expressed through the gate would work in
+        // the application and be a no-op in every test that exercises it.
+        //
+        // The gate is still fed and its answer thrown away: its floor is a
+        // minimum over a two-second window, and a stale one would mis-gate the
+        // first words after unmuting.
+        let speaking = if self.muted {
+            let _ = self.gate.is_speech(samples);
+            false
+        } else {
+            !self.enabled || self.gate.is_speech(samples)
+        };
+        if !speaking && !self.muted {
             // Track the room while it is quiet, which is the only time we can
             // actually see it.
             let (level, tilt) = (rms(samples), f32::from(tilt(samples)));
@@ -448,13 +489,21 @@ impl Sender {
         }
         if opens_silence || keepalive_due {
             self.since_sent = 0;
-            let (level, tilt) = self
-                .room
-                .unwrap_or((rms(samples), f32::from(tilt(samples))));
-            return Ok(Some(Frame {
-                timestamp,
-                body: Body::Comfort(Comfort::from_parts(level, tilt as u8)),
-            }));
+            let body = if self.muted {
+                // **Digital silence, described rather than measured.** The
+                // point of a mute is that the far end learns nothing about
+                // this room, and a measured descriptor would put its level on
+                // the wire once a second. `Comfort::from_parts(0.0, 0)` is
+                // this same value; it is written out so that reading this line
+                // does not require knowing that.
+                Body::Comfort(Comfort::from_parts(0.0, 0))
+            } else {
+                let (level, tilt) = self
+                    .room
+                    .unwrap_or((rms(samples), f32::from(tilt(samples))));
+                Body::Comfort(Comfort::from_parts(level, tilt as u8))
+            };
+            return Ok(Some(Frame { timestamp, body }));
         }
         Ok(None)
     }
@@ -529,6 +578,100 @@ mod tests {
 
     fn send(s: &mut Sender, samples: &[f32]) -> Option<Frame> {
         s.offer(samples, |_| Ok(opus_packet())).unwrap()
+    }
+
+    /// **A muted microphone sends no audio, however loud the room is.**
+    #[test]
+    fn a_muted_sender_sends_no_audio() {
+        let mut s = Sender::new(50, true);
+        s.set_muted(true);
+        for _ in 0..200 {
+            if let Some(f) = send(&mut s, &talking()) {
+                assert!(
+                    !matches!(f.body, Body::Audio(_)),
+                    "a muted sender put speech on the wire"
+                );
+            }
+        }
+    }
+
+    /// **And it does not go quiet.** A sender that stopped would empty the far
+    /// end's buffer after `jitter::COAST_LIMIT` and go stale in a room after
+    /// `room::Membership::STALE`, so a mute would arrive as a peer that left.
+    #[test]
+    fn a_muted_sender_keeps_the_line_alive() {
+        let keepalive = 50;
+        let mut s = Sender::new(keepalive, true);
+        s.set_muted(true);
+        let mut sent = 0;
+        for _ in 0..(keepalive * 4) {
+            if send(&mut s, &talking()).is_some() {
+                sent += 1;
+            }
+        }
+        assert!(
+            sent >= 4,
+            "a muted sender sent {sent} frames in four keepalive windows; \
+             the far end would call that a dead session"
+        );
+    }
+
+    /// **The leak this is really for.** With DTX on, a silent sender describes
+    /// the room once a second -- so a mute that only stopped the *speech* would
+    /// still put how loud this room is on the wire, once a second, for as long
+    /// as somebody believed they were muted.
+    #[test]
+    fn a_muted_sender_describes_no_room() {
+        let mut s = Sender::new(20, true);
+        let mut seed = 1;
+        // Loud enough to be well clear of digital silence, quiet enough that
+        // the gate calls it room rather than speech.
+        for _ in 0..200 {
+            send(&mut s, &room(&mut seed, 0.02));
+        }
+        // It learned this room while it was listening: the control for the
+        // assertion below, so a pass cannot mean "it never described anything".
+        let heard = (0..40)
+            .filter_map(|_| send(&mut s, &room(&mut seed, 0.02)))
+            .filter_map(|f| match f.body {
+                Body::Comfort(c) => Some(c.level),
+                _ => None,
+            })
+            .any(|level| level != 255);
+        assert!(heard, "this sender never described the room, muted or not");
+
+        s.set_muted(true);
+        for _ in 0..200 {
+            if let Some(Frame {
+                body: Body::Comfort(c),
+                ..
+            }) = send(&mut s, &room(&mut seed, 0.02))
+            {
+                assert_eq!(
+                    c.level, 255,
+                    "a muted sender described the room at level {}: anybody \
+                     listening learns how loud it is here",
+                    c.level
+                );
+                assert_eq!(c.tilt, 0, "and its tilt");
+            }
+        }
+    }
+
+    /// Unmuting is heard on the next word, not the next keepalive.
+    #[test]
+    fn unmuting_speaks_at_once() {
+        let mut s = Sender::new(50, true);
+        s.set_muted(true);
+        for _ in 0..50 {
+            send(&mut s, &talking());
+        }
+        s.set_muted(false);
+        let first = send(&mut s, &talking()).expect("speech after unmuting");
+        assert!(
+            matches!(first.body, Body::Audio(_)),
+            "the first frame after unmuting was not speech"
+        );
     }
 
     #[test]

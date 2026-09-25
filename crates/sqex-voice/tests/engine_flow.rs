@@ -87,6 +87,115 @@ fn tone_call(sink: &Path, seconds: u64) -> CallOpts {
     }
 }
 
+/// **A muted peer is silent, not gone.**
+///
+/// The tempting mute is to stop sending. It is wrong: `jitter::COAST_LIMIT` is
+/// two seconds, so a sender that goes quiet empties the far end's buffer, is
+/// counted as an underrun, and has to refill before it plays again -- and in a
+/// room `room::Membership::STALE` tears the session down entirely. Muting
+/// yourself for a minute would arrive at the other end as leaving.
+///
+/// So this mutes A for well past the coast limit and asks B's own counters
+/// whether anything was *missing*. Concealment and underruns are what loss
+/// looks like; deliberate silence shows up as neither.
+#[tokio::test]
+async fn a_muted_peer_is_silent_and_not_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let endpoint = Endpoint {
+        address: addr,
+        server: PubKey::new(server_pub),
+    };
+    let (a_signer, a_id) = signer(11);
+    let (b_signer, b_id) = signer(12);
+
+    // B is the one listening to a muted peer, so B is the one recorded.
+    let events = Collected::default();
+    let mut b_report = events.handle();
+
+    // A's mute, held here so the test can throw it mid-call.
+    let (muting, muted_rx) = tokio::sync::watch::channel(engine::Controls::default());
+
+    let a_dir = dir.path().to_path_buf();
+    let a_task = tokio::spawn(async move {
+        let mut report = Silent;
+        let (client, session, id) =
+            engine::establish(endpoint, &a_signer, b_id, 20, &mut report).await?;
+        let opts = CallOpts {
+            controls: Some(muted_rx),
+            ..tone_call(&a_dir.join("a.wav"), 6)
+        };
+        engine::call(client, session, id, opts, &mut report).await
+    });
+
+    // Long enough to be talking, then muted for three times the coast limit.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = muting.send(engine::Controls { muted: true });
+        // Held until the call ends: dropping the sender must not unmute, and
+        // `control_changed` treats a dropped sender as "wait", never as an
+        // instruction.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        drop(muting);
+    });
+
+    let b = async {
+        let (client, session, id) =
+            engine::establish(endpoint, &b_signer, a_id, 20, &mut b_report).await?;
+        engine::call(
+            client,
+            session,
+            id,
+            tone_call(&dir.path().join("b.wav"), 6),
+            &mut b_report,
+        )
+        .await
+    };
+    let done = tokio::time::timeout(std::time::Duration::from_secs(30), b).await;
+    a_task.abort();
+    assert!(done.is_ok(), "B never finished its six-second call");
+    done.unwrap().expect("B's call");
+
+    let seen = events.events();
+    let stats = seen
+        .iter()
+        .find_map(|e| match e {
+            Event::FinalStats(s) => Some(s.clone()),
+            _ => None,
+        })
+        .expect("B reported no final stats, so this says nothing about them");
+
+    // `sent 300 · recv 280 · loss 0.0% · … · concealed 0 · … · underruns 0 · …`
+    let field = |name: &str| -> u64 {
+        stats
+            .split('·')
+            .find_map(|part| part.trim().strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name:?} in {stats:?}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{name:?} in {stats:?}: {e}"))
+    };
+
+    // The control: B heard A at all. Without this the two assertions below
+    // pass for a call that never carried anything.
+    assert!(
+        field("recv ") > 0,
+        "B received nothing at all, muted or not: {stats}"
+    );
+    assert_eq!(
+        field("concealed "),
+        0,
+        "B concealed frames while A was muted, so a mute is arriving as packet \
+         loss: {stats}"
+    );
+    assert_eq!(
+        field("underruns "),
+        0,
+        "B's buffer ran dry while A was muted, which is what a sender that \
+         stops sending does: {stats}"
+    );
+}
+
 /// The whole point: two engines, a real exchange, and a tone that survives it.
 #[tokio::test]
 async fn a_call_driven_through_the_engine_carries_audio_both_ways() {

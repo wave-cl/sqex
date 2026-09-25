@@ -494,8 +494,10 @@ fn opts(
         dtx: !cli.no_dtx,
         share: Vec::new(),
         // The CLI's calls end on their own: `seconds`, or the source
-        // running out. Nothing outside asks them to stop.
+        // running out. Nothing outside asks them to stop, and nothing is
+        // there to mute them either -- a terminal has no button.
         stop: None,
+        controls: None,
     }
 }
 

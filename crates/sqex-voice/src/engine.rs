@@ -782,6 +782,44 @@ pub struct CallOpts {
     /// and the CLI do.
     #[allow(clippy::type_complexity)]
     pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Controls the caller may change while the call runs. `None` for a call
+    /// nobody is driving, which is what the command line has.
+    pub controls: Option<tokio::sync::watch::Receiver<Controls>>,
+}
+
+/// What can be changed about a call while it is running.
+///
+/// **One channel for all of them, not one per control.** A watch carries the
+/// latest value and nothing else, so a struct costs what a bool costs here and
+/// the second control costs nothing at all -- where a second channel would mean
+/// another `CallOpts` field, another arm in two loops, another field on every
+/// caller's handle and another wiring in each of its spawners.
+///
+/// `stop` is deliberately not one of these. It ends a call rather than setting
+/// anything about it, and a mute must not wake the arm that drains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Controls {
+    /// Send nothing but a keepalive describing digital silence.
+    /// See [`crate::media::Sender::set_muted`].
+    pub muted: bool,
+}
+
+/// Resolves when a control changes, and never when nobody can change one.
+///
+/// The mirror of [`asked_to_stop`]: a `select!` arm needs a future either way,
+/// and a dropped sender is not an instruction.
+async fn control_changed(
+    controls: &mut Option<tokio::sync::watch::Receiver<Controls>>,
+) -> Controls {
+    match controls {
+        Some(rx) => {
+            if rx.changed().await.is_ok() {
+                return *rx.borrow_and_update();
+            }
+            std::future::pending().await
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Resolves when the caller asks the call to stop, and never when nobody
@@ -818,6 +856,7 @@ impl Default for CallOpts {
             dtx: true,
             share: Vec::new(),
             stop: None,
+            controls: None,
         }
     }
 }
@@ -855,8 +894,16 @@ pub async fn call<C: Carrier>(
     let mut seq = 0u64;
     let mut hangup: Option<Instant> = None;
     let mut stop = opts.stop.clone();
+    let mut controls = opts.controls.clone();
     let mut deaf = false;
     let mut outgoing = media::Sender::new(KEEPALIVE_FRAMES, opts.dtx);
+    // **The value already in the channel, before anything can change it.**
+    // `changed()` reports a change and not a state, so a call muted between
+    // being spawned and coming up would come up unmuted and stay that way
+    // until somebody pressed the button twice.
+    if let Some(rx) = &controls {
+        outgoing.set_muted(rx.borrow().muted);
+    }
 
     loop {
         tokio::select! {
@@ -906,6 +953,14 @@ pub async fn call<C: Carrier>(
                 hangup = Some(
                     Instant::now() + Duration::from_millis(500 + opts.depth * FRAME_MS),
                 );
+            }
+
+            // A control changed. Nothing here can fail and nothing here ends
+            // the call, so unlike the arm above it applies and loops -- and it
+            // has no `hangup.is_none()` guard, because muting yourself while
+            // the call drains is a reasonable thing to want.
+            now = control_changed(&mut controls) => {
+                outgoing.set_muted(now.muted);
             }
 
             got = carrier.read_datagram() => {
@@ -1091,7 +1146,15 @@ pub async fn room_call(
 
     let mut hangup: Option<Instant> = None;
     let mut stop = opts.stop.clone();
+    let mut controls = opts.controls.clone();
     let mut outgoing = media::Sender::new(KEEPALIVE_FRAMES, opts.dtx);
+    // **The value already in the channel, before anything can change it.**
+    // `changed()` reports a change and not a state, so a call muted between
+    // being spawned and coming up would come up unmuted and stay that way
+    // until somebody pressed the button twice.
+    if let Some(rx) = &controls {
+        outgoing.set_muted(rx.borrow().muted);
+    }
     // **Frames that go nowhere, counted by the session they claimed.**
     //
     // Both ways of losing one are silent by design: a frame for a session we
@@ -1172,6 +1235,14 @@ pub async fn room_call(
                 hangup = Some(
                     Instant::now() + Duration::from_millis(500 + opts.depth * FRAME_MS),
                 );
+            }
+
+            // A control changed. Nothing here can fail and nothing here ends
+            // the call, so unlike the arm above it applies and loops -- and it
+            // has no `hangup.is_none()` guard, because muting yourself while
+            // the call drains is a reasonable thing to want.
+            now = control_changed(&mut controls) => {
+                outgoing.set_muted(now.muted);
             }
 
             got = client.read_datagram() => {
