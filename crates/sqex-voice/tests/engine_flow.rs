@@ -131,7 +131,10 @@ async fn a_muted_peer_is_silent_and_not_missing() {
     // Long enough to be talking, then muted for three times the coast limit.
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let _ = muting.send(engine::Controls { muted: true });
+        let _ = muting.send(engine::Controls {
+            muted: true,
+            ..Default::default()
+        });
         // Held until the call ends: dropping the sender must not unmute, and
         // `control_changed` treats a dropped sender as "wait", never as an
         // instruction.

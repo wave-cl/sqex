@@ -797,11 +797,75 @@ pub struct CallOpts {
 ///
 /// `stop` is deliberately not one of these. It ends a call rather than setting
 /// anything about it, and a mute must not wake the arm that drains.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Controls {
     /// Send nothing but a keepalive describing digital silence.
     /// See [`crate::media::Sender::set_muted`].
     pub muted: bool,
+    /// Which microphone to capture from, by name, matched as
+    /// [`crate::audio::open_source`] matches it. `None` is the default
+    /// device, chosen the way a call with no `--in` chooses it.
+    ///
+    /// Changing this mid-call reopens the capture device. A name that matches
+    /// nothing **keeps the microphone already open** and reports why: a bad
+    /// choice must not end a call somebody is in the middle of.
+    pub input: Option<String>,
+}
+
+/// Swap the capture device mid-call.
+///
+/// **The call survives a bad name.** `pick_device` matches a substring, so a
+/// stale choice -- a headset that has been unplugged since it was picked --
+/// resolves to nothing, and ending the call over it would be far worse than
+/// going on with the microphone already open. So a failure is reported and
+/// the old source is kept.
+///
+/// The new device need not offer the old device's rate, so the encoder is
+/// rebuilt when it changes. Dropping the old receiver stops the old device.
+fn swap_input(
+    opts: &CallOpts,
+    want: Option<&str>,
+    source: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<f32>>,
+    capture: &mut audio::Rate,
+    // Not `encoder`: that is the name of the function that builds one, and a
+    // parameter would shadow it in here.
+    enc: &mut opus::Encoder,
+    report: &mut dyn Report,
+) {
+    let (fresh, rate) = match audio::open_source(&opts.source, opts.seconds, want) {
+        Ok(open) => open,
+        Err(why) => {
+            report.event(Event::BadFrame {
+                seq: 0,
+                why: format!("keeping the microphone already open: {why}"),
+            });
+            return;
+        }
+    };
+    if rate != *capture {
+        match encoder(opts.bitrate, rate) {
+            Ok(fresh) => *enc = fresh,
+            // The device opened and the codec will not follow it. Keep both
+            // the old source and the old encoder rather than pair a new rate
+            // with an encoder built for the old one, which would send noise.
+            Err(why) => {
+                report.event(Event::BadFrame {
+                    seq: 0,
+                    why: format!("keeping the microphone already open: {why}"),
+                });
+                return;
+            }
+        }
+        *capture = rate;
+    }
+    *source = fresh;
+    // A readout, as `default_capture` does it: which microphone is live is a
+    // thing the operator can otherwise only infer from what the far end says.
+    eprintln!(
+        "capturing from {} at {} Hz",
+        want.unwrap_or("the default microphone"),
+        rate.hz()
+    );
 }
 
 /// Resolves when a control changes, and never when nobody can change one.
@@ -814,7 +878,7 @@ async fn control_changed(
     match controls {
         Some(rx) => {
             if rx.changed().await.is_ok() {
-                return *rx.borrow_and_update();
+                return rx.borrow_and_update().clone();
             }
             std::future::pending().await
         }
@@ -872,8 +936,11 @@ pub async fn call<C: Carrier>(
 ) -> Result<(), String> {
     // Capture and playback pick their own rates, and Opus converts between them
     // and whatever the far end chose. Nothing is negotiated.
-    let (mut source, capture) =
+    let (mut source, mut capture) =
         audio::open_source(&opts.source, opts.seconds, opts.input.as_deref())?;
+    // Which microphone is open, so a control change can tell whether it is
+    // being asked for one it already has.
+    let mut open_input = opts.input.clone();
     let (out, play_rate) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
     let mut encoder = encoder(opts.bitrate, capture)?;
     let mut playback = Playback::new(play_rate.hz())?;
@@ -902,7 +969,22 @@ pub async fn call<C: Carrier>(
     // being spawned and coming up would come up unmuted and stay that way
     // until somebody pressed the button twice.
     if let Some(rx) = &controls {
-        outgoing.set_muted(rx.borrow().muted);
+        let now = rx.borrow().clone();
+        outgoing.set_muted(now.muted);
+        // And the microphone, for the same reason: a call spawned with one
+        // already chosen opened the *default* device above, and no change
+        // event will ever fire to correct it.
+        if now.input != open_input {
+            swap_input(
+                &opts,
+                now.input.as_deref(),
+                &mut source,
+                &mut capture,
+                &mut encoder,
+                report,
+            );
+            open_input = now.input;
+        }
     }
 
     loop {
@@ -961,6 +1043,20 @@ pub async fn call<C: Carrier>(
             // the call drains is a reasonable thing to want.
             now = control_changed(&mut controls) => {
                 outgoing.set_muted(now.muted);
+                // Only on a real change: reopening the device somebody is
+                // already speaking into would cut a word out of the call for
+                // nothing, and a watch fires for whatever field moved.
+                if now.input != open_input {
+                    swap_input(
+                        &opts,
+                        now.input.as_deref(),
+                        &mut source,
+                        &mut capture,
+                        &mut encoder,
+                        report,
+                    );
+                    open_input = now.input.clone();
+                }
             }
 
             got = carrier.read_datagram() => {
@@ -1119,8 +1215,11 @@ pub async fn room_call(
         return Err("this path does not carry datagrams, so it cannot carry a room".into());
     }
 
-    let (mut source, capture) =
+    let (mut source, mut capture) =
         audio::open_source(&opts.source, opts.seconds, opts.input.as_deref())?;
+    // Which microphone is open, so a control change can tell whether it is
+    // being asked for one it already has.
+    let mut open_input = opts.input.clone();
     let (out, play_rate) = audio::open_sink(&opts.sink, opts.output.as_deref())?;
     let mut encoder = encoder(opts.bitrate, capture)?;
     let mut mixer = Mixer::new(play_rate.frame());
@@ -1153,7 +1252,22 @@ pub async fn room_call(
     // being spawned and coming up would come up unmuted and stay that way
     // until somebody pressed the button twice.
     if let Some(rx) = &controls {
-        outgoing.set_muted(rx.borrow().muted);
+        let now = rx.borrow().clone();
+        outgoing.set_muted(now.muted);
+        // And the microphone, for the same reason: a call spawned with one
+        // already chosen opened the *default* device above, and no change
+        // event will ever fire to correct it.
+        if now.input != open_input {
+            swap_input(
+                &opts,
+                now.input.as_deref(),
+                &mut source,
+                &mut capture,
+                &mut encoder,
+                report,
+            );
+            open_input = now.input;
+        }
     }
     // **Frames that go nowhere, counted by the session they claimed.**
     //
@@ -1243,6 +1357,20 @@ pub async fn room_call(
             // the call drains is a reasonable thing to want.
             now = control_changed(&mut controls) => {
                 outgoing.set_muted(now.muted);
+                // Only on a real change: reopening the device somebody is
+                // already speaking into would cut a word out of the call for
+                // nothing, and a watch fires for whatever field moved.
+                if now.input != open_input {
+                    swap_input(
+                        &opts,
+                        now.input.as_deref(),
+                        &mut source,
+                        &mut capture,
+                        &mut encoder,
+                        report,
+                    );
+                    open_input = now.input.clone();
+                }
             }
 
             got = client.read_datagram() => {

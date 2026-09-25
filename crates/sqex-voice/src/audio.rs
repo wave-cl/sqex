@@ -792,6 +792,48 @@ fn pick_device(want: Option<&str>, input: bool) -> Result<cpal::platform::Device
     ))
 }
 
+/// An input device a caller may choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// The name, spelled as [`open_source`] matches it.
+    pub name: String,
+    /// The one a call that names nothing would actually capture from.
+    ///
+    /// **Not the system default.** `default_capture` deliberately steps around
+    /// a connected headset, because opening its microphone switches it to
+    /// narrowband and can stop its speaker opening at all — so the system
+    /// default and the device a call really uses are often different, and a
+    /// chooser that marked the wrong one would be telling its reader something
+    /// untrue about their own call.
+    pub default: bool,
+}
+
+/// Every input device, for a chooser to offer.
+///
+/// [`list_devices`] prints for a person reading a terminal; this answers a
+/// program. Names only — the rates are a diagnostic and mean nothing to
+/// somebody picking a microphone.
+pub fn inputs() -> Result<Vec<Device>, String> {
+    let host = cpal::default_host();
+    // What a call would really open, so the mark is on the right row.
+    let live = default_capture(&host).ok().map(|d| describe(&d));
+    let mut out = Vec::new();
+    for device in host.devices().map_err(|e| format!("list devices: {e}"))? {
+        if !device.supports_input() {
+            continue;
+        }
+        let name = describe(&device);
+        // A device with no readable name cannot be named back to
+        // `pick_device`, so offering it would be offering a dead choice.
+        if name == "unnamed device" || out.iter().any(|d: &Device| d.name == name) {
+            continue;
+        }
+        let default = Some(&name) == live.as_ref();
+        out.push(Device { name, default });
+    }
+    Ok(out)
+}
+
 /// Print every device and the rates it offers, so the next problem of this
 /// shape can be diagnosed without reading this file.
 pub fn list_devices() -> Result<(), String> {
@@ -1046,6 +1088,63 @@ mod tests {
     /// Reports rather than asserts, like the carriage measurement in sqexd:
     /// the numbers inform the design and should not gate CI.
     /// `cargo test -p sqex-voice -- --ignored --nocapture dtx`
+    /// **The invariants, on whatever hardware this runs on.**
+    ///
+    /// A CI runner has no microphone and a laptop has several, so the list
+    /// itself cannot be asserted. What must hold either way is that every row
+    /// is a name somebody could be given back to `pick_device`, and that the
+    /// list does not claim two different devices are both the one a call would
+    /// use — which would be two ticks in a chooser.
+    #[test]
+    fn the_input_list_is_one_a_chooser_could_draw() {
+        let Ok(found) = inputs() else {
+            // No host, no devices, no test. Not a failure: it is what a
+            // headless runner looks like.
+            return;
+        };
+        for device in &found {
+            assert!(
+                !device.name.trim().is_empty(),
+                "a nameless device cannot be chosen: {found:?}"
+            );
+            assert_ne!(
+                device.name, "unnamed device",
+                "the placeholder name reached the chooser: {found:?}"
+            );
+        }
+        let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "the same device is offered twice: {names:?}"
+        );
+        assert!(
+            found.iter().filter(|d| d.default).count() <= 1,
+            "two devices both claim to be the one a call would use: {found:?}"
+        );
+    }
+
+    /// Every name offered resolves back to a device.
+    ///
+    /// The chooser's whole contract: `inputs()` spells a name the way
+    /// `pick_device` matches it. If those two ever drift, a chooser would
+    /// offer rows that fail when picked, and the failure would land mid-call.
+    #[test]
+    fn every_name_offered_can_be_opened_again() {
+        let Ok(found) = inputs() else { return };
+        for device in &found {
+            assert!(
+                pick_device(Some(&device.name), true).is_ok(),
+                "{:?} is offered but does not resolve: the chooser and the \
+                 matcher disagree",
+                device.name
+            );
+        }
+    }
+
     #[test]
     #[ignore = "reports numbers; run explicitly"]
     fn dtx_packet_sizes() {
