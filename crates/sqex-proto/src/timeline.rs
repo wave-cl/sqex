@@ -315,6 +315,19 @@ impl Timeline {
         self.messages.values()
     }
 
+    /// Which entry set the name, topic and picture this fold holds, and `0`
+    /// for a fold that saw none.
+    ///
+    /// **Zero is not "no name".** A fold that never reached a metadata entry
+    /// and a channel whose admins never named it both leave `name` empty, and
+    /// a reader that cached the second as though it were the first would
+    /// remember an empty name for a channel that has one. Anything keeping
+    /// this fold's metadata between runs keeps this number beside it and asks
+    /// it that question.
+    pub fn metadata_seq(&self) -> u64 {
+        self.metadata_seq
+    }
+
     /// SIP-57: drop a message whose timer has run out. What a store does
     /// on disk, done to the copy in memory.
     pub fn forget(&mut self, seq: u64) -> bool {

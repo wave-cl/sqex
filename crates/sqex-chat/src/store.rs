@@ -35,6 +35,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha512};
+use sqex_proto::blob::Attachment;
 use sqex_proto::channel::{KIND_MEMBER, KIND_SYSTEM, System, direct_message_id};
 use sqex_proto::channel_key::{ChannelKey, Replay};
 use sqex_proto::entry_sig::GENESIS;
@@ -210,6 +211,14 @@ CREATE TABLE IF NOT EXISTS channel_meta (
     kind    INTEGER NOT NULL DEFAULT 0,
     label   TEXT    NOT NULL DEFAULT '',
     admins  BLOB    NOT NULL DEFAULT x'', -- concatenated 32-byte accounts
+    -- The rest of SIP-21's metadata, so that listing the conversations does
+    -- not mean folding every one of them: `topic` and the channel picture as
+    -- an encoded `Attachment`, and the sequence number of the entry they came
+    -- from. `meta_seq = 0` means no fold has ever reached a metadata entry
+    -- here, which is a different fact from a channel its admins never named.
+    topic    TEXT    NOT NULL DEFAULT '',
+    avatar   BLOB    NOT NULL DEFAULT x'',
+    meta_seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (exchange, channel)
 );
 -- SIP-17's replay set. Not secret — it is a list of counters the exchange
@@ -380,6 +389,15 @@ pub struct Channel {
     pub public: Option<bool>,
     pub label: String,
     pub admins: Vec<PubKey>,
+    /// SIP-21's topic, as the last fold of this channel read it.
+    pub topic: String,
+    /// The channel's picture, as the last fold of this channel read it.
+    pub avatar: Option<Attachment>,
+    /// The entry the three above came from, and `0` for a channel no fold has
+    /// ever read metadata for — see [`Timeline::metadata_seq`]. A client
+    /// listing conversations without folding them uses this to tell "this
+    /// channel has no name" from "nothing has read its name yet".
+    pub meta_seq: u64,
 }
 
 /// The `kind` column, which is an integer and now carries two facts.
@@ -1082,6 +1100,24 @@ impl Store {
             db.execute_batch("ALTER TABLE profile ADD COLUMN avatar BLOB NOT NULL DEFAULT x''")
                 .map_err(storage("add profile.avatar"))?;
         }
+        // The channel's topic and picture beside its name (2026-09-25), so a
+        // client can list its conversations without folding them. A store from
+        // before the columns has `meta_seq = 0` for every channel, which says
+        // exactly what is true of it: nothing here was read off a metadata
+        // entry yet, and the first fold of each channel fills it in.
+        let has_meta_seq: bool = db
+            .prepare("SELECT 1 FROM pragma_table_info('channel_meta') WHERE name = 'meta_seq'")
+            .and_then(|mut s| s.exists([]))
+            .map_err(storage("inspect the channel_meta table"))?;
+        if !has_meta_seq {
+            db.execute_batch(
+                "ALTER TABLE channel_meta ADD COLUMN topic TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE channel_meta ADD COLUMN avatar BLOB NOT NULL DEFAULT x'';
+                 ALTER TABLE channel_meta ADD COLUMN meta_seq INTEGER NOT NULL DEFAULT 0",
+            )
+            .map_err(storage("add the channel_meta metadata columns"))?;
+        }
+
         let assets = match path {
             Some(p) => Some(assets_dir(p)?),
             None => None,
@@ -1240,48 +1276,8 @@ impl Store {
     /// an epoch's plaintext there is. Store-side, so a client with no
     /// connection yet can draw from the disc (sigil, 2026-09-22).
     pub fn history(&self, channel: &[u8; 32], admins: &[PubKey]) -> Result<Timeline> {
-        let mut timeline = Timeline::new();
         let held = self.messages(channel)?;
-        let mut with_body: Vec<u64> = Vec::new();
-        for (seq, account, posted, kind, plain) in held {
-            if plain.as_ref().is_some_and(|p| !p.is_empty()) {
-                with_body.push(seq);
-            }
-            timeline.apply(
-                &Received {
-                    seq,
-                    account,
-                    posted,
-                    kind,
-                    // What this client verified when the entry arrived. The
-                    // store keeps no signatures, so nothing can be re-checked
-                    // here — which is only honest because `poll` refuses to
-                    // write an entry that failed.
-                    verdict: Verdict::Valid,
-                    // Nor can a receipt be re-checked from the store, and
-                    // unlike the verdict this one is not safely defaulted to
-                    // the good case: a rebuilt timeline has no receipt in front
-                    // of it, and *unclaimed* is exactly what that is.
-                    tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
-                    standing: Standing::Unclaimed,
-                    // Two decoders, chosen by kind and never both: a system
-                    // entry carries SIP-16's own layout and a member entry a
-                    // SIP-19 body, and neither decoder would make sense of the
-                    // other's bytes.
-                    system: (kind == KIND_SYSTEM)
-                        .then(|| {
-                            plain
-                                .as_deref()
-                                .and_then(|p| System::decode(p).ok().flatten())
-                        })
-                        .flatten(),
-                    body: (kind == KIND_MEMBER)
-                        .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
-                        .flatten(),
-                },
-                admins,
-            );
-        }
+        let (timeline, with_body) = fold_rows(held, admins);
 
         // Anything the fold says was deleted, and whose words are still here.
         //
@@ -1290,14 +1286,181 @@ impl Store {
         // do it kept its plaintext, and would have kept it for good. Folding
         // is where we find out which those are, and it happens once per
         // channel at startup rather than on every poll.
+        //
+        // **This is why a channel is folded whole or not at all.** A fold of
+        // the last N rows would not see a redaction of the N+1st, and the
+        // words it deleted would stay on the disc with nothing left to find
+        // them -- see `history_tail`, which is allowed no further than a
+        // preview line for exactly this reason.
         for seq in with_body {
             if timeline.get(seq).is_some_and(|m| m.redacted) {
                 self.redact_message(channel, seq)?;
             }
         }
+        // What the fold read about the channel itself, kept so that the next
+        // start can name this conversation without folding it again.
+        self.remember_meta(channel, &timeline)?;
         Ok(timeline)
     }
 
+    /// The last `rows` of a channel, folded -- **for a preview line, and
+    /// nothing else**.
+    ///
+    /// A suffix of a channel is not that channel. `Timeline::apply` resolves
+    /// an edit, a redaction, a reaction and a call's end against the sequence
+    /// number they name, and drops any whose target is below the window; the
+    /// name, topic and picture come from wherever an admin last set them,
+    /// which is usually the top; and `history`'s sweep of redacted bodies
+    /// cannot run on rows it never read. All of that is tolerable for the one
+    /// line a conversation list shows and for nothing further, so a caller
+    /// that is about to draw a transcript calls `history`.
+    ///
+    /// `rows` is counted in stored rows rather than messages, so a tail of
+    /// reactions still reaches back past them to something said.
+    pub fn history_tail(
+        &self,
+        channel: &[u8; 32],
+        admins: &[PubKey],
+        rows: usize,
+    ) -> Result<Timeline> {
+        let held = self.messages_tail(channel, rows)?;
+        let (timeline, _) = fold_rows(held, admins);
+        Ok(timeline)
+    }
+
+    /// How many of a channel's messages this store holds.
+    ///
+    /// Counted in SQL rather than by folding: the count a conversation list
+    /// needs is a row count, and folding to arrive at it opens every sealed
+    /// body on the way.
+    pub fn message_count(&self, channel: &[u8; 32]) -> Result<usize> {
+        let n: i64 = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM message WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
+                |r| r.get(0),
+            )
+            .map_err(storage("count messages"))?;
+        Ok(n as usize)
+    }
+
+    /// When the newest thing in a channel was posted, and its sequence
+    /// number. `None` for a channel holding nothing.
+    ///
+    /// One row, read backwards along the primary key, and no body opened:
+    /// what a list sorts on, and what a client asks before it decides whether
+    /// to fold anything at all.
+    pub fn newest_message(&self, channel: &[u8; 32]) -> Result<Option<(u64, u64)>> {
+        self.db
+            .query_row(
+                "SELECT seq, posted FROM message
+                 WHERE channel = ?1 AND exchange = ?2 ORDER BY seq DESC LIMIT 1",
+                params![&channel[..], self.scope()?],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()
+            .map_err(storage("read the newest message"))
+    }
+
+    /// The last `rows` rows of a channel, oldest first -- `messages` with a
+    /// bound. Only `history_tail` should want this; see its warning.
+    #[allow(clippy::type_complexity)]
+    fn messages_tail(
+        &self,
+        channel: &[u8; 32],
+        rows: usize,
+    ) -> Result<Vec<(u64, PubKey, u64, u8, Option<Vec<u8>>)>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                // Backwards along `(exchange, channel, seq)`, so the rows
+                // skipped are never read and their bodies never opened, then
+                // turned back the way a fold wants them.
+                "SELECT seq, account, posted, kind, sealed FROM message
+                 WHERE channel = ?1 AND exchange = ?2 ORDER BY seq DESC LIMIT ?3",
+            )
+            .map_err(storage("prepare the message tail"))?;
+        let got = stmt
+            .query_map(params![&channel[..], self.scope()?, rows as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    PubKey::new(r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, i64>(3)? as u8,
+                    r.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })
+            .map_err(storage("query the message tail"))?;
+        let mut out = Vec::new();
+        for row in got {
+            let (seq, account, posted, kind, sealed) = row.map_err(storage("read message"))?;
+            let plain = match sealed {
+                Some(s) => Some(self.unseal_bytes(&s)?),
+                None => None,
+            };
+            out.push((seq, account, posted, kind, plain));
+        }
+        out.reverse();
+        Ok(out)
+    }
+}
+
+/// Fold stored rows into a timeline, and say which of them still hold words.
+///
+/// Free of the store on purpose: it decides nothing about *which* rows it is
+/// given, so the one caller allowed to give it a suffix is the one that
+/// documents why.
+#[allow(clippy::type_complexity)]
+fn fold_rows(
+    held: Vec<(u64, PubKey, u64, u8, Option<Vec<u8>>)>,
+    admins: &[PubKey],
+) -> (Timeline, Vec<u64>) {
+    let mut timeline = Timeline::new();
+    let mut with_body: Vec<u64> = Vec::new();
+    for (seq, account, posted, kind, plain) in held {
+        if plain.as_ref().is_some_and(|p| !p.is_empty()) {
+            with_body.push(seq);
+        }
+        timeline.apply(
+            &Received {
+                seq,
+                account,
+                posted,
+                kind,
+                // What this client verified when the entry arrived. The
+                // store keeps no signatures, so nothing can be re-checked
+                // here — which is only honest because `poll` refuses to
+                // write an entry that failed.
+                verdict: Verdict::Valid,
+                // Nor can a receipt be re-checked from the store, and
+                // unlike the verdict this one is not safely defaulted to
+                // the good case: a rebuilt timeline has no receipt in front
+                // of it, and *unclaimed* is exactly what that is.
+                tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
+                standing: Standing::Unclaimed,
+                // Two decoders, chosen by kind and never both: a system
+                // entry carries SIP-16's own layout and a member entry a
+                // SIP-19 body, and neither decoder would make sense of the
+                // other's bytes.
+                system: (kind == KIND_SYSTEM)
+                    .then(|| {
+                        plain
+                            .as_deref()
+                            .and_then(|p| System::decode(p).ok().flatten())
+                    })
+                    .flatten(),
+                body: (kind == KIND_MEMBER)
+                    .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
+                    .flatten(),
+            },
+            admins,
+        );
+    }
+    (timeline, with_body)
+}
+
+impl Store {
     /// The direct-message channel with `them`, as this store knows it: an
     /// alias where one was recorded (SIP-60 §A direct message opened twice),
     /// the derived id otherwise.
@@ -2431,7 +2594,7 @@ impl Store {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT channel, kind, label, admins FROM channel_meta
+                "SELECT channel, kind, label, admins, topic, avatar, meta_seq FROM channel_meta
                  WHERE exchange = ?1 ORDER BY label, channel",
             )
             .map_err(storage("prepare channels"))?;
@@ -2442,12 +2605,16 @@ impl Store {
                     Kind::from_i64(r.get::<_, i64>(1)?),
                     r.get::<_, String>(2)?,
                     r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Vec<u8>>(5)?,
+                    r.get::<_, i64>(6)? as u64,
                 ))
             })
             .map_err(storage("query channels"))?;
         let mut out = Vec::new();
         for row in rows {
-            let (channel, kind, label, flat) = row.map_err(storage("read channel"))?;
+            let (channel, kind, label, flat, topic, avatar, meta_seq) =
+                row.map_err(storage("read channel"))?;
             let admins = flat
                 .as_chunks::<32>()
                 .0
@@ -2460,9 +2627,61 @@ impl Store {
                 public: kind.public(),
                 label,
                 admins,
+                topic,
+                // Kept as its wire bytes, so a picture this store cannot make
+                // sense of -- written by a later version -- is dropped rather
+                // than failing the whole list.
+                avatar: Attachment::read(&avatar, &mut 0).ok(),
+                meta_seq,
             });
         }
         Ok(out)
+    }
+
+    /// Keep what a fold of this channel read about the channel itself.
+    ///
+    /// Called wherever a `Timeline` is folded or advanced, so that the next
+    /// run can name a conversation without folding it again. An older fold
+    /// never overwrites a newer one: the metadata entry's own sequence number
+    /// decides, exactly as it does inside the fold.
+    pub fn remember_meta(&self, channel: &[u8; 32], timeline: &Timeline) -> Result<()> {
+        let seq = timeline.metadata_seq();
+        if seq == 0 {
+            // The fold read no metadata entry. It may simply not have reached
+            // one; either way it knows nothing that could replace what is
+            // stored, and an empty name written here would be a claim.
+            return Ok(());
+        }
+        let avatar = timeline
+            .avatar
+            .as_ref()
+            .map(|a| a.encode())
+            .unwrap_or_default();
+        self.db
+            .execute(
+                "INSERT INTO channel_meta (channel, exchange, label, topic, avatar, meta_seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (exchange, channel)
+                 DO UPDATE SET
+                     -- A direct message is labelled with the person in it, and
+                     -- its fold names nothing: an empty name from a fold never
+                     -- replaces a label somebody else put there. Only a
+                     -- group's own name comes from here, which is the rule
+                     -- `poll` already follows.
+                     label = CASE WHEN ?3 = '' THEN label ELSE ?3 END,
+                     topic = ?4, avatar = ?5, meta_seq = ?6
+                 WHERE meta_seq <= ?6",
+                params![
+                    &channel[..],
+                    self.scope()?,
+                    &timeline.name,
+                    &timeline.topic,
+                    avatar,
+                    seq as i64
+                ],
+            )
+            .map_err(storage("remember channel metadata"))?;
+        Ok(())
     }
 
     // ---- attachments, kept ----------------------------------------------
@@ -4080,6 +4299,284 @@ mod tests {
         assert!(group.group, "the group lost its kind");
         assert_eq!(group.label, "the group");
         assert_eq!(group.admins, vec![key(1), key(2)]);
+    }
+
+    /// A conversation can be listed without being folded: the count, the
+    /// newest row and the tail are all the list needs, and none of them opens
+    /// the whole channel.
+    #[test]
+    fn a_list_reads_a_channel_without_folding_it() {
+        let s = scoped(&seed(1), None);
+        let channel = [7; 32];
+        assert_eq!(s.message_count(&channel).unwrap(), 0);
+        assert_eq!(s.newest_message(&channel).unwrap(), None);
+
+        for seq in 1..=40u64 {
+            let body = Body::Post(sqex_proto::message::Post::text(&format!("line {seq}")));
+            s.put_message(
+                &channel,
+                Kept {
+                    seq,
+                    account: key(2),
+                    posted: 1_000 + seq,
+                    kind: KIND_MEMBER,
+                    plain: Some(&body.encode()),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(s.message_count(&channel).unwrap(), 40);
+        assert_eq!(s.newest_message(&channel).unwrap(), Some((40, 1_040)));
+
+        // A tail of five reaches five rows and no further.
+        let tail = s.history_tail(&channel, &[key(2)], 5).unwrap();
+        let said: Vec<&str> = tail
+            .messages()
+            .map(|m| m.post.body_text().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            said,
+            ["line 36", "line 37", "line 38", "line 39", "line 40"]
+        );
+        assert_eq!(
+            tail.messages().last().map(|m| m.seq),
+            Some(40),
+            "the tail must end where the channel does"
+        );
+    }
+
+    /// A tail is counted in rows, not in messages: a conversation whose last
+    /// words are buried under reactions still shows a line.
+    #[test]
+    fn a_tail_of_reactions_still_reaches_what_was_said() {
+        let s = scoped(&seed(1), None);
+        let channel = [7; 32];
+        let post = Body::Post(sqex_proto::message::Post::text("the last thing said"));
+        s.put_message(
+            &channel,
+            Kept {
+                seq: 1,
+                account: key(2),
+                posted: 100,
+                kind: KIND_MEMBER,
+                plain: Some(&post.encode()),
+            },
+        )
+        .unwrap();
+        for seq in 2..=4u64 {
+            let react = Body::Reaction {
+                target: 1,
+                add: true,
+                emoji: "\u{1f44d}".into(),
+            };
+            s.put_message(
+                &channel,
+                Kept {
+                    seq,
+                    account: key(2),
+                    posted: 100 + seq,
+                    kind: KIND_MEMBER,
+                    plain: Some(&react.encode()),
+                },
+            )
+            .unwrap();
+        }
+        let tail = s.history_tail(&channel, &[key(2)], 20).unwrap();
+        assert_eq!(
+            tail.messages().next().map(|m| m.post.body_text().unwrap()),
+            Some("the last thing said")
+        );
+    }
+
+    /// **The limit of a tail, pinned rather than left to be discovered.** A
+    /// reaction whose target is below the window is dropped by the fold, which
+    /// is why `history_tail` is allowed no further than a preview line.
+    #[test]
+    fn a_tail_loses_what_points_below_it() {
+        let s = scoped(&seed(1), None);
+        let channel = [7; 32];
+        let post = Body::Post(sqex_proto::message::Post::text("said early"));
+        s.put_message(
+            &channel,
+            Kept {
+                seq: 1,
+                account: key(2),
+                posted: 100,
+                kind: KIND_MEMBER,
+                plain: Some(&post.encode()),
+            },
+        )
+        .unwrap();
+        for seq in 2..=6u64 {
+            let filler = Body::Post(sqex_proto::message::Post::text(&format!("filler {seq}")));
+            s.put_message(
+                &channel,
+                Kept {
+                    seq,
+                    account: key(2),
+                    posted: 100 + seq,
+                    kind: KIND_MEMBER,
+                    plain: Some(&filler.encode()),
+                },
+            )
+            .unwrap();
+        }
+        let react = Body::Reaction {
+            target: 1,
+            add: true,
+            emoji: "\u{1f44d}".into(),
+        };
+        s.put_message(
+            &channel,
+            Kept {
+                seq: 7,
+                account: key(3),
+                posted: 107,
+                kind: KIND_MEMBER,
+                plain: Some(&react.encode()),
+            },
+        )
+        .unwrap();
+
+        let whole = s.history(&channel, &[key(2)]).unwrap();
+        assert_eq!(
+            whole.get(1).map(|m| m.reactions.len()),
+            Some(1),
+            "the whole fold keeps the reaction"
+        );
+        let tail = s.history_tail(&channel, &[key(2)], 3).unwrap();
+        assert!(
+            tail.get(1).is_none(),
+            "the reacted-to message is below the window, as it should be"
+        );
+        assert_eq!(
+            tail.messages().count(),
+            2,
+            "three rows, one of them a reaction with nothing to attach to"
+        );
+    }
+
+    /// A fold keeps what it read about the channel itself, so the next start
+    /// can name the conversation without folding it again -- and an older
+    /// fold never overwrites a newer one.
+    #[test]
+    fn a_fold_remembers_the_channels_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let channel = [7; 32];
+        {
+            let s = scoped(&seed(1), Some(&path));
+            s.put_channel(&channel, true, Some(false), "", &[key(2)])
+                .unwrap();
+            // Nothing has read a name here yet, which is not the same fact as
+            // a channel whose admins never gave it one.
+            assert_eq!(s.channels().unwrap()[0].meta_seq, 0);
+
+            for (seq, name, topic) in [(3u64, "the first name", "one"), (9, "renamed", "two")] {
+                let meta = Body::Metadata {
+                    name: name.into(),
+                    topic: topic.into(),
+                    avatar: None,
+                };
+                s.put_message(
+                    &channel,
+                    Kept {
+                        seq,
+                        account: key(2),
+                        posted: 100 + seq,
+                        kind: KIND_MEMBER,
+                        plain: Some(&meta.encode()),
+                    },
+                )
+                .unwrap();
+            }
+            s.history(&channel, &[key(2)]).unwrap();
+        }
+        let s = scoped(&seed(1), Some(&path));
+        let listed = s.channels().unwrap();
+        let c = listed.iter().find(|c| c.channel == channel).unwrap();
+        assert_eq!(c.label, "renamed", "the newest metadata entry names it");
+        assert_eq!(c.topic, "two");
+        assert_eq!(c.meta_seq, 9);
+
+        // An older fold -- a tail that reached only the first entry -- does
+        // not walk the name backwards.
+        let old = s.history_tail(&channel, &[key(2)], 1).unwrap();
+        assert_eq!(old.metadata_seq(), 9, "the tail read the newer entry");
+        let stale = s.history_tail(&channel, &[key(2)], 0).unwrap();
+        s.remember_meta(&channel, &stale).unwrap();
+        assert_eq!(
+            s.channels().unwrap()[0].label,
+            "renamed",
+            "a fold that read no metadata must not blank the name"
+        );
+    }
+
+    /// A direct message is labelled with the person in it, and its fold names
+    /// nothing: the fold must not replace that label with an empty one.
+    #[test]
+    fn a_folds_empty_name_leaves_a_direct_messages_label_alone() {
+        let s = scoped(&seed(1), None);
+        let dm = [8; 32];
+        s.put_channel(&dm, false, Some(false), "bob", &[key(1), key(3)])
+            .unwrap();
+        let meta = Body::Metadata {
+            name: String::new(),
+            topic: "just the two of us".into(),
+            avatar: None,
+        };
+        s.put_message(
+            &dm,
+            Kept {
+                seq: 2,
+                account: key(1),
+                posted: 102,
+                kind: KIND_MEMBER,
+                plain: Some(&meta.encode()),
+            },
+        )
+        .unwrap();
+        s.history(&dm, &[key(1), key(3)]).unwrap();
+        let c = s
+            .channels()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.channel == dm)
+            .unwrap();
+        assert_eq!(c.label, "bob", "the peer's name was overwritten");
+        assert_eq!(c.topic, "just the two of us");
+    }
+
+    /// A store written before the metadata columns existed opens, keeps its
+    /// rows, and answers "nothing has read this channel's name yet".
+    #[test]
+    fn a_store_from_before_the_metadata_columns_grows_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        {
+            let s = scoped(&seed(1), Some(&path));
+            s.put_channel(&[7; 32], true, Some(false), "the group", &[key(1)])
+                .unwrap();
+            // The shape of the table before 2026-09-25, rebuilt underneath a
+            // store that already has rows in it.
+            s.db.execute_batch(
+                "CREATE TABLE channel_meta_old AS
+                         SELECT exchange, channel, kind, label, admins FROM channel_meta;
+                     DROP TABLE channel_meta;
+                     ALTER TABLE channel_meta_old RENAME TO channel_meta",
+            )
+            .unwrap();
+        }
+        let s = scoped(&seed(1), Some(&path));
+        let c = s.channels().unwrap();
+        assert_eq!(c.len(), 1, "the rows did not survive the migration");
+        assert_eq!(c[0].label, "the group");
+        assert_eq!(c[0].topic, "");
+        assert_eq!(c[0].avatar, None);
+        assert_eq!(
+            c[0].meta_seq, 0,
+            "an upgraded row must say that nothing has read its metadata"
+        );
     }
 
     #[test]

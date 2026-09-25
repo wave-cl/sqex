@@ -3799,6 +3799,7 @@ impl Chat {
             .collect();
         let before = self.store.entry_count(channel)?;
         self.fold_entries(timeline, channel, &info, &admins, &bound, &fresh, 0, true)?;
+        self.store.remember_meta(channel, timeline)?;
         // What was kept, not what was offered: an entry that failed its
         // checks was refused in there, silently to the sibling.
         Ok((self.store.entry_count(channel)? - before) as usize)
@@ -6885,6 +6886,13 @@ impl Chat {
         if last > since {
             self.store.set_since(channel, last)?;
         }
+        // What this fold read about the channel itself -- its name, topic and
+        // picture -- kept beside the channel so the next start can list the
+        // conversation without folding it. Here and not inside `fold_entries`,
+        // which also folds a *stray*: an earlier incarnation's entries are
+        // numbered in a sequence space of their own, and the name it held is
+        // not this channel's.
+        self.store.remember_meta(channel, timeline)?;
         // SIP-53 §Posting again: a rehome read in this batch is a fork; what was held above
         // it under the old origin is dealt with now, and the next poll reads
         // the winning history from there. A receipt under a key this client
