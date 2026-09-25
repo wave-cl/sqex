@@ -571,6 +571,31 @@ enum AdminCmd {
         #[command(subcommand)]
         action: AdminDeviceCmd,
     },
+    /// SIP-35 §An operator may refuse a copy: what this exchange holds a copy
+    /// of, and whether it will. A member's word entitles a peer to pull and
+    /// obliges nobody to store.
+    Channel {
+        #[command(subcommand)]
+        action: AdminChannelCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminChannelCmd {
+    /// Drop this exchange's copy of a channel and refuse it from now on.
+    ///
+    /// The rows go -- entries, membership, keys, attachments -- and the
+    /// refusal stays, so a copy pulled for an account homed here does not
+    /// come back on the next cycle. The origin is not told and the channel's
+    /// members elsewhere are unaffected: this is what **this** exchange
+    /// holds. A channel this exchange orders is refused; taking one of those
+    /// apart is `close`, signed by one of its admins.
+    Forget { channel: String },
+    /// Withdraw the refusal. Nothing is fetched by this; the next pull may
+    /// take a copy again.
+    Allow { channel: String },
+    /// The channels this exchange refuses to copy.
+    Refused,
 }
 
 #[derive(Subcommand)]
@@ -2289,6 +2314,7 @@ async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
     match cmd {
         AdminCmd::Whitelist { action } => whitelist(cli, cfg, action).await,
         AdminCmd::Peer { action } => peer(cli, cfg, action).await,
+        AdminCmd::Channel { action } => channel_admin(cli, cfg, action).await,
         AdminCmd::Device { action } => {
             let op = match action {
                 AdminDeviceCmd::Register { credential } => {
@@ -3119,6 +3145,55 @@ async fn peer(cli: &Cli, cfg: &Config, action: &PeerCmd) -> Result<(), String> {
     match action {
         PeerCmd::List => print_peers(&result(&v, 0)),
         _ => println!("ok: {}", v["results"]),
+    }
+    Ok(())
+}
+
+/// SIP-35 §An operator may refuse a copy.
+async fn channel_admin(cli: &Cli, cfg: &Config, action: &AdminChannelCmd) -> Result<(), String> {
+    let channel = |s: &String| -> Result<[u8; 32], String> {
+        s.trim()
+            .parse::<PubKey>()
+            .map(|k| *k.as_bytes())
+            .map_err(|e| format!("bad channel: {e}"))
+    };
+    let op = match action {
+        AdminChannelCmd::Forget { channel: c } => Op::ChannelForget(channel(c)?),
+        AdminChannelCmd::Allow { channel: c } => Op::ChannelAllow(channel(c)?),
+        AdminChannelCmd::Refused => Op::ChannelRefused,
+    };
+    let v = submit(cli, cfg, vec![op.to_operation()]).await?;
+    let r = result(&v, 0);
+    match action {
+        AdminChannelCmd::Forget { .. } => {
+            if r["ok"].as_bool() == Some(false) {
+                return Err(r["error"].as_str().unwrap_or("refused").to_string());
+            }
+            println!(
+                "dropped {} entr(ies) and {} member row(s); no copy will be taken again \
+                 (`sqex admin channel allow` undoes that)",
+                r["entries"], r["members"]
+            );
+        }
+        AdminChannelCmd::Allow { .. } => println!(
+            "{}",
+            if r["changed"].as_bool() == Some(true) {
+                "allowed: a pull may take a copy again"
+            } else {
+                "that channel was not refused"
+            }
+        ),
+        AdminChannelCmd::Refused => {
+            let channels = r["channels"].as_array().cloned().unwrap_or_default();
+            if channels.is_empty() {
+                println!("this exchange refuses no copies");
+            } else {
+                println!("{} channel(s) refused:", channels.len());
+                for c in &channels {
+                    println!("  {}", c.as_str().unwrap_or("?"));
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -2140,3 +2140,188 @@ async fn a_welcome_channel_replicates_as_public_and_stays_out_of_the_directory()
     assert_eq!(there.total, 1, "the origin stopped listing its own channel");
     assert_eq!(there.channels[0].channel, general);
 }
+
+/// **SIP-35 §An operator may refuse a copy.** A member's word entitles a
+/// peer to pull and obliges nobody to store: the operator drops the copy and
+/// the exchange takes none again until the refusal is withdrawn.
+///
+/// The half that makes it a fix rather than a clear-out is the second pull:
+/// before this, deleting a copy's rows was undone by the next cycle, because
+/// the origin still lists the channel for an account homed here. The control
+/// is that pull with the refusal removed.
+#[tokio::test]
+async fn an_operator_drops_a_copy_and_the_pull_does_not_bring_it_back() {
+    use crate::carried_device_flow::admin;
+    use sqex_proto::Op;
+    use sqex_proto::h3::H3Client;
+    use sqexd::replica::{Origin, pull_once};
+
+    let origin_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let (replica_sk, replica_pub) = squic::generate_keypair();
+    std::fs::write(
+        replica_dir.path().join("host_key"),
+        hex::encode(replica_sk.to_bytes()),
+    )
+    .unwrap();
+    let replica_key = PubKey::new(replica_pub);
+    let (alice_seed, alice) = identity(171);
+    let (admin_seed, admin_key) = identity(172);
+    let channel = [171u8; 32];
+
+    // An origin with Alice's public room, replicated to the second exchange
+    // on her signed authorisation.
+    let (origin_addr, origin_pub, _h) = server_in(origin_dir.path(), &[replica_key]).await;
+    let origin = PubKey::new(origin_pub);
+    let mut a = Client::connect_as(origin_addr, &origin_pub, &alice_seed)
+        .await
+        .unwrap();
+    let s = Signer::new(alice_seed, alice, origin_pub);
+    let mut chain = Chain::default();
+    a_room(&mut a, &s, &mut chain, channel).await;
+    say(&mut a, &s, &mut chain, channel, b"in the room").await;
+    let info = s.info(&mut a, channel).await;
+    let action = s.action_at(
+        &info,
+        channel,
+        sqex_proto::channel::EVENT_REPLICATE,
+        &replica_key,
+        &[],
+    );
+    let (code, body) = a
+        .post(
+            "/channel/replicate",
+            ByAccount {
+                channel,
+                account: replica_key,
+                action,
+            }
+            .encode(TYPE_REPLICATE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // The replica: a real exchange, with an administrator, so the operator's
+    // act is a signed transaction and not a function call.
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = [{:?}]\n\
+         welcome_channel = \"\"\n",
+        replica_dir.path().join("host_key").to_string_lossy(),
+        replica_dir.path().join("sqex.state").to_string_lossy(),
+        admin_key.to_string(),
+    );
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let bound = sqexd::bind(config, None, signing_key).await.unwrap();
+    let replica_addr = bound.local_addr;
+    let replica = std::sync::Arc::clone(&bound.server);
+    tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+
+    let spec = Origin {
+        key: origin,
+        addr: origin_addr,
+        channels: vec![channel],
+        interval: std::time::Duration::from_secs(1),
+        predecessors: Vec::new(),
+    };
+    let pull = async || {
+        let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+            .await
+            .unwrap();
+        pull_once(&mut client, &replica, &spec).await.unwrap()
+    };
+    let took = pull().await;
+    assert!(took[&channel].stored >= 2, "{took:?}");
+    let store = replica.channels();
+    assert!(
+        store.fetch(&alice, &alice, &channel, 0, false).is_ok(),
+        "the copy was not taken"
+    );
+
+    // The operator drops it. Signed, audited, and answered with what went.
+    let v = admin(
+        replica_addr,
+        replica_pub,
+        admin_seed,
+        vec![Op::ChannelForget(channel)],
+    )
+    .await;
+    assert_eq!(v["results"][0]["ok"], true, "{v}");
+    assert_eq!(v["results"][0]["refused"], true);
+    assert!(v["results"][0]["entries"].as_u64().unwrap_or(0) >= 2, "{v}");
+    assert!(
+        store.fetch(&alice, &alice, &channel, 0, false).is_err(),
+        "the copy survived the forget"
+    );
+
+    // **And it stays dropped.** The origin still serves the channel and the
+    // authorisation stands; the refusal is this exchange's own.
+    let took = pull().await;
+    assert!(
+        !took.contains_key(&channel),
+        "the copy came back on the next pull: {took:?}"
+    );
+    assert!(store.fetch(&alice, &alice, &channel, 0, false).is_err());
+
+    // The list says so, and withdrawing it lets the next pull take the copy.
+    let v = admin(
+        replica_addr,
+        replica_pub,
+        admin_seed,
+        vec![Op::ChannelRefused],
+    )
+    .await;
+    assert_eq!(
+        v["results"][0]["channels"][0].as_str(),
+        Some(PubKey::new(channel).to_base58().as_str()),
+        "{v}"
+    );
+    let v = admin(
+        replica_addr,
+        replica_pub,
+        admin_seed,
+        vec![Op::ChannelAllow(channel)],
+    )
+    .await;
+    assert_eq!(v["results"][0]["changed"], true, "{v}");
+    let took = pull().await;
+    assert!(
+        took[&channel].stored >= 2,
+        "the copy did not come back: {took:?}"
+    );
+    assert!(store.fetch(&alice, &alice, &channel, 0, false).is_ok());
+
+    // The guard: a channel this exchange **orders** is not taken apart this
+    // way. Bob's room at the replica stays after a forget that refuses.
+    let (bob_seed, bob) = identity(173);
+    let mut b = Client::connect_as(replica_addr, &replica_pub, &bob_seed)
+        .await
+        .unwrap();
+    let bs = Signer::new(bob_seed, bob, replica_pub);
+    let mut bchain = Chain::default();
+    let ours = [173u8; 32];
+    a_room(&mut b, &bs, &mut bchain, ours).await;
+    let v = admin(
+        replica_addr,
+        replica_pub,
+        admin_seed,
+        vec![Op::ChannelForget(ours)],
+    )
+    .await;
+    assert_eq!(v["results"][0]["ok"], false, "{v}");
+    assert!(
+        v["results"][0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("orders that channel")),
+        "{v}"
+    );
+    assert!(
+        store.fetch(&bob, &bob, &ours, 0, false).is_ok(),
+        "a channel this exchange orders was destroyed through the copy route"
+    );
+}

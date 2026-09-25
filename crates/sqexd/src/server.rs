@@ -1439,6 +1439,14 @@ impl Server {
         self.state.lock().unwrap().peers_with(key)
     }
 
+    /// SIP-35 §An operator may refuse a copy: whether this exchange holds no
+    /// copy of `channel` by the operator's standing decision. Checked by
+    /// every pull, because a refusal that only deleted rows would last until
+    /// the next cycle.
+    pub fn refuses_copy(&self, channel: &[u8; 32]) -> bool {
+        self.state.lock().unwrap().refuses_copy(channel)
+    }
+
     /// SIP-39 §The peer directory: the peer list as a directory. Never this exchange itself,
     /// and a label only where it is a domain.
     pub(crate) fn peer_directory(&self) -> Peers {
@@ -5836,6 +5844,55 @@ impl Server {
                     "peers": state.peer_count(),
                     "note": "bridges already open are not torn down",
                 })
+            }
+            // SIP-35 §An operator may refuse a copy. Two steps, both needed:
+            // the rows go, and the refusal stays -- a copy this exchange
+            // pulls for an account homed here comes back on the next cycle
+            // otherwise, which is what made a plain delete useless.
+            Op::ChannelForget(channel) => {
+                if self.channels.orders(channel) {
+                    return json!({
+                        "ok": false,
+                        "error": "this exchange orders that channel; `close`, signed by one of \
+                                  its admins, is how it is taken apart",
+                    });
+                }
+                let dropped = self.channels.forget_copy(channel);
+                let refused = state.refuse_copy(*channel);
+                match dropped {
+                    Ok((entries, members)) => json!({
+                        "ok": true,
+                        "entries": entries,
+                        "members": members,
+                        "refused": refused,
+                        "note": "no copy of this channel will be taken again until `channel allow`",
+                    }),
+                    // Nothing held, and the refusal still stands: an operator
+                    // may refuse a copy before one arrives.
+                    Err(_) => json!({
+                        "ok": true,
+                        "entries": 0,
+                        "members": 0,
+                        "refused": refused,
+                        "note": "no copy was held; none will be taken",
+                    }),
+                }
+            }
+            Op::ChannelAllow(channel) => {
+                let changed = state.allow_copy(channel);
+                json!({
+                    "ok": true,
+                    "changed": changed,
+                    "note": "a pull may take a copy again; nothing is fetched by this",
+                })
+            }
+            Op::ChannelRefused => {
+                let channels: Vec<String> = state
+                    .refused_copies()
+                    .into_iter()
+                    .map(|c| PubKey::new(c).to_base58())
+                    .collect();
+                json!({ "ok": true, "channels": channels })
             }
             Op::PeerList => {
                 let peers: Vec<serde_json::Value> = state

@@ -4479,6 +4479,46 @@ impl Channels {
         Ok(())
     }
 
+    /// SIP-35 §An operator may refuse a copy: drop this exchange's copy of a
+    /// channel -- its entries, membership, keys and attachments -- and the
+    /// row that says it replicates. Returns what went (entries, members).
+    ///
+    /// Refused on a channel this exchange **orders**: an operator taking a
+    /// local channel apart is `close`, signed by one of its admins, and a
+    /// route meant for copies must not become a way around that.
+    pub fn forget_copy(&self, channel: &[u8; 32]) -> Result<(u64, u64), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin forget"))?;
+        let replicated: bool = tx
+            .query_row(
+                "SELECT 1 FROM replicated WHERE channel = ?1",
+                params![&channel[..]],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage("read the replica row"))?
+            .is_some();
+        if !replicated {
+            return Err(ChannelError::NoSuchChannel);
+        }
+        let entries: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM entry WHERE channel = ?1",
+                params![&channel[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(storage("count entries"))? as u64;
+        let (members, _) = counts(&tx, channel)?;
+        destroy(&tx, channel)?;
+        tx.execute(
+            "DELETE FROM replicated WHERE channel = ?1",
+            params![&channel[..]],
+        )
+        .map_err(storage("drop the replica row"))?;
+        tx.commit().map_err(storage("commit forget"))?;
+        Ok((entries, members as u64))
+    }
+
     /// Refuse a write to a channel this exchange only replicates.
     ///
     /// **Writes go to the origin, always.** A replica accepting a post would be

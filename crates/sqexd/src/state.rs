@@ -15,7 +15,7 @@
 //! crash mid-write cannot corrupt it. Keys are stored base58 so the file is
 //! legible.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,6 +87,12 @@ struct Persisted {
     /// would never have run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     peers: Option<Vec<PersistedKey>>,
+    /// SIP-35 §An operator may refuse a copy: channels this exchange has
+    /// dropped and will not take again, base58. Operator policy, so it
+    /// lives here rather than in the channel store -- it has to outlive
+    /// the rows it removed, or the next pull would bring them back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused: Vec<String>,
 }
 
 /// The live server state.
@@ -101,6 +107,9 @@ pub struct State {
     /// provenance as a whitelist entry. Administered at runtime; config only
     /// seeds it on the first run that has no peer list yet.
     peers: BTreeMap<PubKey, WhitelistEntry>,
+    /// SIP-35 §An operator may refuse a copy: channel identifiers this
+    /// exchange will not hold a copy of.
+    refused: BTreeSet<[u8; 32]>,
     audit: Vec<AuditEntry>,
 }
 
@@ -155,12 +164,18 @@ impl State {
                 }
                 None => seeded(peer_seed),
             };
+            let refused = persisted
+                .refused
+                .iter()
+                .filter_map(|s| PubKey::from_base58(s).ok().map(|k| *k.as_bytes()))
+                .collect();
             let mut state = State {
                 path,
                 enabled: persisted.enabled,
                 keys,
                 x25519: HashSet::new(),
                 peers,
+                refused,
                 audit: persisted.audit,
             };
             state.rebuild_x25519();
@@ -172,6 +187,7 @@ impl State {
             keys: seeded(seed),
             x25519: HashSet::new(),
             peers: seeded(peer_seed),
+            refused: BTreeSet::new(),
             audit: Vec::new(),
         };
         state.rebuild_x25519();
@@ -290,6 +306,27 @@ impl State {
         self.peers.remove(key).is_some()
     }
 
+    /// SIP-35 §An operator may refuse a copy: hold no copy of this channel,
+    /// from now on. Returns whether the list changed.
+    pub fn refuse_copy(&mut self, channel: [u8; 32]) -> bool {
+        self.refused.insert(channel)
+    }
+
+    /// Withdraw the refusal: a pull may take the channel again.
+    pub fn allow_copy(&mut self, channel: &[u8; 32]) -> bool {
+        self.refused.remove(channel)
+    }
+
+    /// Whether this exchange refuses to hold a copy of `channel`.
+    pub fn refuses_copy(&self, channel: &[u8; 32]) -> bool {
+        self.refused.contains(channel)
+    }
+
+    /// Every channel refused, oldest ordering by identifier.
+    pub fn refused_copies(&self) -> Vec<[u8; 32]> {
+        self.refused.iter().copied().collect()
+    }
+
     pub fn record(&mut self, entry: AuditEntry) {
         self.audit.push(entry);
         if self.audit.len() > MAX_AUDIT {
@@ -337,6 +374,11 @@ impl State {
                     })
                     .collect(),
             ),
+            refused: self
+                .refused
+                .iter()
+                .map(|c| PubKey::new(*c).to_base58())
+                .collect(),
         };
         let json = serde_json::to_vec_pretty(&persisted)
             .map_err(|e| Error::Malformed(format!("cannot encode state: {e}")))?;

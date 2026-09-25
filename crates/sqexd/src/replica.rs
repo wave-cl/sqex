@@ -432,6 +432,12 @@ pub async fn pull_once_from(
 
     let mut all = HashMap::new();
     for channel in &origin.channels {
+        // SIP-35 §An operator may refuse a copy: not asked for at all. The
+        // refusal outlives the rows it dropped, so a configured origin or an
+        // account homed here cannot bring the copy back.
+        if server.refuses_copy(channel) {
+            continue;
+        }
         // SIP-53: a channel this origin no longer orders -- moved to another
         // exchange, or to this one -- is not pulled from here.
         match store.origin_of(channel) {
@@ -1879,6 +1885,10 @@ pub async fn run_homed(
                                         // repeating it.
                                         told_folds.insert((origin, c));
                                     }
+                                    continue;
+                                }
+                                if server.refuses_copy(&c) {
+                                    // SIP-35 §An operator may refuse a copy.
                                     continue;
                                 }
                                 channels.push(c);

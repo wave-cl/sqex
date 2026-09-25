@@ -121,6 +121,19 @@ pub enum Op {
     /// SIP-58: revoke a device by the account's own signed revocation
     /// (SIP-32), carried the same way.
     DeviceRevoke(crate::credential::Revocation),
+    /// SIP-35 §An operator may refuse a copy: drop this exchange's copy of a
+    /// channel and hold none of it from now on.
+    ///
+    /// A member's word entitles a peer to *pull*; it obliges nobody to
+    /// *store*. Without this an operator had no way to be rid of a copy: the
+    /// abandon sweep wants an empty channel for thirty days, `close` wants an
+    /// admin the copy may not derive, and `unreplicate` is the origin's route
+    /// -- and a plain delete came back on the next pull.
+    ChannelForget([u8; 32]),
+    /// Withdraw the refusal: a pull may take the channel again.
+    ChannelAllow([u8; 32]),
+    /// Read the channels this exchange refuses to copy.
+    ChannelRefused,
 }
 
 impl Op {
@@ -145,6 +158,9 @@ impl Op {
             Op::PeerList => 0x11,
             Op::DeviceRegister(_) => 0x12,
             Op::DeviceRevoke(_) => 0x13,
+            Op::ChannelForget(_) => 0x14,
+            Op::ChannelAllow(_) => 0x15,
+            Op::ChannelRefused => 0x16,
         }
     }
 
@@ -189,6 +205,7 @@ impl Op {
             Op::WhitelistRemove(k) | Op::AdmissionDeny(k) | Op::PeerRemove(k) => {
                 out.extend_from_slice(k.as_bytes())
             }
+            Op::ChannelForget(c) | Op::ChannelAllow(c) => out.extend_from_slice(&c[..]),
             Op::DeviceRegister(c) => out.extend_from_slice(&c.encode()),
             Op::DeviceRevoke(r) => out.extend_from_slice(&r.encode()),
             Op::AuditTail(n) => out.extend_from_slice(&n.to_be_bytes()),
@@ -237,6 +254,9 @@ impl Op {
             0x11 => Op::PeerList,
             0x12 => Op::DeviceRegister(crate::credential::Credential::decode(rest)?),
             0x13 => Op::DeviceRevoke(crate::credential::Revocation::decode(rest)?),
+            0x14 => Op::ChannelForget(*key(rest)?.as_bytes()),
+            0x15 => Op::ChannelAllow(*key(rest)?.as_bytes()),
+            0x16 => Op::ChannelRefused,
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
         // Every op consumes its payload exactly; reject trailing bytes.
@@ -268,6 +288,9 @@ impl Op {
             Op::PeerList => "peer-list",
             Op::DeviceRegister(_) => "device-register",
             Op::DeviceRevoke(_) => "device-revoke",
+            Op::ChannelForget(_) => "channel-forget",
+            Op::ChannelAllow(_) => "channel-allow",
+            Op::ChannelRefused => "channel-refused",
         }
     }
 
@@ -293,6 +316,14 @@ impl Op {
             Op::PeerList => "Read the relay peers".into(),
             Op::DeviceRegister(c) => format!("Register device {} of {}", c.delegate, c.account),
             Op::DeviceRevoke(r) => format!("Revoke device {} of {}", r.device, r.account),
+            Op::ChannelForget(c) => format!(
+                "Drop this exchange's copy of channel {} and refuse it from now on",
+                PubKey::new(*c)
+            ),
+            Op::ChannelAllow(c) => {
+                format!("Allow a copy of channel {} again", PubKey::new(*c))
+            }
+            Op::ChannelRefused => "Read the channels this exchange refuses to copy".into(),
         }
     }
 
@@ -352,6 +383,8 @@ impl Op {
                 | Op::PeerRemove(_)
                 | Op::DeviceRegister(_)
                 | Op::DeviceRevoke(_)
+                | Op::ChannelForget(_)
+                | Op::ChannelAllow(_)
         )
     }
 
@@ -368,6 +401,7 @@ impl Op {
             Op::PeerRemove(k) => Some(k.to_base58()),
             Op::DeviceRegister(c) => Some(c.delegate.to_base58()),
             Op::DeviceRevoke(r) => Some(r.device.to_base58()),
+            Op::ChannelForget(c) | Op::ChannelAllow(c) => Some(PubKey::new(*c).to_base58()),
             _ => None,
         }
     }
