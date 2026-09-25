@@ -1978,7 +1978,7 @@ async fn a_member_posts_at_a_replica_and_the_origin_orders_it() {
 /// to anyone identified, as a public room: what anybody may join, anybody
 /// may read a copy of. Posting still needs membership, at the origin.
 #[tokio::test]
-async fn a_welcome_channel_with_no_constitution_replicates_as_public() {
+async fn a_welcome_channel_replicates_as_public_and_stays_out_of_the_directory() {
     use sqex_proto::h3::H3Client;
     use sqexd::channel::ChannelError;
     use sqexd::replica::{Origin, pull_once};
@@ -2108,4 +2108,35 @@ async fn a_welcome_channel_with_no_constitution_replicates_as_public() {
         store.fetch(&stranger, &stranger, &private, 0, false),
         Err(ChannelError::NoSuchChannel)
     ));
+
+    // **And it is not in this exchange's directory** (SIP-35 §A copy is not
+    // in the directory, 2026-09-25). The copy takes the origin's shape, so
+    // its row here says public -- which is what makes it readable above --
+    // and the directory is the rooms *this* exchange orders. Before this,
+    // trunk.exchange listed two `general`s, one of them squic.org's, and a
+    // join on the copy was refused because writes go to the origin.
+    let listing = store.list("", 0).expect("the directory");
+    assert_eq!(
+        listing.total,
+        0,
+        "the copy is in the replica's public directory: {:?}",
+        listing.channels.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    assert!(store.list("general", 0).unwrap().channels.is_empty());
+    // The origin still lists its own, which is the half that must not move.
+    let (code, body) = b
+        .post(
+            "/channel/list",
+            sqex_proto::channel::List {
+                offset: 0,
+                query: String::new(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let there = sqex_proto::channel::Listing::decode(&body).unwrap();
+    assert_eq!(there.total, 1, "the origin stopped listing its own channel");
+    assert_eq!(there.channels[0].channel, general);
 }

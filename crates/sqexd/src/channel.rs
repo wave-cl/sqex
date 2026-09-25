@@ -2414,12 +2414,23 @@ impl Channels {
 
     /// Search the public directory. Private channels never appear, under any
     /// query.
+    ///
+    /// **Nor does a copy** (SIP-35 §A copy is not in the directory,
+    /// 2026-09-25). A channel replicated here takes the origin's shape
+    /// (`take_shape`), visibility included, so a copy of a public channel
+    /// became a public row locally and this listing offered it -- trunk's
+    /// directory showed two `general`s, one of them squic.org's, and a join
+    /// on it was refused, since writes go to the origin. A directory is the
+    /// rooms **this exchange orders**; a copy is here to serve the members
+    /// who live here, and `/channel/search` still finds the original at its
+    /// own exchange and says where that is.
     pub fn list(&self, query: &str, offset: u32) -> Result<Listing, ChannelError> {
         let db = self.db.lock().unwrap();
         let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
         let total: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM channel WHERE visibility = 1
+                 AND id NOT IN (SELECT channel FROM replicated)
                  AND (name LIKE ?1 ESCAPE '\\' OR topic LIKE ?1 ESCAPE '\\')",
                 params![&like],
                 |r| r.get(0),
@@ -2433,7 +2444,9 @@ impl Channels {
                         (SELECT COALESCE(MAX(seq), 0) FROM entry e WHERE e.channel = c.id),
                         c.instance
                  FROM channel c
-                 WHERE c.visibility = 1 AND (c.name LIKE ?1 ESCAPE '\\'
+                 WHERE c.visibility = 1
+                   AND c.id NOT IN (SELECT channel FROM replicated)
+                   AND (c.name LIKE ?1 ESCAPE '\\'
                                              OR c.topic LIKE ?1 ESCAPE '\\')
                  ORDER BY c.created ASC LIMIT ?2 OFFSET ?3",
             )
