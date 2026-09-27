@@ -22,11 +22,23 @@ pub const WAKE_BODY: &[u8] = b"wake";
 /// How long a wake may take before it is given up on.
 pub const WAKE_TIMEOUT_SECS: u64 = 5;
 
+/// SIP-50 §Leaving a device out: bit 0 of `Register`'s trailing flags byte.
+/// Other bits are reserved and refused.
+pub const FLAG_QUIET: u8 = 0b0000_0001;
+
 /// `POST /wake/register`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
     pub ttl: u32,
     pub endpoint: String,
+    /// SIP-50 §Leaving a device out: hold the registration, but do not let it
+    /// count toward the account's `reach`.
+    ///
+    /// For a device that wants to be woken and does not want its owner
+    /// reported as reachable on its account -- a spare phone in a drawer that
+    /// is still registered says nothing useful about whether its owner can be
+    /// got hold of.
+    pub quiet: bool,
 }
 
 impl Register {
@@ -36,6 +48,13 @@ impl Register {
         out.extend_from_slice(&self.ttl.to_be_bytes());
         out.extend_from_slice(&(self.endpoint.len() as u16).to_be_bytes());
         out.extend_from_slice(self.endpoint.as_bytes());
+        // **Written only when set.** SIP-50 makes the byte optional and says
+        // an exchange from before it refuses the longer body as malformed, so
+        // a device that has nothing to say with it should not be refused for
+        // saying nothing.
+        if self.quiet {
+            out.push(FLAG_QUIET);
+        }
         out
     }
 
@@ -45,7 +64,8 @@ impl Register {
         }
         let ttl = u32::from_be_bytes(b[1..5].try_into().unwrap());
         let len = u16::from_be_bytes([b[5], b[6]]) as usize;
-        if b.len() != 7 + len {
+        // The endpoint, and at most SIP-50's flags byte after it.
+        if b.len() != 7 + len && b.len() != 8 + len {
             return Err(Error::Malformed("wake registration cut short".into()));
         }
         if len > MAX_ENDPOINT {
@@ -53,7 +73,11 @@ impl Register {
                 "endpoint is {len} bytes, limit is {MAX_ENDPOINT}"
             )));
         }
-        let endpoint = std::str::from_utf8(&b[7..])
+        // **Bounded by the length, not by the end of the body.** This read
+        // `&b[7..]`, which was right only while the body could hold nothing
+        // after the endpoint; with a flags byte allowed it would have eaten
+        // it and then refused the registration as not UTF-8.
+        let endpoint = std::str::from_utf8(&b[7..7 + len])
             .map_err(|_| Error::Malformed("endpoint is not UTF-8".into()))?
             .to_string();
         if ttl == 0 || ttl > MAX_TTL {
@@ -61,7 +85,17 @@ impl Register {
                 "ttl is {ttl}, want 1..={MAX_TTL}"
             )));
         }
-        Ok(Register { ttl, endpoint })
+        let flags = b.get(7 + len).copied().unwrap_or(0);
+        if flags & !FLAG_QUIET != 0 {
+            return Err(Error::Malformed(format!(
+                "wake registration sets reserved flag bits: {flags:#010b}"
+            )));
+        }
+        Ok(Register {
+            ttl,
+            endpoint,
+            quiet: flags & FLAG_QUIET != 0,
+        })
     }
 }
 
@@ -107,16 +141,19 @@ mod tests {
         let r = Register {
             ttl: 3600,
             endpoint: "https://push.example/up/abc".into(),
+            quiet: false,
         };
         assert_eq!(Register::decode(&r.encode()).unwrap(), r);
         let long = Register {
             ttl: 1,
             endpoint: "https://".to_string() + &"x".repeat(MAX_ENDPOINT),
+            quiet: false,
         };
         assert!(Register::decode(&long.encode()).is_err());
         let forever = Register {
             ttl: MAX_TTL + 1,
             endpoint: "https://a/b".into(),
+            quiet: false,
         };
         assert!(Register::decode(&forever.encode()).is_err());
         assert!(is_forget(&forget()));
@@ -137,5 +174,46 @@ mod tests {
         assert!(!acceptable("https://host/x#frag", true));
         assert!(!acceptable("https://", true));
         assert!(!acceptable("ftp://host/x", true));
+    }
+
+    /// **SIP-50's quiet flag, and the byte it must not be mistaken for.**
+    ///
+    /// The endpoint used to be read as "everything after the length", which
+    /// was right only while nothing could follow it. With a flags byte
+    /// allowed, that would have swallowed it -- and because the flag byte is
+    /// rarely valid UTF-8 continuation, the registration would have been
+    /// refused as "endpoint is not UTF-8" rather than read correctly, which
+    /// is a confusing way to fail.
+    #[test]
+    fn a_quiet_registration_keeps_its_endpoint_to_itself() {
+        let loud = Register {
+            ttl: 600,
+            endpoint: "https://push.example/aaa".into(),
+            quiet: false,
+        };
+        let quiet = Register {
+            quiet: true,
+            ..loud.clone()
+        };
+        assert_eq!(Register::decode(&loud.encode()).unwrap(), loud);
+        assert_eq!(Register::decode(&quiet.encode()).unwrap(), quiet);
+        // The flag is a byte on the end, not part of the endpoint.
+        assert_eq!(quiet.encode().len(), loud.encode().len() + 1);
+        assert_eq!(
+            Register::decode(&quiet.encode()).unwrap().endpoint,
+            loud.endpoint,
+            "the flags byte was read as part of the endpoint"
+        );
+
+        // **Absent means no flags**, which is what an older device sends.
+        let old = loud.encode();
+        assert!(!Register::decode(&old).unwrap().quiet);
+
+        // Reserved bits are refused rather than ignored: this is a request,
+        // and a device asking for something this exchange does not know
+        // should hear so rather than be quietly given something else.
+        let mut reserved = quiet.encode();
+        *reserved.last_mut().unwrap() = 0b0000_0010;
+        assert!(Register::decode(&reserved).is_err());
     }
 }

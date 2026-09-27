@@ -25,6 +25,10 @@ pub const FLAG_WITHHOLD: u8 = 0b0000_0001;
 pub const FLAG_AWAY: u8 = 0b0000_0010;
 /// Every flag a beat may carry; the rest are reserved and MUST be zero.
 const FLAGS_KNOWN: u8 = FLAG_WITHHOLD | FLAG_AWAY;
+/// SIP-50 §Reachable: bit 0 of the byte after the flags. A member of this
+/// account holds a wake registration that has not expired. Other bits are
+/// reserved and must be zero.
+pub const REACH_HELD: u8 = 0b0000_0001;
 
 /// An identity asserting it is alive.
 ///
@@ -160,6 +164,21 @@ pub struct Reply {
     pub now: u64,
     /// The last beat said nobody was at the keyboard.
     pub away: bool,
+    /// SIP-50: some member of this account holds a wake registration that has
+    /// not expired, so a ring would reach it.
+    ///
+    /// **A fact, not a verdict**, exactly as `last_seen` is: an endpoint is
+    /// held. Whether somebody who is not beating but can be woken should be
+    /// drawn as *reachable* is the consumer's to decide, and SIP-50 asks that
+    /// it be drawn apart from active, away and absent -- a person who can be
+    /// woken is not there, and is not gone.
+    ///
+    /// Answered whether or not `found` is set: an account that has never
+    /// beaten and holds a registration is `found = false, reach = true`, which
+    /// is the ordinary state of somebody whose only client is a phone. A
+    /// withheld account is `found = false, reach = false` -- withholding
+    /// withholds.
+    pub reach: bool,
 }
 
 impl Reply {
@@ -172,6 +191,7 @@ impl Reply {
             interval_secs: 0,
             now,
             away: false,
+            reach: false,
         }
     }
 
@@ -182,13 +202,25 @@ impl Reply {
         out.extend_from_slice(&self.interval_secs.to_be_bytes());
         out.extend_from_slice(&self.now.to_be_bytes());
         out.push(if self.away { FLAG_AWAY } else { 0 });
+        // SIP-50's byte, after the flags. Always written: a reader from
+        // before it ignores a trailing byte it does not know, and one that
+        // understands it must not have to guess whether silence means
+        // "no registration" or "an exchange that cannot say".
+        out.push(if self.reach { REACH_HELD } else { 0 });
         out
     }
 
     pub fn decode(b: &[u8]) -> Result<Reply> {
-        if b.len() != 21 && b.len() != 22 {
+        // **A range, not a list.** This read `!= 21 && != 22` and refused
+        // anything longer, so SIP-50's reach byte would have made every
+        // client built before it reject the reply outright -- an exchange
+        // could not have been deployed ahead of its readers. Trailing bytes
+        // a reader does not know are ignored, which is the same rule the
+        // flags byte already follows, so the next field after this one costs
+        // no flag day either.
+        if b.len() < 21 {
             return Err(Error::Malformed(format!(
-                "reply is {} bytes, want 21 or 22",
+                "reply is {} bytes, want at least 21",
                 b.len()
             )));
         }
@@ -200,6 +232,7 @@ impl Reply {
             // Bits this reader does not know are ignored, as SIP-4's
             // reserved bits are: a reply is a report, not a request.
             away: b.get(21).is_some_and(|f| f & FLAG_AWAY != 0),
+            reach: b.get(22).is_some_and(|f| f & REACH_HELD != 0),
         })
     }
 
@@ -275,15 +308,18 @@ mod tests {
     #[test]
     fn reply_round_trip_and_staleness() {
         for away in [false, true] {
-            let r = Reply {
-                found: true,
-                last_seen: 1000,
-                interval_secs: 60,
-                now: 1180,
-                away,
-            };
-            assert_eq!(Reply::decode(&r.encode()).unwrap(), r);
-            assert_eq!(r.staleness(), 180, "three missed beats at a 60s interval");
+            for reach in [false, true] {
+                let r = Reply {
+                    found: true,
+                    last_seen: 1000,
+                    interval_secs: 60,
+                    now: 1180,
+                    away,
+                    reach,
+                };
+                assert_eq!(Reply::decode(&r.encode()).unwrap(), r);
+                assert_eq!(r.staleness(), 180, "three missed beats at a 60s interval");
+            }
         }
 
         let nf = Reply::not_found(500);
@@ -303,12 +339,41 @@ mod tests {
             interval_secs: 60,
             now: 1180,
             away: true,
+            reach: true,
         };
         let old = &r.encode()[..21];
         let back = Reply::decode(old).unwrap();
-        assert!(back.found && !back.away);
+        assert!(back.found && !back.away && !back.reach);
         assert_eq!(back.last_seen, 1000);
+        // Twenty-two bytes is an exchange that knows the flags and not the
+        // reach byte.
+        let flags_only = Reply::decode(&r.encode()[..22]).unwrap();
+        assert!(flags_only.away && !flags_only.reach);
+        // Short is still malformed: those bytes are the reply, not a tail.
         assert!(Reply::decode(&r.encode()[..20]).is_err());
-        assert!(Reply::decode(&[r.encode(), vec![0]].concat()).is_err());
+    }
+
+    /// **A reader ignores a trailing byte it does not know.**
+    ///
+    /// This is the property that let SIP-50 be deployed at all. The decoder
+    /// used to accept twenty-one bytes or twenty-two and refuse anything
+    /// else, so the moment an exchange appended the reach byte every client
+    /// built before it would have called the reply malformed -- the exchange
+    /// could not go first, and neither could the clients, which is a flag
+    /// day. Asserted going forward, with a byte nothing defines yet, so the
+    /// field after `reach` costs nobody an upgrade either.
+    #[test]
+    fn a_reply_with_a_field_this_reader_does_not_know_still_reads() {
+        let r = Reply {
+            found: true,
+            last_seen: 1000,
+            interval_secs: 60,
+            now: 1180,
+            away: true,
+            reach: true,
+        };
+        let from_the_future = [r.encode(), vec![0xFF, 0xFF]].concat();
+        let back = Reply::decode(&from_the_future).expect("a longer reply is not malformed");
+        assert_eq!(back, r, "and everything this reader does know still reads");
     }
 }
