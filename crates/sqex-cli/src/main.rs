@@ -433,6 +433,12 @@ enum WakeCmd {
         /// How long to keep it, in days.
         #[arg(long, default_value_t = 30)]
         days: u32,
+        /// Be woken, but do not let this registration say your account can
+        /// be reached (SIP-50). For a device that should still get its ring
+        /// and has no business speaking for whether you are contactable --
+        /// a spare phone in a drawer.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Drop this device's endpoint. Nothing further is posted to it.
     Forget,
@@ -2820,7 +2826,7 @@ async fn wake(cli: &Cli, cfg: &Config, cmd: &WakeCmd) -> Result<(), String> {
     use sqex_proto::wake::{MAX_TTL, Register, acceptable, forget};
     let (mut client, _server) = connect(cli, cfg).await?;
     match cmd {
-        WakeCmd::Register { url, days } => {
+        WakeCmd::Register { url, days, quiet } => {
             if !acceptable(url, false) {
                 return Err(
                     "the endpoint must be an absolute https:// URL of at most 512 bytes".into(),
@@ -2833,13 +2839,28 @@ async fn wake(cli: &Cli, cfg: &Config, cmd: &WakeCmd) -> Result<(), String> {
             let req = Register {
                 ttl,
                 endpoint: url.clone(),
+                quiet: *quiet,
             };
             let (code, body) = client.post("/wake/register", req.encode()).await?;
             match code {
                 200 => {
-                    println!("registered for {days} day(s)");
+                    println!(
+                        "registered for {days} day(s){}",
+                        if *quiet {
+                            " — and not counted toward this account's reach"
+                        } else {
+                            ""
+                        }
+                    );
                     Ok(())
                 }
+                // SIP-50 §Leaving a device out: an exchange from before the
+                // flags byte refuses the longer body outright, and the answer
+                // is to register without it — which also settles the
+                // question, since such an exchange reports no reach anyway.
+                400 if *quiet => Err("this exchange is from before SIP-50 and refused the \
+                                      quiet flag; register without --quiet"
+                    .into()),
                 404 => Err("this exchange does not wake devices (SIP-45)".into()),
                 _ => Err(format!("register failed ({code}): {}", said(&body))),
             }

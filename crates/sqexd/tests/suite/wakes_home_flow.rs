@@ -43,6 +43,7 @@ pub(crate) async fn register_wake(c: &mut Client, d: &Distributor) -> u16 {
             "/wake/register",
             Register {
                 ttl: 3600,
+                quiet: false,
                 endpoint: d.url.clone(),
             }
             .encode(),

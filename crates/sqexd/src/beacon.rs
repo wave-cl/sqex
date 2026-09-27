@@ -60,27 +60,73 @@ impl Beacons {
         now
     }
 
-    /// What the exchange can tell `asker` about `target`.
+    /// What the exchange can tell `asker` about `target`, from `target`'s own
+    /// beat alone.
     ///
     /// A withheld record is disclosed only to its owner, so `asker` is the
     /// querier's own bound identity, or `None` for an anonymous querier (who is
     /// therefore never the owner). Reading is otherwise open: SIP-4 privileges
     /// beating, not asking.
+    ///
+    /// This is the answer for a **device** key, which SIP-50 keeps as it was:
+    /// a device is asked about as a device. An account with registered devices
+    /// is answered by [`read_across`].
     pub fn read(&self, target: &PubKey, asker: Option<&PubKey>) -> Reply {
+        self.read_across(std::slice::from_ref(target), asker, false)
+    }
+
+    /// SIP-50: one answer for `set`, which is an account and every device
+    /// whose registration stands.
+    ///
+    /// **The freshest beat in the set, not the account's own.** Before this, a
+    /// person whose only client was a phone was absent for ever: the phone
+    /// beats under its *device* key (SIP-22), and a consumer asking about the
+    /// account found nothing there. The interval reported is therefore that
+    /// device's declared interval, because there is no such thing as the
+    /// account's.
+    ///
+    /// **Withholding inverts.** A withhold from *any* member withholds the
+    /// whole account from public readers -- the account is one person, and the
+    /// device they set it on speaks for them -- while the members themselves
+    /// still see it, as SIP-4 lets an identity see its own withheld beacon.
+    /// So a person who withholds on their desktop is not disclosed by their
+    /// phone having beaten.
+    ///
+    /// `reach` is the caller's to determine, because it comes from the device
+    /// registry and not from here; it is answered whether or not anything was
+    /// found, and forced to false when the set is withheld -- withholding
+    /// withholds.
+    pub fn read_across(&self, set: &[PubKey], asker: Option<&PubKey>, reach: bool) -> Reply {
         let now = now_unix();
         let seen = self.seen.lock().unwrap();
-        match seen.get(target) {
-            Some(o) if !o.withhold || asker == Some(target) => Reply {
+        let mine = asker.is_some_and(|a| set.contains(a));
+        let withheld = !mine && set.iter().any(|k| seen.get(k).is_some_and(|o| o.withhold));
+        if withheld {
+            // Withheld records are reported exactly as absent ones: telling a
+            // stranger "this exists but you may not see it" is itself the
+            // disclosure being withheld.
+            return Reply::not_found(now);
+        }
+        let freshest = set
+            .iter()
+            .filter_map(|k| seen.get(k))
+            .max_by_key(|o| o.last_seen);
+        match freshest {
+            Some(o) => Reply {
                 found: true,
                 last_seen: o.last_seen,
                 interval_secs: o.interval_secs,
                 now,
                 away: o.away,
+                reach,
             },
-            // Withheld records are reported exactly as absent ones: telling a
-            // stranger "this exists but you may not see it" is itself the
-            // disclosure being withheld.
-            _ => Reply::not_found(now),
+            // Nothing in the set has beaten. Still an answer about reach: an
+            // account that has never beaten and can be woken is the ordinary
+            // state of somebody whose only client is a phone.
+            None => Reply {
+                reach,
+                ..Reply::not_found(now)
+            },
         }
     }
 
@@ -165,5 +211,93 @@ mod tests {
         assert_eq!(r.interval_secs, 120);
         assert!(!b.read(&id, None).found, "withhold now applies");
         assert_eq!(b.len(), 1, "same identity, one record");
+    }
+
+    /// **The freshest beat in the set, which is the whole point of SIP-50.**
+    ///
+    /// A person whose only client is a phone beats under the *device* key
+    /// (SIP-22), so an account read that looked only at the account's own key
+    /// found nothing and reported them absent for ever. The interval comes
+    /// from whichever device that beat was, because there is no such thing as
+    /// the account's interval.
+    #[test]
+    fn an_account_is_read_from_whichever_of_its_devices_beat_last() {
+        let b = Beacons::new();
+        let (account, phone, desktop) = (key(1), key(2), key(3));
+
+        // Only the phone has ever beaten: the account itself never has.
+        b.record(phone, 90, false, false);
+        let r = b.read_across(&[account, phone, desktop], None, false);
+        assert!(
+            r.found,
+            "the account reads as absent while its phone is beating"
+        );
+        assert_eq!(
+            r.interval_secs, 90,
+            "the interval is the device's, not the account's"
+        );
+
+        // The desktop beats after it, and is the fresher of the two.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        b.record(desktop, 30, false, true);
+        let r = b.read_across(&[account, phone, desktop], None, false);
+        assert_eq!(r.interval_secs, 30, "the older beat won");
+        assert!(r.away, "and its flags came with it");
+
+        // Asked about as a device, a device answers for itself alone.
+        let just_the_phone = b.read(&phone, None);
+        assert_eq!(just_the_phone.interval_secs, 90);
+    }
+
+    /// **A withhold from any member withholds the account**, and the members
+    /// themselves still see it. The account is one person, and the device
+    /// they set it on speaks for them -- so withholding on a desktop is not
+    /// undone by a phone that has beaten.
+    #[test]
+    fn one_device_withholding_withholds_the_whole_account() {
+        let b = Beacons::new();
+        let (account, phone, desktop, stranger) = (key(1), key(2), key(3), key(9));
+        let set = [account, phone, desktop];
+
+        b.record(phone, 60, false, false);
+        assert!(b.read_across(&set, Some(&stranger), false).found);
+
+        b.record(desktop, 60, true, false);
+        let to_a_stranger = b.read_across(&set, Some(&stranger), false);
+        assert!(
+            !to_a_stranger.found,
+            "the phone's beat disclosed a withheld account"
+        );
+        assert!(
+            !to_a_stranger.reach,
+            "withholding withholds the reach bit too"
+        );
+
+        // Its own devices see it, as SIP-4 lets an identity see its own.
+        for me in &set {
+            assert!(
+                b.read_across(&set, Some(me), true).found,
+                "a member of the set cannot see its own account"
+            );
+        }
+        // And nobody at all is a stranger.
+        assert!(!b.read_across(&set, None, false).found);
+    }
+
+    /// **Reach is answered whether or not anything beat.** An account that
+    /// has never beaten and holds a wake registration is the ordinary state
+    /// of somebody whose only client is a phone that is asleep: not there,
+    /// and not gone.
+    #[test]
+    fn an_account_that_never_beat_still_says_it_can_be_woken() {
+        let b = Beacons::new();
+        let set = [key(1), key(2)];
+        let r = b.read_across(&set, None, true);
+        assert!(!r.found, "nothing has beaten");
+        assert!(r.reach, "and a ring would still reach it");
+        assert_eq!(r.last_seen, 0);
+
+        let quiet = b.read_across(&set, None, false);
+        assert!(!quiet.found && !quiet.reach);
     }
 }

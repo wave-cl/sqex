@@ -161,7 +161,12 @@ CREATE TABLE IF NOT EXISTS wake (
     device   BLOB PRIMARY KEY,
     endpoint TEXT NOT NULL,
     expires  INTEGER NOT NULL,
-    woken    INTEGER NOT NULL DEFAULT 0
+    woken    INTEGER NOT NULL DEFAULT 0,
+    -- SIP-50 §Leaving a device out: hold the registration, do not count it
+    -- toward the account's reach. Nought by default, which is what every
+    -- registration made before this document gets and is the right answer
+    -- for them: they never asked to be left out.
+    quiet    INTEGER NOT NULL DEFAULT 0
 );
 -- SIP-59: where an account lives, by its own signed statement -- the
 -- latest Move presented here, whether it names this exchange or another.
@@ -256,6 +261,7 @@ impl Registry {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         add_column(&db, "wake", "account", "BLOB")?;
+        add_column(&db, "wake", "quiet", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(Registry { db: Mutex::new(db) })
     }
 
@@ -755,15 +761,23 @@ impl Registry {
         device: &PubKey,
         endpoint: &str,
         ttl: u32,
+        quiet: bool,
     ) -> Result<(), DeviceError> {
         let db = self.db.lock().unwrap();
+        // `quiet` is set on the update too: a device that registers again
+        // without the flag has stopped asking to be left out, and a stored
+        // value that outlived the request it came from would be a setting
+        // nobody could clear.
         db.execute(
-            "INSERT INTO wake (device, endpoint, expires, woken) VALUES (?1, ?2, ?3, 0)
-             ON CONFLICT (device) DO UPDATE SET endpoint = ?2, expires = ?3",
+            "INSERT INTO wake (device, endpoint, expires, woken, quiet)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT (device)
+             DO UPDATE SET endpoint = ?2, expires = ?3, quiet = ?4",
             params![
                 device.as_bytes(),
                 endpoint,
-                (now_unix() + u64::from(ttl)) as i64
+                (now_unix() + u64::from(ttl)) as i64,
+                i64::from(quiet)
             ],
         )
         .map_err(storage("register wake"))?;
@@ -838,6 +852,48 @@ impl Registry {
             }
         }
         out
+    }
+
+    /// SIP-50 §Reachable: whether a ring would reach anybody on this account.
+    ///
+    /// True when some member of the set -- the account itself, or a device
+    /// whose registration stands -- holds a wake registration that has not
+    /// expired and did not ask to be left out.
+    ///
+    /// **Its own query rather than a filter over [`wakeable`].** That one
+    /// answers "who do I wake", and `quiet` must not touch it: a device that
+    /// asked not to count toward its account's reach still wants to be woken,
+    /// and folding the flag in there would quietly stop delivering to it.
+    /// This answers "would a ring reach anybody", which is a different
+    /// question with a different answer.
+    pub fn reachable(&self, account: &PubKey) -> bool {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        // Registrations made by a device of this account, joined through the
+        // registry so a revoked or expired device does not keep an account
+        // looking reachable on a credential it no longer has.
+        let by_device: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM wake w JOIN device d ON d.device = w.device
+                 WHERE d.account = ?1 AND d.not_after >= ?2
+                   AND w.expires >= ?2 AND w.quiet = 0",
+                params![account.as_bytes(), now as i64],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if by_device > 0 {
+            return true;
+        }
+        // And the account's own, which covers a client that is its own device
+        // (SIP-22) and a registration collected from a former home (SIP-59).
+        db.query_row(
+            "SELECT COUNT(*) FROM wake
+             WHERE (device = ?1 OR account = ?1) AND expires >= ?2 AND quiet = 0",
+            params![account.as_bytes(), now as i64],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
     }
 
     /// SIP-59 §Collecting wakes: the live registrations of `account`'s devices and of the

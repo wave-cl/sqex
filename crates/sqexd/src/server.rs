@@ -2980,7 +2980,7 @@ async fn route(
                 }
                 match server
                     .devices
-                    .register_wake(&device, &req.endpoint, req.ttl)
+                    .register_wake(&device, &req.endpoint, req.ttl, req.quiet)
                 {
                     Ok(()) => (
                         200,
@@ -3021,7 +3021,25 @@ async fn route(
         ("POST", "/beacon/read") => match Read::decode(body) {
             Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
             Ok(read) => {
-                let reply = server.beacons.read(&read.key, peer.identity.as_ref());
+                // SIP-50: an account with registered devices is answered from
+                // the whole set -- itself and every device whose registration
+                // stands -- because a person whose only client is a phone
+                // beats under the *device* key and was absent for ever when
+                // this asked about the account alone.
+                //
+                // A key with no devices is its own device (SIP-22), so the
+                // set is just itself and the answer is what it always was.
+                // A device key asked about directly is answered as a device,
+                // which is what SIP-50 says and what a consumer wanting
+                // per-device presence still has.
+                let mut set = vec![read.key];
+                if let Ok(devices) = server.devices.list(&read.key) {
+                    set.extend(devices.devices.iter().map(|d| d.device));
+                }
+                let reach = server.devices.reachable(&read.key);
+                let reply = server
+                    .beacons
+                    .read_across(&set, peer.identity.as_ref(), reach);
                 (200, "application/octet-stream", reply.encode())
             }
         },

@@ -520,6 +520,7 @@ async fn a_former_home_hands_off_the_keys_services_and_a_move_back_reopens_them(
             "/wake/register",
             sqex_proto::wake::Register {
                 ttl: 3600,
+                quiet: false,
                 endpoint: "http://127.0.0.1:1/up".into(),
             }
             .encode(),
@@ -609,6 +610,7 @@ async fn a_former_home_hands_off_the_keys_services_and_a_move_back_reopens_them(
             "/wake/register",
             sqex_proto::wake::Register {
                 ttl: 3600,
+                quiet: false,
                 endpoint: "http://127.0.0.1:1/up".into(),
             }
             .encode(),

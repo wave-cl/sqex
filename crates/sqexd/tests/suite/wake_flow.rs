@@ -215,6 +215,7 @@ async fn an_absent_device_is_woken_once_and_a_listening_one_not_at_all() {
             "/wake/register",
             Register {
                 ttl: 3600,
+                quiet: false,
                 endpoint: "http://10.0.0.9/up".into(),
             }
             .encode(),
@@ -227,6 +228,7 @@ async fn an_absent_device_is_woken_once_and_a_listening_one_not_at_all() {
             "/wake/register",
             Register {
                 ttl: 3600,
+                quiet: false,
                 endpoint: pushes.url.clone(),
             }
             .encode(),
@@ -354,6 +356,7 @@ async fn a_gone_endpoint_is_forgotten() {
         "/wake/register",
         Register {
             ttl: 3600,
+            quiet: false,
             endpoint: gone.url.clone(),
         }
         .encode(),
@@ -370,5 +373,128 @@ async fn a_gone_endpoint_is_forgotten() {
         gone.bodies.lock().unwrap().len(),
         1,
         "the exchange kept knocking"
+    );
+}
+
+/// **SIP-50 §Leaving a device out: quiet stops the reporting, not the waking.**
+///
+/// A device that holds a wake registration and would rather its account not
+/// be reported reachable says so when it registers. That is a statement about
+/// what the exchange *says*, and the easy mistake is to fold the flag into
+/// the query that decides who gets woken -- which would silently stop
+/// delivering to a device that still very much wants its ring.
+///
+/// So both halves are asserted against one another: the reach bit goes out,
+/// and the wake still arrives.
+#[tokio::test]
+async fn a_quiet_registration_is_still_woken_and_stops_saying_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (alice_seed, alice) = identity(151);
+    let (bob_seed, bob) = identity(152);
+    let channel = [151u8; 32];
+
+    // Alice makes a room; Bob joins it and will be the one asleep.
+    let mut a = Client::connect_as(addr, &server_pub, &alice_seed)
+        .await
+        .unwrap();
+    let s = Signer::new(alice_seed, alice, server_pub);
+    let mut chain = Chain::default();
+    let req = s.create_chained(
+        &mut chain,
+        channel,
+        instance_for(channel, 0),
+        Visibility::Public,
+        3600,
+        "room",
+        vec![],
+    );
+    let (code, _) = a.post("/channel/create", req.encode()).await.unwrap();
+    assert_eq!(code, 200);
+    let mut b = Client::connect_as(addr, &server_pub, &bob_seed)
+        .await
+        .unwrap();
+    let joining = Signer::new(bob_seed, bob, server_pub).action_outside(
+        channel,
+        instance_for(channel, 0),
+        sqex_proto::channel::EVENT_JOINED,
+        &bob,
+        &[],
+        0,
+        sqex_proto::entry_sig::GENESIS,
+    );
+    let (code, _) = b
+        .post(
+            "/channel/join",
+            sqex_proto::channel::ByChannelSigned {
+                channel,
+                action: joining,
+            }
+            .encode(sqex_proto::channel::TYPE_JOIN),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    let pushes = distributor(200).await;
+    let read_bob = sqex_proto::beacon::Read { key: bob }.encode();
+    let reach_of = |body: &[u8]| {
+        sqex_proto::beacon::Reply::decode(body)
+            .expect("a reply")
+            .reach
+    };
+
+    // Registered loudly: the account reads as reachable.
+    let (code, body) = b
+        .post(
+            "/wake/register",
+            Register {
+                ttl: 3600,
+                endpoint: pushes.url.clone(),
+                quiet: false,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let (_, body) = a.post("/beacon/read", read_bob.clone()).await.unwrap();
+    assert!(
+        reach_of(&body),
+        "a live registration did not set the reach bit"
+    );
+
+    // The same device, asking to be left out of its account's reach.
+    let (code, body) = b
+        .post(
+            "/wake/register",
+            Register {
+                ttl: 3600,
+                endpoint: pushes.url.clone(),
+                quiet: true,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code,
+        200,
+        "the flags byte was refused: {}",
+        common::said(&body)
+    );
+    let (_, body) = a.post("/beacon/read", read_bob).await.unwrap();
+    assert!(
+        !reach_of(&body),
+        "a quiet registration still reported the account reachable"
+    );
+
+    // **And it is still woken.** This is the half that folding `quiet` into
+    // the delivery query would have broken, silently.
+    drop(b);
+    say(&mut a, &s, &mut chain, channel, b"anybody there").await;
+    assert!(
+        wakes_within(&pushes, 1, 5).await,
+        "a quiet device was not woken -- quiet is about what is said, not who is reached"
     );
 }
