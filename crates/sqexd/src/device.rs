@@ -854,6 +854,32 @@ impl Registry {
         out
     }
 
+    /// SIP-51: the wake endpoint of one device, for an event addressed to
+    /// that device alone.
+    ///
+    /// **No fallback to the account.** [`wakeable`] stands the account in for
+    /// its devices when it has none, because an event for a person has to
+    /// reach somebody; a device asked for by key either registered an
+    /// endpoint or did not, and inventing one would wake whoever holds the
+    /// account for a session they are not a party to.
+    ///
+    /// `quiet` is not consulted, for the reason given on [`reachable`]: a
+    /// device that asked not to count toward its account's reach still wants
+    /// its own wakes.
+    pub fn wakeable_device(&self, device: &PubKey) -> Option<(String, u64)> {
+        let now = now_unix();
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT endpoint, woken FROM wake WHERE device = ?1 AND expires >= ?2",
+            params![device.as_bytes(), now as i64],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|(endpoint, woken)| (endpoint, woken as u64))
+    }
+
     /// SIP-50 §Reachable: whether a ring would reach anybody on this account.
     ///
     /// True when some member of the set -- the account itself, or a device

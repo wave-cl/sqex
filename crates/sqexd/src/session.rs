@@ -129,6 +129,26 @@ struct Inner {
     sessions: HashMap<u64, Live>,
 }
 
+/// What an `open` did: the answer that goes on the wire, and whether it
+/// recorded a *new* pending open.
+///
+/// `fresh` is false for an established session (in either direction) and for
+/// a renewal of an open already standing. It is the one thing SIP-51 needs to
+/// decide whether to raise its event, and it is reported rather than acted on
+/// here because acting on it means reading the device registry.
+#[derive(Debug)]
+pub struct Opened {
+    pub ack: OpenAck,
+    pub fresh: bool,
+}
+
+impl Opened {
+    /// An answer that recorded no new open.
+    fn nothing(ack: OpenAck) -> Opened {
+        Opened { ack, fresh: false }
+    }
+}
+
 /// Every session the exchange is carrying.
 #[derive(Default)]
 pub struct Sessions {
@@ -145,14 +165,20 @@ impl Sessions {
     /// Returns `Established` with the peer's ephemeral only when the peer has
     /// asked for `me` too. Otherwise the request is recorded and the caller
     /// learns nothing.
-    pub fn open(&self, me: PubKey, peer: PubKey, ephemeral: [u8; 32]) -> OpenAck {
+    ///
+    /// The [`Opened`] wrapper carries what the *route* layer needs and the
+    /// wire does not: whether this was a new pending open. SIP-51's event is
+    /// published from there, never from here -- reading the device registry
+    /// takes the database lock, and this function is called holding the
+    /// session lock (SIP-30's deadlock, the same shape as `Server::tell`).
+    pub fn open(&self, me: PubKey, peer: PubKey, ephemeral: [u8; 32]) -> Opened {
         let now = now_unix();
         let mut inner = self.inner.lock().unwrap();
         inner.expire(now);
 
         if me == peer {
             // A session with yourself has no second end to consent.
-            return OpenAck::waiting(now);
+            return Opened::nothing(OpenAck::waiting(now));
         }
 
         // Already established? Answer idempotently, so a repeated open (a retry,
@@ -173,12 +199,12 @@ impl Sessions {
         if let Some((id, role)) = existing {
             let live = &inner.sessions[&id];
             if live.own_ephemeral_for(role) == ephemeral {
-                return OpenAck {
+                return Opened::nothing(OpenAck {
                     state: OpenState::Established,
                     session_id: id,
                     peer_ephemeral: live.peer_ephemeral_for(role),
                     now,
-                };
+                });
             }
             inner.sessions.remove(&id);
         }
@@ -206,19 +232,33 @@ impl Sessions {
                     open: true,
                 },
             );
-            return OpenAck {
+            return Opened::nothing(OpenAck {
                 state: OpenState::Established,
                 session_id: id,
                 peer_ephemeral: theirs.ephemeral,
                 now,
-            };
+            });
         }
 
         // Record the request and disclose nothing.
+        //
+        // SIP-51 §Once per open: a repeated `Open` offering the ephemeral
+        // already standing is the renewal a client makes to keep its open
+        // alive, and is not a new open -- a desktop renewing every ten
+        // seconds must not wake a phone every time. One offering a different
+        // ephemeral is somebody starting again, and is. An `Open` after the
+        // last expired is too: `expire` above has already dropped it.
+        let renewal = inner
+            .pending
+            .get(&(me, peer))
+            .is_some_and(|p| p.ephemeral == ephemeral);
         inner
             .pending
             .insert((me, peer), Pending { ephemeral, at: now });
-        OpenAck::waiting(now)
+        Opened {
+            ack: OpenAck::waiting(now),
+            fresh: !renewal,
+        }
     }
 
     /// SIP-39 §Pairs across exchanges: the ephemeral `me` is offering `peer` in an open still
@@ -343,7 +383,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b) = (key(1), key(2));
 
-        let ack = s.open(a, b, [10u8; 32]);
+        let ack = s.open(a, b, [10u8; 32]).ack;
         assert_eq!(ack.state, OpenState::Waiting);
         assert_eq!(ack.session_id, 0);
         assert_eq!(
@@ -351,12 +391,12 @@ mod tests {
             "nothing about the peer is disclosed before they consent"
         );
 
-        let ack_b = s.open(b, a, [20u8; 32]);
+        let ack_b = s.open(b, a, [20u8; 32]).ack;
         assert_eq!(ack_b.state, OpenState::Established);
         assert_eq!(ack_b.peer_ephemeral, [10u8; 32], "and now A's ephemeral");
 
         // A asks again and now learns B's.
-        let ack_a = s.open(a, b, [10u8; 32]);
+        let ack_a = s.open(a, b, [10u8; 32]).ack;
         assert_eq!(ack_a.state, OpenState::Established);
         assert_eq!(ack_a.session_id, ack_b.session_id, "the same session");
         assert_eq!(ack_a.peer_ephemeral, [20u8; 32]);
@@ -367,7 +407,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b) = (key(1), key(2));
         for _ in 0..5 {
-            assert_eq!(s.open(a, b, [1u8; 32]).state, OpenState::Waiting);
+            assert_eq!(s.open(a, b, [1u8; 32]).ack.state, OpenState::Waiting);
         }
         assert_eq!(s.len(), 0, "no session exists to be probed");
     }
@@ -377,7 +417,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b) = (key(1), key(2));
         s.open(a, b, [10u8; 32]);
-        let id = s.open(b, a, [20u8; 32]).session_id;
+        let id = s.open(b, a, [20u8; 32]).ack.session_id;
 
         s.send(&a, id, 0, vec![1, 2, 3]).unwrap();
         s.send(&a, id, 1, vec![4]).unwrap();
@@ -399,7 +439,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b, eve) = (key(1), key(2), key(3));
         s.open(a, b, [10u8; 32]);
-        let id = s.open(b, a, [20u8; 32]).session_id;
+        let id = s.open(b, a, [20u8; 32]).ack.session_id;
 
         assert_eq!(s.send(&eve, id, 0, vec![1]), Err(SendError::NoSession));
         let got = s.recv(&eve, id);
@@ -413,7 +453,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b) = (key(1), key(2));
         s.open(a, b, [10u8; 32]);
-        let id = s.open(b, a, [20u8; 32]).session_id;
+        let id = s.open(b, a, [20u8; 32]).ack.session_id;
 
         assert!(s.close(&b, id));
         assert!(!s.recv(&a, id).open, "A sees the session has ended");
@@ -426,7 +466,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b) = (key(1), key(2));
         s.open(a, b, [10u8; 32]);
-        let id = s.open(b, a, [20u8; 32]).session_id;
+        let id = s.open(b, a, [20u8; 32]).ack.session_id;
 
         for i in 0..MAX_QUEUED_FRAMES {
             s.send(&a, id, i as u64, vec![1]).unwrap();
@@ -447,7 +487,7 @@ mod tests {
         let s = Sessions::new();
         let (a, b, eve) = (key(1), key(2), key(3));
         s.open(a, b, [10u8; 32]);
-        let id = s.open(b, a, [20u8; 32]).session_id;
+        let id = s.open(b, a, [20u8; 32]).ack.session_id;
 
         assert_eq!(s.counterpart(&a, id), Some(b));
         assert_eq!(s.counterpart(&b, id), Some(a));
@@ -470,11 +510,49 @@ mod tests {
         );
     }
 
+    /// SIP-51 reads `fresh` to decide whether to tell the target, so what it
+    /// means has to be exact: a *new* pending open, and nothing else. The
+    /// event is a wake on somebody's phone, and the difference between "new"
+    /// and "still standing" is the difference between one buzz and one every
+    /// coalescing interval for as long as their desktop is up.
+    #[test]
+    fn only_a_new_pending_open_is_fresh() {
+        let s = Sessions::new();
+        let (a, b) = (key(1), key(9));
+
+        assert!(s.open(a, b, [1u8; 32]).fresh, "the first open was not new");
+        assert!(
+            !s.open(a, b, [1u8; 32]).fresh,
+            "a renewal -- the same ephemeral re-offered -- was taken for a new open"
+        );
+        assert!(
+            s.open(a, b, [2u8; 32]).fresh,
+            "a different ephemeral is somebody starting again, and is a new open"
+        );
+
+        // The other end answers: the session establishes, and neither the
+        // answer nor a later retry of it is a new open. The target is in the
+        // session by then and has nothing left to be told.
+        let done = s.open(b, a, [9u8; 32]);
+        assert_eq!(done.ack.state, OpenState::Established);
+        assert!(
+            !done.fresh,
+            "establishing a session was reported as an open"
+        );
+        assert!(
+            !s.open(b, a, [9u8; 32]).fresh,
+            "a retry against an established session was reported as an open"
+        );
+
+        // And a session with yourself, which records no pending at all.
+        assert!(!s.open(a, a, [1u8; 32]).fresh);
+    }
+
     #[test]
     fn a_session_with_yourself_is_refused() {
         let s = Sessions::new();
         let a = key(1);
-        assert_eq!(s.open(a, a, [1u8; 32]).state, OpenState::Waiting);
+        assert_eq!(s.open(a, a, [1u8; 32]).ack.state, OpenState::Waiting);
         assert_eq!(s.len(), 0);
     }
 
@@ -484,7 +562,7 @@ mod tests {
         let (low, high) = (key(1), key(9));
         // The higher key asks first.
         s.open(high, low, [90u8; 32]);
-        let ack = s.open(low, high, [10u8; 32]);
+        let ack = s.open(low, high, [10u8; 32]).ack;
         assert_eq!(ack.state, OpenState::Established);
         assert_eq!(
             ack.peer_ephemeral, [90u8; 32],

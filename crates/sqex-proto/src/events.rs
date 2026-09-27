@@ -83,6 +83,19 @@ pub const KIND_RINGING: u8 = 0x09;
 pub const KIND_CROSSCALL: u8 = 0x0A;
 /// SIP-56: a report awaits the admins of this channel. Admins only.
 pub const KIND_REPORTED: u8 = 0x0B;
+/// SIP-51: a device of your account has opened a SIP-12 session toward you.
+/// Names the opener's device key, so a target with several siblings opens
+/// toward the right one, and nothing else -- a hint, per SIP-30, and the
+/// device registry is the authority the woken device checks it against.
+///
+/// **Delivered per device, not per account.** The session is with that
+/// device; the account's other devices have nothing to do about it.
+///
+/// `0x0C` rather than the `0x0B` SIP-51 asked for while it was in Draft:
+/// SIP-56 was finished first and holds that one. The document was amended to
+/// match rather than the number quietly chosen here, because a kind two
+/// documents claim is a client reading one event as the other.
+pub const KIND_SIBLING: u8 = 0x0C;
 
 /// What happened to a membership.
 pub const MEMBER_JOINED: u8 = 0x01;
@@ -167,6 +180,9 @@ pub enum Event {
     CrossCall { bridge: [u8; 16], caller: PubKey },
     /// SIP-56: a member reported an entry in this channel. To its admins.
     Reported { channel: [u8; 32] },
+    /// SIP-51: `device`, a sibling of this one, has a SIP-12 open standing
+    /// toward it.
+    Sibling { device: PubKey },
     /// A kind this build does not know. Carried rather than rejected so that
     /// ignoring it is deliberate; see the module docs.
     Unknown(u8),
@@ -212,6 +228,7 @@ impl Event {
             }
             Event::Profile { account } => one(KIND_PROFILE, account.as_bytes()),
             Event::Reported { channel } => one(KIND_REPORTED, channel),
+            Event::Sibling { device } => one(KIND_SIBLING, device.as_bytes()),
             Event::Admission => vec![KIND_ADMISSION],
             Event::Heartbeat => vec![KIND_HEARTBEAT],
             Event::Resync => vec![KIND_RESYNC],
@@ -280,6 +297,12 @@ impl Event {
                 Event::CrossCall {
                     bridge: body[0..16].try_into().unwrap(),
                     caller: PubKey::new(body[16..48].try_into().unwrap()),
+                }
+            }
+            KIND_SIBLING => {
+                want(32)?;
+                Event::Sibling {
+                    device: PubKey::new(body[0..32].try_into().unwrap()),
                 }
             }
             KIND_PROFILE => {
@@ -386,6 +409,29 @@ mod tests {
         PubKey::new([n; 32])
     }
 
+    /// The name of a variant, for a message worth reading.
+    ///
+    /// Its only real job is the `match`: it is exhaustive, so a kind added to
+    /// [`Event`] and not thought about here stops this file compiling, and
+    /// whoever adds it is then standing beside the round-trip test.
+    fn named(e: &Event) -> &'static str {
+        match e {
+            Event::Channel { .. } => "channel",
+            Event::Signal { .. } => "signal",
+            Event::Cursor { .. } => "cursor",
+            Event::Membership { .. } => "membership",
+            Event::Profile { .. } => "profile",
+            Event::Admission => "admission",
+            Event::Heartbeat => "heartbeat",
+            Event::Resync => "resync",
+            Event::Ringing { .. } => "ringing",
+            Event::CrossCall { .. } => "cross call",
+            Event::Reported { .. } => "reported",
+            Event::Sibling { .. } => "sibling",
+            Event::Unknown(_) => "unknown",
+        }
+    }
+
     #[test]
     fn every_kind_survives_a_round_trip() {
         let all = [
@@ -404,10 +450,40 @@ mod tests {
             Event::Admission,
             Event::Heartbeat,
             Event::Resync,
+            Event::Ringing {
+                channel: [7; 32],
+                seq: 12,
+            },
+            Event::CrossCall {
+                bridge: [8; 16],
+                caller: key(9),
+            },
+            Event::Reported { channel: [10; 32] },
+            Event::Sibling { device: key(11) },
         ];
-        for e in all {
-            assert_eq!(Event::decode(&e.encode()).unwrap(), e, "{e:?}");
+        for e in &all {
+            assert_eq!(&Event::decode(&e.encode()).unwrap(), e, "{}", named(e));
         }
+        // And "every" means every kind, not every kind somebody remembered.
+        // This test carried the name while covering eight of twelve; a ring,
+        // a cross-call, a report and a sibling were never encoded here once.
+        let covered: std::collections::BTreeSet<u8> = all.iter().map(|e| e.encode()[0]).collect();
+        let kinds: std::collections::BTreeSet<u8> = [
+            KIND_CHANNEL,
+            KIND_SIGNAL,
+            KIND_CURSOR,
+            KIND_MEMBERSHIP,
+            KIND_PROFILE,
+            KIND_ADMISSION,
+            KIND_HEARTBEAT,
+            KIND_RESYNC,
+            KIND_RINGING,
+            KIND_CROSSCALL,
+            KIND_REPORTED,
+            KIND_SIBLING,
+        ]
+        .into();
+        assert_eq!(covered, kinds, "a kind goes through no round trip here");
     }
 
     #[test]

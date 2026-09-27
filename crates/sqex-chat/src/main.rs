@@ -1909,6 +1909,13 @@ impl Dirty {
             // answer one — and the event names a bridge, not a channel, so there
             // is nothing to fetch either. sqex-voice is what answers these.
             ChatEvent::CrossCall { .. } => {}
+            // SIP-51: a device of this account has a session open toward this
+            // one, wanting a SIP-42 history sync. This client does not sync
+            // history to siblings -- it holds none of its own, it reads the
+            // exchange -- so there is nothing to answer with and nothing to
+            // fetch. The event exists to wake a phone, and a terminal on a
+            // desktop is not one.
+            ChatEvent::Sibling { .. } => {}
             // Everything, because we do not know what we missed.
             ChatEvent::Resync => self.everything(open),
             // SIP-19's rule, and the reason a later kind of event needs no flag

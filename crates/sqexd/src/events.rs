@@ -57,6 +57,11 @@ struct Sub {
     id: u64,
     tx: mpsc::Sender<Event>,
     behind: Arc<AtomicBool>,
+    /// Which of the account's devices this stream belongs to. Streams are
+    /// filed under the *account* (SIP-22), which is right for everything
+    /// addressed to a person; SIP-51's event is addressed to one device, and
+    /// without this there is no way to tell its stream from its sibling's.
+    device: PubKey,
 }
 
 /// Live event streams, by the identity that opened them.
@@ -86,6 +91,7 @@ impl Subscribers {
             id,
             tx,
             behind: Arc::clone(&behind),
+            device,
         });
         Some(Feed {
             rx,
@@ -158,6 +164,30 @@ impl Subscribers {
                 if sub.tx.try_send(event).is_err() {
                     sub.behind.store(true, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+
+    /// SIP-51: to one device of `who`, and not to its siblings.
+    ///
+    /// The account is passed as well as the device because streams are filed
+    /// under the account: with it this is a walk over one person's streams,
+    /// and without it a scan of everybody's.
+    ///
+    /// Silent when that device holds no stream. It is not a delivery
+    /// guarantee and is not meant to be -- SIP-30 is hints, and the wake is
+    /// what reaches a device that is not listening.
+    pub fn publish_to_device(&self, who: &PubKey, device: &PubKey, event: Event) {
+        let mut map = self.by_identity.lock().unwrap();
+        let Some(subs) = map.get_mut(who) else {
+            return;
+        };
+        for sub in subs.iter_mut().filter(|s| s.device == *device) {
+            if sub.behind.load(Ordering::Relaxed) {
+                continue;
+            }
+            if sub.tx.try_send(event).is_err() {
+                sub.behind.store(true, Ordering::Relaxed);
             }
         }
     }

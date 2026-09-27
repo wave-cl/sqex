@@ -70,6 +70,7 @@ mod route_coverage;
 mod search_flow;
 mod session_flow;
 mod shared_room_flow;
+mod sibling_flow;
 mod signed_entry_flow;
 mod soft_state_flow;
 mod sqnr_flow;

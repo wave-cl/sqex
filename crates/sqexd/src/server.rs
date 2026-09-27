@@ -1536,6 +1536,36 @@ impl Server {
         self.channels.wake(channel);
     }
 
+    /// SIP-51: tell a device that a device of its own account has opened a
+    /// session toward it, and wake it for that.
+    ///
+    /// Raised only for siblings, and that bound is the whole security
+    /// argument: SIP-12 discloses nothing about a pending open because any
+    /// visible effect at the target would make `open` a presence probe for
+    /// any key. Between two devices of one account there is nothing to learn
+    /// -- the registry lists them both, the account signed both credentials,
+    /// and that one of them wants the other is a fact the account arranged.
+    ///
+    /// Called from the route layer, never from inside `Sessions`: the registry
+    /// read below takes the database lock, and `Sessions::open` is called
+    /// holding the session lock.
+    pub(crate) fn told_sibling(&self, opener: &PubKey, target: &PubKey) {
+        // `account_for` answers a key that is registered to nobody with
+        // itself, so two strangers never come back equal -- but two devices of
+        // one account do, and so do an account and a device of its own, which
+        // is the second case SIP-51 names.
+        let mine = self.devices.account_for(opener);
+        if mine != self.devices.account_for(target) {
+            return;
+        }
+        let event = EventKind::Sibling { device: *opener };
+        self.events.publish_to_device(&mine, target, event);
+        if let Some(w) = self.waker.get() {
+            w.tell_device(target, &event);
+        }
+        tracing::debug!(%opener, %target, "a device opened toward a sibling (SIP-51)");
+    }
+
     /// SIP-45: the same people, to their devices that are not listening.
     fn wake(&self, to: &[PubKey], event: &EventKind) {
         if let Some(w) = self.waker.get() {
@@ -5524,9 +5554,25 @@ async fn route(
                 // call, whose caller is on another exchange and so has no local
                 // pending open to match. If so, the relay completes the bridge;
                 // otherwise it is an ordinary local open.
-                let ack =
-                    crate::relay::try_answer(server, me, open.peer, open.ephemeral, now_unix())
-                        .unwrap_or_else(|| server.sessions.open(me, open.peer, open.ephemeral));
+                let ack = match crate::relay::try_answer(
+                    server,
+                    me,
+                    open.peer,
+                    open.ephemeral,
+                    now_unix(),
+                ) {
+                    // A cross-exchange answer is never a sibling's open: its
+                    // caller is on another exchange, and a device of this
+                    // account is not.
+                    Some(ack) => ack,
+                    None => {
+                        let done = server.sessions.open(me, open.peer, open.ephemeral);
+                        if done.fresh {
+                            server.told_sibling(&me, &open.peer);
+                        }
+                        done.ack
+                    }
+                };
                 (200, "application/octet-stream", ack.encode())
             }
         },

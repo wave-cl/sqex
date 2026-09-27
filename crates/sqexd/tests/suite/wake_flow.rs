@@ -117,6 +117,13 @@ pub(crate) async fn distributor(status: u16) -> Distributor {
     }
 }
 
+impl Distributor {
+    /// Every body that arrived, in order.
+    pub(crate) fn bodies(&self) -> Vec<Vec<u8>> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
 pub(crate) async fn wakes_within(d: &Distributor, n: usize, secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
     while tokio::time::Instant::now() < deadline {

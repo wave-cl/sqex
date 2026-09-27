@@ -19,7 +19,13 @@ use crate::state::now_unix;
 
 /// What `tell` hands the waker: who was told, and whether it was a ring.
 pub struct Told {
+    /// Accounts. Every device of each of them is woken, as SIP-45 has it.
     pub accounts: Vec<PubKey>,
+    /// SIP-51: devices, named one by one. An event addressed to a single
+    /// device wakes that device; its siblings are not parties to the session
+    /// it is about, and a wake they can do nothing with is a wake nobody
+    /// asked for.
+    pub devices: Vec<PubKey>,
     pub urgent: bool,
 }
 
@@ -57,6 +63,19 @@ impl Waker {
         }
         let _ = self.tx.send(Told {
             accounts: accounts.to_vec(),
+            devices: Vec::new(),
+            urgent: urgent(event),
+        });
+    }
+
+    /// SIP-51: wake one device, and none of its siblings.
+    pub fn tell_device(&self, device: &PubKey, event: &Event) {
+        if !wakes(event) {
+            return;
+        }
+        let _ = self.tx.send(Told {
+            accounts: Vec::new(),
+            devices: vec![*device],
             urgent: urgent(event),
         });
     }
@@ -79,30 +98,43 @@ pub fn start(server: Weak<Server>) -> Waker {
                 break;
             };
             let now = now_unix();
-            for account in &told.accounts {
-                for (device, endpoint, woken) in server.devices.wakeable(account) {
-                    if server.events.listening(&device) {
-                        continue;
-                    }
-                    if !told.urgent && now.saturating_sub(woken) < WAKE_MIN_SECS {
-                        continue;
-                    }
-                    server.devices.woke(&device);
-                    let client = client.clone();
-                    let server = Arc::clone(&server);
-                    tokio::spawn(async move {
-                        match client.post(&endpoint).body(WAKE_BODY).send().await {
-                            Ok(r) if r.status() == 404 || r.status() == 410 => {
-                                // The distributor no longer knows it.
-                                server.devices.forget_wake(&device);
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::debug!(device = %device, "wake failed: {e}");
-                            }
-                        }
-                    });
+            // Every device of each account told, and then the devices named
+            // one by one. Both go through the same coalescing and the same
+            // "is it already listening" check -- a device addressed by key is
+            // not a special case of a device, only of the addressing.
+            let each: Vec<(PubKey, String, u64)> = told
+                .accounts
+                .iter()
+                .flat_map(|a| server.devices.wakeable(a))
+                .chain(told.devices.iter().filter_map(|d| {
+                    server
+                        .devices
+                        .wakeable_device(d)
+                        .map(|(endpoint, woken)| (*d, endpoint, woken))
+                }))
+                .collect();
+            for (device, endpoint, woken) in each {
+                if server.events.listening(&device) {
+                    continue;
                 }
+                if !told.urgent && now.saturating_sub(woken) < WAKE_MIN_SECS {
+                    continue;
+                }
+                server.devices.woke(&device);
+                let client = client.clone();
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    match client.post(&endpoint).body(WAKE_BODY).send().await {
+                        Ok(r) if r.status() == 404 || r.status() == 410 => {
+                            // The distributor no longer knows it.
+                            server.devices.forget_wake(&device);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(device = %device, "wake failed: {e}");
+                        }
+                    }
+                });
             }
         }
     });
