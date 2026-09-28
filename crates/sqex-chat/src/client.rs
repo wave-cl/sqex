@@ -5073,6 +5073,17 @@ impl Chat {
         self.timers.get(channel).copied().unwrap_or(0)
     }
 
+    /// SIP-57: when each timed message in `channel` goes, by sequence.
+    ///
+    /// **What a reader needs and could not ask for.** `set_timer` says what
+    /// *this* client puts on what it sends; this says what is actually on the
+    /// messages in hand, whoever sent them. Without it a client can honour a
+    /// timer — [`Self::expire`] does, inside `poll` — and cannot say there is
+    /// one, so messages leave the transcript with nothing to explain them.
+    pub fn timers(&self, channel: &[u8; 32]) -> Result<std::collections::HashMap<u64, u64>> {
+        Ok(self.store.timers(channel)?)
+    }
+
     /// SIP-57: delete every timed message whose time has come, from the
     /// store and from `timeline` where it is that channel's. Returns what
     /// went.

@@ -1600,6 +1600,31 @@ impl Store {
         Ok(())
     }
 
+    /// SIP-57: when each timed message in `channel` goes, by sequence.
+    ///
+    /// **A read, where there was only a delete.** [`Self::expire_timed`] was
+    /// the only way to learn anything about a timer, and it learns it by
+    /// removing the message -- so a client could honour a timer and could not
+    /// *say* there was one. A reader watching messages disappear with nothing
+    /// to explain them is being shown what looks like loss.
+    ///
+    /// Whole-channel rather than per message: a transcript asks about every
+    /// line it draws, and one query is not sixty.
+    pub fn timers(&self, channel: &[u8; 32]) -> Result<std::collections::HashMap<u64, u64>> {
+        let scope = self.scope()?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT seq, until FROM timed WHERE exchange = ?1 AND channel = ?2")
+            .map_err(storage("prepare timers"))?;
+        let rows = stmt
+            .query_map(params![scope, &channel[..]], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+            })
+            .map_err(storage("read timers"))?;
+        rows.collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()
+            .map_err(storage("read timers"))
+    }
+
     /// SIP-57: delete every message whose timer has run out, and say which.
     pub fn expire_timed(&self, now: u64) -> Result<Vec<([u8; 32], u64)>> {
         let scope = self.scope()?;
@@ -3727,6 +3752,40 @@ mod tests {
 
     fn seed(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    /// **A timer is readable before it runs out, which is the whole point.**
+    ///
+    /// `expire_timed` was the only way to learn anything about a timer, and
+    /// it learns it by deleting the message — so a client could honour a
+    /// timer and could not say there was one, and a reader watched messages
+    /// leave with nothing to explain them. `timers` answers while the
+    /// message is still there.
+    #[test]
+    fn a_timer_can_be_read_while_the_message_is_still_here() {
+        let store = scoped(&seed(1), None);
+        let channel = seed(7);
+
+        store.note_timer(&channel, 4, 1_000).unwrap();
+        store.note_timer(&channel, 9, 2_000).unwrap();
+        // Another channel's, which must not come back with this one's.
+        store.note_timer(&seed(8), 5, 3_000).unwrap();
+
+        let held = store.timers(&channel).unwrap();
+        assert_eq!(held.get(&4), Some(&1_000), "{held:?}");
+        assert_eq!(held.get(&9), Some(&2_000), "{held:?}");
+        assert_eq!(held.len(), 2, "another channel's timers came too: {held:?}");
+
+        // And what has gone is gone: the point of reading is to say what is
+        // *coming*, so an expired one must not still be reported as pending.
+        store.expire_timed(1_500).unwrap();
+        let left = store.timers(&channel).unwrap();
+        assert_eq!(
+            left.get(&4),
+            None,
+            "an expired timer is still listed: {left:?}"
+        );
+        assert_eq!(left.get(&9), Some(&2_000), "{left:?}");
     }
 
     /// Two clients under one identity share a device key and a prekey pool,
