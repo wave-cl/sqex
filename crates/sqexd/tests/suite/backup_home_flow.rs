@@ -535,7 +535,15 @@ async fn a_backup_written_at_the_new_home_stands_over_the_former_homes() {
     // H's collect may still be letting go of X's copy -- fetched, compared,
     // found older -- when X has already released it: the quota counts a
     // blob for the moment between the two. Settled is what is asserted.
-    for _ in 0..40 {
+    //
+    // **Fifteen seconds, not six.** H is given a three-second home cycle
+    // above, and the release needs a cycle to come round plus the round
+    // trips inside it -- so six seconds was two ticks with no slack, and on
+    // a loaded machine it intermittently failed with `used` at 43: the newer
+    // backup and the superseded one still counted together. Five times the
+    // interval, which is what `attest_flow` settled on for the same reason
+    // after the same kind of failure.
+    for _ in 0..100 {
         if at_h.used == 9 {
             break;
         }
