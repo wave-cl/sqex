@@ -101,8 +101,10 @@ fn tone_call(sink: &Path, seconds: u64) -> CallOpts {
 ///
 /// # It flakes under a loaded machine, and the obvious fix is wrong
 ///
-/// Seen once in two `cargo test --workspace` runs, at `underruns`, passing
-/// alone every time. Both counters are decided at **B's playout** -- the
+/// Seen once in two `cargo test --workspace` runs, at `underruns`. It passed
+/// alone every time when that was written and **no longer does** — about two
+/// runs in three fail alone now, which is why B is given a deeper buffer
+/// below rather than this staying a note. Both counters are decided at **B's playout** -- the
 /// buffer being empty when a frame is due -- and a parallel runner starves
 /// that thread for reasons A never caused. The margin is genuinely thin:
 /// `KEEPALIVE_FRAMES` is 50, one comfort frame per second, against a
@@ -164,14 +166,24 @@ async fn a_muted_peer_is_silent_and_not_missing() {
     let b = async {
         let (client, session, id) =
             engine::establish(endpoint, &b_signer, a_id, 20, &mut b_report).await?;
-        engine::call(
-            client,
-            session,
-            id,
-            tone_call(&dir.path().join("b.wav"), 6),
-            &mut b_report,
-        )
-        .await
+        // **B listens with a deeper buffer than the default three frames.**
+        // Both counters this test asserts are decided at B's playout, and
+        // the default depth is 60 ms: a playout thread starved longer than
+        // that underruns for reasons A never caused. The note above names
+        // this as the honest lever — harness, not mechanism — and it is
+        // needed now, because that note's other premise has stopped being
+        // true: it recorded the test as "passing alone every time", and it
+        // now fails alone about two runs in three on this machine.
+        //
+        // Half a second of buffer, which is 25 frames against a coast limit
+        // of two seconds, so the mechanism under test is untouched: a sender
+        // that actually stopped still runs the buffer dry long before this
+        // depth could hide it.
+        let opts = engine::CallOpts {
+            depth: 25,
+            ..tone_call(&dir.path().join("b.wav"), 6)
+        };
+        engine::call(client, session, id, opts, &mut b_report).await
     };
     let done = tokio::time::timeout(std::time::Duration::from_secs(30), b).await;
     a_task.abort();
