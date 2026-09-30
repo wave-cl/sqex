@@ -89,9 +89,11 @@ pub struct FileConfig {
     pub welcome_channel: String,
 
     /// The sQUIC envelope versions this server parses (SIP-29). Omitted means
-    /// squic's own default, which is both. Narrowing it to `[2]` retires
-    /// version 1, after which clients older than sqex v0.11.0 cannot reach
-    /// this exchange at all.
+    /// squic's own default, which is every version it knows — today version 4
+    /// alone, so there is nothing to narrow. Versions 1 to 3 were removed
+    /// rather than deprecated. A list naming a version squic cannot parse is
+    /// refused at `listen`, rather than binding and then dropping every
+    /// Initial in silence; the setting survives for the next transition.
     ///
     /// Deliberately `Option`: resolving an omitted key to a hard-coded list
     /// would silently override squic's default and pin whatever this file
