@@ -189,6 +189,39 @@ pub enum Event {
 }
 
 impl Event {
+    /// The kind byte this event encodes as. `Unknown` reports the byte it was
+    /// carried under, so a reader that forwards one does not relabel it.
+    pub fn kind(&self) -> u8 {
+        match self {
+            Event::Channel { .. } => KIND_CHANNEL,
+            Event::Signal { .. } => KIND_SIGNAL,
+            Event::Cursor { .. } => KIND_CURSOR,
+            Event::Membership { .. } => KIND_MEMBERSHIP,
+            Event::Profile { .. } => KIND_PROFILE,
+            Event::Admission => KIND_ADMISSION,
+            Event::Heartbeat => KIND_HEARTBEAT,
+            Event::Resync => KIND_RESYNC,
+            Event::Ringing { .. } => KIND_RINGING,
+            Event::CrossCall { .. } => KIND_CROSSCALL,
+            Event::Reported { .. } => KIND_REPORTED,
+            Event::Sibling { .. } => KIND_SIBLING,
+            Event::Unknown(k) => *k,
+        }
+    }
+
+    /// The channel this event is about, for the kinds that name one.
+    pub fn channel(&self) -> Option<[u8; 32]> {
+        match self {
+            Event::Channel { channel, .. }
+            | Event::Signal { channel }
+            | Event::Cursor { channel }
+            | Event::Membership { channel, .. }
+            | Event::Ringing { channel, .. }
+            | Event::Reported { channel } => Some(*channel),
+            _ => None,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Event::Channel { channel, last_seq } => {
@@ -403,6 +436,51 @@ impl Framer {
 
 #[cfg(test)]
 mod tests {
+    /// `kind()` is a second statement of what `encode()` writes, so the two can
+    /// disagree. Checked against the encoding itself rather than against a
+    /// hand-written table, which would be a third thing to keep in step.
+    #[test]
+    fn kind_matches_the_first_byte_of_the_encoding() {
+        use super::*;
+        for e in [
+            Event::Channel {
+                channel: [1; 32],
+                last_seq: 2,
+            },
+            Event::Signal { channel: [1; 32] },
+            Event::Cursor { channel: [1; 32] },
+            Event::Membership {
+                channel: [1; 32],
+                account: PubKey::new([2; 32]),
+                what: 1,
+            },
+            Event::Profile {
+                account: PubKey::new([2; 32]),
+            },
+            Event::Admission,
+            Event::Heartbeat,
+            Event::Resync,
+            Event::Ringing {
+                channel: [1; 32],
+                seq: 3,
+            },
+            Event::CrossCall {
+                bridge: [4; 16],
+                caller: PubKey::new([2; 32]),
+            },
+            Event::Reported { channel: [1; 32] },
+            Event::Sibling {
+                device: PubKey::new([2; 32]),
+            },
+        ] {
+            assert_eq!(
+                e.kind(),
+                e.encode()[0],
+                "kind() disagrees with encode() for {e:?}"
+            );
+        }
+    }
+
     use super::*;
 
     fn key(n: u8) -> PubKey {

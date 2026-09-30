@@ -119,6 +119,11 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
         Sqnr("signed transactions"),
         ExchangeAdmin,
     ),
+    // Answered in `handle_stream` rather than `route`, like `/events`: its
+    // answer never finishes. Authorised by the signed transaction in its body
+    // and not by the connection, because a YubiKey administrator has no
+    // transport identity to authorise with.
+    ("POST", "/admin/tail", Cli("sqex admin tail"), ExchangeAdmin),
     ("POST", "/beacon/beat", Cli("sqex beacon"), Identity),
     ("POST", "/beacon/read", Cli("sqex beacon read"), Anyone),
     // SIP-25 rendezvous. Coordination only: nothing punches yet, and the

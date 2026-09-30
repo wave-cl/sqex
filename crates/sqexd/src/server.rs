@@ -112,6 +112,10 @@ const MAX_CHUNK_BODY: usize = sqex_proto::blob_store::CHUNK + 1024;
 /// sequence of length-prefixed frames with no end.
 const EVENT_STREAM: &str = "application/vnd.sqex.events";
 
+/// The operator tail's content type, distinct so a reader cannot mistake one
+/// stream for the other.
+const TAIL_STREAM: &str = "application/vnd.sqex.tail";
+
 /// How often a quiet event stream says it is still there.
 ///
 /// Under the transport's 60 s idle timeout, so a stream cannot be reaped for
@@ -312,6 +316,11 @@ pub struct Server {
     /// these and is not an authority over them — it checks that an issuer
     /// signed, and cannot check whether a claim is true.
     attestations: Attestations,
+    /// Operators watching this exchange live (`/admin/tail`). Separate from
+    /// `events` on purpose: that one belongs to accounts and is part of the
+    /// service, this one belongs to an operator and must never cost the
+    /// service anything.
+    tails: crate::tail::Tails,
     /// SIP-28: where identities say they can be reached. Beside the beacon on
     /// purpose — this holds what they *said*, the beacon holds what the
     /// exchange *saw*, and a resolution carries both so a consumer can tell
@@ -1526,9 +1535,37 @@ impl Server {
     /// and reading a member list takes that same non-reentrant lock. Publishing
     /// from inside `wake` would deadlock the daemon. Nothing here holds the
     /// database, and `Channels` stays unaware that subscriptions exist.
+    /// Show a published event to any operator watching.
+    ///
+    /// Called from the three `tell*` helpers rather than from
+    /// `Subscribers::publish`, because the recipient list is computed here and
+    /// because `events` has no business knowing an operator exists.
+    ///
+    /// **This is the line that crosses every fan-out scope.** A tail sees what
+    /// each account was told, so it shows channel membership, SIP-30's
+    /// sender exclusion, SIP-21's block filter on profiles and the admin-only
+    /// scoping of admission and reports — all at once, which no single account
+    /// can. It carries no content, because a SIP-30 event has none to carry.
+    fn tell_the_tail(&self, to: &[PubKey], event: &EventKind) {
+        if !self.tails.watching() {
+            return;
+        }
+        let kind = event.kind();
+        let channel = event.channel();
+        for who in to {
+            let who = *who;
+            self.tails.publish(|| sqex_proto::tail::Record::Event {
+                to: who,
+                event: kind,
+                channel,
+            });
+        }
+    }
+
     pub(crate) fn tell(&self, channel: &[u8; 32], event: EventKind) {
         let to = self.channels.members_of(channel);
         self.events.publish(&to, event);
+        self.tell_the_tail(&to, &event);
         self.wake(&to, &event);
         // SIP-35 §Waiting: and the peers waiting on this channel, for everything a
         // pull would carry -- an entry woke them already; a signal, a
@@ -1560,6 +1597,7 @@ impl Server {
         }
         let event = EventKind::Sibling { device: *opener };
         self.events.publish_to_device(&mine, target, event);
+        self.tell_the_tail(std::slice::from_ref(target), &event);
         if let Some(w) = self.waker.get() {
             w.tell_device(target, &event);
         }
@@ -1583,6 +1621,7 @@ impl Server {
             .filter(|m| m != not)
             .collect();
         self.events.publish(&to, event);
+        self.tell_the_tail(&to, &event);
         self.wake(&to, &event);
         self.channels.wake(channel);
     }
@@ -1595,6 +1634,7 @@ impl Server {
             to.push(*also);
         }
         self.events.publish(&to, event);
+        self.tell_the_tail(&to, &event);
         self.wake(&to, &event);
         self.channels.wake(channel);
     }
@@ -1841,6 +1881,7 @@ pub async fn bind_with(
         endpoints: Endpoints::new(),
         attestations: Attestations::open(attest_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open attestations: {e}")))?,
+        tails: crate::tail::Tails::new(),
         rendezvous: Rendezvous::new(),
         mailbox: Mailbox::open(mailbox_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the mailbox: {e}")))?,
@@ -2113,6 +2154,9 @@ pub async fn serve(bound: Bound) -> Result<()> {
                             crate::tunnel::serve(&server, conn, peer).await;
                         } else {
                             let identity = peer.identity;
+                            // Kept for the tail below: `serve_h3` takes the
+                            // Arc, and the line it feeds is written after.
+                            let watching = Arc::clone(&server);
                             let ended = serve_h3(server, conn.clone(), peer).await;
                             // **The transport, in numbers, once per
                             // connection.** A slow download looked identical
@@ -2137,6 +2181,16 @@ pub async fn serve(bound: Bound) -> Result<()> {
                                 rx_bytes = s.udp_rx.bytes,
                                 "connection ended"
                             );
+                            watching
+                                .tails
+                                .publish(|| sqex_proto::tail::Record::Connection {
+                                    opened: false,
+                                    peer: conn.remote_address().to_string(),
+                                    identity,
+                                    rtt_ms: s.path.rtt.as_millis().min(u32::MAX as u128) as u32,
+                                    lost: s.path.lost_packets,
+                                    bytes: s.udp_tx.bytes + s.udp_rx.bytes,
+                                });
                             if let Err(e) = ended {
                                 tracing::debug!("connection ended: {e}");
                             }
@@ -2349,7 +2403,53 @@ async fn handle_stream(
         return serve_events(&server, &body, peer, &mut stream).await;
     }
 
+    // The operator's tail, the second route whose answer never finishes, and
+    // here for the same reason. Written in this exact shape because
+    // `route_coverage`'s `handled_early` scanner reads this file as text and
+    // matches the literal form -- a variable here would make the route
+    // invisible to the test that exists to notice it.
+    if method == http::Method::POST && path == "/admin/tail" {
+        return serve_tail(&server, &body, &mut stream).await;
+    }
+
+    let began = std::time::Instant::now();
     let (status, content_type, out) = route(&server, method.as_str(), &path, &body, peer).await;
+
+    // One emission point, three kinds, and the closure is why it can sit on
+    // the request path: with nobody watching it is one relaxed atomic load and
+    // none of this runs.
+    server.tails.publish(|| {
+        let account = peer.identity.map(|d| server.devices.account_for(&d));
+        let micros = began.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        if status >= 400 {
+            // A refusal says *why* where it can. The body is a `Refusal` and
+            // decoding it costs something, which is exactly the work the
+            // closure defers until somebody is actually watching.
+            let why = sqex_proto::refusal::Refusal::decode(&out)
+                .map(|r| format!("{:?} {}", r.code, r.detail.unwrap_or_default()))
+                .unwrap_or_else(|_| format!("status {status}"));
+            sqex_proto::tail::Record::Refusal {
+                account,
+                route: path.clone(),
+                why,
+            }
+        } else if let (true, Some(id)) = (path.starts_with("/peer/"), peer.identity) {
+            // The exchange-to-exchange wire, named by the exchange on the far
+            // end rather than by an account.
+            sqex_proto::tail::Record::Peer {
+                peer: id,
+                what: path.clone(),
+            }
+        } else {
+            sqex_proto::tail::Record::Request {
+                account,
+                route: path.clone(),
+                status,
+                micros,
+            }
+        }
+    });
+
     respond(&mut stream, status, content_type, out).await
 }
 
@@ -2434,6 +2534,120 @@ async fn serve_events(
         server.devices.released(&feed.device);
     }
     Ok(())
+}
+
+/// Hold a response stream open and write the operator's tail to it.
+///
+/// Authorised by a signed SIP-10 transaction in the request body, not by the
+/// connection's identity, and that difference is the whole reason this cannot
+/// reuse `/events`: a YubiKey administrator has no transport identity at all —
+/// it signs Ed25519 and never releases the seed sQUIC needs for its handshake,
+/// which is why signed commands exist. The nonce is spent here at open and the
+/// stream's authority afterwards is the transaction already verified.
+async fn serve_tail(
+    server: &Arc<Server>,
+    body: &[u8],
+    stream: &mut h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+) -> Result<()> {
+    // The same four checks `/admin/command` makes, through the same function.
+    let (admin, ops) = match server.authorise(body) {
+        Ok(ok) => ok,
+        Err(e) => {
+            let (code, kind) = error_status(&e);
+            let out = serde_json::json!({ "error": kind, "detail": e.to_string() })
+                .to_string()
+                .into_bytes();
+            return respond(stream, code, "application/json", out).await;
+        }
+    };
+
+    // Exactly one op, and it must be the one that opens a tail. A batch would
+    // raise the question of what a half-applied transaction means when the
+    // answer is a stream rather than a result.
+    let kinds = match ops.as_slice() {
+        [Op::TailOpen { version, kinds }] if *version == sqex_proto::tail::VERSION => *kinds,
+        [Op::TailOpen { version, .. }] => {
+            let out = serde_json::json!({
+                "error": "unsupported_version",
+                "detail": format!("this exchange speaks tail version {}, not {version}",
+                                  sqex_proto::tail::VERSION),
+            })
+            .to_string()
+            .into_bytes();
+            return respond(stream, 400, "application/json", out).await;
+        }
+        _ => {
+            let out = serde_json::json!({
+                "error": "malformed",
+                "detail": "a tail is opened by exactly one tail-open op",
+            })
+            .to_string()
+            .into_bytes();
+            return respond(stream, 400, "application/json", out).await;
+        }
+    };
+
+    let Some(mut watch) = server.tails.open(kinds) else {
+        let out = serde_json::json!({
+            "error": "too_many_tails",
+            "detail": format!("this exchange carries {} tails at once", crate::tail::MAX_TAILS),
+        })
+        .to_string()
+        .into_bytes();
+        return respond(stream, 429, "application/json", out).await;
+    };
+
+    // **Recorded, unconditionally.** A tail is a read, so `Op::is_mutation` is
+    // false for it and `execute`'s audit path would skip it -- and this is the
+    // one read worth more than most mutations, because it is a live view of who
+    // is doing what. With no config gate on the capability, this entry is the
+    // only control on it, so it is written before the first line goes out and
+    // it reaches every other tail as well.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.record(AuditEntry {
+            time: now_unix(),
+            admin: admin.to_base58(),
+            action: "tail-open".into(),
+            target: Some(format!("kinds {kinds:#06x}")),
+            outcome: "opened".into(),
+        });
+        let _ = state.save();
+    }
+    tracing::info!(admin = %admin.short(), kinds = kinds, "an operator opened a tail");
+    server.tails.publish(|| sqex_proto::tail::Record::Admin {
+        admin,
+        action: "tail-open".into(),
+    });
+
+    // No content-length, and no `finish`, for the reason `serve_events` gives.
+    let head = http::Response::builder()
+        .status(200)
+        .header("content-type", TAIL_STREAM)
+        .body(())
+        .map_err(|e| Error::Malformed(format!("response build: {e}")))?;
+    if stream.send_response(head).await.is_err() {
+        server.tails.close(&watch);
+        return Ok(());
+    }
+
+    crate::tail::pump(&mut watch, &mut TailSink { stream }, HEARTBEAT).await;
+    server.tails.close(&watch);
+    Ok(())
+}
+
+/// Where the h3 response stream meets the tail pump.
+struct TailSink<'a> {
+    stream: &'a mut h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
+}
+
+impl crate::tail::Sink for TailSink<'_> {
+    async fn write(&mut self, line: sqex_proto::tail::Line) -> std::result::Result<(), ()> {
+        self.stream
+            .send_data(bytes::Bytes::from(line.frame()))
+            .await
+            .map_err(|_| ())
+    }
 }
 
 /// Where the h3 response stream meets the pump. The pump itself lives in
@@ -5716,6 +5930,12 @@ impl Server {
             "mailbox_durable": self.mailbox.durable(),
             "attestations": self.attestations.len(),
             "attestations_durable": self.attestations.durable(),
+            // Who is watching this exchange, and how many have ever watched.
+            // On `/status`, which anybody may read, deliberately: a live view
+            // of everyone's activity should not itself be the one thing an
+            // operator can do unobserved.
+            "tails": self.tails.len(),
+            "tails_opened": self.tails.opened(),
             // SIP-35 §Passing a limit through: what each origin last refused this exchange, and
             // whether writes to it are held.
             "origins": self.origins_value(),
@@ -5755,11 +5975,14 @@ impl Server {
         self.status_value(&state).to_string().into_bytes()
     }
 
-    /// Decode, authenticate, and apply a signed transaction (a batch of ops);
-    /// return the JSON response body on success. The batch is applied
-    /// atomically: every op is decoded and checked first, so one bad op means
-    /// none are applied.
-    async fn execute(&self, body: &[u8]) -> Result<Vec<u8>> {
+    /// Steps 1-4 of a signed transaction: the nonce, the signature and server
+    /// binding, the admin list, and the summary each op was signed under.
+    /// Returns the signer and the decoded batch, having applied nothing.
+    ///
+    /// Extracted so `/admin/command` and `/admin/tail` authenticate through
+    /// **one** path. Two copies of this would be two things to keep in step,
+    /// and the one that fell behind would be the one that let somebody in.
+    fn authorise(&self, body: &[u8]) -> Result<(PubKey, Vec<Op>)> {
         let signed = SignedTransaction::decode(body)?;
         let txn = &signed.transaction;
 
@@ -5789,23 +6012,36 @@ impl Server {
             }
             ops.push(op);
         }
+        Ok((signed.admin, ops))
+    }
+
+    /// Decode, authenticate, and apply a signed transaction (a batch of ops);
+    /// return the JSON response body on success. The batch is applied
+    /// atomically: every op is decoded and checked first, so one bad op means
+    /// none are applied.
+    async fn execute(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let (admin, ops) = self.authorise(body)?;
 
         // 5. Apply the batch under one lock, then persist once.
         let mut state = self.state.lock().unwrap();
         let mut results = Vec::with_capacity(ops.len());
         let mut mutated = false;
         for op in &ops {
-            results.push(self.apply(&mut state, op, &signed.admin));
+            results.push(self.apply(&mut state, op, &admin));
             if op.is_mutation() {
                 mutated = true;
                 state.record(AuditEntry {
                     time: now_unix(),
-                    admin: signed.admin.to_base58(),
+                    admin: admin.to_base58(),
                     action: op.name().to_string(),
                     target: op.target(),
                     outcome: "ok".into(),
                 });
-                tracing::info!(admin = %signed.admin.short(), action = op.name(), "admin op applied");
+                tracing::info!(admin = %admin.short(), action = op.name(), "admin op applied");
+                self.tails.publish(|| sqex_proto::tail::Record::Admin {
+                    admin,
+                    action: op.name().to_string(),
+                });
             }
         }
         if mutated {
@@ -6085,6 +6321,15 @@ impl Server {
                     .collect();
                 json!({ "names": names })
             }
+            // Not applied here, and saying so is the point. A tail is not a
+            // command with a result -- it authorises the stream that
+            // `/admin/tail` serves, and that route reads this op itself. A
+            // caller that sends it here has the right signature and the wrong
+            // door, which is worth a sentence rather than a silent no-op.
+            Op::TailOpen { .. } => json!({
+                "ok": false,
+                "error": "tail-open authorises a stream; POST the same transaction to /admin/tail"
+            }),
         }
     }
 

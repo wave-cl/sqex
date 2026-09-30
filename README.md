@@ -207,6 +207,23 @@ reload the admin list, read the audit tail, and list, admit and deny pending
 SIP-24 admission requests. Every mutation is recorded to a
 persisted audit log (who, what, when).
 
+**One op does not work like the others.** `tail-open` authorises a stream
+rather than returning a result, so it is posted to `/admin/tail` instead of
+`/admin/command` — the answer never finishes, the way `/events` does not. It is
+authorised by the same signed transaction, through the same four checks, and
+the nonce is spent when the stream opens.
+
+`sqex admin tail` is what that is for: a live line per request, connection,
+published event, admin op, peering call and refusal. Two things are worth
+knowing before running it. It shows **what every account is told**, so it
+crosses scopes no single account can see — channel membership, who is typing to
+whom, who is calling whom. And it carries **no content**, because a SIP-30 event
+has none and a private channel's bodies are sealed to keys this exchange has
+never held. Opening one is written to the audit log even though it is a read,
+and `/status` reports how many tails are open, so it is not something an
+operator can do unobserved. A tail that falls behind is dropped past rather than
+waited for, and is told how many lines it lost.
+
 The three admission ops are in the vocabulary and executed by the server, but
 `sqex admin` does not expose them yet: it covers `whitelist`, `audit` and
 `reload-admins`. Deciding on a request today means building the op through

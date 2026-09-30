@@ -556,6 +556,22 @@ enum AdminCmd {
         #[arg(short = 'n', long, default_value_t = 50)]
         count: u32,
     },
+    /// Watch everything this exchange does, live, until you stop.
+    ///
+    /// This shows what every account is told, not what you are told: channel
+    /// membership, who is typing to whom, who is calling whom, who published a
+    /// profile. No message content — a SIP-30 event carries none, and a
+    /// private channel's bodies are sealed to keys this exchange has never
+    /// held. Opening one is written to the audit log.
+    Tail {
+        /// Which kinds to show: request, connection, event, admin, peer,
+        /// refusal. Default: all of them.
+        #[arg(long, value_delimiter = ',')]
+        kinds: Vec<String>,
+        /// One JSON object per line, for a pipe.
+        #[arg(long)]
+        json: bool,
+    },
     /// Re-read the server's admin list from its config file.
     ReloadAdmins,
     /// Administer names (SIP-38): assign, release, or list them. The
@@ -2351,6 +2367,7 @@ async fn admin(cli: &Cli, cfg: &Config, cmd: &AdminCmd) -> Result<(), String> {
             print_audit(&result(&v, 0));
             Ok(())
         }
+        AdminCmd::Tail { kinds, json } => tail(cli, cfg, kinds, *json).await,
         AdminCmd::ReloadAdmins => {
             let v = submit(cli, cfg, vec![Op::ReloadAdmins.to_operation()]).await?;
             println!("{}", result(&v, 0));
@@ -3348,6 +3365,213 @@ async fn submit(cli: &Cli, cfg: &Config, ops: Vec<Operation>) -> Result<serde_js
     };
     let touch = || eprintln!("👆  Touch your YubiKey to sign…");
     flow::sign_and_submit(&mut client, &backend, server, ops, &review, &touch).await
+}
+
+/// Open a live tail and print it until interrupted.
+///
+/// Signs exactly as [`submit`] does and then **streams** instead of posting:
+/// `flow::sign_and_submit` is hardcoded to `/admin/command` and lives in a
+/// pinned external crate, so the fifteen lines between the challenge and the
+/// signature are repeated here rather than reached into. The alternative is a
+/// sqnr release to add one path parameter, for one caller.
+async fn tail(cli: &Cli, cfg: &Config, kinds: &[String], json: bool) -> Result<(), String> {
+    use sqex_proto::tail::{self, Framer};
+
+    let kinds = parse_tail_kinds(kinds)?;
+    let (mut client, server) = connect(cli, cfg).await?;
+    let backend = signing_backend(cli, cfg).await?;
+
+    let op = Op::TailOpen {
+        version: tail::VERSION,
+        kinds,
+    }
+    .to_operation();
+    let (cs, nonce_bytes) = client.get("/admin/challenge").await?;
+    if cs != 200 || nonce_bytes.len() != 32 {
+        return Err(format!("challenge failed (status {cs})"));
+    }
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&nonce_bytes);
+    let transaction = Transaction {
+        server,
+        nonce,
+        ops: vec![op],
+    };
+    eprintln!("About to sign 1 operation:");
+    for o in &transaction.ops {
+        eprintln!("  • {}", o.summary);
+        for d in &o.detail {
+            eprintln!("      {d}");
+        }
+    }
+    if backend.is_yubikey() {
+        eprintln!("👆  Touch your YubiKey to sign…");
+    }
+    let signature = backend.sign(&transaction.signing_bytes()).await?;
+    let signed = sqnr_core::SignedTransaction {
+        transaction,
+        admin: backend.public(),
+        signature,
+    };
+
+    let mut stream = client
+        .stream("POST", "/admin/tail", signed.encode())
+        .await?;
+    if stream.status() != 200 {
+        // The refusal body is JSON here, as it is for `/admin/command`.
+        let mut said = Vec::new();
+        while let Ok(Some(chunk)) = stream.next().await {
+            said.extend_from_slice(&chunk);
+        }
+        let v: serde_json::Value = serde_json::from_slice(&said).unwrap_or(serde_json::Value::Null);
+        return Err(format!(
+            "{} ({}) {}",
+            v["error"].as_str().unwrap_or("error"),
+            stream.status(),
+            v["detail"].as_str().unwrap_or("")
+        )
+        .trim()
+        .to_string());
+    }
+    eprintln!("(watching; ^C to stop)");
+
+    let mut framer = Framer::new();
+    while let Some(chunk) = stream.next().await? {
+        for line in framer.feed(&chunk).map_err(|e| e.to_string())? {
+            if json {
+                println!("{}", tail_json(&line));
+            } else if let Some(text) = tail_line(&line) {
+                println!("{text}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_tail_kinds(names: &[String]) -> Result<u16, String> {
+    use sqex_proto::tail::*;
+    if names.is_empty() {
+        return Ok(WANT_ALL);
+    }
+    let mut bits = 0u16;
+    for n in names {
+        bits |= match n.trim() {
+            "request" => WANT_REQUEST,
+            "connection" => WANT_CONNECTION,
+            "event" => WANT_EVENT,
+            "admin" => WANT_ADMIN,
+            "peer" => WANT_PEER,
+            "refusal" => WANT_REFUSAL,
+            other => {
+                return Err(format!(
+                    "unknown kind {other:?}; want request, connection, event, admin, peer, refusal"
+                ));
+            }
+        };
+    }
+    Ok(bits)
+}
+
+fn short(k: &sqnr_core::PubKey) -> String {
+    let s = k.to_base58();
+    s.chars().take(8).collect()
+}
+
+/// A heartbeat is not printed: it exists to prove the stream is alive, and a
+/// line a second saying nothing happened would bury the lines that matter.
+fn tail_line(line: &sqex_proto::tail::Line) -> Option<String> {
+    use sqex_proto::tail::Record;
+    let at = line.at;
+    Some(match &line.record {
+        Record::Heartbeat => return None,
+        Record::Request {
+            account,
+            route,
+            status,
+            micros,
+        } => format!(
+            "[{at}] {:<10} {route} {status} {micros}µs",
+            account.as_ref().map(short).unwrap_or_else(|| "-".into())
+        ),
+        Record::Connection {
+            opened,
+            peer,
+            identity,
+            rtt_ms,
+            lost,
+            bytes,
+        } => format!(
+            "[{at}] {:<10} conn {} {peer} rtt={rtt_ms}ms lost={lost} bytes={bytes}",
+            identity.as_ref().map(short).unwrap_or_else(|| "-".into()),
+            if *opened { "opened" } else { "ended" }
+        ),
+        Record::Event { to, event, channel } => format!(
+            "[{at}] {:<10} event {event:#04x}{}",
+            short(to),
+            channel
+                .map(|c| format!(" channel {}", short(&sqnr_core::PubKey::new(c))))
+                .unwrap_or_default()
+        ),
+        Record::Admin { admin, action } => {
+            format!("[{at}] {:<10} admin {action}", short(admin))
+        }
+        Record::Peer { peer, what } => format!("[{at}] {:<10} peer {what}", short(peer)),
+        Record::Refusal {
+            account,
+            route,
+            why,
+        } => format!(
+            "[{at}] {:<10} refused {route}: {why}",
+            account.as_ref().map(short).unwrap_or_else(|| "-".into())
+        ),
+        // Said loudly. The whole reason the exchange counts these rather than
+        // blocking is that an operator must know the view is incomplete.
+        Record::Dropped { records } => {
+            format!("[{at}] *** {records} line(s) dropped — this tail fell behind ***")
+        }
+    })
+}
+
+fn tail_json(line: &sqex_proto::tail::Line) -> String {
+    use sqex_proto::tail::Record;
+    let body = match &line.record {
+        Record::Request {
+            account,
+            route,
+            status,
+            micros,
+        } => serde_json::json!({"kind":"request","account":account.map(|a| a.to_base58()),
+                                "route":route,"status":status,"micros":micros}),
+        Record::Connection {
+            opened,
+            peer,
+            identity,
+            rtt_ms,
+            lost,
+            bytes,
+        } => serde_json::json!({"kind":"connection","opened":opened,"peer":peer,
+                                "identity":identity.map(|a| a.to_base58()),
+                                "rtt_ms":rtt_ms,"lost":lost,"bytes":bytes}),
+        Record::Event { to, event, channel } => {
+            serde_json::json!({"kind":"event","to":to.to_base58(),"event":event,
+                               "channel":channel.map(|c| sqnr_core::PubKey::new(c).to_base58())})
+        }
+        Record::Admin { admin, action } => {
+            serde_json::json!({"kind":"admin","admin":admin.to_base58(),"action":action})
+        }
+        Record::Peer { peer, what } => {
+            serde_json::json!({"kind":"peer","peer":peer.to_base58(),"what":what})
+        }
+        Record::Refusal {
+            account,
+            route,
+            why,
+        } => serde_json::json!({"kind":"refusal","account":account.map(|a| a.to_base58()),
+                                "route":route,"why":why}),
+        Record::Dropped { records } => serde_json::json!({"kind":"dropped","records":records}),
+        Record::Heartbeat => serde_json::json!({"kind":"heartbeat"}),
+    };
+    serde_json::json!({"at": line.at, "seq": line.seq, "record": body}).to_string()
 }
 
 /// What the exchange said about a refusal, for an operator to read.

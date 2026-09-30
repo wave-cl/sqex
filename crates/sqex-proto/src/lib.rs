@@ -45,6 +45,7 @@ pub mod room;
 pub mod safety;
 pub mod session;
 pub mod succession;
+pub mod tail;
 pub mod timeline;
 pub mod tunnel;
 pub mod wake;
@@ -134,6 +135,14 @@ pub enum Op {
     ChannelAllow([u8; 32]),
     /// Read the channels this exchange refuses to copy.
     ChannelRefused,
+    /// Open a live tail of what this exchange is doing (`POST /admin/tail`).
+    ///
+    /// Unlike every op above it, this one is not applied and answered -- it
+    /// authorises a stream, and the route reads it rather than `apply`. It is
+    /// an `Op` so a tail is opened by the same signed, nonce-bound transaction
+    /// as everything else an administrator does, which is also what makes
+    /// SIP-10 present it for review and ask a YubiKey for a touch first.
+    TailOpen { version: u8, kinds: u16 },
 }
 
 impl Op {
@@ -161,6 +170,7 @@ impl Op {
             Op::ChannelForget(_) => 0x14,
             Op::ChannelAllow(_) => 0x15,
             Op::ChannelRefused => 0x16,
+            Op::TailOpen { .. } => 0x17,
         }
     }
 
@@ -220,6 +230,10 @@ impl Op {
                 out.push(name.len() as u8);
                 out.extend_from_slice(name.as_bytes());
             }
+            Op::TailOpen { version, kinds } => {
+                out.push(*version);
+                out.extend_from_slice(&kinds.to_be_bytes());
+            }
             _ => {}
         }
         out
@@ -257,6 +271,17 @@ impl Op {
             0x14 => Op::ChannelForget(*key(rest)?.as_bytes()),
             0x15 => Op::ChannelAllow(*key(rest)?.as_bytes()),
             0x16 => Op::ChannelRefused,
+            0x17 => {
+                let [version, hi, lo] = rest else {
+                    return Err(Error::Malformed(
+                        "tail-open wants a version byte and two kind bytes".into(),
+                    ));
+                };
+                Op::TailOpen {
+                    version: *version,
+                    kinds: u16::from_be_bytes([*hi, *lo]),
+                }
+            }
             other => return Err(Error::Malformed(format!("unknown op tag {other:#x}"))),
         };
         // Every op consumes its payload exactly; reject trailing bytes.
@@ -291,6 +316,7 @@ impl Op {
             Op::ChannelForget(_) => "channel-forget",
             Op::ChannelAllow(_) => "channel-allow",
             Op::ChannelRefused => "channel-refused",
+            Op::TailOpen { .. } => "tail-open",
         }
     }
 
@@ -324,6 +350,12 @@ impl Op {
                 format!("Allow a copy of channel {} again", PubKey::new(*c))
             }
             Op::ChannelRefused => "Read the channels this exchange refuses to copy".into(),
+            // Deliberately blunt. This is the line an administrator reads
+            // before touching a YubiKey, and what it authorises is a live view
+            // of who is doing what on this exchange.
+            Op::TailOpen { .. } => {
+                "Watch everything this exchange does, live, until you stop".into()
+            }
         }
     }
 
@@ -364,6 +396,10 @@ impl Op {
                 d
             }
             Op::PeerRemove(k) => vec![format!("exchange: {}", k.to_base58())],
+            Op::TailOpen { kinds, .. } => vec![
+                format!("kinds: {kinds:#06x}"),
+                "includes events sent to every account, which no one account sees".into(),
+            ],
             _ => vec![],
         }
     }
@@ -545,7 +581,59 @@ mod tests {
             },
             Op::PeerRemove(PubKey::new([3u8; 32])),
             Op::PeerList,
+            Op::AdmissionList,
+            Op::ChannelForget([1u8; 32]),
+            Op::ChannelAllow([2u8; 32]),
+            Op::ChannelRefused,
+            Op::TailOpen {
+                version: crate::tail::VERSION,
+                kinds: crate::tail::WANT_ALL,
+            },
+            Op::DeviceRegister(
+                crate::credential::Credential::issue(
+                    &[11u8; 32],
+                    &PubKey::new([12u8; 32]),
+                    crate::credential::SCOPE_CHAT,
+                    1_700_000_000,
+                    1_700_003_600,
+                )
+                .expect("a well-formed credential"),
+            ),
+            Op::DeviceRevoke(crate::credential::Revocation::issue(
+                &[11u8; 32],
+                &PubKey::new([12u8; 32]),
+                1_700_000_000,
+            )),
         ]
+    }
+
+    /// **The fixture above must name every tag.** It was hand-kept and had
+    /// drifted: six variants were missing, so a `payload`/`decode`
+    /// disagreement in any of them would have shipped — `payload` has a
+    /// `_ => {}` arm that silently encodes nothing, and `decode` matches on a
+    /// `u8` rather than exhaustively. This closes it by construction.
+    #[test]
+    fn the_fixture_covers_every_tag() {
+        let mut have: Vec<u8> = all().iter().map(|o| o.tag()).collect();
+        have.sort_unstable();
+        have.dedup();
+        let want: Vec<u8> = (0x01..=0x17).collect();
+        assert_eq!(have, want, "a tag is missing from the round-trip fixture");
+    }
+
+    /// A tail is a read, so it is not audited by `execute`'s mutation rule —
+    /// the route records it explicitly instead. Asserted so that moving it
+    /// into `is_mutation` (which would audit it twice, and call a read a
+    /// change) is a deliberate act rather than a slip.
+    #[test]
+    fn opening_a_tail_is_not_a_mutation() {
+        assert!(
+            !Op::TailOpen {
+                version: crate::tail::VERSION,
+                kinds: crate::tail::WANT_ALL
+            }
+            .is_mutation()
+        );
     }
 
     #[test]
