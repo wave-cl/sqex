@@ -409,12 +409,10 @@ async fn a_statement_and_its_withdrawal_survive_a_restart() {
         now() - 1,
         now() + 3600,
     );
-    let (code, body) = c
-        .post("/attest/lodge", withdrawal.encode())
-        .await
-        .unwrap();
+    let (code, body) = c.post("/attest/lodge", withdrawal.encode()).await.unwrap();
     assert_eq!(
-        code, 200,
+        code,
+        200,
         "a legitimate withdrawal was refused after a restart: {}",
         common::said(&body)
     );
