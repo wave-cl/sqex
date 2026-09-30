@@ -76,7 +76,7 @@ struct Cli {
 
     /// Transmit continuously, even while nobody is speaking.
     ///
-    /// By default a silent speaker stops sending (SIP-14), which is most of the
+    /// By default a silent speaker stops sending (SIP-15), which is most of the
     /// bandwidth in a room. Turn that off where the *pattern* of who speaks when
     /// is sensitive: the exchange cannot read a call either way, but it can see
     /// when packets flow.

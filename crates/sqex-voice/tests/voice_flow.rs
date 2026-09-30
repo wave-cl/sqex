@@ -486,7 +486,7 @@ async fn a_pause_is_heard_as_the_room_and_costs_almost_nothing() {
     // holds a second of audio. Collecting the lot and only then draining
     // made it look like a backlog from a ring, which `Jitter::pop` now
     // drops -- and this call's timeline is the whole point of the test.
-    // Popping once per *arrival* would not do: under SIP-14 the sender
+    // Popping once per *arrival* would not do: under SIP-15 the sender
     // stops sending through a pause while the timeline runs on, so there
     // are far fewer packets than slots.
     let mut buffer = Jitter::new(3);

@@ -1,4 +1,4 @@
-//! SIP-14: telling silence apart from loss.
+//! SIP-15: telling silence apart from loss.
 //!
 //! Opus knows when nobody is talking, and says so by emitting a one-byte packet
 //! instead of sixty-five. Acting on that — not sending — is where the bandwidth
@@ -203,7 +203,7 @@ impl Frame {
 
 /// Decides whether a frame is speech, adapting to the room it is in.
 ///
-/// SIP-14 left this to the codec and SIP-15 takes it back, for a reason worth
+/// SIP-15 takes this decision away from the codec, for a reason worth
 /// keeping in view: Opus's detector is deciding whether *encoding* is
 /// worthwhile, not whether *transmitting* is, and against a noise floor it keeps
 /// deciding yes. Once the far end can synthesise the room, we can afford to be
@@ -1063,8 +1063,8 @@ mod tests {
 ///
 /// These answer questions about how the codec and this framing actually behave
 /// that no documentation does. `#[ignore]`d so they never gate CI, and kept so
-/// nobody has to re-derive the answers. The measurements that rejected SIP-14's
-/// design are recorded in SIP-14 itself, which is Replaced — they are not
+/// nobody has to re-derive the answers. The measurements that rejected leaving
+/// the decision to the codec are recorded in SIP-15's rationale — they are not
 /// re-runnable against this code and should not be.
 ///
 /// ```text

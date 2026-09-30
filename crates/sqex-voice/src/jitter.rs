@@ -50,8 +50,8 @@ pub enum Playout {
     /// not write zeros.
     Comfort(Comfort),
     /// The sender said nothing and has not yet described it — the opening of a
-    /// call, before any descriptor has arrived. Fall back to SIP-14's
-    /// behaviour: hand the decoder nothing and let its state decide.
+    /// call, before any descriptor has arrived. Fall back to the
+    /// no-descriptor rule: hand the decoder nothing and let its state decide.
     Silence,
     /// Nothing is in flight, or the buffer is still filling. Play silence and
     /// do not advance — an idle line is not a lost packet.
@@ -115,7 +115,7 @@ pub struct Stats {
     pub duplicate: u64,
     /// Slots played from Opus's imagination rather than from a packet.
     pub concealed: u64,
-    /// Slots the sender chose not to fill (SIP-14 discontinuous transmission).
+    /// Slots the sender chose not to fill (SIP-15 discontinuous transmission).
     pub silent: u64,
     /// Times the buffer emptied and had to refill.
     pub underruns: u64,
@@ -146,7 +146,7 @@ impl Stats {
 /// out the far side as an even cadence.
 pub struct Jitter {
     /// Keyed by media timestamp — *where audio belongs in time* — not by
-    /// packet sequence. With SIP-14 the two differ: a sender that stops talking
+    /// packet sequence. Under SIP-15 the two differ: a sender that stops talking
     /// stops sending, so the timestamp runs on while the sequence does not.
     frames: BTreeMap<u64, Media>,
     /// The media timestamp the next tick will play.
@@ -405,7 +405,7 @@ impl Jitter {
     }
 
     /// A slot the peer chose not to fill: the room if they have described it,
-    /// and SIP-14's fallback if they have not yet.
+    /// and the no-descriptor fallback if they have not yet.
     fn quiet(&self) -> Playout {
         match self.comfort {
             Some(c) => Playout::Comfort(c),
@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(j.stats.trimmed, 0);
     }
 
-    /// The whole point of SIP-14. A speaker who stops talking stops sending,
+    /// The whole point of the two counters. A speaker who stops talking stops sending,
     /// so the timestamp runs on while the sequence does not — and those slots
     /// must be played as silence, never concealed. Concealment extrapolates
     /// from what was last heard, so concealing here would put words in a
@@ -687,7 +687,7 @@ mod tests {
     }
 
     /// Before any descriptor arrives there is nothing to synthesise, so a gap
-    /// falls back to SIP-14's behaviour rather than guessing at a level.
+    /// falls back to handing the decoder nothing rather than guessing at a level.
     #[test]
     fn a_pause_before_any_descriptor_falls_back() {
         let mut j = Jitter::new(1);

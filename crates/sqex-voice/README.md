@@ -175,7 +175,7 @@ match. Measured on a live exchange, two seconds of speech and ten of pause:
 | | packets |
 |---|---|
 | `--no-dtx` (continuous) | 600 |
-| SIP-14 (the codec's own detector) | 182 |
+| the codec's own detector | 182 |
 | **now** | **125** |
 
 The reason it needs a descriptor at all is that a pause is **not a lost frame**.
