@@ -2439,6 +2439,7 @@ async fn handle_stream(
             sqex_proto::tail::Record::Peer {
                 peer: id,
                 what: path.clone(),
+                micros,
             }
         } else {
             sqex_proto::tail::Record::Request {
@@ -6937,18 +6938,20 @@ fn no_identity(action: &str) -> (u16, &'static str, Vec<u8>) {
 /// varies.
 /// SIP-35 §Waiting: the channels among `watched` that have an entry past the seq
 /// the peer holds, at once; else the first to change -- an entry, a
-/// signal, a read mark, a redaction -- within `secs`; else none. The
-/// notifiers are taken before the first look, as `fetch_waiting` takes
-/// its one, so a change in the gap still wakes the wait.
+/// signal, a read mark, a redaction -- within `secs`; else none.
+///
+/// **Every waiter is registered before the first look**, and that ordering is
+/// the whole correctness of the wait. `Channels::wake` uses `notify_waiters`,
+/// which wakes whoever is *already* parked and stores no permit for anybody who
+/// arrives later -- so a change landing between the look and the registration
+/// reaches nobody and the wait sits out its full timeout. Taking the `Arc` early
+/// is not enough and used to be what this did: an `Arc<Notify>` in hand is not a
+/// registered waiter, and the comment here claimed a safety it did not have.
 async fn wait_for_changes(
     server: &Arc<Server>,
     watched: &[([u8; 32], u64)],
     secs: u16,
 ) -> Vec<[u8; 32]> {
-    let notifiers: Vec<_> = watched
-        .iter()
-        .map(|(c, _)| server.channels.notifier(c))
-        .collect();
     let past = |server: &Server| -> Vec<[u8; 32]> {
         watched
             .iter()
@@ -6956,25 +6959,53 @@ async fn wait_for_changes(
             .map(|(c, _)| *c)
             .collect()
     };
-    let already = past(server);
-    if !already.is_empty() || secs == 0 || watched.is_empty() {
-        return already;
+    if secs == 0 || watched.is_empty() {
+        return past(server);
     }
+    let notifiers: Vec<_> = watched
+        .iter()
+        .map(|(c, _)| server.channels.notifier(c))
+        .collect();
     // One task per notifier, each reporting its index once; the first to
-    // report ends the wait, and the rest are dropped with the receiver.
+    // report ends the wait, and the rest are dropped with the receiver. Each
+    // says when it is parked, and the look below waits for all of them, so
+    // there is no window in which a change can be missed.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<usize>(watched.len().max(1));
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<()>(watched.len().max(1));
     let tasks: Vec<_> = notifiers
         .into_iter()
         .enumerate()
         .map(|(i, n)| {
             let tx = tx.clone();
+            let ready = ready_tx.clone();
             tokio::spawn(async move {
-                n.notified().await;
+                let fut = n.notified();
+                tokio::pin!(fut);
+                // Registers this waiter without awaiting, so the permit-less
+                // `notify_waiters` below cannot pass it by.
+                fut.as_mut().enable();
+                let _ = ready.send(()).await;
+                fut.await;
                 let _ = tx.send(i).await;
             })
         })
         .collect();
     drop(tx);
+    drop(ready_tx);
+    for _ in 0..tasks.len() {
+        if ready_rx.recv().await.is_none() {
+            break;
+        }
+    }
+    // Only now is it safe to look: every waiter is parked, so a change from
+    // here on wakes one of them.
+    let already = past(server);
+    if !already.is_empty() {
+        for t in &tasks {
+            t.abort();
+        }
+        return already;
+    }
     let woken = tokio::time::timeout(std::time::Duration::from_secs(secs as u64), rx.recv()).await;
     for t in &tasks {
         t.abort();

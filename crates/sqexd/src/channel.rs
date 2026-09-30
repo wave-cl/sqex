@@ -2974,6 +2974,23 @@ impl Channels {
     /// its members and can open none of them. Each carries the epoch its `Put`
     /// was made at, because that is bound into the SIP-32 signature and a peer
     /// has no other way to know it.
+    /// The highest epoch this exchange holds an envelope for, or 0 for none.
+    ///
+    /// What a replica passes as `since_epoch` below. `pull_envelopes` matches
+    /// `to_epoch >= since_epoch`, so the current epoch is re-offered every
+    /// time -- which is wanted, because a member added to the epoch already
+    /// running gets an envelope for it after the fact.
+    pub fn highest_envelope_epoch(&self, channel: &[u8; 32]) -> u32 {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT COALESCE(MAX(to_epoch), 0) FROM envelope WHERE channel = ?1",
+            params![&channel[..]],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u32)
+        .unwrap_or(0)
+    }
+
     pub fn pull_envelopes(
         &self,
         channel: &[u8; 32],

@@ -982,7 +982,12 @@ async fn pull_envelopes(
             "/peer/envelopes",
             PullEnvelopes {
                 channel: *channel,
-                since_epoch: 0,
+                // Not 0. Asking from the beginning made the origin ship the
+                // channel's whole envelope set on every pull, and cost this
+                // replica an Ed25519 verification per envelope each time --
+                // work proportional to the channel's age, repeated for ever.
+                // The wire has had this parameter all along.
+                since_epoch: store.highest_envelope_epoch(channel),
             }
             .encode(),
         )
@@ -1456,10 +1461,35 @@ async fn wait_on(
     }
 }
 
+/// What the pause decided: whether there is anything to pull, and whether the
+/// connection is still good.
+///
+/// **A wait that answered "nothing changed" is not an instruction to pull**, and
+/// that distinction is the whole of SIP-35 §Waiting: the interval is "the safety
+/// net rather than the delivery". Collapsing the two -- which is what returning a
+/// bare `bool` did -- made a quiet replica pull its origin's whole state every
+/// time a wait ran out.
+enum Next {
+    /// Pull, and then pause again.
+    Pull,
+    /// Nothing has changed. Wait again without pulling.
+    Wait,
+    /// The connection is gone; redial.
+    Stop,
+}
+
 /// Between pulls: wait on the origin (SIP-35 §Waiting) where it lets us, sleep the
 /// interval where it does not, and come back early for a poke either way.
-/// `waits_from` is when the origin may next be asked to wait, after a
-/// refusal. Returns whether the connection is still good.
+///
+/// The wait asks for as long as SIP-16 allows rather than for `interval`. Those
+/// were the same number once, which made the long poll exactly as long as the
+/// poll it replaced: an operator lowering `interval_secs` for freshness turned
+/// waiting back into polling, at one cycle per poll instead of one request.
+/// `interval` now means what SIP-35 says it means -- how often everything is
+/// swept, whatever the waits did.
+///
+/// `waits_from` is when the origin may next be asked to wait, after a refusal.
+/// `sweep_at` is when the next full pull is due.
 #[allow(clippy::too_many_arguments)]
 async fn pause_or_wait(
     client: &mut H3Client,
@@ -1469,27 +1499,45 @@ async fn pause_or_wait(
     interval: std::time::Duration,
     poke: &tokio::sync::Notify,
     waits_from: &mut tokio::time::Instant,
-) -> bool {
+    sweep_at: &mut tokio::time::Instant,
+) -> Next {
+    // An origin that will not wait, or nothing to wait on: the interval is all
+    // there is, and it is both the delivery and the safety net.
     if tokio::time::Instant::now() < *waits_from || channels.is_empty() {
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep_until(*sweep_at) => {}
             _ = poke.notified() => {}
         }
-        return true;
+        *sweep_at = tokio::time::Instant::now() + interval;
+        return Next::Pull;
     }
-    let secs = interval
-        .as_secs()
-        .clamp(1, sqex_proto::channel::MAX_WAIT as u64) as u16;
+    let secs = sqex_proto::channel::MAX_WAIT;
     tokio::select! {
         waited = wait_on(client, store, channels, seen, secs) => match waited {
-            Waited::Changed | Waited::Quiet => true,
+            Waited::Changed => {
+                *sweep_at = tokio::time::Instant::now() + interval;
+                Next::Pull
+            }
+            // The origin said nothing changed. Believe it.
+            Waited::Quiet => Next::Wait,
             Waited::Unsupported => {
                 *waits_from = tokio::time::Instant::now() + WAIT_RETRY;
-                true
+                *sweep_at = tokio::time::Instant::now() + interval;
+                Next::Pull
             }
-            Waited::Lost => false,
+            Waited::Lost => Next::Stop,
         },
-        _ = poke.notified() => true,
+        // The safety net: a wait can be lost with the connection and an origin
+        // can answer early with nothing, so everything is swept on the interval
+        // whatever the waits did.
+        _ = tokio::time::sleep_until(*sweep_at) => {
+            *sweep_at = tokio::time::Instant::now() + interval;
+            Next::Pull
+        }
+        _ = poke.notified() => {
+            *sweep_at = tokio::time::Instant::now() + interval;
+            Next::Pull
+        }
     }
 }
 
@@ -1573,6 +1621,8 @@ pub async fn run(
         }
     };
     let mut waits_from = tokio::time::Instant::now();
+    // When everything is next swept, whatever the waits do (SIP-35 §Waiting).
+    let mut sweep_at = tokio::time::Instant::now() + origin.interval;
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = holes_in(server.channels(), &origin.channels);
     loop {
@@ -1607,17 +1657,32 @@ pub async fn run(
                             note_holes(&mut holes, &took);
                         }
                     }
-                    if !pause_or_wait(
-                        &mut client,
-                        server.channels(),
-                        &origin.channels,
-                        &seen,
-                        origin.interval,
-                        &forwarder.poke,
-                        &mut waits_from,
-                    )
-                    .await
-                    {
+                    // Wait until there is something to pull. A quiet answer
+                    // loops here rather than falling through to another pull,
+                    // which is the difference between waiting and polling.
+                    let mut lost = false;
+                    loop {
+                        match pause_or_wait(
+                            &mut client,
+                            server.channels(),
+                            &origin.channels,
+                            &seen,
+                            origin.interval,
+                            &forwarder.poke,
+                            &mut waits_from,
+                            &mut sweep_at,
+                        )
+                        .await
+                        {
+                            Next::Pull => break,
+                            Next::Wait => continue,
+                            Next::Stop => {
+                                lost = true;
+                                break;
+                            }
+                        }
+                    }
+                    if lost {
                         break;
                     }
                 }

@@ -3515,7 +3515,9 @@ fn tail_line(line: &sqex_proto::tail::Line) -> Option<String> {
         Record::Admin { admin, action } => {
             format!("[{at}] {:<10} admin {action}", short(admin))
         }
-        Record::Peer { peer, what } => format!("[{at}] {:<10} peer {what}", short(peer)),
+        Record::Peer { peer, what, micros } => {
+            format!("[{at}] {:<10} peer {what} {micros}\u{b5}s", short(peer))
+        }
         Record::Refusal {
             account,
             route,
@@ -3559,8 +3561,8 @@ fn tail_json(line: &sqex_proto::tail::Line) -> String {
         Record::Admin { admin, action } => {
             serde_json::json!({"kind":"admin","admin":admin.to_base58(),"action":action})
         }
-        Record::Peer { peer, what } => {
-            serde_json::json!({"kind":"peer","peer":peer.to_base58(),"what":what})
+        Record::Peer { peer, what, micros } => {
+            serde_json::json!({"kind":"peer","peer":peer.to_base58(),"what":what,"micros":micros})
         }
         Record::Refusal {
             account,

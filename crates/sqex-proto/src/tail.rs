@@ -121,8 +121,16 @@ pub enum Record {
     },
     /// A signed admin op was applied.
     Admin { admin: PubKey, action: String },
-    /// Something crossed the exchange-to-exchange wire.
-    Peer { peer: PubKey, what: String },
+    /// Something crossed the exchange-to-exchange wire. `micros` is how long
+    /// the origin held it, which for `/peer/wait` is the whole question: a
+    /// held request and a hot loop look identical without it, and reading
+    /// this record without a duration is what made a long poll look like
+    /// polling on 2026-09-30.
+    Peer {
+        peer: PubKey,
+        what: String,
+        micros: u32,
+    },
     /// A caller was refused: a rate limit, a whitelist drop, a malformed body.
     Refusal {
         account: Option<PubKey>,
@@ -287,9 +295,10 @@ impl Line {
                 out.extend_from_slice(admin.as_bytes());
                 put_text(&mut out, action);
             }
-            Record::Peer { peer, what } => {
+            Record::Peer { peer, what, micros } => {
                 out.extend_from_slice(peer.as_bytes());
                 put_text(&mut out, what);
+                out.extend_from_slice(&micros.to_be_bytes());
             }
             Record::Refusal {
                 account,
@@ -380,6 +389,7 @@ impl Line {
                 Record::Peer {
                     peer: PubKey::new(peer.try_into().unwrap()),
                     what: take_text(b, &mut at)?,
+                    micros: take_u32(b, &mut at)?,
                 }
             }
             KIND_REFUSAL => Record::Refusal {
@@ -519,6 +529,7 @@ mod tests {
             Record::Peer {
                 peer: key(5),
                 what: "pull".into(),
+                micros: 25_000_000,
             },
             Record::Refusal {
                 account: Some(key(6)),

@@ -353,3 +353,60 @@ async fn a_replica_on_a_long_interval_is_live_anyway() {
         "the replica took {took:?} to show a post -- it polled instead of waiting"
     );
 }
+
+/// How many requests the origin has served.
+async fn requests_at(c: &mut Client) -> u64 {
+    let (code, body) = c.get("/status").await.unwrap();
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["requests"].as_u64().unwrap()
+}
+
+/// **A wait that runs out must not cause a pull.** SIP-35 §Waiting is explicit
+/// that the interval is "the safety net rather than the delivery": a replica
+/// pulls the channels a wait *names*, and pulls everything only on its
+/// interval. An answer of "nothing changed" is not an instruction to pull.
+///
+/// The window below is longer than one wait (`MAX_WAIT`, 25 s) and far shorter
+/// than the interval, so every request the origin serves in it is a request
+/// the design says should not exist. That window is only expressible because
+/// the two are separable; while `wait_secs` was derived from `interval_secs`
+/// no such window existed, which is why nothing caught this.
+#[tokio::test]
+async fn a_wait_that_runs_out_does_not_pull() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let y_dir = tempfile::tempdir().unwrap();
+    let (y_key, _) = key_in(y_dir.path());
+    let (x_addr, x_pub) = origin_in(x_dir.path(), &[y_key]).await;
+    let (alice_seed, alice) = identity(91);
+    let mut a = Client::connect_as(x_addr, &x_pub, &alice_seed)
+        .await
+        .unwrap();
+    let s = Signer::new(alice_seed, alice, x_pub);
+    let mut chain = Chain::default();
+    let channel = [91u8; 32];
+    channel_at(&mut a, &s, &mut chain, channel, y_key, &["first"]).await;
+
+    // A long interval, so the safety-net pull cannot fire during the window.
+    let (y_addr, y_pub) = replica_in(y_dir.path(), PubKey::new(x_pub), x_addr, channel, 300).await;
+    let mut at_y = Client::connect_as(y_addr, &y_pub, &alice_seed)
+        .await
+        .unwrap();
+    until(&mut at_y, channel, &["first"]).await;
+
+    // Settle, so the count below covers a quiet replica and not its catch-up.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let before = requests_at(&mut a).await;
+    tokio::time::sleep(Duration::from_secs(32)).await;
+    let after = requests_at(&mut a).await;
+
+    // Two `/status` calls of our own are in the delta, and the wait may be
+    // re-issued once when it runs out. Anything beyond that is a pull nobody
+    // asked for.
+    let served = after - before;
+    assert!(
+        served <= 4,
+        "a quiet replica cost the origin {served} requests in 32s; a wait that \
+         ran out pulled instead of waiting again"
+    );
+}
