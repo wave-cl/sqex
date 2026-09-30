@@ -353,3 +353,75 @@ async fn an_expired_statement_is_not_served() {
     let (code, _) = c.post("/attest/lodge", stale.encode()).await.unwrap();
     assert_eq!(code, 401, "an expired statement was accepted");
 }
+
+/// **An attestation survives a restart, and a withdrawal still lands after
+/// one.** This module's own header says why it must: an attestation "is meant
+/// to be repeated to third parties who never saw the connection, so it outlives
+/// the connection by design and losing it on a restart would lose something
+/// nobody could reproduce".
+///
+/// The second half is the sharper case. A revocation naming an attestation this
+/// exchange does not hold is refused — deliberately, because one that names
+/// nothing is indistinguishable from one that names something the reader has not
+/// seen. So an ephemeral store does not merely forget Alice's statement on a
+/// restart; it makes her legitimate withdrawal of it **unlodgeable**, and the
+/// only signal is a 404 that reads as "you never said that".
+#[tokio::test]
+async fn a_statement_and_its_withdrawal_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, h) = server_in(dir.path()).await;
+    let (alice_seed, alice) = who(71);
+    let (_, bob) = who(72);
+
+    let a = Attestation::sign(
+        &alice_seed,
+        &bob,
+        CLAIM_OPERATES,
+        b"ex.example.org".to_vec(),
+        now() - 1,
+        now() + 3600,
+    );
+    let mut c = Client::connect(addr, &server_pub).await.unwrap();
+    let (code, body) = c.post("/attest/lodge", a.encode()).await.unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    assert_eq!(read(&mut c, bob, None).await.attestations, vec![a.clone()]);
+    drop(c);
+
+    // Restart against the same state directory. A fresh port, because the
+    // config binds :0 -- what is being tested is the store, not the address.
+    h.abort();
+    let _ = h.await;
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut c = Client::connect(addr, &server_pub).await.unwrap();
+
+    assert_eq!(
+        read(&mut c, bob, None).await.attestations,
+        vec![a.clone()],
+        "the statement did not survive the restart"
+    );
+
+    // And Alice can still withdraw what she said before the restart.
+    let withdrawal = Attestation::sign(
+        &alice_seed,
+        &bob,
+        CLAIM_REVOKES,
+        a.digest().to_vec(),
+        now() - 1,
+        now() + 3600,
+    );
+    let (code, body) = c
+        .post("/attest/lodge", withdrawal.encode())
+        .await
+        .unwrap();
+    assert_eq!(
+        code, 200,
+        "a legitimate withdrawal was refused after a restart: {}",
+        common::said(&body)
+    );
+
+    // The claim is gone and the withdrawal stands in its place, so a reader
+    // arriving now sees that Alice withdrew rather than that she never spoke.
+    let held = read(&mut c, bob, Some(alice)).await;
+    assert_eq!(held.attestations.len(), 1);
+    assert_eq!(held.attestations[0].claim, CLAIM_REVOKES);
+}

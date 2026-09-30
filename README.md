@@ -256,11 +256,11 @@ the ops for it remain.
 ## Storage
 
 With `state_file` set, `sqexd` keeps the whitelist and audit log in that file
-and puts four SQLite databases beside it: `channels.db`, `devices.db`,
-`profiles.db` and `prekeys.db`. SQLite is bundled (no system library), and the
-channel log runs in WAL mode with `synchronous = FULL` — this is the service
-that promised to remember, so an entry is on the disk before the exchange says
-it accepted it.
+and puts seven SQLite databases beside it: `channels.db`, `devices.db`,
+`profiles.db`, `prekeys.db`, `mailbox.db`, `names.db` and `attest.db`. SQLite
+is bundled (no system library), and the channel log runs in WAL mode with
+`synchronous = FULL` — this is the service that promised to remember, so an
+entry is on the disk before the exchange says it accepted it.
 
 `prekeys.db` is there because of a bug worth knowing about if you are building
 something similar. Prekeys were held in memory on the argument that one

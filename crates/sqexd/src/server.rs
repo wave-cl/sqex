@@ -1717,6 +1717,15 @@ pub async fn bind_with(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("names.db"));
+    // SIP-27: an attestation is meant to be repeated to third parties who never
+    // saw the connection, so it outlives the connection by design. It also has
+    // to, for a sharper reason: a revocation naming an attestation this exchange
+    // does not hold is refused, so a store that forgot on a restart made a
+    // legitimate withdrawal unlodgeable.
+    let attest_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("attest.db"));
 
     // The managed whitelist is applied to the transport as well as to the
     // routes -- see `Server::sync_transport`. It is not set here because the
@@ -1830,7 +1839,8 @@ pub async fn bind_with(
         challenges: Challenges::new(config.challenge_ttl),
         beacons: Beacons::new(),
         endpoints: Endpoints::new(),
-        attestations: Attestations::new(),
+        attestations: Attestations::open(attest_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open attestations: {e}")))?,
         rendezvous: Rendezvous::new(),
         mailbox: Mailbox::open(mailbox_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open the mailbox: {e}")))?,
@@ -2184,6 +2194,16 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 server.relay.sweep(now_unix());
                 // SIP-56: buckets that have refilled are no buckets.
                 server.limiter.sweep();
+                // SIP-27: expiry is the only guarantee an attestation carries,
+                // and nothing else deletes a row. A single SQLite DELETE, so
+                // spawn_blocking like the sweeps above.
+                let attests = Arc::clone(&server);
+                if let Ok(dropped) =
+                    tokio::task::spawn_blocking(move || attests.attestations.sweep()).await
+                    && dropped > 0
+                {
+                    tracing::info!(dropped, "swept expired attestations");
+                }
                 // SIP-47: a device is admitted for as long as its credential
                 // stands, and a credential runs out with nobody at the door
                 // to say so. The one time-driven change to the whitelist.
@@ -2658,6 +2678,11 @@ async fn route(
                         "a revocation must name an attestation this exchange holds, by its own issuer",
                     ),
                 ),
+                // Distinct from the two above on purpose: those are answers
+                // about the statement, and a caller told its attestation was
+                // refused will not offer it again. This says the exchange
+                // failed, and offering it again is the right response.
+                Err(LodgeError::Storage) => refuse(500, Code::Storage, None),
             },
         },
         // Open to anybody, because an attestation is meant to travel. The
@@ -5689,6 +5714,8 @@ impl Server {
             // SIP-5 §Durability: a memory-only deployment says so here, since a client
             // cannot tell and should not have to.
             "mailbox_durable": self.mailbox.durable(),
+            "attestations": self.attestations.len(),
+            "attestations_durable": self.attestations.durable(),
             // SIP-35 §Passing a limit through: what each origin last refused this exchange, and
             // whether writes to it are held.
             "origins": self.origins_value(),
