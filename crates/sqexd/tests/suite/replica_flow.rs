@@ -2325,3 +2325,65 @@ async fn an_operator_drops_a_copy_and_the_pull_does_not_bring_it_back() {
         "a channel this exchange orders was destroyed through the copy route"
     );
 }
+
+/// **An origin that has no record of a channel is asked once, not every time.**
+///
+/// SIP-43 makes the origin authoritative for a device's chain position, so a
+/// copy asks `/peer/standing` on every `/channel/info` for a channel it holds a
+/// copy of. A copy outlives its origin's record easily -- an origin wiped and
+/// restored, or one that forgot a copy it no longer wants -- and then every one
+/// of those asks is a cross-exchange round trip, on the path a member waits
+/// for, certain to come back `NoSuchChannel`.
+///
+/// Found live between the two exchanges in this estate before it was measured:
+/// four channels in that state, sixteen refusals a minute, for ever.
+///
+/// Not asking costs nothing. With the origin holding no record, the copy's own
+/// entries are the whole of the chain -- what `/channel/info` falls back to, and
+/// what SIP-43 says a rehome would rebuild. Counted at the origin, because the
+/// saving is a request that is not made and nothing on this side can see that.
+#[tokio::test]
+async fn an_origin_with_no_record_of_a_channel_is_asked_once() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let y_dir = tempfile::tempdir().unwrap();
+    // The replica's own key, so the origin admits it as a peer and the refusal
+    // below is about the channel rather than about the caller.
+    let (y_seed, y_key) = identity(96);
+    let (x_addr, x_pub, _h) = server_in(x_dir.path(), &[y_key]).await;
+    let _ = y_dir;
+
+    let asked = || async {
+        let mut probe = sqnr::Client::connect(x_addr, &x_pub).await.unwrap();
+        let (code, body) = probe.get("/status").await.unwrap();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["requests"].as_u64().unwrap()
+    };
+
+    let forwarder = sqexd::replica::Forwarder::new(PubKey::new(x_pub), x_addr, "x.test".into());
+    // A channel this origin has never heard of, which is the state a copy of a
+    // forgotten channel is in.
+    let absent = [96u8; 32];
+    let (_, device) = identity(97);
+
+    let before = asked().await;
+    for _ in 0..5 {
+        assert!(
+            forwarder
+                .standing(&y_seed, &absent, &device)
+                .await
+                .is_none(),
+            "the origin has no record of this channel, so there is no standing"
+        );
+    }
+    let after = asked().await;
+
+    // Five looks, one ask: the first is answered and the rest are held off.
+    // Two `/status` of our own are in the delta.
+    let spent = after - before - 2;
+    assert!(
+        spent <= 1,
+        "five looks at a channel the origin has no record of cost it {spent} \
+         requests; the answer should be asked for once and then held"
+    );
+}

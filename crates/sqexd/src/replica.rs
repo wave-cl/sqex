@@ -1229,6 +1229,14 @@ fn refused_forward(code: u16, body: &[u8]) -> ForwardFailed {
     ForwardFailed::Refused(code)
 }
 
+/// How long an origin's "no record of that channel" is believed before it is
+/// asked again.
+///
+/// The order of SIP-35's `WAIT_RETRY`: long enough that the answer is not paid
+/// for repeatedly, short enough that an origin which recovers the channel is
+/// noticed without an operator.
+const NO_STANDING_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub struct Forwarder {
     pub key: PubKey,
     pub addr: SocketAddr,
@@ -1237,6 +1245,22 @@ pub struct Forwarder {
     client: tokio::sync::Mutex<Option<H3Client>>,
     /// Rung after a post the origin took, so the entry is pulled now.
     pub poke: tokio::sync::Notify,
+    /// SIP-43: channels this origin has said it holds no record of, and when to
+    /// ask again.
+    ///
+    /// A copy outlives its origin's record of a channel easily enough -- an
+    /// origin wiped and restored, or one that forgot a copy it no longer wants
+    /// -- and until now every `/channel/info` for such a channel spent a
+    /// cross-exchange round trip to be told `NoSuchChannel` again, on the path a
+    /// member waits for. Found live between the two exchanges in this estate:
+    /// four channels, sixteen refusals a minute, every one of them certain to
+    /// fail.
+    ///
+    /// Not asking costs nothing here. With the origin holding no record, the
+    /// copy's own entries are the whole of the chain -- which is exactly what
+    /// the caller falls back to (`chain_from_entries`) and what SIP-43 says a
+    /// rehome would rebuild.
+    no_standing: std::sync::Mutex<HashMap<[u8; 32], tokio::time::Instant>>,
 }
 
 impl Forwarder {
@@ -1247,6 +1271,7 @@ impl Forwarder {
             domain,
             client: tokio::sync::Mutex::new(None),
             poke: tokio::sync::Notify::new(),
+            no_standing: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1325,6 +1350,12 @@ impl Forwarder {
         channel: &[u8; 32],
         device: &PubKey,
     ) -> Option<sqex_proto::peer::Standing> {
+        // Asked once per hold, not once per `/channel/info`.
+        if let Some(until) = self.no_standing.lock().unwrap().get(channel)
+            && tokio::time::Instant::now() < *until
+        {
+            return None;
+        }
         let mut slot = self.client.lock().await;
         if slot.is_none() {
             *slot = Some(
@@ -1339,8 +1370,22 @@ impl Forwarder {
             device: *device,
         };
         match client.post("/peer/standing", req.encode()).await {
-            Ok((200, body)) => sqex_proto::peer::Standing::decode(&body).ok(),
-            Ok(_) => None,
+            Ok((200, body)) => {
+                self.no_standing.lock().unwrap().remove(channel);
+                sqex_proto::peer::Standing::decode(&body).ok()
+            }
+            // The origin answered, and the answer was a refusal -- it holds no
+            // record of this channel, or will not serve it here. Either way the
+            // next look should not pay for the same answer.
+            Ok(_) => {
+                self.no_standing
+                    .lock()
+                    .unwrap()
+                    .insert(*channel, tokio::time::Instant::now() + NO_STANDING_HOLD);
+                None
+            }
+            // Not noted: a lost connection says nothing about the channel, and
+            // holding off on it would turn a blip into ten quiet minutes.
             Err(_) => {
                 *slot = None;
                 None
