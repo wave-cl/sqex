@@ -461,7 +461,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     let account = match label.parse::<PubKey>() {
         Ok(k) => k,
         Err(_) if listed || (server.open_calls() && word.is_some()) => {
-            match resolve_name_at(peer_addr, &peer_key, &server.relay.seed, label).await {
+            match resolve_name_at(server, peer_addr, &peer_key, &domain, label).await {
                 Some(a) => a,
                 None => return CallAck::rejected(relay::REASON_NO_ACCOUNT, now),
             }
@@ -486,7 +486,7 @@ pub async fn place_call(server: &Arc<Server>, caller: PubKey, open: CallOpen, no
     // home it names where that is a peer too -- one hop, never chased.
     let (peer_key, peer_addr) = if by_key.is_none()
         && let Some((home, home_domain)) =
-            home_at(peer_addr, &peer_key, &server.relay.seed, &account).await
+            home_at(server, peer_addr, &peer_key, &domain, &account).await
         && home != peer_key
         && !home_domain.is_empty()
     {
@@ -1299,22 +1299,24 @@ async fn link_to_key(server: &Arc<Server>, key: PubKey) -> Option<SocketAddr> {
 }
 
 pub(crate) async fn resolve_name_at(
+    server: &Arc<Server>,
     addr: SocketAddr,
     key: &PubKey,
-    seed: &[u8; 32],
+    domain: &str,
     name: &str,
 ) -> Option<PubKey> {
-    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
-    let (status, body) = client
-        .post(
+    let (status, body) = server
+        .ask_peer(
+            key,
+            addr,
+            domain,
             "/name/resolve",
             name::Resolve {
                 name: name.to_string(),
             }
             .encode(),
         )
-        .await
-        .ok()?;
+        .await?;
     if status != 200 {
         return None;
     }
@@ -1326,16 +1328,21 @@ pub(crate) async fn resolve_name_at(
 /// key and domain hint. `None` where it says "here", does not know, or is
 /// from before SIP-59.
 pub(crate) async fn home_at(
+    server: &Arc<Server>,
     addr: SocketAddr,
     key: &PubKey,
-    seed: &[u8; 32],
+    domain: &str,
     account: &PubKey,
 ) -> Option<(PubKey, String)> {
-    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
-    let (status, body) = client
-        .post("/account/home", account.as_bytes().to_vec())
-        .await
-        .ok()?;
+    let (status, body) = server
+        .ask_peer(
+            key,
+            addr,
+            domain,
+            "/account/home",
+            account.as_bytes().to_vec(),
+        )
+        .await?;
     if status != 200 {
         return None;
     }
@@ -1345,7 +1352,6 @@ pub(crate) async fn home_at(
 
 /// SIP-60: an account's devices as its home lists them, asked as this
 /// exchange. `None` where the home refuses or does not answer.
-/// SIP-60: the devices `account` holds, as the exchange at `addr` lists them.
 ///
 /// **Asked over the connection already open to that exchange.** This dialled its
 /// own, asked once and dropped it; measured on trunk over 297 s, four of the

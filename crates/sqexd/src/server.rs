@@ -7159,10 +7159,9 @@ async fn locate(server: &Arc<Server>, req: &Locate) -> (u16, &'static str, Vec<u
     if !server.may_ask(&key) {
         return refuse(403, Code::NotAuthorised, Some("not a federated domain"));
     }
-    let seed = server.exchange_seed;
     let account = match label.parse::<PubKey>() {
         Ok(k) => k,
-        Err(_) => match crate::relay::resolve_name_at(addr, &key, &seed, label).await {
+        Err(_) => match crate::relay::resolve_name_at(server, addr, &key, &domain, label).await {
             Some(a) => a,
             None => return refuse(404, Code::NotFound, Some("no such name there")),
         },
@@ -7170,7 +7169,7 @@ async fn locate(server: &Arc<Server>, req: &Locate) -> (u16, &'static str, Vec<u
     // The home, followed once where the domain's exchange says the account
     // moved on -- as a call is placed (SIP-59).
     let (mut home, mut home_domain, mut home_addr) = (key, domain.clone(), addr);
-    if let Some((h, d)) = crate::relay::home_at(addr, &key, &seed, &account).await
+    if let Some((h, d)) = crate::relay::home_at(server, addr, &key, &domain, &account).await
         && h != key
         && !d.is_empty()
         && let Ok((found, a)) = crate::relay::find_peer(server, &d).await
