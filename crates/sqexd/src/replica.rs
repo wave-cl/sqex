@@ -1428,6 +1428,38 @@ enum Waited {
 /// How long after an origin refused a wait before trying it again.
 const WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// SIP-35 §Waiting: the least time between one wait on an origin and the next.
+///
+/// A wait is meant to hold, and a replica that believes a quiet answer waits
+/// again as soon as it gets one -- so an origin that answers quiet *instantly*
+/// gets asked again instantly. That is not hypothetical: an origin answers at
+/// once, with nothing, when every channel the caller named is one it may not
+/// pull, which is what a replica holding only refused copies would name. This
+/// side does not get to assume the far origin is a version that does not do
+/// that, so a quiet answer is held to the floor before the next wait goes out.
+const WAIT_FLOOR: std::time::Duration =
+    std::time::Duration::from_secs(sqex_proto::peer::PEER_MIN_INTERVAL);
+
+/// `wait_on`, never answering a quiet sooner than `WAIT_FLOOR` after it asked.
+///
+/// Only a quiet is floored: a change must come back at once -- that is the
+/// whole point of waiting -- and a refusal or a lost connection leads to a
+/// backoff or a redial rather than straight back here.
+async fn wait_on_floored(
+    client: &mut H3Client,
+    store: &Channels,
+    channels: &[[u8; 32]],
+    seen: &HashMap<[u8; 32], u64>,
+    secs: u16,
+) -> Waited {
+    let began = tokio::time::Instant::now();
+    let waited = wait_on(client, store, channels, seen, secs).await;
+    if matches!(waited, Waited::Quiet) {
+        tokio::time::sleep_until(began + WAIT_FLOOR).await;
+    }
+    waited
+}
+
 /// SIP-35 §Waiting: hold one request at the origin naming `channels` and where each
 /// stands here, for up to `secs`. At most `MAX_WAIT_CHANNELS` are named.
 ///
@@ -1513,7 +1545,7 @@ async fn pause_or_wait(
     }
     let secs = sqex_proto::channel::MAX_WAIT;
     tokio::select! {
-        waited = wait_on(client, store, channels, seen, secs) => match waited {
+        waited = wait_on_floored(client, store, channels, seen, secs) => match waited {
             Waited::Changed => {
                 *sweep_at = tokio::time::Instant::now() + interval;
                 Next::Pull
@@ -1553,50 +1585,91 @@ fn note_seen(seen: &mut HashMap<[u8; 32], u64>, took: &HashMap<[u8; 32], Took>) 
 }
 
 /// SIP-35 §Waiting for the loops that pull from several origins a cycle: wait on
-/// all of them at once, and come back when any changes, when `notify`
-/// fires, or when the interval runs out. Each origin's connection is
-/// spent on its wait; the next cycle dials afresh.
+/// all of them at once, and come back when any of them has something, when
+/// `notify` fires, or when the sweep falls due.
+///
+/// **A quiet answer is not an instruction to pull** -- the same distinction
+/// `pause_or_wait` draws, and for the same reason. Where a single-origin loop
+/// can return `Next::Wait` and be called again with its connection, these loops
+/// spend a connection per origin per cycle, so there is nowhere to hand a
+/// "wait again" back to: the re-waiting happens here, on the origins that
+/// answered quiet, until one of them has something or the interval falls due.
+/// Before this, every origin answering "nothing changed" still cost the caller
+/// a full cycle -- a dial, a `/peer/mine` per account and a pull per channel.
+///
+/// The wait asks for as long as SIP-16 allows rather than for `interval`, which
+/// made the long poll exactly as long as the poll it replaced.
+///
+/// `sweep_at` is when the next full pull is due, and is moved on by `interval`
+/// when this returns -- a pull always follows.
 async fn wait_any(
     server: &Arc<crate::server::Server>,
     waits: Vec<(H3Client, Vec<[u8; 32]>)>,
     seen: &HashMap<[u8; 32], u64>,
     interval: std::time::Duration,
     notify: &tokio::sync::Notify,
+    sweep_at: &mut tokio::time::Instant,
 ) {
-    let secs = interval
-        .as_secs()
-        .clamp(1, sqex_proto::channel::MAX_WAIT as u64) as u16;
-    let mut set = tokio::task::JoinSet::new();
-    for (mut client, channels) in waits {
-        if channels.is_empty() {
-            continue;
-        }
-        let server = Arc::clone(server);
-        let seen = seen.clone();
-        set.spawn(
-            async move { wait_on(&mut client, server.channels(), &channels, &seen, secs).await },
-        );
-    }
-    let sleep = tokio::time::sleep(interval);
-    tokio::pin!(sleep);
+    let secs = sqex_proto::channel::MAX_WAIT;
+    let mut live: Vec<(H3Client, Vec<[u8; 32]>)> =
+        waits.into_iter().filter(|(_, c)| !c.is_empty()).collect();
     loop {
-        tokio::select! {
-            _ = &mut sleep => return,
-            _ = notify.notified() => return,
-            next = set.join_next() => match next {
-                Some(Ok(Waited::Changed)) => return,
-                Some(_) => continue,
-                None => {
-                    // Nothing left to wait on: sleep out the interval.
-                    tokio::select! {
-                        _ = &mut sleep => {}
-                        _ = notify.notified() => {}
-                    }
-                    return;
-                }
-            },
+        if live.is_empty() {
+            // Nothing left that will wait -- a first cycle, every origin
+            // refusing, or every connection lost. The interval is both the
+            // delivery and the safety net, as it was before any of this.
+            tokio::select! {
+                _ = tokio::time::sleep_until(*sweep_at) => {}
+                _ = notify.notified() => {}
+            }
+            break;
         }
+        let mut set = tokio::task::JoinSet::new();
+        for (mut client, channels) in std::mem::take(&mut live) {
+            let server = Arc::clone(server);
+            let seen = seen.clone();
+            // The client comes back with the answer: an origin that said
+            // nothing changed is waited on again over the same connection
+            // rather than redialled.
+            set.spawn(async move {
+                let waited =
+                    wait_on_floored(&mut client, server.channels(), &channels, &seen, secs).await;
+                (client, channels, waited)
+            });
+        }
+        let mut quiet: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
+        let mut pull = false;
+        loop {
+            tokio::select! {
+                // The safety net: everything is swept on the interval whatever
+                // the waits did.
+                _ = tokio::time::sleep_until(*sweep_at) => {
+                    pull = true;
+                    break;
+                }
+                _ = notify.notified() => {
+                    pull = true;
+                    break;
+                }
+                next = set.join_next() => match next {
+                    Some(Ok((client, channels, Waited::Quiet))) => quiet.push((client, channels)),
+                    Some(Ok((_, _, Waited::Changed))) => {
+                        pull = true;
+                        break;
+                    }
+                    // Refused the wait, or lost: that origin drops out of the
+                    // waiting and is redialled by the next cycle.
+                    Some(Ok(_)) | Some(Err(_)) => continue,
+                    None => break,
+                },
+            }
+        }
+        if pull {
+            break;
+        }
+        live = quiet;
     }
+    *sweep_at = tokio::time::Instant::now() + interval;
 }
 
 /// Waits its interval between pulls, floored by SIP-35 at `PEER_MIN_INTERVAL`
@@ -1703,12 +1776,23 @@ pub async fn run_moved(
     interval: std::time::Duration,
 ) {
     let never = tokio::sync::Notify::new();
+    // The first cycle pulls when the interval is up, as it did before there was
+    // any waiting to do.
+    let mut sweep_at = tokio::time::Instant::now() + interval;
     let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = HashMap::new();
     let mut seeded: std::collections::HashSet<PubKey> = std::collections::HashSet::new();
     loop {
-        wait_any(&server, std::mem::take(&mut waits), &seen, interval, &never).await;
+        wait_any(
+            &server,
+            std::mem::take(&mut waits),
+            &seen,
+            interval,
+            &never,
+            &mut sweep_at,
+        )
+        .await;
         for (origin, domain, channels) in server.channels().moved_channels(&configured) {
             if domain.is_empty() {
                 continue;
@@ -1767,6 +1851,9 @@ pub async fn run_homed(
     configured: Vec<(PubKey, Vec<[u8; 32]>)>,
     interval: std::time::Duration,
 ) {
+    // The first cycle pulls when the interval is up, as it did before there was
+    // any waiting to do.
+    let mut sweep_at = tokio::time::Instant::now() + interval;
     let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = HashMap::new();
@@ -1784,6 +1871,7 @@ pub async fn run_homed(
             &seen,
             interval,
             &server.homed,
+            &mut sweep_at,
         )
         .await;
         let me = server.public_key;

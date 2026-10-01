@@ -254,11 +254,23 @@ async fn a_wait_answers_when_a_channel_changes_and_says_nothing_of_the_rest() {
         took >= Duration::from_millis(900),
         "the wait answered early: {took:?}"
     );
-    // A channel the peer may not pull is never named, even when behind.
-    let (_, changed) = wait(&mut as_y, vec![(closed, 0)], 1).await;
+    // A channel the peer may not pull is never named, even when behind --
+    // and the wait still *holds*. There is nothing for the origin to watch
+    // once that channel is filtered out, and answering an empty watch list
+    // the instant it arrives invites the caller straight back: a replica
+    // that believes a quiet answer (SIP-35 §Waiting) waits again as soon as
+    // it has one, so two conformant versions would spin on each other. This
+    // assertion used to throw the duration away, which is how that went
+    // unseen.
+    let (took, changed) = wait(&mut as_y, vec![(closed, 0)], 1).await;
     assert!(
         changed.channels.is_empty(),
         "a wait named a channel the peer may not pull"
+    );
+    assert!(
+        took >= Duration::from_millis(900),
+        "a wait with every channel filtered out answered at once ({took:?}) -- \
+         a caller that waits again on a quiet answer would spin here"
     );
 
     // Up to date, and a post lands during the wait: answered within the

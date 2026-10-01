@@ -6959,8 +6959,18 @@ async fn wait_for_changes(
             .map(|(c, _)| *c)
             .collect()
     };
-    if secs == 0 || watched.is_empty() {
+    if secs == 0 {
         return past(server);
+    }
+    if watched.is_empty() {
+        // A wait with nothing to watch is still a wait. Answering it the
+        // instant it arrives invites the caller to ask again at once, and a
+        // caller that believes a quiet answer (SIP-35 §Waiting) and waits again
+        // would spin here -- so it is held for the time it asked for and then
+        // answered empty, which is what a wait over quiet channels looks like.
+        // Reached when `may_pull` refuses every channel the caller named.
+        tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+        return Vec::new();
     }
     let notifiers: Vec<_> = watched
         .iter()

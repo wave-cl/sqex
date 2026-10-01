@@ -29,6 +29,18 @@ async fn exchange_in(
     peers: &[PubKey],
     found: &[(&str, PubKey, SocketAddr)],
 ) -> (SocketAddr, [u8; 32]) {
+    exchange_in_every(dir, peers, found, 1).await
+}
+
+/// The same, sweeping for its homed accounts every `home_secs` -- which is the
+/// safety net, not the delivery, so a test wanting to see what the *waiting*
+/// does sets it far longer than a wait.
+async fn exchange_in_every(
+    dir: &Path,
+    peers: &[PubKey],
+    found: &[(&str, PubKey, SocketAddr)],
+    home_secs: u64,
+) -> (SocketAddr, [u8; 32]) {
     let list = peers
         .iter()
         .map(|p| format!("{:?}", p.to_string()))
@@ -41,7 +53,7 @@ async fn exchange_in(
     }
     let config_toml = format!(
         "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
-         welcome_channel = \"\"\nreplication_peers = [{list}]\nhome_secs = 1\n\
+         welcome_channel = \"\"\nreplication_peers = [{list}]\nhome_secs = {home_secs}\n\
          wake_loopback = true\n",
         key_path.to_string_lossy(),
         dir.join("sqex.state").to_string_lossy(),
@@ -618,4 +630,68 @@ async fn a_former_home_hands_off_the_keys_services_and_a_move_back_reopens_them(
         .await
         .unwrap();
     assert_eq!(code, 200);
+}
+
+/// **A wait that runs out must be replaced by another.** SIP-35 §Waiting makes
+/// the interval "the safety net rather than the delivery", and that only holds
+/// if something is waiting for the whole of it.
+///
+/// The home loop opened one wait per cycle and, when it came back quiet, slept
+/// out the rest of the interval with nothing open. Delivery was therefore
+/// prompt for the first `MAX_WAIT` seconds of every interval and as slow as the
+/// interval after that -- which is what stopped `home_secs` being raised, and
+/// so what kept the sweep, and its cost, frequent.
+///
+/// Bob's post below is made *after* the first wait has run out, with the sweep
+/// an interval and a half away. It can only arrive promptly if a second wait
+/// replaced the first.
+#[tokio::test]
+async fn a_home_keeps_waiting_after_its_first_wait_runs_out() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let (b_key, _) = key_in(b_dir.path());
+    let (x_addr, x_pub) = exchange_in(x_dir.path(), &[b_key], &[]).await;
+    let x_key = PubKey::new(x_pub);
+    // A sweep far enough off that nothing below can be a sweep.
+    let (b_addr, b_pub) =
+        exchange_in_every(b_dir.path(), &[x_key], &[("x.test", x_key, x_addr)], 120).await;
+
+    let (alice_seed, alice) = identity(237);
+    let (bob_seed, bob) = identity(238);
+    let channel = [237u8; 32];
+    let (_a, _ca, mut b, mut cb) =
+        group_at_x(x_addr, x_pub, alice_seed, alice, bob_seed, bob, channel).await;
+
+    let mv = Move::sign(&alice_seed, &b_key, now());
+    let mut at_b = Client::connect_as(b_addr, &b_pub, &alice_seed)
+        .await
+        .unwrap();
+    let (code, body) = present(
+        &mut at_b,
+        &Moving {
+            mv,
+            domain: "b.test".into(),
+            origins: vec![(x_key, "x.test".into())],
+        },
+    )
+    .await;
+    assert_eq!(code, 200, "{}", common::said(&body));
+    until(&mut at_b, channel, |t| t.len() == 2).await;
+
+    // Past the first wait, so what answers the post below is a second one.
+    let hold = std::time::Duration::from_secs(sqex_proto::channel::MAX_WAIT as u64 + 3);
+    tokio::time::sleep(hold).await;
+
+    let sb = Signer::new(bob_seed, bob, x_pub);
+    let info = sb.info(&mut b, channel).await;
+    let post = sb.post_chained(&mut cb, channel, info.instance, 0, 1, b"late".to_vec());
+    let started = std::time::Instant::now();
+    assert_eq!(b.post("/channel/post", post.encode()).await.unwrap().0, 200);
+    until(&mut at_b, channel, |t| t.len() == 3).await;
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "a post made {hold:?} into the interval took {took:?} to reach the home -- \
+         the first wait ran out and nothing replaced it"
+    );
 }
