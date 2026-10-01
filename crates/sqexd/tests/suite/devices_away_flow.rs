@@ -261,3 +261,93 @@ async fn a_former_home_that_cannot_ask_the_home_answers_its_own_registry() {
         "a stale list was not said to be stale"
     );
 }
+
+/// **The home is asked over the connection already open to it.**
+///
+/// `devices_at` dialled the home, asked `/device/list` once and dropped the
+/// connection. Its caller caches the *answer* for `DEVICES_TTL` but not the
+/// connection, so every miss -- and a miss is per account -- paid a handshake and
+/// a round trip. Measured on trunk over 297 s with the tail's connection ids:
+/// four of the eleven connections the far exchange closed were this, each alive
+/// under a second.
+///
+/// Two accounts, because the answer cache is per account and one would hide the
+/// second ask. The first is asked for *outside* the window, so what the window
+/// measures is purely whether the second reused what the first opened.
+///
+/// Counted at the home, because a connection that is never opened cannot be seen
+/// from the asking side.
+#[tokio::test]
+async fn the_home_is_asked_over_one_connection() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let h_dir = tempfile::tempdir().unwrap();
+    let (x_at, h_at): (SocketAddr, SocketAddr) = (free_port(), free_port());
+    let x_key = key_in(x_dir.path());
+    let h_key = key_in(h_dir.path());
+    let (x_addr, x_pub) = exchange_in(
+        x_dir.path(),
+        x_at,
+        "x.test",
+        &[],
+        &[("h.test", h_key, h_at)],
+    )
+    .await;
+    let (h_addr, h_pub) = exchange_in(
+        h_dir.path(),
+        h_at,
+        "h.test",
+        &[],
+        &[("x.test", x_key, x_addr)],
+    )
+    .await;
+
+    let (ann_seed, ann) = identity(111);
+    let (ann_dev_seed, ann_dev) = identity(112);
+    let (cal_seed, cal) = identity(113);
+    let (cal_dev_seed, cal_dev) = identity(114);
+    let (bob_seed, _bob) = identity(115);
+
+    // Both accounts start at X and move to H, which is how X comes to know
+    // their home is elsewhere (SIP-59: the account tells it).
+    for (seed, dev_seed, dev) in [
+        (ann_seed, ann_dev_seed, ann_dev),
+        (cal_seed, cal_dev_seed, cal_dev),
+    ] {
+        let mut at_x = Client::connect_as(x_addr, &x_pub, &seed).await.unwrap();
+        move_to(&mut at_x, &seed, &x_key, "x.test", now()).await;
+        let mut at_h = Client::connect_as(h_addr, &h_pub, &seed).await.unwrap();
+        move_to(&mut at_h, &seed, &h_key, "h.test", now() + 1).await;
+        move_to(&mut at_x, &seed, &h_key, "h.test", now() + 1).await;
+        let mut dev_at_h = Client::connect_as(h_addr, &h_pub, &dev_seed).await.unwrap();
+        enrol(&mut dev_at_h, &seed, &dev).await;
+    }
+
+    let mut bob_at_x = Client::connect_as(x_addr, &x_pub, &bob_seed).await.unwrap();
+    // Outside the window: this is the ask that opens the connection.
+    assert_eq!(listed(&mut bob_at_x, &ann).await, vec![ann_dev]);
+
+    let opened = || async {
+        let mut probe = sqnr::Client::connect(h_addr, &h_pub).await.unwrap();
+        let (code, body) = probe.get("/status").await.unwrap();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["connections"].as_u64().unwrap()
+    };
+
+    let before = opened().await;
+    assert_eq!(
+        listed(&mut bob_at_x, &cal).await,
+        vec![cal_dev],
+        "the second account's devices should still come from the home"
+    );
+    let after = opened().await;
+
+    // One probe of our own is in the delta -- the counter is bumped at accept,
+    // so the first probe is already inside `before`.
+    let dialled = (after - before).saturating_sub(1);
+    assert_eq!(
+        dialled, 0,
+        "the home accepted {dialled} new connection(s) for a second account's \
+         devices; it should have been asked over the one already open"
+    );
+}

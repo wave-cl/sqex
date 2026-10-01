@@ -677,6 +677,27 @@ impl Server {
     }
 
     /// SIP-40 §Following: drop the way to `origin`, so the next reach resolves anew.
+    /// One request to another exchange, over the connection already open to it.
+    ///
+    /// The registry is idempotent, so an exchange with no forwarder yet gets one
+    /// and every later ask reuses it. **Pass the domain if you have one**: a
+    /// forwarder created with none is read back empty by
+    /// `directory.rs`'s labelling and by `replica.rs`'s home lookup, and
+    /// `add_forwarder` will not overwrite it later.
+    pub(crate) async fn ask_peer(
+        self: &Arc<Self>,
+        key: &PubKey,
+        addr: std::net::SocketAddr,
+        domain: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Option<(u16, Vec<u8>)> {
+        self.add_forwarder(*key, addr, domain.to_string());
+        self.forwarder(key)?
+            .ask(&self.exchange_seed, path, body)
+            .await
+    }
+
     pub(crate) fn forget_forwarder(&self, origin: &PubKey) {
         self.origins.write().unwrap().remove(origin);
     }
@@ -1115,8 +1136,8 @@ impl Server {
         {
             return Some(kept.clone());
         }
-        let (addr, _) = self.reach(home).await?;
-        let theirs = crate::relay::devices_at(addr, home, &self.exchange_seed, account).await?;
+        let (addr, domain) = self.reach(home).await?;
+        let theirs = crate::relay::devices_at(self, addr, home, &domain, account).await?;
         self.devices_elsewhere
             .lock()
             .unwrap()
@@ -7158,7 +7179,7 @@ async fn locate(server: &Arc<Server>, req: &Locate) -> (u16, &'static str, Vec<u
     {
         (home, home_domain, home_addr) = (h, d, a);
     }
-    let devices = crate::relay::devices_at(home_addr, &home, &seed, &account)
+    let devices = crate::relay::devices_at(server, home_addr, &home, &home_domain, &account)
         .await
         .unwrap_or(sqex_proto::device::Devices {
             now: now_unix(),

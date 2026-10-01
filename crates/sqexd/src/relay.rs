@@ -1345,20 +1345,29 @@ pub(crate) async fn home_at(
 
 /// SIP-60: an account's devices as its home lists them, asked as this
 /// exchange. `None` where the home refuses or does not answer.
+/// SIP-60: the devices `account` holds, as the exchange at `addr` lists them.
+///
+/// **Asked over the connection already open to that exchange.** This dialled its
+/// own, asked once and dropped it; measured on trunk over 297 s, four of the
+/// eleven connections the far exchange closed were exactly this, each alive
+/// under a second. Its caller cached the *answer* for `DEVICES_TTL` and not the
+/// connection, so every miss paid a handshake and a round trip.
 pub(crate) async fn devices_at(
+    server: &Arc<Server>,
     addr: SocketAddr,
     key: &PubKey,
-    seed: &[u8; 32],
+    domain: &str,
     account: &PubKey,
 ) -> Option<sqex_proto::device::Devices> {
-    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
-    let (status, body) = client
-        .post(
+    let (status, body) = server
+        .ask_peer(
+            key,
+            addr,
+            domain,
             "/device/list",
             sqex_proto::device::ListDevices { account: *account }.encode(),
         )
-        .await
-        .ok()?;
+        .await?;
     if status != 200 {
         return None;
     }
