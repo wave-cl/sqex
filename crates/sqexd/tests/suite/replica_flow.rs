@@ -2385,3 +2385,82 @@ async fn an_origin_with_no_record_of_a_channel_is_asked_once() {
          requests; the answer should be asked for once and then held"
     );
 }
+
+/// **A pull and a forward share one connection to the origin.**
+///
+/// They did not, and could not: `H3Client::post` took `&mut self`, so a
+/// connection carried one request at a time and a `/peer/wait` parked for
+/// twenty-five seconds owned the whole client. Everything else that wanted to
+/// speak to that origin -- a member's forward, a `/peer/standing`, a name lookup
+/// -- dialled its own. Measured on trunk, one peer held three connections where
+/// it should hold one.
+///
+/// `post` takes `&self` now and HTTP/3 multiplexes, so the parked wait is one
+/// stream among others. Counted at the origin, because a connection that is
+/// never opened cannot be seen from this side.
+#[tokio::test]
+async fn a_pull_and_an_ask_share_one_connection() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let (y_seed, y_key) = identity(98);
+    let (x_addr, x_pub, _h) = server_in(x_dir.path(), &[y_key]).await;
+
+    let opened = || async {
+        let mut probe = sqnr::Client::connect(x_addr, &x_pub).await.unwrap();
+        let (code, body) = probe.get("/status").await.unwrap();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["connections"].as_u64().unwrap()
+    };
+
+    let forwarder = sqexd::replica::Forwarder::new(PubKey::new(x_pub), x_addr, "x.test".into());
+
+    let before = opened().await;
+    // Three separate uses of the origin, of two different kinds.
+    let one = forwarder.connection(&y_seed).await.expect("a connection");
+    assert_eq!(
+        one.post(
+            "/peer/hello",
+            sqex_proto::peer::Hello {
+                version: 1,
+                since: 0
+            }
+            .encode()
+        )
+        .await
+        .map(|(c, _)| c)
+        .ok(),
+        Some(200),
+        "the origin should serve a peer it lists"
+    );
+    let two = forwarder.connection(&y_seed).await.expect("a connection");
+    assert!(
+        std::sync::Arc::ptr_eq(&one, &two),
+        "two asks for the origin's connection handed back different ones"
+    );
+    assert!(
+        forwarder
+            .ask(
+                &y_seed,
+                "/peer/hello",
+                sqex_proto::peer::Hello {
+                    version: 1,
+                    since: 0
+                }
+                .encode()
+            )
+            .await
+            .is_some(),
+        "an ask over the shared connection was not answered"
+    );
+    let after = opened().await;
+
+    // One probe of our own is in the delta -- the counter is bumped at accept,
+    // so the first probe is already inside `before`. Everything else went down
+    // the one connection.
+    let dialled = (after - before).saturating_sub(1);
+    assert_eq!(
+        dialled, 1,
+        "three uses of one origin cost it {dialled} connections; they should \
+         share the one"
+    );
+}

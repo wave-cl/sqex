@@ -302,6 +302,26 @@ pub const MAX_UNFOUND_SECS: u64 = MAX_HOLD_SECS;
 /// again before it is asked for afresh.
 pub const DEVICES_TTL: u64 = 60;
 
+/// SIP-40 §Recognising a rotation: how long `reach_by` answers an exchange's
+/// address from the forwarder before resolving the domain again.
+///
+/// **It has to expire, and the reason is not freshness but detection.** A
+/// rotation is noticed by resolving the domain and finding another key. Before
+/// this, `reach_by` answered from the forwarder for ever once one existed, so the
+/// only thing that ever re-resolved was a *failed dial* -- and an origin that
+/// rotates while its old endpoint keeps answering never fails one. A replica then
+/// talks to the retired exchange indefinitely, taking its silence for quiet.
+/// Found by instrumenting `rotation_flow` after six attempts at sharing a
+/// peering connection, each of which removed the failing dial and with it the
+/// only detector there was.
+///
+/// Ten seconds, which costs little: the loops that call this run on their own
+/// interval (`home_secs`, 300 by default), so in practice a cycle resolves anyway
+/// and this only collapses a burst of asks within one. What made a stale hint
+/// expensive was asking every cycle for ever, and SIP-35's `note_unfound` backoff
+/// is what fixed that -- not this cache.
+const REACH_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct Server {
     pub public_key: PubKey,
     config_path: Option<PathBuf>,
@@ -791,7 +811,13 @@ impl Server {
         key: &PubKey,
         hint: &str,
     ) -> Option<(std::net::SocketAddr, String)> {
-        if let Some(f) = self.forwarder(key) {
+        // **The address cache, and it expires.** Answering from the forwarder for
+        // ever meant a SIP-40 rotation was only ever noticed by a dial that
+        // failed -- and an origin whose old endpoint still answers never fails
+        // one. See `REACH_TTL`.
+        if let Some(f) = self.forwarder(key)
+            && f.fresh(REACH_TTL)
+        {
             return Some((f.addr, f.domain.clone()));
         }
         let hint = hint.trim().to_ascii_lowercase();
@@ -830,7 +856,18 @@ impl Server {
             self.follow_exchange(key, &found, addr, &domain).await;
             return Some((addr, domain));
         }
-        self.add_forwarder(*key, addr, domain.clone());
+        // Resolved, and the same key: the forwarder stands and its clock is
+        // restarted, so the next ask inside the window is answered from it.
+        // Where the address has moved the entry is replaced, since
+        // `add_forwarder` will not overwrite one.
+        match self.forwarder(key) {
+            Some(f) if f.addr == addr => f.resolved_now(),
+            Some(_) => {
+                self.forget_forwarder(key);
+                self.add_forwarder(*key, addr, domain.clone());
+            }
+            None => self.add_forwarder(*key, addr, domain.clone()),
+        }
         Some((addr, domain))
     }
 

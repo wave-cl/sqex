@@ -1261,6 +1261,13 @@ pub struct Forwarder {
     client: tokio::sync::Mutex<Option<std::sync::Arc<H3Client>>>,
     /// Rung after a post the origin took, so the entry is pulled now.
     pub poke: tokio::sync::Notify,
+    /// When this origin's address was last resolved.
+    ///
+    /// `reach_by` answers from here rather than resolving the domain again, and
+    /// that answer has to go stale: a SIP-40 rotation is otherwise invisible for
+    /// as long as the old endpoint keeps answering, which is indefinitely. See
+    /// `Server::REACH_TTL`.
+    resolved: std::sync::Mutex<std::time::Instant>,
     /// SIP-43: channels this origin has said it holds no record of, and when to
     /// ask again.
     ///
@@ -1286,6 +1293,7 @@ impl Forwarder {
             addr,
             domain,
             client: tokio::sync::Mutex::new(None),
+            resolved: std::sync::Mutex::new(std::time::Instant::now()),
             poke: tokio::sync::Notify::new(),
             no_standing: std::sync::Mutex::new(HashMap::new()),
         }
@@ -1347,6 +1355,16 @@ impl Forwarder {
             std::sync::Arc::new(H3Client::connect(self.addr, self.key.as_bytes(), seed).await?);
         *slot = Some(std::sync::Arc::clone(&fresh));
         Ok(fresh)
+    }
+
+    /// Whether the address here was resolved within `ttl`.
+    pub fn fresh(&self, ttl: std::time::Duration) -> bool {
+        self.resolved.lock().unwrap().elapsed() < ttl
+    }
+
+    /// Note that the address here has just been resolved.
+    pub fn resolved_now(&self) {
+        *self.resolved.lock().unwrap() = std::time::Instant::now();
     }
 
     /// Forget the connection, so the next caller dials afresh.
@@ -1699,14 +1717,14 @@ fn note_seen(seen: &mut HashMap<[u8; 32], u64>, took: &HashMap<[u8; 32], Took>) 
 /// when this returns -- a pull always follows.
 async fn wait_any(
     server: &Arc<crate::server::Server>,
-    waits: Vec<(H3Client, Vec<[u8; 32]>)>,
+    waits: Vec<(std::sync::Arc<H3Client>, Vec<[u8; 32]>)>,
     seen: &HashMap<[u8; 32], u64>,
     interval: std::time::Duration,
     notify: &tokio::sync::Notify,
     sweep_at: &mut tokio::time::Instant,
 ) {
     let secs = sqex_proto::channel::MAX_WAIT;
-    let mut live: Vec<(H3Client, Vec<[u8; 32]>)> =
+    let mut live: Vec<(std::sync::Arc<H3Client>, Vec<[u8; 32]>)> =
         waits.into_iter().filter(|(_, c)| !c.is_empty()).collect();
     loop {
         if live.is_empty() {
@@ -1732,7 +1750,7 @@ async fn wait_any(
                 (client, channels, waited)
             });
         }
-        let mut quiet: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
+        let mut quiet: Vec<(std::sync::Arc<H3Client>, Vec<[u8; 32]>)> = Vec::new();
         let mut pull = false;
         loop {
             tokio::select! {
@@ -1794,7 +1812,11 @@ pub async fn run(
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = holes_in(server.channels(), &origin.channels);
     loop {
-        match H3Client::connect(origin.addr, origin.key.as_bytes(), &seed).await {
+        // **The one connection to this origin**, shared with every forward and
+        // lookup the forwarder makes. Possible since `H3Client::post` takes
+        // `&self`: a `/peer/wait` parked for twenty-five seconds is one stream
+        // on it, not the whole client.
+        match forwarder.connection(&seed).await {
             Err(e) => {
                 // SIP-35 §Backing off: a configured origin that takes no connection is
                 // left alone for a hold that doubles with each miss, from
@@ -1851,6 +1873,9 @@ pub async fn run(
                         }
                     }
                     if lost {
+                        // The shared connection goes too, or the next pass is
+                        // handed the same dead one.
+                        forwarder.lost().await;
                         break;
                     }
                 }
@@ -1874,7 +1899,7 @@ pub async fn run_moved(
     // The first cycle pulls when the interval is up, as it did before there was
     // any waiting to do.
     let mut sweep_at = tokio::time::Instant::now() + interval;
-    let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
+    let mut waits: Vec<(std::sync::Arc<H3Client>, Vec<[u8; 32]>)> = Vec::new();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = HashMap::new();
     let mut seeded: std::collections::HashSet<PubKey> = std::collections::HashSet::new();
@@ -1912,7 +1937,13 @@ pub async fn run_moved(
                 holes.extend(holes_in(server.channels(), &task.channels));
                 seeded.insert(origin);
             }
-            match H3Client::connect(task.addr, task.key.as_bytes(), &seed).await {
+            // `add_forwarder` above made sure there is one; the address it was
+            // created with is the one just resolved.
+            let dialled = match server.forwarder(&origin) {
+                Some(f) => f.connection(&seed).await,
+                None => Err("no forwarder for a moved origin".to_string()),
+            };
+            match dialled {
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "cannot reach a moved origin")
                 }
@@ -1949,7 +1980,7 @@ pub async fn run_homed(
     // The first cycle pulls when the interval is up, as it did before there was
     // any waiting to do.
     let mut sweep_at = tokio::time::Instant::now() + interval;
-    let mut waits: Vec<(H3Client, Vec<[u8; 32]>)> = Vec::new();
+    let mut waits: Vec<(std::sync::Arc<H3Client>, Vec<[u8; 32]>)> = Vec::new();
     let mut seen: HashMap<[u8; 32], u64> = HashMap::new();
     let mut holes: Holes = HashMap::new();
     let mut seeded: std::collections::HashSet<PubKey> = std::collections::HashSet::new();
@@ -2034,7 +2065,12 @@ pub async fn run_homed(
                 );
                 continue;
             };
-            let client = match H3Client::connect(addr, origin.as_bytes(), &seed).await {
+            server.add_forwarder(origin, addr, domain.clone());
+            let dialled = match server.forwarder(&origin) {
+                Some(f) => f.connection(&seed).await,
+                None => Err("no forwarder".to_string()),
+            };
+            let client = match dialled {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(origin = %origin, error = %e, "cannot reach an account's origin");
