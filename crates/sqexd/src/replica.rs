@@ -754,6 +754,18 @@ async fn collect_backup(
     if store.backup_generation(account) != 0 {
         // Written here after the Move: the newer state by the account's
         // own act. The former home's copy is released without being read.
+        //
+        // An earlier pass may have got partway through the blobs before a
+        // fetch failed, and this branch is where that pass's cycle now ends
+        // for good -- so what it staged is let go of here. Nothing else
+        // will: every later cycle takes this same branch.
+        match store.release_collected_orphans(account) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(%origin, %account, released = n,
+                "released blobs an unfinished collect had staged for an account that has since written its own backup (SIP-59)"),
+            Err(e) => tracing::debug!(%origin, %account, error = ?e,
+                "could not release what an unfinished collect staged"),
+        }
         let _ = client.post("/peer/backup/took", took.encode()).await;
         server.devices.mark_backup_collected(account, origin);
         tracing::info!(%origin, %account, generation = held.generation,
@@ -822,10 +834,15 @@ async fn collect_backup(
                 "collected an account's backup from its former home (SIP-59)");
         }
         // Written here while the blobs were coming: the account's own act
-        // stands, as above.
+        // stands, as above -- and the blobs this pass fetched for the
+        // manifest it just lost to are let go of, or they stay against the
+        // account's quota for good.
         Ok(false) => {
+            let released = store.release_collected_orphans(account).unwrap_or(0);
             let _ = client.post("/peer/backup/took", took.encode()).await;
             server.devices.mark_backup_collected(account, origin);
+            tracing::info!(%origin, %account, generation = held.generation, released,
+                "an account wrote a backup here while its former home's was being collected; the collected blobs were released (SIP-59)");
         }
         Err(e) => {
             tracing::debug!(%origin, %account, error = ?e, "could not store a collected backup");

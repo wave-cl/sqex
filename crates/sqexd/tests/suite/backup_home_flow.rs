@@ -538,11 +538,22 @@ async fn a_backup_written_at_the_new_home_stands_over_the_former_homes() {
     //
     // **Fifteen seconds, not six.** H is given a three-second home cycle
     // above, and the release needs a cycle to come round plus the round
-    // trips inside it -- so six seconds was two ticks with no slack, and on
-    // a loaded machine it intermittently failed with `used` at 43: the newer
-    // backup and the superseded one still counted together. Five times the
-    // interval, which is what `attest_flow` settled on for the same reason
-    // after the same kind of failure.
+    // trips inside it -- so six seconds was two ticks with no slack. Five
+    // times the interval, which is what `attest_flow` settled on for the
+    // same reason after the same kind of failure.
+    //
+    // **The `used` at 43 this once read was not slowness, and widening the
+    // wait did not fix it.** It was a leak: H read generation 0, went to X
+    // for the blob, and Alice's own write landed in that window, so
+    // `import_backup` answered `false` over a blob already attached and
+    // never released -- permanent, since the next cycle short-circuits on
+    // the generation it then finds. `collect_backup` now calls
+    // `release_collected_orphans` on both paths that end a pass with no
+    // manifest to hold what it staged, and the three
+    // `channel::tests::*superseded_collect*` /
+    // `*sweep_leaves_a_device*` tests hold the orders deterministically --
+    // which is where they belong: no wait here could have distinguished the
+    // leak from a slow release, which is why this one hid for eleven days.
     for _ in 0..100 {
         if at_h.used == 9 {
             break;

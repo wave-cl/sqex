@@ -5903,6 +5903,9 @@ impl Channels {
     /// device wrote it, once every blob it names is held here. `false` when
     /// the account already holds a backup here, of any generation: written
     /// after the Move, by the account's own act, and the newer for it.
+    ///
+    /// A caller that gets `false` has blobs to let go of:
+    /// `release_collected_orphans`.
     pub fn import_backup(
         &self,
         account: &PubKey,
@@ -5953,6 +5956,74 @@ impl Channels {
         .map_err(storage("import backup"))?;
         tx.commit().map_err(storage("commit backup import"))?;
         Ok(true)
+    }
+
+    /// SIP-59 §Collecting the backup: release what a collect staged for
+    /// `account` and no manifest here names. Answers how many it let go of.
+    ///
+    /// A collect reads the generation here, finds 0, and fetches the former
+    /// home's blobs one at a time -- attaching each against the account's
+    /// quota as it goes. Two things end that pass without a manifest to hold
+    /// them: the account's own write landing inside it, so `import_backup`
+    /// answers `false`, and a fetch that fails partway. Either way the bytes
+    /// stay attached with nothing naming them, and **no later cycle releases
+    /// them**: once a backup stands here, every cycle short-circuits on the
+    /// generation. Only a fresh write by the device would collect them, and
+    /// the account has no reason to make one. This was `backup_home_flow`
+    /// reading `used` at 43 against 9, which no wait could have fixed.
+    ///
+    /// Two guards, and both are load-bearing:
+    ///
+    /// * **Named by the standing manifest, kept.** The same bytes are one
+    ///   blob and one attachment, so a manifest written here may well name
+    ///   what the collect went to fetch -- and releasing it would leave that
+    ///   manifest naming bytes that are gone.
+    /// * **Uploaded by a device, kept.** `store_backup_blob` attaches a
+    ///   collected blob under the zero key, which no caller can sign as, and
+    ///   `attach` leaves the uploader of an existing row alone -- so the zero
+    ///   key means a collect put it there first. A device staging its *own*
+    ///   next backup has blobs attached to the account and named by no
+    ///   manifest yet (SIP-48 uploads them to the account itself), and those
+    ///   are the device's: sweeping them would delete a backup mid-upload.
+    pub fn release_collected_orphans(&self, account: &PubKey) -> Result<usize, ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin orphan release"))?;
+        let standing: Vec<u8> = tx
+            .query_row(
+                "SELECT blobs FROM backup WHERE account = ?1",
+                params![account.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read standing manifest"))?
+            .unwrap_or_default();
+        let keep = standing.as_chunks::<32>().0;
+        let staged: Vec<[u8; 32]> = {
+            let mut stmt = tx
+                .prepare("SELECT blob FROM attachment WHERE channel = ?1 AND uploader = ?2")
+                .map_err(storage("prepare staged"))?;
+            let rows = stmt
+                .query_map(params![account.as_bytes(), &[0u8; 32][..]], |r| {
+                    Ok(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0u8; 32]))
+                })
+                .map_err(storage("query staged"))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let mut released = 0usize;
+        for blob in &staged {
+            if keep.contains(blob) {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM attachment WHERE channel = ?1 AND blob = ?2",
+                params![account.as_bytes(), &blob[..]],
+            )
+            .map_err(storage("release a staged blob"))?;
+            collect_blob(&tx, blob)?;
+            released += 1;
+        }
+        tx.commit().map_err(storage("commit orphan release"))?;
+        Ok(released)
     }
 
     /// SIP-59 §Collecting the backup: the generation of the backup `account` holds here, 0 for none.
@@ -8386,5 +8457,237 @@ mod tests {
             },
         )
         .expect("a refresh is not a new attachment");
+    }
+
+    /// SIP-59 §Collecting the backup: a collect that fetched the former
+    /// home's blobs and *then* found a backup written here releases what it
+    /// fetched.
+    ///
+    /// This is the race `backup_home_flow` saw as `used` at 43 against 9.
+    /// `collect_backup` reads the generation here, finds 0, and goes to the
+    /// former home for the blob list and the chunks -- several round trips.
+    /// The account's own write lands inside that window, so the blob is
+    /// attached by a loop that had already decided to fetch it, and
+    /// `import_backup` then answers `false`: hers stands. The 34 bytes it
+    /// fetched stayed attached, counted against the quota with no manifest
+    /// naming them, and **no later cycle releases them** -- the next one
+    /// short-circuits on the generation it now finds. Only a fresh write by
+    /// the device would collect them, and the account has no reason to make
+    /// one. `drop_backup` is not the release: hers is the backup now.
+    #[test]
+    fn a_superseded_collect_releases_the_blobs_it_fetched() {
+        let c = open();
+        let account = key(ALICE);
+        let mine = [1u8; 32];
+        let theirs = [2u8; 32];
+
+        // Her own backup here: written while the collect was fetching, which
+        // is the order that leaks. The other order does not -- `write_backup`
+        // releases what its own manifest does not name.
+        c.store_backup_blob(&account, &mine, 9, &[b"new, at h".to_vec()])
+            .unwrap();
+        c.write_backup(
+            &account,
+            &account,
+            &sqex_proto::backup::Manifest {
+                generation: 1,
+                blobs: vec![mine],
+                sealed: vec![7u8; 8],
+                sig: [0u8; 64],
+            },
+        )
+        .unwrap();
+
+        // The collect stores the former home's blob: it read generation 0
+        // before her write landed.
+        c.store_backup_blob(
+            &account,
+            &theirs,
+            34,
+            &[b"old, at x, generation thirty-seven".to_vec()],
+        )
+        .unwrap();
+        assert!(
+            c.holds_backup_blob(&account, &theirs),
+            "the fetched blob was not attached, so this test proves nothing"
+        );
+        assert_eq!(
+            c.read_backup(&account).unwrap().used,
+            43,
+            "the premise: both blobs are attached before the import"
+        );
+
+        // And then finds hers standing.
+        assert!(
+            !c.import_backup(
+                &account,
+                &sqex_proto::backup::Held {
+                    generation: 37,
+                    device: account,
+                    written: 0,
+                    quota: 0,
+                    used: 0,
+                    blobs: vec![theirs],
+                    sealed: vec![9u8; 8],
+                    sig: [0u8; 64],
+                },
+            )
+            .unwrap(),
+            "a backup written here did not stand over the former home's"
+        );
+        assert_eq!(
+            c.release_collected_orphans(&account).unwrap(),
+            1,
+            "the superseded collect released nothing"
+        );
+
+        assert!(
+            !c.holds_backup_blob(&account, &theirs),
+            "the collect left the former home's blob attached"
+        );
+        assert_eq!(
+            c.read_backup(&account).unwrap().used,
+            9,
+            "the account holds blobs it did not need"
+        );
+        assert_eq!(
+            c.backup_generation(&account),
+            1,
+            "her own backup did not stand"
+        );
+        assert!(
+            c.holds_backup_blob(&account, &mine),
+            "her own blob was released with the former home's"
+        );
+    }
+
+    /// The other side of the release: a blob the superseded manifest named
+    /// and the account's own standing manifest names too. One upload, one
+    /// attachment -- so releasing it because the collect fetched it would
+    /// take it out of *her* backup and leave her manifest naming bytes that
+    /// are gone. The collect's `holds_backup_blob` check usually skips a
+    /// blob already held, but not when her write lands between that check
+    /// and the store, which is the same window that leaks.
+    #[test]
+    fn a_superseded_collect_keeps_a_blob_the_standing_backup_names() {
+        let c = open();
+        let account = key(ALICE);
+        let shared = [3u8; 32];
+
+        c.store_backup_blob(&account, &shared, 12, &[b"both of them".to_vec()])
+            .unwrap();
+        c.write_backup(
+            &account,
+            &account,
+            &sqex_proto::backup::Manifest {
+                generation: 1,
+                blobs: vec![shared],
+                sealed: vec![7u8; 8],
+                sig: [0u8; 64],
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !c.import_backup(
+                &account,
+                &sqex_proto::backup::Held {
+                    generation: 37,
+                    device: account,
+                    written: 0,
+                    quota: 0,
+                    used: 0,
+                    blobs: vec![shared],
+                    sealed: vec![9u8; 8],
+                    sig: [0u8; 64],
+                },
+            )
+            .unwrap(),
+            "a backup written here did not stand over the former home's"
+        );
+        assert_eq!(
+            c.release_collected_orphans(&account).unwrap(),
+            0,
+            "the release took a blob the standing backup names"
+        );
+
+        assert!(
+            c.holds_backup_blob(&account, &shared),
+            "the release took a blob the standing backup names"
+        );
+        assert_eq!(
+            c.read_backup(&account).unwrap().blobs,
+            vec![shared],
+            "her manifest now names bytes that are gone"
+        );
+        assert_eq!(c.read_backup(&account).unwrap().used, 12);
+    }
+
+    /// The sweep must not touch a blob a device uploaded and no manifest
+    /// names yet. SIP-48 uploads a backup segment to the account itself, so
+    /// between the upload and the `write_backup` that names it, that is
+    /// exactly what an in-flight backup looks like: attached to the account,
+    /// named by nothing. Releasing those would delete a backup mid-upload --
+    /// which is why the sweep goes by the uploader and not by "attached and
+    /// unnamed". Here all three kinds sit on the account at once and only
+    /// the collect's is let go of.
+    #[test]
+    fn the_sweep_leaves_a_device_mid_upload_alone() {
+        let c = open();
+        let account = key(ALICE);
+        let device = key(VICTIM);
+        let mine = [4u8; 32];
+        let staged = [5u8; 32];
+        let theirs = [6u8; 32];
+
+        // Named by her standing manifest.
+        c.store_backup_blob(&account, &mine, 9, &[b"in the manifest".to_vec()])
+            .unwrap();
+        c.write_backup(
+            &account,
+            &device,
+            &sqex_proto::backup::Manifest {
+                generation: 1,
+                blobs: vec![mine],
+                sealed: vec![7u8; 8],
+                sig: [0u8; 64],
+            },
+        )
+        .unwrap();
+
+        // Her device's next segment, uploaded and not yet named: a commit
+        // under SIP-48 attaches to the account under the device's key.
+        {
+            let db = c.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO blob (id, size, chunks) VALUES (?1, 20, 1)",
+                params![&staged[..]],
+            )
+            .unwrap();
+            attach(&db, account.as_bytes(), &staged, &device, 0, now_unix()).unwrap();
+        }
+        // And what a collect staged: the zero key, which no device can sign
+        // as.
+        c.store_backup_blob(&account, &theirs, 34, &[b"the former home's".to_vec()])
+            .unwrap();
+
+        assert_eq!(
+            c.release_collected_orphans(&account).unwrap(),
+            1,
+            "the sweep did not let go of exactly the collect's blob"
+        );
+        assert!(
+            c.holds_backup_blob(&account, &staged),
+            "the sweep deleted a segment a device had uploaded and not yet named"
+        );
+        assert!(
+            c.holds_backup_blob(&account, &mine),
+            "the sweep deleted a blob her manifest names"
+        );
+        assert!(
+            !c.holds_backup_blob(&account, &theirs),
+            "the sweep left the collect's blob attached"
+        );
+        assert_eq!(c.read_backup(&account).unwrap().used, 29);
     }
 }
