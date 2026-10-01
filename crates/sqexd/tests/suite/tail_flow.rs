@@ -412,3 +412,56 @@ async fn status_reports_open_tails() {
     assert_eq!(v["tails"], 1, "an open tail is not reported");
     assert_eq!(v["tails_opened"], 1);
 }
+
+/// **A line says which connection it arrived on.**
+///
+/// Without it the tail could say a connection had ended, and say what had been
+/// served, and nothing could join the two. Reading "why is this peer
+/// redialling" meant pairing a close with whatever line happened to precede it
+/// — which is not a pairing at all when several connections interleave, as they
+/// always do. Tried against this estate on 2026-10-01 and the answer had to be
+/// thrown away: it attributed a close to `/device/list` and `/prekey/count`,
+/// which are not even routes the far exchange calls.
+///
+/// The property is the whole of it: requests over one connection carry one id,
+/// and two connections carry two.
+#[tokio::test]
+async fn a_request_names_the_connection_it_arrived_on() {
+    let h = harness().await;
+    let mut watcher = Client::connect(h.addr, &h.server_pub_bytes, &[9u8; 32]).await;
+    let (status, mut stream) = watcher.open_tail(&h.server_pub, &h.admin).await;
+    assert_eq!(status, 200);
+
+    // Two connections, two requests each, interleaved so that neither
+    // ordering nor adjacency could stand in for the identifier.
+    let mut one = Client::connect(h.addr, &h.server_pub_bytes, &[21u8; 32]).await;
+    let mut two = Client::connect(h.addr, &h.server_pub_bytes, &[22u8; 32]).await;
+    for _ in 0..2 {
+        assert_eq!(one.get("/health").await.0, 200);
+        assert_eq!(two.get("/health").await.0, 200);
+    }
+
+    let got = std::sync::atomic::AtomicUsize::new(0);
+    let (saw, seen) = wait_for(&mut stream, Duration::from_secs(8), |l| {
+        matches!(&l.record, Record::Request { route, .. } if route == "/health")
+            && got.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3
+    })
+    .await;
+    assert!(saw, "the tail did not report four requests: {seen:?}");
+
+    let mut by_conn: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for l in &seen {
+        if let Record::Request { route, conn, .. } = &l.record
+            && route == "/health"
+        {
+            *by_conn.entry(*conn).or_default() += 1;
+        }
+    }
+    let mut counts: Vec<usize> = by_conn.values().copied().collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        vec![2, 2],
+        "four requests over two connections should group two and two, got {by_conn:?}"
+    );
+}

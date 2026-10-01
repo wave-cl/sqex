@@ -3487,9 +3487,11 @@ fn tail_line(line: &sqex_proto::tail::Line) -> Option<String> {
             route,
             status,
             micros,
+            conn,
         } => format!(
-            "[{at}] {:<10} {route} {status} {micros}µs",
-            account.as_ref().map(short).unwrap_or_else(|| "-".into())
+            "[{at}] {:<10} {:<5} {route} {status} {micros}µs",
+            account.as_ref().map(short).unwrap_or_else(|| "-".into()),
+            format!("c{conn}")
         ),
         Record::Connection {
             opened,
@@ -3498,31 +3500,43 @@ fn tail_line(line: &sqex_proto::tail::Line) -> Option<String> {
             rtt_ms,
             lost,
             bytes,
+            conn,
         } => format!(
-            "[{at}] {:<10} conn {} {peer} rtt={rtt_ms}ms lost={lost} bytes={bytes}",
+            "[{at}] {:<10} {:<5} conn {} {peer} rtt={rtt_ms}ms lost={lost} bytes={bytes}",
             identity.as_ref().map(short).unwrap_or_else(|| "-".into()),
+            format!("c{conn}"),
             if *opened { "opened" } else { "ended" }
         ),
         Record::Event { to, event, channel } => format!(
-            "[{at}] {:<10} event {event:#04x}{}",
+            "[{at}] {:<10} {:<5} event {event:#04x}{}",
             short(to),
+            "",
             channel
                 .map(|c| format!(" channel {}", short(&sqnr_core::PubKey::new(c))))
                 .unwrap_or_default()
         ),
         Record::Admin { admin, action } => {
-            format!("[{at}] {:<10} admin {action}", short(admin))
+            format!("[{at}] {:<10} {:<5} admin {action}", short(admin), "")
         }
-        Record::Peer { peer, what, micros } => {
-            format!("[{at}] {:<10} peer {what} {micros}\u{b5}s", short(peer))
-        }
+        Record::Peer {
+            peer,
+            what,
+            micros,
+            conn,
+        } => format!(
+            "[{at}] {:<10} {:<5} peer {what} {micros}\u{b5}s",
+            short(peer),
+            format!("c{conn}")
+        ),
         Record::Refusal {
             account,
             route,
             why,
+            conn,
         } => format!(
-            "[{at}] {:<10} refused {route}: {why}",
-            account.as_ref().map(short).unwrap_or_else(|| "-".into())
+            "[{at}] {:<10} {:<5} refused {route}: {why}",
+            account.as_ref().map(short).unwrap_or_else(|| "-".into()),
+            format!("c{conn}")
         ),
         // Said loudly. The whole reason the exchange counts these rather than
         // blocking is that an operator must know the view is incomplete.
@@ -3540,8 +3554,9 @@ fn tail_json(line: &sqex_proto::tail::Line) -> String {
             route,
             status,
             micros,
+            conn,
         } => serde_json::json!({"kind":"request","account":account.map(|a| a.to_base58()),
-                                "route":route,"status":status,"micros":micros}),
+                                "route":route,"status":status,"micros":micros,"conn":conn}),
         Record::Connection {
             opened,
             peer,
@@ -3549,9 +3564,10 @@ fn tail_json(line: &sqex_proto::tail::Line) -> String {
             rtt_ms,
             lost,
             bytes,
+            conn,
         } => serde_json::json!({"kind":"connection","opened":opened,"peer":peer,
                                 "identity":identity.map(|a| a.to_base58()),
-                                "rtt_ms":rtt_ms,"lost":lost,"bytes":bytes}),
+                                "rtt_ms":rtt_ms,"lost":lost,"bytes":bytes,"conn":conn}),
         Record::Event { to, event, channel } => {
             serde_json::json!({"kind":"event","to":to.to_base58(),"event":event,
                                "channel":channel.map(|c| sqnr_core::PubKey::new(c).to_base58())})
@@ -3559,15 +3575,22 @@ fn tail_json(line: &sqex_proto::tail::Line) -> String {
         Record::Admin { admin, action } => {
             serde_json::json!({"kind":"admin","admin":admin.to_base58(),"action":action})
         }
-        Record::Peer { peer, what, micros } => {
-            serde_json::json!({"kind":"peer","peer":peer.to_base58(),"what":what,"micros":micros})
+        Record::Peer {
+            peer,
+            what,
+            micros,
+            conn,
+        } => {
+            serde_json::json!({"kind":"peer","peer":peer.to_base58(),"what":what,
+                               "micros":micros,"conn":conn})
         }
         Record::Refusal {
             account,
             route,
             why,
+            conn,
         } => serde_json::json!({"kind":"refusal","account":account.map(|a| a.to_base58()),
-                                "route":route,"why":why}),
+                                "route":route,"why":why,"conn":conn}),
         Record::Dropped { records } => serde_json::json!({"kind":"dropped","records":records}),
         Record::Heartbeat => serde_json::json!({"kind":"heartbeat"}),
     };

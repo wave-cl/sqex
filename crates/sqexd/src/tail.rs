@@ -247,6 +247,7 @@ mod tests {
             route: "/status".into(),
             status: 200,
             micros: 1,
+            conn: 1,
         }
     }
 

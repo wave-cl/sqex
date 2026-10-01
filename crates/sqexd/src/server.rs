@@ -2224,6 +2224,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
                                     rtt_ms: s.path.rtt.as_millis().min(u32::MAX as u128) as u32,
                                     lost: s.path.lost_packets,
                                     bytes: s.udp_tx.bytes + s.udp_rx.bytes,
+                                    conn: conn.stable_id() as u64,
                                 });
                             if let Err(e) = ended {
                                 tracing::debug!("connection ended: {e}");
@@ -2332,12 +2333,19 @@ async fn serve_h3(server: Arc<Server>, conn: quinn::Connection, peer: Peer) -> R
         .await
         .map_err(|e| Error::Malformed(format!("h3 setup: {e}")))?;
 
+    // What ties a request in the tail to the connection it came in on. quinn's
+    // own identifier, which is unique while this process runs -- enough to
+    // group one connection's lines together in one reading, which is all the
+    // tail wants it for. Not a name for the connection anywhere else: it is
+    // reused after a restart and means nothing to the peer.
+    let conn_id = conn.stable_id() as u64;
+
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let server = Arc::clone(&server);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(server, resolver, peer).await {
+                    if let Err(e) = handle_stream(server, resolver, peer, conn_id).await {
                         tracing::debug!("request error: {e}");
                     }
                 });
@@ -2391,6 +2399,7 @@ async fn handle_stream(
     server: Arc<Server>,
     resolver: h3::server::RequestResolver<h3_quinn::Connection, bytes::Bytes>,
     peer: Peer,
+    conn: u64,
 ) -> Result<()> {
     let (req, mut stream) = resolver
         .resolve_request()
@@ -2466,6 +2475,7 @@ async fn handle_stream(
                 account,
                 route: path.clone(),
                 why,
+                conn,
             }
         } else if let (true, Some(id)) = (path.starts_with("/peer/"), peer.identity) {
             // The exchange-to-exchange wire, named by the exchange on the far
@@ -2474,6 +2484,7 @@ async fn handle_stream(
                 peer: id,
                 what: path.clone(),
                 micros,
+                conn,
             }
         } else {
             sqex_proto::tail::Record::Request {
@@ -2481,6 +2492,7 @@ async fn handle_stream(
                 route: path.clone(),
                 status,
                 micros,
+                conn,
             }
         }
     });

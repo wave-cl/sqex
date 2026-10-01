@@ -36,7 +36,11 @@ use crate::{Error, Result};
 use sqnr_core::PubKey;
 
 /// The version a caller asks for, refused rather than guessed at if unknown.
-pub const VERSION: u8 = 1;
+///
+/// 2 adds `conn` to every record that describes something arriving on a
+/// connection. A reader from before it decodes a line of the new shape as
+/// trailing bytes and refuses it, loudly, which is the point of asking.
+pub const VERSION: u8 = 2;
 
 /// Largest line this will emit or a reader will accept.
 ///
@@ -101,6 +105,8 @@ pub enum Record {
         route: String,
         status: u16,
         micros: u32,
+        /// Which connection it arrived on; see [`Record::Connection`].
+        conn: u64,
     },
     /// A connection arrived or ended. The numbers are the ones the journal
     /// already reports at close, available here as it happens.
@@ -111,6 +117,13 @@ pub enum Record {
         rtt_ms: u32,
         lost: u64,
         bytes: u64,
+        /// This connection's own identifier.
+        ///
+        /// Unique while the exchange runs and reused after a restart, which is
+        /// all it is for: grouping the lines of one connection together in a
+        /// reading of one tail. It is not a name for the connection anywhere
+        /// else and nothing should store it.
+        conn: u64,
     },
     /// A SIP-30 event was published to an account. `event` is that event's own
     /// kind byte; `channel` is present for the kinds that name one.
@@ -130,12 +143,16 @@ pub enum Record {
         peer: PubKey,
         what: String,
         micros: u32,
+        /// Which connection it arrived on; see [`Record::Connection`].
+        conn: u64,
     },
     /// A caller was refused: a rate limit, a whitelist drop, a malformed body.
     Refusal {
         account: Option<PubKey>,
         route: String,
         why: String,
+        /// Which connection it arrived on; see [`Record::Connection`].
+        conn: u64,
     },
     /// This reader fell behind and lines were discarded rather than queued.
     Dropped { records: u64 },
@@ -259,11 +276,13 @@ impl Line {
                 route,
                 status,
                 micros,
+                conn,
             } => {
                 put_key(&mut out, account);
                 put_text(&mut out, route);
                 out.extend_from_slice(&status.to_be_bytes());
                 out.extend_from_slice(&micros.to_be_bytes());
+                out.extend_from_slice(&conn.to_be_bytes());
             }
             Record::Connection {
                 opened,
@@ -272,6 +291,7 @@ impl Line {
                 rtt_ms,
                 lost,
                 bytes,
+                conn,
             } => {
                 out.push(u8::from(*opened));
                 put_text(&mut out, peer);
@@ -279,6 +299,7 @@ impl Line {
                 out.extend_from_slice(&rtt_ms.to_be_bytes());
                 out.extend_from_slice(&lost.to_be_bytes());
                 out.extend_from_slice(&bytes.to_be_bytes());
+                out.extend_from_slice(&conn.to_be_bytes());
             }
             Record::Event { to, event, channel } => {
                 out.extend_from_slice(to.as_bytes());
@@ -295,19 +316,27 @@ impl Line {
                 out.extend_from_slice(admin.as_bytes());
                 put_text(&mut out, action);
             }
-            Record::Peer { peer, what, micros } => {
+            Record::Peer {
+                peer,
+                what,
+                micros,
+                conn,
+            } => {
                 out.extend_from_slice(peer.as_bytes());
                 put_text(&mut out, what);
                 out.extend_from_slice(&micros.to_be_bytes());
+                out.extend_from_slice(&conn.to_be_bytes());
             }
             Record::Refusal {
                 account,
                 route,
                 why,
+                conn,
             } => {
                 put_key(&mut out, account);
                 put_text(&mut out, route);
                 put_text(&mut out, why);
+                out.extend_from_slice(&conn.to_be_bytes());
             }
             Record::Dropped { records } => out.extend_from_slice(&records.to_be_bytes()),
             Record::Heartbeat => {}
@@ -336,6 +365,7 @@ impl Line {
                 route: take_text(b, &mut at)?,
                 status: take_u16(b, &mut at)?,
                 micros: take_u32(b, &mut at)?,
+                conn: take_u64(b, &mut at)?,
             },
             KIND_CONNECTION => {
                 let opened = *b.get(at).ok_or_else(|| short("opened"))? != 0;
@@ -347,6 +377,7 @@ impl Line {
                     rtt_ms: take_u32(b, &mut at)?,
                     lost: take_u64(b, &mut at)?,
                     bytes: take_u64(b, &mut at)?,
+                    conn: take_u64(b, &mut at)?,
                 }
             }
             KIND_EVENT => {
@@ -390,12 +421,14 @@ impl Line {
                     peer: PubKey::new(peer.try_into().unwrap()),
                     what: take_text(b, &mut at)?,
                     micros: take_u32(b, &mut at)?,
+                    conn: take_u64(b, &mut at)?,
                 }
             }
             KIND_REFUSAL => Record::Refusal {
                 account: take_key(b, &mut at)?,
                 route: take_text(b, &mut at)?,
                 why: take_text(b, &mut at)?,
+                conn: take_u64(b, &mut at)?,
             },
             KIND_DROPPED => Record::Dropped {
                 records: take_u64(b, &mut at)?,
@@ -489,12 +522,14 @@ mod tests {
                 route: "/channel/post".into(),
                 status: 200,
                 micros: 1234,
+                conn: 41,
             },
             Record::Request {
                 account: None,
                 route: "/status".into(),
                 status: 200,
                 micros: 7,
+                conn: 42,
             },
             Record::Connection {
                 opened: true,
@@ -503,6 +538,7 @@ mod tests {
                 rtt_ms: 36,
                 lost: 0,
                 bytes: 4096,
+                conn: 43,
             },
             Record::Connection {
                 opened: false,
@@ -511,6 +547,7 @@ mod tests {
                 rtt_ms: 0,
                 lost: 9,
                 bytes: 0,
+                conn: 44,
             },
             Record::Event {
                 to: key(3),
@@ -530,11 +567,13 @@ mod tests {
                 peer: key(5),
                 what: "pull".into(),
                 micros: 25_000_000,
+                conn: 45,
             },
             Record::Refusal {
                 account: Some(key(6)),
                 route: "/channel/post".into(),
                 why: "rate limited".into(),
+                conn: 46,
             },
             Record::Dropped { records: 12 },
             Record::Heartbeat,
@@ -606,6 +645,7 @@ mod tests {
                 account: None,
                 route: "x".repeat(MAX_TEXT + 50),
                 why: "y".into(),
+                conn: 1,
             },
         };
         let back = Line::decode(&line.encode()).expect("decodes");
