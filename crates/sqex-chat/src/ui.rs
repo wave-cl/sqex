@@ -1801,6 +1801,14 @@ pub const HELP: &[(&str, &[(&str, &str)])] = &[
             ),
             ("/rotate", "mint a new key for everyone currently here"),
             (
+                "/agreed <name>",
+                "a group whose key every member contributes to, not one you mint",
+            ),
+            (
+                "/commit [key…]",
+                "change that key, admitting whom you name; the log says so first",
+            ),
+            (
                 "/repost  /unstrand",
                 "send again what a move stranded, or let it go",
             ),

@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 
 use sqnr_core::PubKey;
 
+use crate::agreement::Commit;
 use crate::blob::Attachment;
 use crate::channel::{KIND_SYSTEM, System};
 use crate::message::{Body, EDIT_WINDOW, Post};
@@ -170,6 +171,20 @@ pub struct Received {
     /// `None` on a member entry, and on a system entry whose event this
     /// version does not know — SIP-16 says an unknown event is ignored.
     pub system: Option<System>,
+    /// SIP-87: the commit this member entry carries, where it carries one.
+    ///
+    /// A third thing an entry can be, beside a message and the exchange's own
+    /// record: a member's signed statement of who is in the channel at the
+    /// epoch it creates. Decoded by whoever held the bytes, as `system` is, and
+    /// **verified there too** — this type is handed to the fold and the fold
+    /// cannot check a signature it has no device for.
+    ///
+    /// Carried rather than folded into `body`, because a commit is not a SIP-19
+    /// message and a client that showed it as one would be putting a hash chain
+    /// in front of a reader. SIP-87's third open question is what a client
+    /// shows instead, and it cannot be answered without the commit reaching the
+    /// fold at all.
+    pub commit: Option<Commit>,
 }
 
 /// A message as it should be shown.
@@ -225,12 +240,31 @@ pub struct Happening {
     pub what: System,
 }
 
+/// SIP-87: a member changed the channel's key, and said who it is for.
+///
+/// Beside a [`Happening`] rather than folded into one. A system entry is the
+/// *exchange's* record of a membership change and carries the actor's signature
+/// inside it; a commit is a *member's* record, and under SIP-87 it is the
+/// better witness to an addition — the epoch key does not exist until the
+/// commit naming the member set is in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    pub seq: u64,
+    pub posted: u64,
+    /// The account whose device posted it, which SIP-87 requires to equal
+    /// [`Commit::committer`].
+    pub account: PubKey,
+    pub commit: Commit,
+}
+
 /// The conversation, folded.
 #[derive(Debug, Clone, Default)]
 pub struct Timeline {
     messages: BTreeMap<u64, Message>,
     /// Membership and metadata events, in the exchange's order.
     events: BTreeMap<u64, Happening>,
+    /// SIP-87 commits, in the same sequence space again.
+    commits: BTreeMap<u64, Committed>,
     /// Bodies we could not read at all, by sequence number.
     unreadable: Vec<u64>,
     /// Who wrote each of those, and when: what a redaction of one needs, since
@@ -344,6 +378,18 @@ impl Timeline {
         self.events.values()
     }
 
+    /// SIP-87 commits, in the order the exchange assigned — the same sequence
+    /// space as [`Timeline::messages`] and [`Timeline::events`] again, because a
+    /// reader needs to know who could read what was said next.
+    pub fn commits(&self) -> impl Iterator<Item = &Committed> {
+        self.commits.values()
+    }
+
+    /// The commit that created `epoch`, if this fold reached it.
+    pub fn commit_for(&self, epoch: u32) -> Option<&Committed> {
+        self.commits.values().find(|c| c.commit.epoch == epoch)
+    }
+
     /// Sequence numbers whose body we could not read — a later version of the
     /// format, or a key we do not hold. A client should say something was
     /// there rather than showing a gap it cannot explain.
@@ -403,6 +449,21 @@ impl Timeline {
                     },
                 );
             }
+            return;
+        }
+        // SIP-87, before the body arms: a commit's body is in the clear and is
+        // not a SIP-19 message, so `body` is `None` on one and counting it as
+        // something we failed to read would report a gap that is not there.
+        if let Some(commit) = &e.commit {
+            self.commits.insert(
+                e.seq,
+                Committed {
+                    seq: e.seq,
+                    posted: e.posted,
+                    account: e.account,
+                    commit: commit.clone(),
+                },
+            );
             return;
         }
         let Some(body) = &e.body else {
@@ -610,6 +671,7 @@ mod call_tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 
@@ -746,6 +808,7 @@ mod tests {
             kind: KIND_SYSTEM,
             body: None,
             system: System::decode(&what.encode()).unwrap(),
+            commit: None,
             tombstone: false,
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
@@ -805,6 +868,7 @@ mod tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 
@@ -819,6 +883,7 @@ mod tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 
@@ -833,6 +898,7 @@ mod tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 
@@ -1104,6 +1170,7 @@ mod tests {
                     verdict: Verdict::Valid,
                     standing: Standing::Unclaimed,
                     system: None,
+                    commit: None,
                 },
             ],
             &[],
@@ -1130,6 +1197,7 @@ mod tests {
                     verdict: Verdict::Valid,
                     standing: Standing::Unclaimed,
                     system: None,
+                    commit: None,
                 },
             ],
             &[],
@@ -1157,6 +1225,7 @@ mod tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         };
         // Written by 1; somebody else asks first, then the author does.
         let t = Timeline::fold(
@@ -1251,6 +1320,7 @@ mod deletion_tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 
@@ -1265,6 +1335,7 @@ mod deletion_tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 
@@ -1279,6 +1350,7 @@ mod deletion_tests {
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         }
     }
 

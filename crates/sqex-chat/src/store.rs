@@ -35,6 +35,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha512};
+use sqex_proto::agreement::{Chain, Commit, commit_in};
 use sqex_proto::blob::Attachment;
 use sqex_proto::channel::{KIND_MEMBER, KIND_SYSTEM, System, direct_message_id};
 use sqex_proto::channel_key::{ChannelKey, Replay};
@@ -293,6 +294,51 @@ CREATE TABLE IF NOT EXISTS timed (
     seq      INTEGER NOT NULL,
     until    INTEGER NOT NULL,
     PRIMARY KEY (exchange, channel, seq)
+);
+-- SIP-87: what this device holds for an agreed channel.
+--
+-- The chain secret is sealed at rest beside the epoch keys and for the same
+-- reason: with the log, it is every future epoch of the channel. A row here is
+-- also the answer to "is this channel agreed or admin-keyed", which SIP-87
+-- requires to be settled per channel and never mixed -- so its absence is not
+-- merely missing state, it says the channel is SIP-17's.
+CREATE TABLE IF NOT EXISTS agreement (
+    exchange   BLOB    NOT NULL,
+    channel    BLOB    NOT NULL,
+    epoch      INTEGER NOT NULL,
+    sealed     BLOB    NOT NULL,
+    transcript BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel)
+);
+-- SIP-87 commits, as the log holds them.
+--
+-- Kept in the clear, because they are: a commit body is readable by anybody who
+-- can fetch the channel, which is the whole reason a device can read who was
+-- admitted before it opens the envelope sealed to it.
+--
+-- Keyed by `seq` rather than by epoch, which is not a detail. Two members may
+-- post a commit naming one epoch -- only one of them can win the envelopes, but
+-- nothing stops the loser's entry existing, and a table that kept the first
+-- arrival per epoch would let a loser's commit shadow the winner's for good.
+CREATE TABLE IF NOT EXISTS commitment (
+    exchange BLOB    NOT NULL,
+    channel  BLOB    NOT NULL,
+    seq      INTEGER NOT NULL,
+    epoch    INTEGER NOT NULL,
+    body     BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, seq)
+);
+-- SIP-87 commit secrets opened before the commit they belong to had arrived.
+--
+-- Kept because the envelope is a one-shot: opening it spends the SIP-23 prekey,
+-- so a secret this device cannot yet use is one it can never be sent again.
+-- Dropped as soon as it has derived its epoch.
+CREATE TABLE IF NOT EXISTS contribution (
+    exchange BLOB    NOT NULL,
+    channel  BLOB    NOT NULL,
+    epoch    INTEGER NOT NULL,
+    sealed   BLOB    NOT NULL,
+    PRIMARY KEY (exchange, channel, epoch)
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -1439,6 +1485,12 @@ fn fold_rows(
                 // of it, and *unclaimed* is exactly what that is.
                 tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
                 standing: Standing::Unclaimed,
+                // SIP-87, on the same basis as the verdict above: this store
+                // holds no signatures, so the commit is read back from bytes
+                // that verified when they arrived.
+                commit: (kind == KIND_MEMBER)
+                    .then(|| plain.as_deref().and_then(|p| commit_in(p, &account)))
+                    .flatten(),
                 // Two decoders, chosen by kind and never both: a system
                 // entry carries SIP-16's own layout and a member entry a
                 // SIP-19 body, and neither decoder would make sense of the
@@ -1789,6 +1841,192 @@ impl Store {
             out.push((epoch, ChannelKey::new(self.unseal(&sealed)?)));
         }
         Ok(out)
+    }
+
+    // ---- SIP-87 agreed channels -----------------------------------------
+
+    /// Where this device's chain stands, or `None` for a channel that is
+    /// SIP-17's rather than SIP-87's.
+    pub fn agreement(&self, channel: &[u8; 32]) -> Result<Option<Chain>> {
+        let row: Option<(i64, Vec<u8>, Vec<u8>)> = self
+            .db
+            .query_row(
+                "SELECT epoch, sealed, transcript FROM agreement
+                 WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(storage("read agreement"))?;
+        match row {
+            Some((epoch, sealed, transcript)) => Ok(Some(Chain::new(
+                epoch as u32,
+                self.unseal(&sealed)?,
+                transcript.try_into().unwrap_or([0; 32]),
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Put the chain where `chain` says. Overwrites: a chain only ever moves
+    /// forward, and the caller that moved it is the one that checked.
+    pub fn set_agreement(&self, channel: &[u8; 32], chain: &Chain) -> Result<()> {
+        let sealed = self.seal(&chain.chain)?;
+        self.db
+            .execute(
+                "INSERT INTO agreement (exchange, channel, epoch, sealed, transcript)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, channel)
+                 DO UPDATE SET epoch = excluded.epoch, sealed = excluded.sealed,
+                               transcript = excluded.transcript",
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    chain.epoch as i64,
+                    sealed,
+                    &chain.transcript[..]
+                ],
+            )
+            .map_err(storage("store agreement"))?;
+        Ok(())
+    }
+
+    /// Keep a commit read off the log. Idempotent on its sequence number.
+    pub fn put_commit(&self, channel: &[u8; 32], seq: u64, commit: &Commit) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO commitment (exchange, channel, seq, epoch, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (exchange, channel, seq) DO NOTHING",
+                params![
+                    self.scope()?,
+                    &channel[..],
+                    seq as i64,
+                    commit.epoch as i64,
+                    commit.encode()
+                ],
+            )
+            .map_err(storage("store commit"))?;
+        Ok(())
+    }
+
+    /// Every commit held that names `epoch`, in the order the exchange put them
+    /// in. More than one is somebody posting a commit they did not win; a caller
+    /// tries each rather than trusting the first.
+    pub fn commits_at(&self, channel: &[u8; 32], epoch: u32) -> Result<Vec<Commit>> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT body FROM commitment
+                 WHERE channel = ?1 AND exchange = ?2 AND epoch = ?3 ORDER BY seq",
+            )
+            .map_err(storage("prepare commits"))?;
+        let rows = stmt
+            .query_map(params![&channel[..], self.scope()?, epoch as i64], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .map_err(storage("query commits"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            // A body this version cannot read is skipped rather than fatal: it
+            // is not a commit any member derived an epoch from either.
+            if let Ok(c) = Commit::decode(&row.map_err(storage("read commits"))?) {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The highest epoch any held commit names.
+    pub fn highest_commit(&self, channel: &[u8; 32]) -> Result<u32> {
+        let e: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT MAX(epoch) FROM commitment WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read highest commit"))?
+            .flatten();
+        Ok(e.unwrap_or(0) as u32)
+    }
+
+    /// Keep a commit secret that has no commit to go with it yet.
+    pub fn put_contribution(
+        &self,
+        channel: &[u8; 32],
+        epoch: u32,
+        secret: &[u8; 32],
+    ) -> Result<()> {
+        let sealed = self.seal(secret)?;
+        self.db
+            .execute(
+                "INSERT INTO contribution (exchange, channel, epoch, sealed)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (exchange, channel, epoch) DO NOTHING",
+                params![self.scope()?, &channel[..], epoch as i64, sealed],
+            )
+            .map_err(storage("store contribution"))?;
+        Ok(())
+    }
+
+    pub fn contribution(&self, channel: &[u8; 32], epoch: u32) -> Result<Option<[u8; 32]>> {
+        let sealed: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT sealed FROM contribution
+                 WHERE channel = ?1 AND epoch = ?2 AND exchange = ?3",
+                params![&channel[..], epoch as i64, self.scope()?],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read contribution"))?;
+        match sealed {
+            Some(s) => Ok(Some(self.unseal(&s)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The highest epoch a held commit secret is for, or 0.
+    pub fn highest_contribution(&self, channel: &[u8; 32]) -> Result<u32> {
+        let e: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT MAX(epoch) FROM contribution WHERE channel = ?1 AND exchange = ?2",
+                params![&channel[..], self.scope()?],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage("read highest contribution"))?
+            .flatten();
+        Ok(e.unwrap_or(0) as u32)
+    }
+
+    /// Forget every commit secret at or below `epoch`.
+    ///
+    /// A secret whose epoch the chain has passed is spent, and a spent secret is
+    /// the same thing as the key it produced: there is no reason to go on holding
+    /// two copies of one epoch's secrecy.
+    pub fn forget_contributions_to(&self, channel: &[u8; 32], epoch: u32) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM contribution WHERE channel = ?1 AND exchange = ?2 AND epoch <= ?3",
+                params![&channel[..], self.scope()?, epoch as i64],
+            )
+            .map_err(storage("forget contributions"))?;
+        Ok(())
+    }
+
+    /// Forget a commit secret, its epoch having been derived.
+    pub fn drop_contribution(&self, channel: &[u8; 32], epoch: u32) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM contribution WHERE channel = ?1 AND epoch = ?2 AND exchange = ?3",
+                params![&channel[..], epoch as i64, self.scope()?],
+            )
+            .map_err(storage("drop contribution"))?;
+        Ok(())
     }
 
     // ---- signed entries (SIP-42) ----------------------------------------

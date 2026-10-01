@@ -2635,6 +2635,18 @@ async fn handle_key(
                     settle(chat, open, app, made.ok(), note).await;
                     return;
                 }
+                Command::Agreed(name) => {
+                    let made = chat.create_agreed_group(name, &[]).await;
+                    let note = match &made {
+                        Ok(_) => format!(
+                            "made {name}, keyed by agreement — /commit <key> to admit \
+                             somebody, which is what mints the next epoch"
+                        ),
+                        Err(e) => e.to_string(),
+                    };
+                    settle(chat, open, app, made.ok(), note).await;
+                    return;
+                }
                 Command::Public(name) => {
                     let made = chat.create_public(name, "").await;
                     let note = match &made {
@@ -2805,6 +2817,7 @@ async fn handle_key(
                 },
                 // Handled above: these need no conversation.
                 Command::New(_)
+                | Command::Agreed(_)
                 | Command::Public(_)
                 | Command::Find(_)
                 | Command::Join(_)
@@ -3002,6 +3015,39 @@ async fn handle_key(
                             )
                         })
                     })
+                }
+                Command::Commit(named) => {
+                    let mut who = Vec::new();
+                    let mut unknown = None;
+                    for one in named {
+                        match resolve_peer(chat, one.as_str()).await {
+                            Ok(k) => who.push(k),
+                            Err(e) => {
+                                unknown = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match unknown {
+                        Some(e) => Err(e),
+                        // Named before the commit is built, because a commit
+                        // whose `adds` are wrong is a key bound to the wrong
+                        // member set — and the member set is in the key.
+                        None => chat.commit(&channel, &who, &[]).await.map(|epoch| {
+                            Some(if who.is_empty() {
+                                format!(
+                                    "committed epoch {epoch} — the key changed and nobody \
+                                     joined or left; what came before is unchanged"
+                                )
+                            } else {
+                                format!(
+                                    "committed epoch {epoch} — {} admitted, and the log \
+                                     said so before the key existed",
+                                    who.len()
+                                )
+                            })
+                        }),
+                    }
                 }
                 Command::Rotate => chat.rotate(&channel).await.map(|epoch| {
                     Some(format!(
@@ -3406,6 +3452,12 @@ enum Command {
     SaveAvatar(std::path::PathBuf),
     /// `/rotate` — mint a new key for everyone currently here.
     Rotate,
+    /// SIP-87 `/agreed <name>` — make a private group whose key every member
+    /// contributes to, rather than one an admin mints.
+    Agreed(String),
+    /// SIP-87 `/commit [key…]` — change the key by committing, admitting the
+    /// accounts named. With none, a rekey and nothing else.
+    Commit(Vec<String>),
     /// `/leave` — leave this channel.
     Leave,
     /// `/redact <n>` — delete a message you posted, by its number.
@@ -3603,6 +3655,9 @@ impl Command {
                 Command::Unknown("/unreplicate needs an exchange's public key".into())
             }
             "/rotate" => Command::Rotate,
+            "/agreed" if !rest.is_empty() => Command::Agreed(rest.to_string()),
+            "/agreed" => Command::Unknown("/agreed needs a name".into()),
+            "/commit" => Command::Commit(rest.split_whitespace().map(str::to_string).collect()),
             "/repost" => Command::Repost,
             "/unstrand" => Command::Unstrand,
             // SIP-36 calls. Signalling only; the audio is a room joined with
@@ -4381,10 +4436,66 @@ fn refresh(app: &mut App, open: &[Open], me: &PubKey, names: &HashMap<PubKey, St
             }
         })
         .collect();
+    // SIP-87 commits, folded in the same way and for the same reason calls are.
+    //
+    // This is the question SIP-87 left to an implementation: "a person needs to
+    // see 'X added Y at 14:02', not a chain of hashes", and until a client
+    // renders it the property the document buys is real and invisible. The row
+    // carries who committed and when; the text says what the commit was *for*,
+    // which is the part that makes it a witness to an addition rather than a
+    // notice that something cryptographic happened.
+    let said_of_names = |who: &[PubKey]| -> String {
+        who.iter()
+            .map(|a| names.get(a).cloned().unwrap_or_else(|| short(a)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let commits: Vec<Said> = conv
+        .timeline
+        .commits()
+        .map(|c| {
+            let mut what = Vec::new();
+            if !c.commit.adds.is_empty() {
+                what.push(format!("added {}", said_of_names(&c.commit.adds)));
+            }
+            if !c.commit.removes.is_empty() {
+                what.push(format!("removed {}", said_of_names(&c.commit.removes)));
+            }
+            let text = if what.is_empty() {
+                // A rekey and nothing else, which is the shape of an ordinary
+                // member's commit and of a scheduled one. Said plainly: nobody
+                // joined or left, and the key changed anyway.
+                format!("new key (epoch {}) — nobody joined or left", c.commit.epoch)
+            } else {
+                format!("new key (epoch {}) — {}", c.commit.epoch, what.join(", "))
+            };
+            Said {
+                who: names
+                    .get(&c.account)
+                    .cloned()
+                    .unwrap_or_else(|| short(&c.account)),
+                key: c.account.to_string(),
+                mine: c.account == *me,
+                text,
+                seq: c.seq,
+                has_file: false,
+                at: c.posted,
+                edited: false,
+                again: false,
+                via: None,
+                redacted: false,
+                receipt: None,
+                reply_to: None,
+                reactions: Vec::new(),
+                mentions: Vec::new(),
+            }
+        })
+        .collect();
     // Sorted back into sequence within the conversation that continues; the
     // earlier copies keep their place above it.
     let head = app.earlier_rows;
     app.said.extend(calls);
+    app.said.extend(commits);
     app.said[head..].sort_by_key(|s| s.seq);
     app.peer_typing = conv.typing;
     app.members = conv.members;
@@ -4611,7 +4722,10 @@ fn show(app: &mut ui::App, title: String, lines: Vec<String>) {
 /// only way to find out you were being called was to already be looking at that
 /// conversation, which is the one thing SIP-36 exists to avoid.
 fn activity(timeline: &Timeline) -> usize {
-    timeline.messages().count() + timeline.calls().count()
+    // SIP-87 commits counted too: a channel whose only new entry is a commit
+    // has had something happen in it, and a conversation list that said
+    // otherwise would hide the one event this document exists to make visible.
+    timeline.messages().count() + timeline.calls().count() + timeline.commits().count()
 }
 
 /// The most recent thing that happened, likewise counting calls.
@@ -5037,6 +5151,7 @@ mod tests {
                 tombstone: false,
                 standing: Standing::Unclaimed,
                 system: None,
+                commit: None,
                 body: Some(Body::Post(SipPost::text(text))),
                 verdict: Verdict::Valid,
             },
@@ -5055,6 +5170,7 @@ mod tests {
                 tombstone: false,
                 standing: Standing::Unclaimed,
                 system: None,
+                commit: None,
                 body: Some(Body::Call {
                     media: MEDIA_AUDIO,
                     ring_secs: RING_SECS,
@@ -5213,6 +5329,7 @@ mod tests {
                 tombstone: false,
                 standing: Standing::Unclaimed,
                 system: None,
+                commit: None,
                 body: Some(Body::Post(SipPost::text("hello"))),
                 verdict: Verdict::Valid,
             }],
@@ -5436,6 +5553,7 @@ mod tests {
                 tombstone: false,
                 standing: Standing::Unclaimed,
                 system: None,
+                commit: None,
                 body: Some(Body::Post(SipPost::text("did you see this?"))),
                 verdict: Verdict::Valid,
             }],
@@ -5524,6 +5642,7 @@ mod tests {
                     tombstone: false,
                     standing: Standing::Unclaimed,
                     system: None,
+                    commit: None,
                     body: Some(Body::Post(SipPost::text("theirs"))),
                     verdict: Verdict::Valid,
                 },
@@ -5535,6 +5654,7 @@ mod tests {
                     tombstone: false,
                     standing: Standing::Unclaimed,
                     system: None,
+                    commit: None,
                     body: Some(Body::Post(SipPost::text("mine"))),
                     verdict: Verdict::Valid,
                 },
@@ -5570,6 +5690,7 @@ mod tests {
             tombstone: false,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };
@@ -5615,6 +5736,7 @@ mod tests {
             tombstone: false,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
             body: Some(Body::Post(SipPost::text("hello"))),
             verdict: Verdict::Valid,
         };

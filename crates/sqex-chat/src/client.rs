@@ -6,6 +6,10 @@
 //! because the exchange is either unable or is the party being constrained.
 
 use sha2::{Digest, Sha256};
+use sqex_proto::agreement::{
+    Chain, Commit, MAX_ADDS, MAX_REMOVES, Refused, commit_in, commit_signed_in, contribution_of,
+    generate_secret, read_welcome, welcome,
+};
 use sqex_proto::blob::Attachment;
 use sqex_proto::channel::{
     Ack, Action, ByAccount, ByChannel, ByChannelSigned, ByTarget, ChannelInfo, Create, Created,
@@ -237,6 +241,14 @@ pub enum ChatError {
     AlreadyKeyed(u32),
     /// The operation is an admin's and this account is not one.
     NotAnAdmin,
+    /// SIP-87: this channel is admin-keyed, and a commit is the other kind.
+    ///
+    /// A channel is agreed or admin-keyed from its first commit and MUST NOT
+    /// mix the two, so this is not a state to heal — it is the wrong operation
+    /// for the channel.
+    NotAgreed,
+    /// SIP-87: a commit arrived that this device cannot derive an epoch from.
+    CannotDerive(Refused),
     /// SIP-47: this device is not in the named account's device list, so
     /// the account has not registered it -- or registered a different key.
     NotListed(PubKey),
@@ -406,6 +418,11 @@ impl std::fmt::Display for ChatError {
                  replace it — if they cannot open it, rotate to hand out a new key"
             ),
             ChatError::NotAnAdmin => write!(f, "that is an admin's to do, and you are not one"),
+            ChatError::NotAgreed => write!(
+                f,
+                "this channel's key is minted by an admin (SIP-17), not agreed: a commit is                  the other kind, and a channel cannot hold both"
+            ),
+            ChatError::CannotDerive(why) => write!(f, "{why}"),
             ChatError::NotListed(account) => write!(
                 f,
                 "{account} has not registered this device: the key it registered is not \
@@ -506,6 +523,16 @@ fn predecessors_of(exchange: &PubKey) -> Vec<PubKey> {
 }
 
 /// Everybody a channel key must reach.
+/// Accounts in ascending key order with no repeats, which is how SIP-87 wants a
+/// commit's `adds` and `removes`: the body is hashed into the key, so two
+/// encodings of one member set would be two keys.
+fn sorted(keys: &[PubKey]) -> Vec<PubKey> {
+    let mut out = keys.to_vec();
+    out.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    out.dedup();
+    out
+}
+
 fn members_of(info: &ChannelInfo) -> Vec<PubKey> {
     info.members.iter().map(|m| m.account).collect()
 }
@@ -876,6 +903,13 @@ pub struct Chat {
     reask_home: HashSet<[u8; 32]>,
     /// SIP-60 §A device hints its home: origins this client has hinted its home at this run.
     hinted: HashSet<PubKey>,
+    /// SIP-87: why this device last declined to derive a channel's epoch.
+    ///
+    /// Held rather than returned, because the refusal happens inside a poll and
+    /// must not stop the poll: a device behind the channel still reads the
+    /// epochs it has, and the thing it cannot do is be told what to do about it
+    /// by anybody but a member who commits again.
+    refusals: HashMap<[u8; 32], Refused>,
     /// SIP-40: the keys each exchange held before its current one, as the
     /// pin store remembers them, newest first. What was signed under them
     /// still verifies under them and under nothing else.
@@ -971,6 +1005,7 @@ impl Chat {
             forks_seen: HashSet::new(),
             pending_forks: Vec::new(),
             reask_home: HashSet::new(),
+            refusals: HashMap::new(),
             hinted: HashSet::new(),
             timers: HashMap::new(),
             bound_in: HashMap::new(),
@@ -2921,7 +2956,65 @@ impl Chat {
             )
             .await?;
         let got = Got::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
-        self.absorb_keys(channel, &instance, got).await
+        // SIP-87: whether this device has read the log as far as the exchange
+        // has it. Where it has, the *absence* of a commit for an epoch is a
+        // fact about the channel rather than a fact about this device's cursor
+        // — which is the difference between "no commit, so an admin minted
+        // this" and "no commit yet".
+        let (read_to, _, _) = self.store.cursor(channel)?;
+        let mut settled = read_to >= self.info(channel).await?.last;
+        if !settled && !got.envelopes.is_empty() {
+            // Behind, with envelopes in hand that cannot be classified without
+            // the log. **So the log is read**, rather than guessed at: SIP-87's
+            // rule is a `MUST` and the cost of breaking it is an envelope spent
+            // on the wrong reading, which the exchange will not serve again.
+            //
+            // Fetched and scanned, not folded — the cursor is left where it is
+            // and the entries are read properly by the next poll. One extra
+            // round trip, and only for a device that holds no key for the epoch
+            // in force and has not caught up, which is a device joining. A
+            // caller that has just fetched does not come through here: it uses
+            // `collect_keys_read_to` and pays nothing.
+            if let Ok(fetched) = self.ask(channel, 0).await
+                && let Ok(read) = Entries::decode(&fetched.body, fetched.receipts)
+            {
+                self.note_commits(channel, &read.entries)?;
+                settled = read.last == 0
+                    || read
+                        .entries
+                        .iter()
+                        .map(|e| e.seq)
+                        .max()
+                        .unwrap_or(read_to)
+                        .max(read_to)
+                        >= read.last;
+            }
+        }
+        self.absorb_keys(channel, &instance, got, settled).await
+    }
+
+    /// [`collect_keys`](Self::collect_keys) for a caller that has just fetched
+    /// and so knows better than the cursor does how far the log has been read.
+    ///
+    /// Separate rather than a flag on the public call, because `settled` is a
+    /// claim about what the caller has in its hands and not a preference: a
+    /// caller passing `true` without the entries to back it would have a device
+    /// take a `Welcome` for an epoch key.
+    async fn collect_keys_read_to(&mut self, channel: &[u8; 32], settled: bool) -> Result<usize> {
+        let instance = self.info(channel).await?.instance;
+        let since = self.store.highest_epoch(channel)?;
+        let body = self
+            .post(
+                "/channel/key/get",
+                KeyGet {
+                    channel: *channel,
+                    since_epoch: since,
+                }
+                .encode(),
+            )
+            .await?;
+        let got = Got::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.absorb_keys(channel, &instance, got, settled).await
     }
 
     /// Open the envelopes a `Got` carries and keep what they hold. The
@@ -2933,6 +3026,7 @@ impl Chat {
         channel: &[u8; 32],
         instance: &[u8; 32],
         got: Got,
+        settled: bool,
     ) -> Result<usize> {
         if got.envelopes.is_empty() {
             return Ok(0);
@@ -2941,8 +3035,65 @@ impl Chat {
         let mut pool = self.store.pool(&self.seed)?;
         let mut opened = 0;
         let mut unattested = 0usize;
+        // SIP-87: a chain here says this channel is agreed rather than
+        // admin-keyed, and a channel is one or the other from its first commit.
+        let held = self.store.agreement(channel)?;
         for env in &got.envelopes {
-            if self.store.key(channel, env.from_epoch)?.is_some() {
+            // SIP-87 §A Welcome, and it is the first thing done rather than a
+            // check afterwards: "a device MUST read the commit before opening
+            // the envelope". The put epoch is the envelope's `to_epoch` — a
+            // commit secret spans one epoch and a `Welcome` ends at the one it
+            // admits the device to.
+            let commits = self.store.commits_at(channel, env.to_epoch)?;
+            // Whether the log says this device is *entering* at this epoch.
+            //
+            // **Decided from the commit and not from what this device holds,**
+            // which is deliberately stronger than SIP-87's "a device holding no
+            // chain secret reads the envelope as a `Welcome`". That phrasing has
+            // no answer for a device holding a *stale* chain and named as an add
+            // — a device restored behind the channel and then re-admitted —
+            // which would read its welcome as a commit secret and refuse it
+            // forever, with nothing but another commit to try. The log is the
+            // authority SIP-87 reaches for in the dangerous direction already,
+            // and reaching for it in both is one rule instead of two.
+            //
+            // It costs this: a committer that names a continuing member in
+            // `adds` makes that member overwrite its chain and derive a key
+            // nobody shares. That is a denial of service by a party who could
+            // equally have sent a wrong secret, and the commit is signed, so it
+            // is attributable — which is the same trade `contribution` is for.
+            let welcome = commits.iter().find(|c| c.admits(&self.me)).cloned();
+            if commits.is_empty() {
+                // **Not opened unless this device can tell which rule produced
+                // the epoch.** Opening spends the SIP-23 prekey, and a key taken
+                // under the wrong rule cannot be given back — a `Welcome`'s
+                // chain stored as though it were an epoch key is thirty-two
+                // bytes that decrypt nothing and an envelope that will never be
+                // served again. SIP-87 puts it as a `MUST`: read the commit
+                // first. The envelope keeps at the exchange, which serves it
+                // again on the next collection.
+                //
+                // Three ways to be sure, and the channel being agreed is not one
+                // of them — a device holding a chain and finding no commit for an
+                // epoch has met a channel mixing the two kinds, which SIP-17's
+                // amendment forbids, and the thing to do with it is nothing.
+                let certain = settled || (held.is_none() && self.store.highest_epoch(channel)? > 0);
+                if !certain || held.is_some() {
+                    continue;
+                }
+            }
+            // Already had, and the question is asked of the right epoch for each
+            // of the three kinds this envelope could be.
+            let already = match (&welcome, commits.is_empty()) {
+                // A `Welcome` this device is at or past. Taking it again would
+                // put the chain back to where it was when it was admitted.
+                (Some(commit), _) => held.is_some_and(|c| c.epoch >= commit.epoch),
+                // A commit secret spans the one epoch it creates.
+                (None, false) => self.store.key(channel, env.to_epoch)?.is_some(),
+                // SIP-17, as it always was: the range the envelope names.
+                (None, true) => self.store.key(channel, env.from_epoch)?.is_some(),
+            };
+            if already {
                 continue;
             }
             let secret = match pool.take(env.prekey_id) {
@@ -2969,21 +3120,62 @@ impl Chat {
                 recipient: self.device,
                 ..env.clone()
             };
+            // Against `to_epoch` rather than `from_epoch`: the publisher signed
+            // over the epoch it published *at*, which is where the range ends.
+            // The two coincide on every envelope this client has ever sealed, so
+            // nothing older verifies differently; SIP-87's `Welcome` is the
+            // first envelope where they do not.
             if !self
                 .keys_of(channel)
                 .iter()
-                .any(|key| verify_envelope(key, instance, channel, env.from_epoch, &addressed))
+                .any(|key| verify_envelope(key, instance, channel, env.to_epoch, &addressed))
             {
                 unattested += 1;
                 continue;
             }
-            let keys = match open_envelope(&self.seed, &secret, env) {
+            let slots = match open_envelope(&self.seed, &secret, env) {
                 Ok(k) => k,
                 Err(_) => continue,
             };
-            for (i, k) in keys.into_iter().enumerate() {
-                self.store.put_key(channel, env.from_epoch + i as u32, &k)?;
-                opened += 1;
+            // SIP-87, three ways for one envelope, and the log chose which.
+            match (&welcome, commits.is_empty()) {
+                // Admitted at this epoch: the chain as of the commit, and
+                // whatever past epoch keys the inviter chose to include.
+                (Some(commit), _) => {
+                    let (chain, keys) = match read_welcome(commit, env.from_epoch, &slots) {
+                        Ok(got) => got,
+                        Err(why) => {
+                            self.refusals.insert(*channel, why);
+                            continue;
+                        }
+                    };
+                    self.store.set_agreement(channel, &chain)?;
+                    for (epoch, k) in keys {
+                        self.store.put_key(channel, epoch, &k)?;
+                        opened += 1;
+                    }
+                    self.refusals.remove(channel);
+                }
+                // A commit secret. Kept rather than used here: deriving needs
+                // the chain to stand at the epoch before, and a device whose
+                // chain is behind — or which has none, because a sibling has
+                // yet to hand it one — must keep the secret, since the envelope
+                // that carried it cannot be opened twice.
+                (None, false) => {
+                    let Some(one) = slots.first() else { continue };
+                    self.store
+                        .put_contribution(channel, env.to_epoch, one.as_bytes())?;
+                    let before = self.store.highest_epoch(channel)?;
+                    self.advance_agreement(channel)?;
+                    opened += (self.store.highest_epoch(channel)? > before) as usize;
+                }
+                // SIP-17: an epoch key, generated by an admin and handed over.
+                (None, true) => {
+                    for (i, k) in slots.into_iter().enumerate() {
+                        self.store.put_key(channel, env.from_epoch + i as u32, &k)?;
+                        opened += 1;
+                    }
+                }
             }
         }
         // Counted rather than logged: this crate has no logger, and a caller
@@ -3097,6 +3289,12 @@ impl Chat {
                         account,
                         posted,
                         kind,
+                        // SIP-87, as the verdict beside it: an earlier
+                        // incarnation is rebuilt from a store that wrote
+                        // nothing which failed to verify.
+                        commit: (kind == KIND_MEMBER)
+                            .then(|| plain.as_deref().and_then(|p| commit_in(p, &account)))
+                            .flatten(),
                         verdict: Verdict::Valid,
                         tombstone: plain.as_ref().is_some_and(|p| p.is_empty()),
                         standing: Standing::Unclaimed,
@@ -4507,6 +4705,276 @@ impl Chat {
         let to = self.devices_of(&members_of(&info)).await?;
         self.mint_epoch(channel, info.epoch + 1, &to).await?;
         Ok(self.info(channel).await?.epoch)
+    }
+
+    /// SIP-87: change the epoch by committing, and say who it is for.
+    ///
+    /// The commit is an ordinary SIP-16 entry with a body in the clear, so every
+    /// member reads who was admitted *before* opening the envelope sealed to it —
+    /// which is the whole of the difference from [`rotate`](Self::rotate). The
+    /// epoch key does not exist until that entry is in the log: there is no key
+    /// to hand out ahead of the record of who it was handed to.
+    ///
+    /// **What this does not buy.** Not confidentiality from an admin — one
+    /// willing to be seen adds an identity, commits, and reads from that epoch
+    /// forward. Not forward secrecy of history. Not retroactive removal: a
+    /// removed member keeps every key it held. SIP-87 says all three plainly and
+    /// so does this.
+    ///
+    /// **The order the calls go in is the order they must fail in.** Membership
+    /// moves at the exchange first, then the envelopes, then the entry. A
+    /// commit whose envelopes were refused never reaches the log, so nobody
+    /// derives an epoch from it; a commit whose entry fails to post leaves an
+    /// epoch keyed and unexplained, which the next commit supersedes and which
+    /// no member can read under — loud, and the direction to fail in.
+    ///
+    /// **History is not handed over.** A joiner is welcomed with the chain and
+    /// derives the epoch it was admitted at, and nothing earlier: SIP-17 §History
+    /// is the inviter's choice governs it and this takes the narrow reading,
+    /// which is a commit's reading — a commit is a rotation with a different
+    /// provenance, and a rotation grants no past epoch either.
+    pub async fn commit(
+        &mut self,
+        channel: &[u8; 32],
+        adds: &[PubKey],
+        removes: &[PubKey],
+    ) -> Result<u32> {
+        let Some(chain) = self.store.agreement(channel)? else {
+            return Err(ChatError::NotAgreed);
+        };
+        let adds = sorted(adds);
+        let removes = sorted(removes);
+        if adds.len() > MAX_ADDS || removes.len() > MAX_REMOVES {
+            return Err(ChatError::Protocol(format!(
+                "a commit admits at most {MAX_ADDS} and removes at most {MAX_REMOVES}"
+            )));
+        }
+        if adds.iter().any(|a| removes.contains(a)) {
+            return Err(ChatError::Protocol(
+                "a commit cannot both admit and remove one account".into(),
+            ));
+        }
+        if adds.contains(&self.me) {
+            // A committer is already in the key it is deriving, and a device of
+            // it holding no chain is a sibling's to supply (SIP-42) rather than
+            // a `Welcome`'s. Naming ourselves would seal our own chain to our
+            // own devices and call it an admission.
+            return Err(ChatError::Protocol(
+                "a commit cannot admit the account making it".into(),
+            ));
+        }
+
+        // SIP-16's membership, first. SIP-87 requires `adds` and `removes` to be
+        // consistent with it after the entry, and the exchange is the authority
+        // on membership — so this asks it rather than asserting it.
+        for who in &adds {
+            self.post_invite_without_key(channel, who).await?;
+        }
+        for who in &removes {
+            let info = self.info(channel).await?;
+            let (action, head) = self.sign_action_at(channel, &info, EVENT_REMOVED, who, &[])?;
+            self.post(
+                "/channel/remove",
+                ByAccount {
+                    channel: *channel,
+                    account: *who,
+                    action,
+                }
+                .encode(TYPE_REMOVE),
+            )
+            .await?;
+            self.store.set_chain(channel, action.chain_seq, &head)?;
+        }
+
+        let info = self.info(channel).await?;
+        let epoch = info.epoch + 1;
+        let secret = generate_secret();
+        let mut commit = Commit {
+            epoch,
+            committer: self.me,
+            adds: adds.clone(),
+            removes,
+            contribution: contribution_of(&secret),
+            transcript: chain.transcript,
+            sig: [0; 64],
+        };
+        commit.sign(&self.seed);
+        // Derived before anything is published, so a commit this device could
+        // not itself derive from is never offered to anybody else.
+        let mut next = chain;
+        let key = next
+            .advance(&commit, &secret)
+            .map_err(ChatError::CannotDerive)?;
+
+        // One envelope per device of every account that is a member *after* the
+        // commit, this one included and a removed one never. A device of an
+        // admitted account gets the chain; everybody else gets the secret, which
+        // is thirty-two useless bytes without a chain to mix it into.
+        let (from_epoch, slots) = welcome(&commit, &next.chain, &key, &[]);
+        let mut envelopes = Vec::new();
+        let mut skipped = Vec::new();
+        let members = members_of(&info);
+        for who in &members {
+            let joining = adds.contains(who);
+            let devices = match self.devices_to_seal_to(who).await {
+                Ok(listed) if listed.devices.is_empty() => vec![*who],
+                Ok(listed) => listed.devices.iter().map(|d| d.device).collect(),
+                // SIP-17: a rotation must not be blocked by one member being
+                // unreachable, and the same holds of a commit — except in a
+                // two-party conversation, where skipping the other party leaves
+                // nobody to talk to.
+                Err(e) if members.len() > 2 => {
+                    skipped.push(*who);
+                    let _ = e;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            for device in devices {
+                let p = match self.take_prekey_for(device).await {
+                    Ok(p) => p,
+                    Err(ChatError::NotReady(w)) if members.len() > 2 => {
+                        skipped.push(w);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                let (at, payload) = if joining {
+                    (from_epoch, slots.clone())
+                } else {
+                    (epoch, vec![ChannelKey::new(secret)])
+                };
+                envelopes.push(sign_envelope(
+                    &self.seed,
+                    &self.exchange_of(channel),
+                    &info.instance,
+                    channel,
+                    epoch,
+                    seal_envelope(&device, p.id, &p.public, at, &payload)
+                        .map_err(|e| ChatError::Protocol(e.to_string()))?,
+                ));
+            }
+        }
+        if envelopes.is_empty() {
+            return Err(ChatError::NotReady(
+                skipped.first().copied().unwrap_or(self.me),
+            ));
+        }
+
+        // The epoch advances, so there is a SIP-16 `rotated` entry to sign for.
+        //
+        // **This is where an ordinary member's commit is refused, and SIP-87 did
+        // not expect it to be.** SIP-17 §Put says a non-admin publishing to its
+        // own devices MUST use the current epoch, with one exception: a member
+        // who revoked one of its own devices since the epoch was minted. SIP-17's
+        // amendment for SIP-87 then says "Nothing in this document changes". So
+        // "any member may commit" holds exactly where SIP-17 already let a member
+        // rekey — which is the compromise case SIP-87 is for, reached by
+        // revoking the device first — and a *scheduled* rekey by an ordinary
+        // member is refused as `NotAnAdmin`.
+        let (action, head) = self.sign_action_at(
+            channel,
+            &info,
+            EVENT_ROTATED,
+            &self.me,
+            &epoch.to_be_bytes(),
+        )?;
+        let body = self
+            .post(
+                "/channel/key/put",
+                KeyPut {
+                    channel: *channel,
+                    epoch,
+                    envelopes,
+                    action: Some(action),
+                }
+                .encode(),
+            )
+            .await?;
+        let ack = PutAck::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        self.top_up_prekeys().await?;
+        if !ack.accepted {
+            // Somebody else committed this epoch first. Their commit is in the
+            // log and their secret is waiting for us, so this is a collection
+            // rather than an error — and this commit is abandoned unposted,
+            // which is why the entry comes last.
+            self.collect_keys(channel).await?;
+            return Ok(self.info(channel).await?.epoch);
+        }
+        self.store.set_chain(channel, action.chain_seq, &head)?;
+        self.store.set_agreement(channel, &next)?;
+        self.store.put_key(channel, epoch, &key)?;
+
+        // The entry, last, and under the epoch it creates: the exchange takes a
+        // post only at the channel's current epoch, which the `Put` above has
+        // just moved. A member that opens the envelope before this lands finds
+        // no commit for the epoch, keeps the secret and waits — which is the
+        // same path as a device whose fetch simply has not caught up.
+        //
+        // Asked again rather than reused: the `Put` moved the epoch, and the
+        // entry is signed over a place and a chain position that have to be the
+        // ones standing now.
+        let info = self.info(channel).await?;
+        let (_, mine, seen_epoch) = self.store.cursor(channel)?;
+        let local = if seen_epoch == epoch { mine } else { 0 };
+        let msg_seq = local.max(info.my_msg_seq) + 1;
+        let plain = commit.encode();
+        self.store.set_msg_seq(channel, epoch, msg_seq)?;
+        let posted = self
+            // Never a timer. A commit every later epoch is derived from is not a
+            // thing to let the exchange prune out from under the channel.
+            .post_entry(
+                channel,
+                &info,
+                epoch,
+                msg_seq,
+                &plain,
+                plain.clone(),
+                Some(0),
+            )
+            .await?;
+        self.store.put_commit(channel, posted.seq, &commit)?;
+        Ok(epoch)
+    }
+
+    /// SIP-87: create a private group whose key every member contributes to.
+    ///
+    /// The same channel [`create_group`](Self::create_group) makes, keyed the
+    /// other way: the creator generates `chain_0` and the first commit admits
+    /// the invitees, so epoch 1 exists only once the entry naming them is in the
+    /// log. A channel is agreed or admin-keyed from its first commit and MUST
+    /// NOT mix the two, which is why this is a separate call rather than a
+    /// setting — there is no later point at which it could be decided.
+    pub async fn create_agreed_group(&mut self, name: &str, invite: &[PubKey]) -> Result<[u8; 32]> {
+        let mut channel = [0u8; 32];
+        {
+            use rand_core::RngCore;
+            rand_core::OsRng.fill_bytes(&mut channel);
+        }
+        self.create_signed(Create {
+            channel,
+            instance: [0u8; 32],
+            actions: Vec::new(),
+            visibility: Visibility::Private,
+            retention_secs: RETENTION_SECS,
+            max_entries: 0,
+            name: String::new(),
+            topic: String::new(),
+            // Nobody is invited at creation. An invitee the `Create` carried
+            // would be a member before any commit named it, so its first
+            // envelope would be a commit secret it has no chain for — SIP-87's
+            // own trap, and the one its `Welcome` rule exists to avoid.
+            invites: Vec::new(),
+        })
+        .await?;
+        // Before the first commit, and not after: the chain is what the commit
+        // is derived from.
+        self.store.set_agreement(&channel, &Chain::create())?;
+        self.commit(&channel, invite, &[]).await?;
+        if !name.is_empty() {
+            self.set_name(&channel, name).await?;
+        }
+        Ok(channel)
     }
 
     /// Add somebody without giving them the key.
@@ -6065,16 +6533,41 @@ impl Chat {
         // while reusing one costs the confidentiality of two messages.
         self.store.set_msg_seq(channel, epoch, msg_seq)?;
 
+        self.post_entry(channel, &info, epoch, msg_seq, &plain, sealed, None)
+            .await
+    }
+
+    /// Post one entry, signed and chained, and keep our own copy of it.
+    ///
+    /// The half of [`send_body`](Self::send_body) below the sealing, taken out
+    /// of it so that SIP-87's commit — an ordinary entry whose body is in the
+    /// clear in a channel where everything else is sealed — reaches the log
+    /// through the same SIP-31 chain, the same SIP-34 receipt and the same
+    /// store write, rather than through a second copy of all three.
+    ///
+    /// `timer` overrides SIP-57's per-channel setting, and `Some(0)` is how a
+    /// caller says this entry must not expire.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_entry(
+        &mut self,
+        channel: &[u8; 32],
+        info: &ChannelInfo,
+        epoch: u32,
+        msg_seq: u64,
+        plain: &[u8],
+        sealed: Vec<u8>,
+        timer: Option<u32>,
+    ) -> Result<Posted> {
         // SIP-31. Signed over the body **as posted** — ciphertext here, plain
         // in a public channel — so that anybody can check who wrote it without
         // holding a key. The chain position is the greater of what we remember
         // and what the exchange reports, never its report alone.
-        let (chain_seq, prev) = self.chain_at(channel, &info)?;
+        let (chain_seq, prev) = self.chain_at(channel, info)?;
         // SIP-57: the timer is signed into the entry, so every holder sees
         // the same one.
-        let expires_after = self.timers.get(channel).copied().unwrap_or(0);
+        let expires_after = timer.unwrap_or_else(|| self.timers.get(channel).copied().unwrap_or(0));
         let terms = EntryTerms {
-            place: self.place(channel, &info),
+            place: self.place(channel, info),
             account: self.me,
             device: self.device,
             epoch,
@@ -6135,7 +6628,7 @@ impl Chat {
                 account: self.me,
                 posted: posted.posted,
                 kind: KIND_MEMBER,
-                plain: Some(&plain),
+                plain: Some(plain),
             },
         )?;
         // SIP-57: our own timed message goes from our store at its time too.
@@ -6496,9 +6989,23 @@ impl Chat {
         // entry we checked last, if it was the one immediately before.
         let mut last_head: Option<(u64, [u8; 32])> = None;
         let mut last = since;
+        // SIP-87 commits met in this run, in the order they were ordered in.
+        // Collected rather than acted on one at a time: deriving an epoch needs
+        // the commit *and* the secret sent for it, and a run of entries may
+        // carry several commits whose secrets are already waiting.
+        let mut commits: Vec<(u64, Commit)> = Vec::new();
         for e in entries {
             last = last.max(e.seq);
-            if e.kind == KIND_MEMBER {
+            // SIP-87, ahead of the replay check and of anything being opened: a
+            // commit's body is in the clear, so it is not sealed under a subkey
+            // and spends no AEAD counter. Gating it on `replay` would also make
+            // a commit unreadable on a second pass over the log — which is what
+            // `rewind` does every time a key arrives late — and a commit this
+            // device cannot read is an epoch it can never derive.
+            let commit = (e.kind == KIND_MEMBER && !e.body.is_empty())
+                .then(|| commit_signed_in(&e.body, &e.account, &e.device))
+                .flatten();
+            if e.kind == KIND_MEMBER && commit.is_none() {
                 // SIP-17: a counter we have already seen under this key is
                 // either the exchange replaying or somebody else doing it, and
                 // it must not be decrypted.
@@ -6506,7 +7013,11 @@ impl Chat {
                     continue;
                 }
             }
-            let plain = if e.epoch == 0 {
+            let plain = if commit.is_some() {
+                // Readable by anybody who can fetch the channel, which is the
+                // property the whole `Welcome` rule rests on.
+                Some(e.body.clone())
+            } else if e.epoch == 0 {
                 // Epoch 0 is unsealed by construction: every entry in a public
                 // channel, and the exchange's own system entries everywhere.
                 Some(e.body.clone())
@@ -6573,6 +7084,7 @@ impl Chat {
                         // Nobody vouched for it, so nothing is decoded from
                         // it either.
                         system: None,
+                        commit: None,
                         verdict,
                         standing,
                     },
@@ -6649,7 +7161,15 @@ impl Chat {
                         .push((*channel, was, e.seq.saturating_sub(1)));
                 }
             }
-            let body = plain.and_then(|p| Body::decode(&p).ok().flatten());
+            // SIP-87: kept once it has passed SIP-31 and SIP-34, because what
+            // is written here is what every later epoch is derived from.
+            if let Some(c) = &commit {
+                self.store.put_commit(channel, e.seq, c)?;
+                commits.push((e.seq, c.clone()));
+            }
+            let body = (commit.is_none())
+                .then(|| plain.and_then(|p| Body::decode(&p).ok().flatten()))
+                .flatten();
             let redacts = match &body {
                 Some(Body::Redact { target }) => Some(*target),
                 _ => None,
@@ -6663,6 +7183,7 @@ impl Chat {
                     tombstone,
                     body,
                     system,
+                    commit,
                     verdict,
                     standing,
                 },
@@ -6680,7 +7201,131 @@ impl Chat {
                 self.store.redact_message(channel, target)?;
             }
         }
+        // SIP-87: a commit plus the secret sent for it is an epoch key. Done
+        // after the run rather than inside it so that a device which had the
+        // secret waiting catches up through every commit this fetch brought,
+        // rather than one per fetch.
+        if !commits.is_empty() {
+            self.advance_agreement(channel)?;
+        }
         Ok(last)
+    }
+
+    /// SIP-87: keep the commits a run of entries carries, without folding it.
+    ///
+    /// The fold does this too, and this exists because of *when*: an envelope
+    /// cannot be classified until the commit for its epoch is known, and the
+    /// collection that opens envelopes runs before the fold.
+    fn note_commits(&mut self, channel: &[u8; 32], entries: &[Entry]) -> Result<usize> {
+        let mut noted = 0;
+        for e in entries {
+            if e.kind != KIND_MEMBER || e.body.is_empty() {
+                continue;
+            }
+            if let Some(c) = commit_signed_in(&e.body, &e.account, &e.device) {
+                self.store.put_commit(channel, e.seq, &c)?;
+                noted += 1;
+            }
+        }
+        Ok(noted)
+    }
+
+    /// SIP-87: derive every epoch this device now holds both halves of.
+    ///
+    /// The two halves are a commit, from the log, and the secret it was sent,
+    /// from an envelope — and they arrive in either order, so this is the one
+    /// place either arrival leads to. It stops at the first epoch it cannot
+    /// derive and says why: a device behind the channel **refuses** rather than
+    /// deriving nonsense, which is the control SIP-87 asks for by name.
+    fn advance_agreement(&mut self, channel: &[u8; 32]) -> Result<u32> {
+        let Some(mut chain) = self.store.agreement(channel)? else {
+            return Ok(0);
+        };
+        let ceiling = self.store.highest_commit(channel)?;
+        while chain.epoch < ceiling {
+            let next = chain.epoch + 1;
+            let Some(secret) = self.store.contribution(channel, next)? else {
+                // Nothing for the next epoch. Ordinary while a commit's secret
+                // is still in flight — and **not** ordinary when this device
+                // holds a secret for an epoch further up, which is SIP-87's
+                // restore case exactly: the chain is behind, the secret in hand
+                // is for an epoch it cannot reach, and the epochs between are
+                // ones nobody will send again. Named rather than left as
+                // silence, because the device's only way forward is to be
+                // admitted again by a commit and somebody has to be told.
+                let ahead = self.store.highest_contribution(channel)?;
+                if ahead > next {
+                    self.refusals.insert(
+                        *channel,
+                        Refused::WrongEpoch {
+                            held: chain.epoch,
+                            commit: ahead,
+                        },
+                    );
+                }
+                break;
+            };
+            // Every commit held for the epoch, because more than one may exist
+            // and only the one whose published contribution matches the secret
+            // this device was sent is the one the members derived from.
+            let mut refused = None;
+            let mut moved = false;
+            for commit in self.store.commits_at(channel, next)? {
+                let mut attempt = chain;
+                match attempt.advance(&commit, &secret) {
+                    Ok(key) => {
+                        self.store.put_key(channel, next, &key)?;
+                        self.store.set_agreement(channel, &attempt)?;
+                        self.store.drop_contribution(channel, next)?;
+                        self.refusals.remove(channel);
+                        chain = attempt;
+                        moved = true;
+                        break;
+                    }
+                    Err(why) => refused = Some(why),
+                }
+            }
+            if !moved {
+                // Recorded rather than returned. This runs inside a poll, and a
+                // device that cannot derive an epoch must still read the
+                // entries of the ones it can — SIP-87's own case for it is a
+                // restore, where the channel goes on without the device and the
+                // device has to be able to say so.
+                if let Some(why) = refused {
+                    self.refusals.insert(*channel, why);
+                }
+                break;
+            }
+            // Entries under this epoch were held and unreadable; now they are
+            // not, and nothing else would revisit them.
+            self.store.rewind(channel)?;
+        }
+        // Secrets the chain has passed. SIP-87 lets a client discard
+        // `chain_{n-1}` once it has `chain_n`, and the same holds of the secret
+        // that took it there: it is the epoch key by another name, and the epoch
+        // key is kept.
+        self.store.forget_contributions_to(channel, chain.epoch)?;
+        Ok(chain.epoch)
+    }
+
+    /// SIP-87: the epoch this device's chain stands at.
+    ///
+    /// `None` for a channel that is admin-keyed, which is a different fact from
+    /// standing at epoch 0: the first says the chain does not apply here, and
+    /// the second that this device is a member of an agreed channel which has
+    /// not been keyed yet.
+    pub fn agreed_epoch(&self, channel: &[u8; 32]) -> Result<Option<u32>> {
+        Ok(self.store.agreement(channel)?.map(|c| c.epoch))
+    }
+
+    /// SIP-87: why this device last declined to derive an epoch for `channel`.
+    ///
+    /// `None` is the ordinary state and also the state of a channel that is
+    /// SIP-17's. A client SHOULD surface this: the failure it names is a device
+    /// that has to be admitted again, and SIP-87 is explicit that the exchange
+    /// holds no part of a chain and cannot help.
+    pub fn refusal(&self, channel: &[u8; 32]) -> Option<Refused> {
+        self.refusals.get(channel).copied()
     }
 
     /// Make a conversation out of what a fetch brought back.
@@ -6853,12 +7498,39 @@ impl Chat {
             }
         };
 
+        // SIP-87 §A Welcome, and it has to come before the collection below: "a
+        // device MUST read the commit before opening the envelope". The entries
+        // this fetch carried are already in hand, so the commits in them are
+        // noted here rather than waiting for the fold — which runs *after* the
+        // collection, and would leave a joining device unable to tell a
+        // `Welcome` from a SIP-17 key at the one moment it has to.
+        //
+        // Noted on the commit's own signature, which is an Ed25519 signature by
+        // the device the exchange stamped on the entry over the whole body. The
+        // fold stores it again once SIP-31 and SIP-34 have had their say, and the
+        // two agree; what this cannot do is let a forged commit produce a key,
+        // because a chain only advances on a commit whose contribution matches
+        // the secret and whose transcript matches the one it holds.
+        self.note_commits(channel, &entries.entries)?;
+        // And whether the commits just noted are all of them. The cursor has not
+        // moved yet, so it is the wrong thing to ask: what matters is that this
+        // fetch reached the newest entry the exchange holds, in which case an
+        // epoch with no commit is an epoch an admin minted.
+        let settled = entries.last == 0
+            || entries
+                .entries
+                .iter()
+                .map(|e| e.seq)
+                .max()
+                .unwrap_or(since)
+                .max(since)
+                >= entries.last;
         // Somebody may have rotated while this client was running — after a
         // removal, or after revoking a device. Collect once when we hold no key
         // for the epoch in force, or a client would sit showing unreadable
         // entries until it was restarted.
         if info.epoch > 0 && self.store.key(channel, info.epoch)?.is_none() {
-            self.collect_keys(channel).await?;
+            self.collect_keys_read_to(channel, settled).await?;
             info = self.info(channel).await?;
             self.told_about
                 .insert(*channel, (info.clone(), std::time::Instant::now()));
@@ -6896,6 +7568,18 @@ impl Chat {
         )?;
         if last > since {
             self.store.set_since(channel, last)?;
+        }
+        // SIP-87, and the other side of the deferral in `absorb_keys`: now that
+        // the log has been read, an envelope this device declined to classify
+        // can be. Gated on holding no key for the epoch in force, which is the
+        // same condition the collection above it runs on — so for a channel
+        // whose key an admin minted this is a retry that finds nothing, and for
+        // an agreed one it is where a `Welcome` is taken.
+        if info.epoch > 0
+            && info.visibility != Visibility::Public
+            && self.store.key(channel, info.epoch)?.is_none()
+        {
+            let _ = self.collect_keys(channel).await;
         }
         // What this fold read about the channel itself -- its name, topic and
         // picture -- kept beside the channel so the next start can list the
@@ -7062,6 +7746,30 @@ impl Chat {
             let mut keys_opened = 0;
             let mut fetched = None;
             if c.status == STATUS_OK {
+                // SIP-87 §A Welcome, before the envelopes and not after: a
+                // catch-up carries the entries and the envelopes in one answer,
+                // and "a device MUST read the commit before opening the
+                // envelope" settles which goes first. Only the commits are taken
+                // out here; the caller folds the entries as it always did.
+                //
+                // Without this the whole value of SIP-47 would be lost to an
+                // agreed channel — a joining device would defer every envelope
+                // and need a second round trip to do what it came for.
+                let mut settled = true;
+                if !c.fetched.is_empty() {
+                    let read = Entries::decode(&c.fetched, false)
+                        .map_err(|e| ChatError::Protocol(e.to_string()))?;
+                    self.note_commits(&c.channel, &read.entries)?;
+                    settled = read.last == 0
+                        || read
+                            .entries
+                            .iter()
+                            .map(|e| e.seq)
+                            .max()
+                            .unwrap_or(asked.since)
+                            .max(asked.since)
+                            >= read.last;
+                }
                 if !c.got.is_empty() {
                     let got =
                         Got::decode(&c.got).map_err(|e| ChatError::Protocol(e.to_string()))?;
@@ -7070,7 +7778,9 @@ impl Chat {
                         // envelope: one round trip, only for a channel that
                         // actually handed keys over.
                         let instance = self.info(&c.channel).await?.instance;
-                        keys_opened = self.absorb_keys(&c.channel, &instance, got).await?;
+                        keys_opened = self
+                            .absorb_keys(&c.channel, &instance, got, settled)
+                            .await?;
                     }
                 }
                 if !c.fetched.is_empty() {

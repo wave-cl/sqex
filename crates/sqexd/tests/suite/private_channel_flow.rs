@@ -1079,6 +1079,7 @@ fn timeline_of(
             verdict: Verdict::Valid,
             standing: Standing::Unclaimed,
             system: None,
+            commit: None,
         })
         .collect();
     Timeline::fold(&received, admins)
