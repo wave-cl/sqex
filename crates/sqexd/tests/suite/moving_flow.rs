@@ -695,3 +695,101 @@ async fn a_home_keeps_waiting_after_its_first_wait_runs_out() {
          the first wait ran out and nothing replaced it"
     );
 }
+
+/// The origins `/status` reports, by key.
+async fn origin_keys(c: &mut Client) -> Vec<String> {
+    let (code, body) = c.get("/status").await.unwrap();
+    assert_eq!(code, 200);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["origins"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|o| o["key"].as_str().unwrap_or("?").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **An exchange is never one of its own origins.** Both writers of
+/// `home_origin` take the origin from whoever is talking to them -- a Move's
+/// `origins` list is the presenter's, and `/account/hint` takes a device's
+/// `origin` verbatim -- and neither checked it against this exchange's own key.
+///
+/// A self-row costs no traffic, because the home task skips `origin == me`, but
+/// that skip is exactly why it can never settle: its mail is never collected so
+/// it stays pending for good, it holds one of `MAX_HINTS`, and `/status` shows
+/// the exchange failing to reach itself in the list an operator reads to
+/// diagnose a failing forward. Found live at trunk, from a Move presented eight
+/// days earlier.
+///
+/// Both halves are asserted: the self-origin is dropped *and* the real one is
+/// kept, since a filter that threw away everything would pass the first alone.
+#[tokio::test]
+async fn an_exchange_is_not_stored_as_its_own_origin() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let (b_key, _) = key_in(b_dir.path());
+    let (x_addr, x_pub) = exchange_in(x_dir.path(), &[b_key], &[]).await;
+    let x_key = PubKey::new(x_pub);
+    let (b_addr, b_pub) = exchange_in(b_dir.path(), &[x_key], &[("x.test", x_key, x_addr)]).await;
+
+    let (alice_seed, alice) = identity(239);
+    let (bob_seed, bob) = identity(240);
+    let channel = [239u8; 32];
+    let (_a, _ca, _b, _cb) =
+        group_at_x(x_addr, x_pub, alice_seed, alice, bob_seed, bob, channel).await;
+
+    // The Move names B -- the home it is being presented to -- beside the real
+    // origin. A client did exactly this against trunk.
+    let mv = Move::sign(&alice_seed, &b_key, now());
+    let mut at_b = Client::connect_as(b_addr, &b_pub, &alice_seed)
+        .await
+        .unwrap();
+    let (code, body) = present(
+        &mut at_b,
+        &Moving {
+            mv,
+            domain: "b.test".into(),
+            origins: vec![(x_key, "x.test".into()), (b_key, "b.test".into())],
+        },
+    )
+    .await;
+    assert_eq!(code, 200, "{}", common::said(&body));
+    // The move still works: the real origin was pulled from.
+    until(&mut at_b, channel, |t| t.len() == 2).await;
+
+    let keys = origin_keys(&mut at_b).await;
+    assert!(
+        keys.contains(&x_key.to_string()),
+        "the real origin was dropped with the self one: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&b_key.to_string()),
+        "the exchange stored itself as one of its own origins: {keys:?}"
+    );
+
+    // The other writer: a device hinting its own home is told it is not
+    // pulling, rather than having the row stored.
+    let (code, body) = at_b
+        .post(
+            "/account/hint",
+            sqex_proto::home::Hint {
+                origin: b_key,
+                domain: "b.test".into(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    assert!(
+        !sqex_proto::home::Hinted::decode(&body).unwrap().pulling,
+        "a hint naming the home itself was accepted"
+    );
+    let keys = origin_keys(&mut at_b).await;
+    assert!(
+        !keys.contains(&b_key.to_string()),
+        "a self-hint was stored: {keys:?}"
+    );
+}

@@ -1118,7 +1118,10 @@ impl Registry {
         )
         .map_err(storage("clear origins"))?;
         if mv.home == *me {
-            for (origin, domain) in origins {
+            // Not this exchange itself, for the reason given on
+            // `add_home_origin`: the presenter chooses this list, and one that
+            // named its own destination left a row nothing could ever clear.
+            for (origin, domain) in origins.iter().filter(|(o, _)| o != me) {
                 tx.execute(
                     "INSERT OR REPLACE INTO home_origin (account, origin, domain) VALUES (?1, ?2, ?3)",
                     params![mv.account.as_bytes(), origin.as_bytes(), domain],
@@ -1283,6 +1286,15 @@ impl Registry {
         me: &PubKey,
     ) -> bool {
         if !self.home_of(account).is_some_and(|(h, _, _)| h == *me) {
+            return false;
+        }
+        // An exchange is never one of its own origins. `origin` comes from the
+        // caller -- `/account/hint` takes it from a device verbatim -- and a
+        // self-hint would be a row the home task skips (`origin == me`) and so
+        // can never settle: its mail is never collected, so it stays pending
+        // for good, and it shows in `/status` as this exchange failing to
+        // reach itself. Found live at trunk, from a Move; see `record_move`.
+        if origin == me {
             return false;
         }
         let db = self.db.lock().unwrap();
