@@ -40,7 +40,7 @@ use sqnr_core::PubKey;
 /// 2 adds `conn` to every record that describes something arriving on a
 /// connection. A reader from before it decodes a line of the new shape as
 /// trailing bytes and refuses it, loudly, which is the point of asking.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 /// Largest line this will emit or a reader will accept.
 ///
@@ -126,12 +126,24 @@ pub enum Record {
         /// connection anywhere else and nothing should store it.
         conn: u64,
     },
-    /// A SIP-30 event was published to an account. `event` is that event's own
-    /// kind byte; `channel` is present for the kinds that name one.
+    /// A SIP-30 event was published. `event` is that event's own kind byte;
+    /// `channel` is present for the kinds that name one.
+    ///
+    /// **One line per event, with two counts, not one line per recipient.**
+    /// `to` is how many accounts were entitled to hear it and `live` how many
+    /// streams it was actually written to -- very different numbers, and a line
+    /// per recipient conflated them. A read mark in a 32-member channel drew 32
+    /// lines saying an event had gone to somebody, when one stream was open and
+    /// one frame went out; an operator reading that over-counted by 32. It also
+    /// scaled the tail with membership rather than activity: at SIP-16's
+    /// `MAX_MEMBERS` one read mark is 256 lines, and two of those overrun
+    /// `QUEUE` and cost the watcher a `Dropped` -- the instrument losing records
+    /// because somebody marked a message read.
     Event {
-        to: PubKey,
         event: u8,
         channel: Option<[u8; 32]>,
+        to: u32,
+        live: u32,
     },
     /// A signed admin op was applied.
     Admin { admin: PubKey, action: String },
@@ -302,8 +314,12 @@ impl Line {
                 out.extend_from_slice(&bytes.to_be_bytes());
                 out.extend_from_slice(&conn.to_be_bytes());
             }
-            Record::Event { to, event, channel } => {
-                out.extend_from_slice(to.as_bytes());
+            Record::Event {
+                event,
+                channel,
+                to,
+                live,
+            } => {
                 out.push(*event);
                 match channel {
                     Some(c) => {
@@ -312,6 +328,8 @@ impl Line {
                     }
                     None => out.push(0),
                 }
+                out.extend_from_slice(&to.to_be_bytes());
+                out.extend_from_slice(&live.to_be_bytes());
             }
             Record::Admin { admin, action } => {
                 out.extend_from_slice(admin.as_bytes());
@@ -382,8 +400,6 @@ impl Line {
                 }
             }
             KIND_EVENT => {
-                let to = b.get(at..at + 32).ok_or_else(|| short("event account"))?;
-                at += 32;
                 let event = *b.get(at).ok_or_else(|| short("event kind"))?;
                 at += 1;
                 let present = *b.get(at).ok_or_else(|| short("channel flag"))?;
@@ -402,9 +418,10 @@ impl Line {
                     }
                 };
                 Record::Event {
-                    to: PubKey::new(to.try_into().unwrap()),
                     event,
                     channel,
+                    to: take_u32(b, &mut at)?,
+                    live: take_u32(b, &mut at)?,
                 }
             }
             KIND_ADMIN => {
@@ -551,14 +568,16 @@ mod tests {
                 conn: 44,
             },
             Record::Event {
-                to: key(3),
                 event: 0x01,
                 channel: Some([7u8; 32]),
+                to: 32,
+                live: 1,
             },
             Record::Event {
-                to: key(3),
                 event: 0x07,
                 channel: None,
+                to: 1,
+                live: 0,
             },
             Record::Admin {
                 admin: key(4),

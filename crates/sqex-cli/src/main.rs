@@ -3507,9 +3507,17 @@ fn tail_line(line: &sqex_proto::tail::Line) -> Option<String> {
             format!("c{conn}"),
             if *opened { "opened" } else { "ended" }
         ),
-        Record::Event { to, event, channel } => format!(
-            "[{at}] {:<10} {:<5} event {event:#04x}{}",
-            short(to),
+        // `to` is how many accounts were entitled to hear it, `live` how many
+        // streams it reached. One line, because a line per recipient read as
+        // that many events having happened.
+        Record::Event {
+            event,
+            channel,
+            to,
+            live,
+        } => format!(
+            "[{at}] {:<10} {:<5} event {event:#04x}{} to={to} live={live}",
+            "-",
             "",
             channel
                 .map(|c| format!(" channel {}", short(&sqnr_core::PubKey::new(c))))
@@ -3568,9 +3576,15 @@ fn tail_json(line: &sqex_proto::tail::Line) -> String {
         } => serde_json::json!({"kind":"connection","opened":opened,"peer":peer,
                                 "identity":identity.map(|a| a.to_base58()),
                                 "rtt_ms":rtt_ms,"lost":lost,"bytes":bytes,"conn":conn}),
-        Record::Event { to, event, channel } => {
-            serde_json::json!({"kind":"event","to":to.to_base58(),"event":event,
-                               "channel":channel.map(|c| sqnr_core::PubKey::new(c).to_base58())})
+        Record::Event {
+            event,
+            channel,
+            to,
+            live,
+        } => {
+            serde_json::json!({"kind":"event","event":event,
+                               "channel":channel.map(|c| sqnr_core::PubKey::new(c).to_base58()),
+                               "to":to,"live":live})
         }
         Record::Admin { admin, action } => {
             serde_json::json!({"kind":"admin","admin":admin.to_base58(),"action":action})

@@ -465,3 +465,106 @@ async fn a_request_names_the_connection_it_arrived_on() {
         "four requests over two connections should group two and two, got {by_conn:?}"
     );
 }
+
+/// **One line per event, with how far it reached.**
+///
+/// The tail wrote a line per *recipient*, so a read mark in a 32-member channel
+/// drew 32 lines saying an event had gone to somebody -- while one stream was
+/// open and one frame went out. An operator reading that over-counted by 32, and
+/// the tail's volume scaled with membership rather than activity: at SIP-16's
+/// `MAX_MEMBERS` one read mark is 256 lines, and two of those overrun `QUEUE`
+/// and cost the watcher a `Dropped` -- the instrument losing records because
+/// somebody marked a message read.
+///
+/// `live` is asserted separately from `to`, because that is the distinction a
+/// line per recipient could not express: entitled to hear it is not told.
+#[tokio::test]
+async fn an_event_is_one_line_saying_how_far_it_reached() {
+    let h = harness().await;
+    let mut watcher = Client::connect(h.addr, &h.server_pub_bytes, &[9u8; 32]).await;
+    let (status, mut stream) = watcher.open_tail(&h.server_pub, &h.admin).await;
+    assert_eq!(status, 200);
+
+    // One member, holding no stream: `to` is 1 and `live` 0, which is the pair a
+    // line per recipient could not tell apart.
+    let alice_sk = SigningKey::from_bytes(&[41u8; 32]);
+    let alice_seed = alice_sk.to_bytes();
+    let alice = sqnr_core::PubKey::new(alice_sk.verifying_key().to_bytes());
+    let mut a = Client::connect(h.addr, &h.server_pub_bytes, &alice_seed).await;
+    let channel = [41u8; 32];
+    let s = crate::common::Signer::new(alice_seed, alice, h.server_pub_bytes);
+    let mut chain = crate::common::Chain::default();
+    let create = s.create_chained(
+        &mut chain,
+        channel,
+        crate::common::instance_for(channel, 0),
+        sqex_proto::channel::Visibility::Public,
+        3600,
+        "tailing",
+        vec![],
+    );
+    let (code, body) = a.post("/channel/create", create.encode()).await;
+    assert_eq!(code, 200, "{}", crate::common::said(&body));
+
+    // **A second member, because one cannot tell the two shapes apart.** With a
+    // single member "a line per recipient" *is* one line, so a one-member test
+    // passes against the behaviour it exists to refuse -- which this one did,
+    // until the sabotage showed it.
+    let bob_sk = SigningKey::from_bytes(&[42u8; 32]);
+    let bob_seed = bob_sk.to_bytes();
+    let bob = sqnr_core::PubKey::new(bob_sk.verifying_key().to_bytes());
+    let mut b = Client::connect(h.addr, &h.server_pub_bytes, &bob_seed).await;
+    let bs = crate::common::Signer::new(bob_seed, bob, h.server_pub_bytes);
+    let action = bs.action_outside(
+        channel,
+        crate::common::instance_for(channel, 0),
+        sqex_proto::channel::EVENT_JOINED,
+        &bob,
+        &[],
+        0,
+        sqex_proto::entry_sig::GENESIS,
+    );
+    let (code, body) = b
+        .post(
+            "/channel/join",
+            sqex_proto::channel::ByChannelSigned { channel, action }
+                .encode(sqex_proto::channel::TYPE_JOIN),
+        )
+        .await;
+    assert_eq!(code, 200, "{}", crate::common::said(&body));
+
+    // Bob's join is told to the members, which is now two of them.
+    // **Waited past the events, not stopped at one.** A request made after them
+    // is the marker: stopping at the first matching event line meant a second,
+    // duplicate line was never read, and the test passed against the behaviour
+    // it exists to refuse. The sabotage showed that too.
+    let (code, _) = a.get("/health").await;
+    assert_eq!(code, 200);
+    let (saw, seen) = wait_for(
+        &mut stream,
+        Duration::from_secs(8),
+        |l| matches!(&l.record, Record::Request { route, .. } if route == "/health"),
+    )
+    .await;
+    assert!(saw, "the tail never reported the marker request: {seen:?}");
+
+    let events: Vec<(u32, u32)> = seen
+        .iter()
+        .filter_map(|l| match &l.record {
+            Record::Event {
+                event, to, live, ..
+            } if *event == 0x04 => Some((*to, *live)),
+            _ => None,
+        })
+        .collect();
+    // Two membership changes, two lines: the create (one member entitled) and
+    // Bob's join (two). A line per recipient would make the join two lines and
+    // this three -- which is the whole distinction, and why one member could not
+    // test it.
+    assert_eq!(
+        events,
+        vec![(1, 0), (2, 0)],
+        "two membership changes should draw two lines, with the count entitled \
+         and nought written to a stream nobody held: {events:?}"
+    );
+}

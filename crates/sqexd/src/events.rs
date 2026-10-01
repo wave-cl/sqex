@@ -149,8 +149,15 @@ impl Subscribers {
     /// **Never call this while holding the channel database lock.** The
     /// recipient list has to be read out of that database first, and the guard
     /// is not reentrant.
-    pub fn publish(&self, to: &[PubKey], event: Event) {
+    /// Returns how many streams it was written to.
+    ///
+    /// Reported in the tail beside the number of accounts entitled to hear it,
+    /// because those two are very different numbers and conflating them
+    /// overstated what had happened: a read mark in a 32-member channel read as
+    /// 32 events when one stream was open and one frame went out.
+    pub fn publish(&self, to: &[PubKey], event: Event) -> usize {
         let mut map = self.by_identity.lock().unwrap();
+        let mut written = 0usize;
         for who in to {
             let Some(subs) = map.get_mut(who) else {
                 continue;
@@ -163,9 +170,12 @@ impl Subscribers {
                 }
                 if sub.tx.try_send(event).is_err() {
                     sub.behind.store(true, Ordering::Relaxed);
+                } else {
+                    written += 1;
                 }
             }
         }
+        written
     }
 
     /// SIP-51: to one device of `who`, and not to its siblings.
@@ -177,19 +187,23 @@ impl Subscribers {
     /// Silent when that device holds no stream. It is not a delivery
     /// guarantee and is not meant to be -- SIP-30 is hints, and the wake is
     /// what reaches a device that is not listening.
-    pub fn publish_to_device(&self, who: &PubKey, device: &PubKey, event: Event) {
+    pub fn publish_to_device(&self, who: &PubKey, device: &PubKey, event: Event) -> usize {
         let mut map = self.by_identity.lock().unwrap();
         let Some(subs) = map.get_mut(who) else {
-            return;
+            return 0;
         };
+        let mut written = 0usize;
         for sub in subs.iter_mut().filter(|s| s.device == *device) {
             if sub.behind.load(Ordering::Relaxed) {
                 continue;
             }
             if sub.tx.try_send(event).is_err() {
                 sub.behind.store(true, Ordering::Relaxed);
+            } else {
+                written += 1;
             }
         }
+        written
     }
 
     /// How many streams an identity holds. For tests and `/status`.
