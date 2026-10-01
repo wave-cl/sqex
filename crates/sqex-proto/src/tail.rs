@@ -117,12 +117,13 @@ pub enum Record {
         rtt_ms: u32,
         lost: u64,
         bytes: u64,
-        /// This connection's own identifier.
+        /// This connection's own identifier: the count of connections the
+        /// exchange had accepted before it.
         ///
-        /// Unique while the exchange runs and reused after a restart, which is
-        /// all it is for: grouping the lines of one connection together in a
-        /// reading of one tail. It is not a name for the connection anywhere
-        /// else and nothing should store it.
+        /// Unique while the exchange runs and restarting from zero after,
+        /// which is all it is for: grouping the lines of one connection
+        /// together in a reading of one tail. It is not a name for the
+        /// connection anywhere else and nothing should store it.
         conn: u64,
     },
     /// A SIP-30 event was published to an account. `event` is that event's own

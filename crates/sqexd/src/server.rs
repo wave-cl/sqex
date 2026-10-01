@@ -2176,7 +2176,14 @@ pub async fn serve(bound: Bound) -> Result<()> {
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
-                        server.connections.fetch_add(1, Ordering::Relaxed);
+                        // The ordinal this connection is known by in the
+                        // tail, taken from the counter that was being bumped
+                        // here anyway. quinn's own `stable_id` is unique too
+                        // but is pointer-sized, and fifteen digits in every
+                        // line of an instrument built to be read is a poor
+                        // trade for an identity nothing outside one reading
+                        // needs.
+                        let conn_id = server.connections.fetch_add(1, Ordering::Relaxed);
                         // SIP-39: a peering exchange's link negotiates the
                         // `sqex-relay` ALPN and is driven by the relay protocol,
                         // not HTTP/3. SIP-85: a member's tunnel connection
@@ -2191,7 +2198,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
                             // Kept for the tail below: `serve_h3` takes the
                             // Arc, and the line it feeds is written after.
                             let watching = Arc::clone(&server);
-                            let ended = serve_h3(server, conn.clone(), peer).await;
+                            let ended = serve_h3(server, conn.clone(), peer, conn_id).await;
                             // **The transport, in numbers, once per
                             // connection.** A slow download looked identical
                             // from outside whether the path was lossy, the
@@ -2224,7 +2231,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
                                     rtt_ms: s.path.rtt.as_millis().min(u32::MAX as u128) as u32,
                                     lost: s.path.lost_packets,
                                     bytes: s.udp_tx.bytes + s.udp_rx.bytes,
-                                    conn: conn.stable_id() as u64,
+                                    conn: conn_id,
                                 });
                             if let Err(e) = ended {
                                 tracing::debug!("connection ended: {e}");
@@ -2317,7 +2324,12 @@ pub async fn serve(bound: Bound) -> Result<()> {
 }
 
 /// Drive one HTTP/3 connection: accept request streams and answer each.
-async fn serve_h3(server: Arc<Server>, conn: quinn::Connection, peer: Peer) -> Result<()> {
+async fn serve_h3(
+    server: Arc<Server>,
+    conn: quinn::Connection,
+    peer: Peer,
+    conn_id: u64,
+) -> Result<()> {
     // An identified connection can carry session datagrams, so register it and
     // pump them for as long as it lives. Anonymous connections cannot be a
     // party to a session, so they are never registered and never forwarded to.
@@ -2332,13 +2344,6 @@ async fn serve_h3(server: Arc<Server>, conn: quinn::Connection, peer: Peer) -> R
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn.clone()))
         .await
         .map_err(|e| Error::Malformed(format!("h3 setup: {e}")))?;
-
-    // What ties a request in the tail to the connection it came in on. quinn's
-    // own identifier, which is unique while this process runs -- enough to
-    // group one connection's lines together in one reading, which is all the
-    // tail wants it for. Not a name for the connection anywhere else: it is
-    // reused after a restart and means nothing to the peer.
-    let conn_id = conn.stable_id() as u64;
 
     loop {
         match h3_conn.accept().await {
