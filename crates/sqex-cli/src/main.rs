@@ -3352,8 +3352,7 @@ fn remove_ops(keys: &[String]) -> Result<Vec<Operation>, String> {
 
 /// Connect, resolve the signer, and run the signed transaction.
 async fn submit(cli: &Cli, cfg: &Config, ops: Vec<Operation>) -> Result<serde_json::Value, String> {
-    let (mut client, server) = connect(cli, cfg).await?;
-    let backend = signing_backend(cli, cfg).await?;
+    let (mut client, server, backend) = connect_signed(cli, cfg).await?;
     let review = |txn: &Transaction| {
         eprintln!("About to sign {} operation(s):", txn.ops.len());
         for op in &txn.ops {
@@ -3378,8 +3377,7 @@ async fn tail(cli: &Cli, cfg: &Config, kinds: &[String], json: bool) -> Result<(
     use sqex_proto::tail::{self, Framer};
 
     let kinds = parse_tail_kinds(kinds)?;
-    let (mut client, server) = connect(cli, cfg).await?;
-    let backend = signing_backend(cli, cfg).await?;
+    let (mut client, server, backend) = connect_signed(cli, cfg).await?;
 
     let op = Op::TailOpen {
         version: tail::VERSION,
@@ -3650,13 +3648,55 @@ async fn connect(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey), String> {
     // over one would be answered once and then closed. A YubiKey cannot be
     // a transport key and connects anonymously, which is the documented
     // cost of the transport gate.
-    let client = match load_software_identity(cli, cfg) {
-        Ok(signer) if !cli.yubikey => {
-            Client::connect_as(socket, server.as_bytes(), &signer.seed()).await?
+    //
+    // The YubiKey case is decided *before* the load, not in a guard after it: a
+    // match guard runs after its scrutinee, so asking here first asked an
+    // operator holding a YubiKey for the passphrase to a file whose result was
+    // then thrown away -- a passphrase and a PIN for one command.
+    let client = if cli.yubikey {
+        Client::connect(socket, server.as_bytes()).await?
+    } else {
+        match load_software_identity(cli, cfg) {
+            Ok(signer) => Client::connect_as(socket, server.as_bytes(), &signer.seed()).await?,
+            // No identity, or one that would not load: a read-only command
+            // still works anonymously wherever the whitelist is off.
+            Err(_) => Client::connect(socket, server.as_bytes()).await?,
         }
-        _ => Client::connect(socket, server.as_bytes()).await?,
     };
     Ok((client, server))
+}
+
+/// The card, its key, and the PIN that unlocks it.
+async fn yubikey_backend() -> Result<Backend, String> {
+    let card = Card::spawn();
+    let public = PubKey::new(card.pubkey().await?);
+    let pin = rpassword::prompt_password("YubiKey user PIN: ").map_err(|e| e.to_string())?;
+    card.unlock(pin).await?;
+    Ok(Backend::yubikey(card, public))
+}
+
+/// Connect *and* build the signing backend, from **one** load of the identity.
+///
+/// The two are separate jobs -- the transport key is what names the connection
+/// (SIP-3), the signature is what carries the authority (SIP-11) -- but for a
+/// software identity they are the same file, and loading it once per job asked
+/// an operator with an encrypted identity for the passphrase twice per command.
+/// Every command that both connects and signs comes through here.
+async fn connect_signed(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey, Backend), String> {
+    let (socket, server) = endpoint(cli, cfg).await?;
+    if cli.yubikey {
+        // A YubiKey cannot be a transport key, so there is no file to load and
+        // no passphrase to ask for -- the PIN is the only secret. The
+        // connection is anonymous, which is the documented cost of the
+        // transport gate.
+        let client = Client::connect(socket, server.as_bytes()).await?;
+        let backend = yubikey_backend().await?;
+        return Ok((client, server, backend));
+    }
+    // Loaded once; the seed names the connection and the key signs.
+    let signer = load_software_identity(cli, cfg)?;
+    let client = Client::connect_as(socket, server.as_bytes(), &signer.seed()).await?;
+    Ok((client, server, Backend::software(signer)))
 }
 
 /// Build a signing backend, prompting the operator for a passphrase (encrypted
@@ -3664,11 +3704,7 @@ async fn connect(cli: &Cli, cfg: &Config) -> Result<(Client, PubKey), String> {
 /// prompt — the unattended path.
 async fn signing_backend(cli: &Cli, cfg: &Config) -> Result<Backend, String> {
     if cli.yubikey {
-        let card = Card::spawn();
-        let public = PubKey::new(card.pubkey().await?);
-        let pin = rpassword::prompt_password("YubiKey user PIN: ").map_err(|e| e.to_string())?;
-        card.unlock(pin).await?;
-        Ok(Backend::yubikey(card, public))
+        yubikey_backend().await
     } else {
         let path = identity_path(cli, cfg)?;
         if !path.exists() {
