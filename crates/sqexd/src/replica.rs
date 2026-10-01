@@ -334,7 +334,7 @@ pub fn entry_hash_of(place: &Place, e: &Entry) -> [u8; 32] {
 /// the origin's own retention window before anything is asked for. It
 /// authenticates nothing — the sQUIC connection already did that, both ways.
 pub async fn pull_once(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     origin: &Origin,
 ) -> Result<HashMap<[u8; 32], Took>, String> {
@@ -395,7 +395,7 @@ pub fn holes_in(store: &Channels, channels: &[[u8; 32]]) -> Holes {
 /// [`pull_once`], pulling each channel in `holes` from the position noted
 /// there rather than from the highest held.
 pub async fn pull_once_from(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     origin: &Origin,
     holes: &Holes,
@@ -663,7 +663,7 @@ pub async fn pull_once_from(
 /// refusal or a failure leaves it for the next cycle. What the quota
 /// here would not take is left where it was.
 async fn collect_mail(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     origin: &PubKey,
     account: &PubKey,
@@ -719,7 +719,7 @@ async fn collect_mail(
 /// answer (nothing held, stored, superseded, or given up over quota) and
 /// left for the next cycle on a failure, with the blobs already held kept.
 async fn collect_backup(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     origin: &PubKey,
     account: &PubKey,
@@ -858,7 +858,7 @@ async fn collect_backup(
 /// hint is marked on any decoded answer, and left for the next cycle on a
 /// failure.
 async fn collect_wakes(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     origin: &PubKey,
     account: &PubKey,
@@ -918,11 +918,7 @@ async fn collect_wakes(
 /// predecessors with the origin. An origin from before 0.81.0 (SIP-40 §Lineage) answers
 /// `not_found`, which is an empty lineage; a lineage that fails a rule is
 /// dropped whole and what was held stays. `true` when something changed.
-async fn learn_lineage(
-    client: &mut H3Client,
-    server: &crate::server::Server,
-    origin: &Origin,
-) -> bool {
+async fn learn_lineage(client: &H3Client, server: &crate::server::Server, origin: &Origin) -> bool {
     let Ok((code, body)) = client.post("/exchange/lineage", Vec::new()).await else {
         return false;
     };
@@ -956,7 +952,7 @@ async fn learn_lineage(
     }
 }
 
-async fn pull_shape(client: &mut H3Client, store: &Channels, channel: &[u8; 32]) {
+async fn pull_shape(client: &H3Client, store: &Channels, channel: &[u8; 32]) {
     if store.shape_known(channel) {
         return;
     }
@@ -987,7 +983,7 @@ async fn pull_shape(client: &mut H3Client, store: &Channels, channel: &[u8; 32])
 /// on the way through would be caught here, and a replica that skipped the
 /// check would be handing members a key somebody else chose.
 async fn pull_envelopes(
-    client: &mut H3Client,
+    client: &H3Client,
     store: &Channels,
     origin: &Origin,
     predecessors: &[PubKey],
@@ -1069,7 +1065,7 @@ pub fn acceptable_blob(id: &[u8; 32], chunks: &[Vec<u8>]) -> bool {
 /// of its ciphertext, so a replica that recomputes the hash has checked
 /// everything there is to check — an origin cannot substitute a byte without
 /// changing the name.
-async fn pull_blobs(client: &mut H3Client, store: &Channels, channel: &[u8; 32]) {
+async fn pull_blobs(client: &H3Client, store: &Channels, channel: &[u8; 32]) {
     let Ok((200, body)) = client
         .post(
             "/peer/blobs",
@@ -1133,7 +1129,7 @@ async fn pull_blobs(client: &mut H3Client, store: &Channels, channel: &[u8; 32])
 /// origin's own store enforces it on the way in, so a replay of an older record
 /// changes nothing.
 async fn pull_profiles(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     store: &Channels,
     channel: &[u8; 32],
@@ -1170,11 +1166,7 @@ async fn pull_profiles(
 /// and a copy refused every entry a linked device ever signed (SIP-44 §The handover
 /// turned that up, since a handover makes every account's own key a
 /// linked device of the new one).
-pub async fn account_for(
-    client: &mut H3Client,
-    account: &PubKey,
-    device: &PubKey,
-) -> Option<PubKey> {
+pub async fn account_for(client: &H3Client, account: &PubKey, device: &PubKey) -> Option<PubKey> {
     let (code, body) = client
         .post("/device/list", ListDevices { account: *account }.encode())
         .await
@@ -1259,7 +1251,14 @@ pub struct Forwarder {
     pub addr: SocketAddr,
     /// Where the origin is reached by SIP-33, for `/channel/home`.
     pub domain: String,
-    client: tokio::sync::Mutex<Option<H3Client>>,
+    /// The one connection to this origin, shared.
+    ///
+    /// `Arc`, and the lock is held only long enough to clone it out: HTTP/3
+    /// multiplexes, so a parked `/peer/wait` and a member's forward and a name
+    /// lookup can all be in flight on it at once. Holding the lock across the
+    /// request instead would have made this a queue, and a queue behind a
+    /// twenty-five second long poll is why these used to be three connections.
+    client: tokio::sync::Mutex<Option<std::sync::Arc<H3Client>>>,
     /// Rung after a post the origin took, so the entry is pulled now.
     pub poke: tokio::sync::Notify,
     /// SIP-43: channels this origin has said it holds no record of, and when to
@@ -1302,15 +1301,10 @@ impl Forwarder {
         path: &str,
         body: &[u8],
     ) -> std::result::Result<Forwarded, ForwardFailed> {
-        let mut slot = self.client.lock().await;
-        if slot.is_none() {
-            *slot = Some(
-                H3Client::connect(self.addr, self.key.as_bytes(), seed)
-                    .await
-                    .map_err(|e| ForwardFailed::Unreachable(format!("dial the origin: {e}")))?,
-            );
-        }
-        let client = slot.as_mut().expect("just filled");
+        let client = self
+            .connection(seed)
+            .await
+            .map_err(|e| ForwardFailed::Unreachable(format!("dial the origin: {e}")))?;
         let req = sqex_proto::peer::ForwardAction {
             device: *device,
             path: path.to_string(),
@@ -1322,7 +1316,7 @@ impl Forwarder {
         {
             Ok(a) => a,
             Err(e) => {
-                *slot = None;
+                self.lost().await;
                 return Err(ForwardFailed::Unreachable(e.to_string()));
             }
         };
@@ -1335,6 +1329,29 @@ impl Forwarder {
             self.poke.notify_one();
         }
         Ok(forwarded)
+    }
+
+    /// The connection to this origin, dialling only if there is none.
+    ///
+    /// The lock is taken to read or fill the slot and dropped before the caller
+    /// uses what it got, so two callers overlap rather than queue.
+    pub async fn connection(
+        &self,
+        seed: &[u8; 32],
+    ) -> std::result::Result<std::sync::Arc<H3Client>, String> {
+        let mut slot = self.client.lock().await;
+        if let Some(held) = slot.as_ref() {
+            return Ok(std::sync::Arc::clone(held));
+        }
+        let fresh =
+            std::sync::Arc::new(H3Client::connect(self.addr, self.key.as_bytes(), seed).await?);
+        *slot = Some(std::sync::Arc::clone(&fresh));
+        Ok(fresh)
+    }
+
+    /// Forget the connection, so the next caller dials afresh.
+    pub async fn lost(&self) {
+        *self.client.lock().await = None;
     }
 
     /// One request to this origin, over the connection already open to it.
@@ -1359,21 +1376,13 @@ impl Forwarder {
     /// only questions asked of *it* -- and a question on a warm connection is
     /// sub-millisecond against the ~35 ms and a handshake a fresh dial costs.
     pub async fn ask(&self, seed: &[u8; 32], path: &str, body: Vec<u8>) -> Option<(u16, Vec<u8>)> {
-        let mut slot = self.client.lock().await;
-        if slot.is_none() {
-            *slot = Some(
-                H3Client::connect(self.addr, self.key.as_bytes(), seed)
-                    .await
-                    .ok()?,
-            );
-        }
-        let client = slot.as_mut().expect("just filled");
+        let client = self.connection(seed).await.ok()?;
         match client.post(path, body).await {
             Ok(answer) => Some(answer),
             // The connection failed, not the question: cleared so the next ask
             // dials afresh, as every other method here does.
             Err(_) => {
-                *slot = None;
+                self.lost().await;
                 None
             }
         }
@@ -1383,20 +1392,15 @@ impl Forwarder {
     /// for it, so the acts-for gate is open when the act arrives. Best
     /// effort and idempotent: an origin holding it already says stale.
     pub async fn carry_move(&self, seed: &[u8; 32], mv: &sqex_proto::home::Move, domain: &str) {
-        let mut slot = self.client.lock().await;
-        if slot.is_none() {
-            *slot = match H3Client::connect(self.addr, self.key.as_bytes(), seed).await {
-                Ok(c) => Some(c),
-                Err(_) => return,
-            };
-        }
-        let client = slot.as_mut().expect("just filled");
+        let Ok(client) = self.connection(seed).await else {
+            return;
+        };
         let req = sqex_proto::peer::PeerMoved {
             mv: *mv,
             domain: domain.to_string(),
         };
         if client.post("/peer/moved", req.encode()).await.is_err() {
-            *slot = None;
+            self.lost().await;
         }
     }
 
@@ -1415,15 +1419,7 @@ impl Forwarder {
         {
             return None;
         }
-        let mut slot = self.client.lock().await;
-        if slot.is_none() {
-            *slot = Some(
-                H3Client::connect(self.addr, self.key.as_bytes(), seed)
-                    .await
-                    .ok()?,
-            );
-        }
-        let client = slot.as_mut().expect("just filled");
+        let client = self.connection(seed).await.ok()?;
         let req = sqex_proto::peer::PullStanding {
             channel: *channel,
             device: *device,
@@ -1446,7 +1442,7 @@ impl Forwarder {
             // Not noted: a lost connection says nothing about the channel, and
             // holding off on it would turn a blip into ten quiet minutes.
             Err(_) => {
-                *slot = None;
+                self.lost().await;
                 None
             }
         }
@@ -1463,15 +1459,10 @@ impl Forwarder {
         carry: Option<&sqex_proto::credential::Credential>,
         post: &sqex_proto::channel::Post,
     ) -> std::result::Result<Forwarded, ForwardFailed> {
-        let mut slot = self.client.lock().await;
-        if slot.is_none() {
-            *slot = Some(
-                H3Client::connect(self.addr, self.key.as_bytes(), seed)
-                    .await
-                    .map_err(|e| ForwardFailed::Unreachable(format!("dial the origin: {e}")))?,
-            );
-        }
-        let client = slot.as_mut().expect("just filled");
+        let client = self
+            .connection(seed)
+            .await
+            .map_err(|e| ForwardFailed::Unreachable(format!("dial the origin: {e}")))?;
         let req = Forward {
             device: *device,
             post: post.clone(),
@@ -1483,7 +1474,7 @@ impl Forwarder {
             Ok(a) => a,
             Err(e) => {
                 // The connection is suspect; the next post starts a new one.
-                *slot = None;
+                self.lost().await;
                 return Err(ForwardFailed::Unreachable(e.to_string()));
             }
         };
@@ -1550,7 +1541,7 @@ const WAIT_FLOOR: std::time::Duration =
 /// whole point of waiting -- and a refusal or a lost connection leads to a
 /// backoff or a redial rather than straight back here.
 async fn wait_on_floored(
-    client: &mut H3Client,
+    client: &H3Client,
     store: &Channels,
     channels: &[[u8; 32]],
     seen: &HashMap<[u8; 32], u64>,
@@ -1571,7 +1562,7 @@ async fn wait_on_floored(
 /// entries included: a wait keyed on what is stored would answer at once
 /// for ever while an entry the replica refuses sits at the origin.
 async fn wait_on(
-    client: &mut H3Client,
+    client: &H3Client,
     store: &Channels,
     channels: &[[u8; 32]],
     seen: &HashMap<[u8; 32], u64>,
@@ -1628,7 +1619,7 @@ enum Next {
 /// `sweep_at` is when the next full pull is due.
 #[allow(clippy::too_many_arguments)]
 async fn pause_or_wait(
-    client: &mut H3Client,
+    client: &H3Client,
     store: &Channels,
     channels: &[[u8; 32]],
     seen: &HashMap<[u8; 32], u64>,
@@ -1729,7 +1720,7 @@ async fn wait_any(
             break;
         }
         let mut set = tokio::task::JoinSet::new();
-        for (mut client, channels) in std::mem::take(&mut live) {
+        for (client, channels) in std::mem::take(&mut live) {
             let server = Arc::clone(server);
             let seen = seen.clone();
             // The client comes back with the answer: an origin that said
@@ -1737,7 +1728,7 @@ async fn wait_any(
             // rather than redialled.
             set.spawn(async move {
                 let waited =
-                    wait_on_floored(&mut client, server.channels(), &channels, &seen, secs).await;
+                    wait_on_floored(&client, server.channels(), &channels, &seen, secs).await;
                 (client, channels, waited)
             });
         }
@@ -1819,11 +1810,11 @@ pub async fn run(
                 pause(std::time::Duration::from_secs(hold)).await;
                 continue;
             }
-            Ok(mut client) => {
+            Ok(client) => {
                 // One connection, many pulls: a fresh handshake per pull would
                 // cost more than the pull.
                 loop {
-                    match pull_once_from(&mut client, &server, &origin, &holes).await {
+                    match pull_once_from(&client, &server, &origin, &holes).await {
                         Err(e) => {
                             tracing::warn!(origin = %origin.key, error = %e, "pull failed");
                             break;
@@ -1840,7 +1831,7 @@ pub async fn run(
                     let mut lost = false;
                     loop {
                         match pause_or_wait(
-                            &mut client,
+                            &client,
                             server.channels(),
                             &origin.channels,
                             &seen,
@@ -1925,7 +1916,7 @@ pub async fn run_moved(
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "cannot reach a moved origin")
                 }
-                Ok(mut client) => match pull_once_from(&mut client, &server, &task, &holes).await {
+                Ok(client) => match pull_once_from(&client, &server, &task, &holes).await {
                     Err(e) => {
                         tracing::warn!(origin = %origin, error = %e, "pull from a moved origin failed")
                     }
@@ -2043,7 +2034,7 @@ pub async fn run_homed(
                 );
                 continue;
             };
-            let mut client = match H3Client::connect(addr, origin.as_bytes(), &seed).await {
+            let client = match H3Client::connect(addr, origin.as_bytes(), &seed).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(origin = %origin, error = %e, "cannot reach an account's origin");
@@ -2126,12 +2117,7 @@ pub async fn run_homed(
                                         && !told_folds.contains(&(origin, c))
                                         && server.origin_held(&origin).is_none()
                                         && tell_folded(
-                                            &mut client,
-                                            &server,
-                                            &origin,
-                                            &c,
-                                            account,
-                                            &instance,
+                                            &client, &server, &origin, &c, account, &instance,
                                         )
                                         .await
                                     {
@@ -2162,15 +2148,15 @@ pub async fn run_homed(
                 }
                 // SIP-59 §Collecting mail: the account's mail waiting at this origin, once.
                 if pending_mail.contains(&(*account, origin)) {
-                    collect_mail(&mut client, &server, &origin, account).await;
+                    collect_mail(&client, &server, &origin, account).await;
                 }
                 // SIP-59 §Collecting the backup: and its backup, once.
                 if pending_backup.contains(&(*account, origin)) {
-                    collect_backup(&mut client, &server, &origin, account).await;
+                    collect_backup(&client, &server, &origin, account).await;
                 }
                 // SIP-59 §Collecting wakes: and where its devices asked to be woken, once.
                 if pending_wakes.contains(&(*account, origin)) {
-                    collect_wakes(&mut client, &server, &origin, account).await;
+                    collect_wakes(&client, &server, &origin, account).await;
                 }
             }
             if channels.is_empty() {
@@ -2187,7 +2173,7 @@ pub async fn run_homed(
                 holes.extend(holes_in(server.channels(), &task.channels));
                 seeded.insert(origin);
             }
-            match pull_once_from(&mut client, &server, &task, &holes).await {
+            match pull_once_from(&client, &server, &task, &holes).await {
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "pull for a homed account failed")
                 }
@@ -2205,11 +2191,7 @@ pub async fn run_homed(
 /// SIP-43 §Read marks at a replica: pull the origin's read marks and signal log for a channel and
 /// apply them here. Best effort: an origin from before 0.71.0 (SIP-43 §Read marks at a replica) refuses both
 /// as it refuses any peering route it lacks, and nothing changes.
-async fn pull_soft_state(
-    client: &mut H3Client,
-    server: &crate::server::Server,
-    channel: &[u8; 32],
-) {
+async fn pull_soft_state(client: &H3Client, server: &crate::server::Server, channel: &[u8; 32]) {
     let store = server.channels();
     if let Ok((200, body)) = client
         .post(
@@ -2296,7 +2278,7 @@ fn note_refused(
 /// conversation under `instance`. The origin verifies and folds, or says
 /// why not; either way this home has done its part for the cycle.
 async fn tell_folded(
-    client: &mut H3Client,
+    client: &H3Client,
     server: &crate::server::Server,
     origin: &PubKey,
     channel: &[u8; 32],
@@ -2333,7 +2315,7 @@ async fn tell_folded(
 /// SIP-53: ask an origin where a channel went, via the standing it answers
 /// for any device -- here this exchange's own key.
 async fn standing_moved(
-    client: &mut H3Client,
+    client: &H3Client,
     channel: &[u8; 32],
     me: &PubKey,
 ) -> Option<(PubKey, String)> {

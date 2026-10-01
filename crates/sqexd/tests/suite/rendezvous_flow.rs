@@ -341,14 +341,13 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
     let (alice_seed, alice) = who(71);
     let (bob_seed, bob) = who(72);
 
-    let mut a =
+    let a =
         sqex_proto::h3::H3Client::connect_from(addr, &server_pub, &alice_seed, Some(alice_port))
             .await
             .unwrap();
-    let mut b =
-        sqex_proto::h3::H3Client::connect_from(addr, &server_pub, &bob_seed, Some(bob_port))
-            .await
-            .unwrap();
+    let b = sqex_proto::h3::H3Client::connect_from(addr, &server_pub, &bob_seed, Some(bob_port))
+        .await
+        .unwrap();
 
     let (code, _) = a
         .post(

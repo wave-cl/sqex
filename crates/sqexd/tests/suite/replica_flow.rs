@@ -528,10 +528,10 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
         interval: std::time::Duration::from_secs(1),
         predecessors: Vec::new(),
     };
-    let mut h3 = sqex_proto::h3::H3Client::connect(addr, &server_pub, &peer_seed)
+    let h3 = sqex_proto::h3::H3Client::connect(addr, &server_pub, &peer_seed)
         .await
         .unwrap();
-    let took = sqexd::replica::pull_once(&mut h3, &gapped, &spec)
+    let took = sqexd::replica::pull_once(&h3, &gapped, &spec)
         .await
         .unwrap();
     assert_eq!(
@@ -549,7 +549,7 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
         "the roster was not derived once the constitution arrived"
     );
     // And it is settled: the next pull has nothing to fill.
-    let took = sqexd::replica::pull_once(&mut h3, &gapped, &spec)
+    let took = sqexd::replica::pull_once(&h3, &gapped, &spec)
         .await
         .unwrap();
     assert_eq!(took[&channel].stored, 0);
@@ -569,9 +569,7 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
     assert_eq!(took.stored as usize, pulled.entries.len() - 1);
     assert_eq!(holed.channels().lowest_gap(&channel), Some(missing - 1));
     // Pulling from the highest held fills nothing.
-    let took = sqexd::replica::pull_once(&mut h3, &holed, &spec)
-        .await
-        .unwrap();
+    let took = sqexd::replica::pull_once(&h3, &holed, &spec).await.unwrap();
     assert_eq!(
         took[&channel].stored, 0,
         "a plain pull filled a middle hole"
@@ -579,7 +577,7 @@ async fn a_replica_stores_what_verifies_and_refuses_the_rest() {
     // Pulling from the hole fills it, and the hole is gone.
     let holes = sqexd::replica::holes_in(holed.channels(), &[channel]);
     assert_eq!(holes.get(&channel), Some(&(missing - 1, 0)));
-    let took = sqexd::replica::pull_once_from(&mut h3, &holed, &spec, &holes)
+    let took = sqexd::replica::pull_once_from(&h3, &holed, &spec, &holes)
         .await
         .unwrap();
     assert_eq!(took[&channel].stored, 1, "{took:?}");
@@ -884,7 +882,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     // well as entries, and a replica is an exchange.
     let replica = bind_replica(replica_dir.path()).await;
     let store = replica.channels();
-    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .expect("the replica could not reach the origin");
     let spec = Origin {
@@ -895,7 +893,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
         predecessors: Vec::new(),
     };
 
-    let took = pull_once(&mut client, &replica, &spec).await.unwrap();
+    let took = pull_once(&client, &replica, &spec).await.unwrap();
     let t = took.get(&channel).expect("the channel was not pulled");
     assert!(t.stored >= 4, "create, message, join, message: {t:?}");
     assert!(t.refused.is_empty(), "an honest origin was refused: {t:?}");
@@ -906,7 +904,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
     assert_eq!(store.highest(&channel), t.stored);
 
     // A second pull asks only for what is new, and there is nothing.
-    let again = pull_once(&mut client, &replica, &spec).await.unwrap();
+    let again = pull_once(&client, &replica, &spec).await.unwrap();
     assert_eq!(
         again.get(&channel).unwrap().stored,
         0,
@@ -923,7 +921,7 @@ async fn a_second_exchange_pulls_a_channel_and_ends_up_holding_it() {
         b"after the replica caught up",
     )
     .await;
-    let third = pull_once(&mut client, &replica, &spec).await.unwrap();
+    let third = pull_once(&client, &replica, &spec).await.unwrap();
     assert_eq!(third.get(&channel).unwrap().stored, 1);
     assert_eq!(store.highest(&channel), t.stored + 1);
 }
@@ -1025,10 +1023,10 @@ async fn a_replica_serves_a_derived_roster_and_refuses_one_it_cannot_derive() {
     // From the beginning: the constitution arrives, so the roster is derived.
     let replica = bind_replica(replica_dir.path()).await;
     let whole = replica.channels();
-    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .unwrap();
-    pull_once(&mut client, &replica, &spec).await.unwrap();
+    pull_once(&client, &replica, &spec).await.unwrap();
 
     // Alice and Bob are both members at the replica, and it never saw a roster.
     let read = whole
@@ -1309,7 +1307,7 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
     assert_eq!(code, 200, "{}", common::said(&body));
 
     let replica = bind_replica(replica_dir.path()).await;
-    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .unwrap();
     let spec = Origin {
@@ -1319,7 +1317,7 @@ async fn envelopes_blobs_and_profiles_cross_and_are_checked_on_the_way_in() {
         interval: std::time::Duration::from_secs(1),
         predecessors: Vec::new(),
     };
-    let took = pull_once(&mut client, &replica, &spec).await.unwrap();
+    let took = pull_once(&client, &replica, &spec).await.unwrap();
     assert!(took.get(&channel).unwrap().stored > 0);
 
     // The envelope crossed, and Alice can ask the replica for her key.
@@ -1459,12 +1457,12 @@ async fn a_peer_acting_for_an_account_pulls_only_that_accounts_channels() {
     // being exercised: a full replica would need one per channel.
     let replica = bind_replica(replica_dir.path()).await;
     let store = replica.channels();
-    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .expect("the replica could not reach the origin");
 
     let took = pull_once(
-        &mut client,
+        &client,
         &replica,
         &Origin {
             key: origin,
@@ -1485,7 +1483,7 @@ async fn a_peer_acting_for_an_account_pulls_only_that_accounts_channels() {
     // And Bob's is refused, because Alice is not in it. Being named for one
     // account is not being named for the exchange.
     let took = pull_once(
-        &mut client,
+        &client,
         &replica,
         &Origin {
             key: origin,
@@ -2076,7 +2074,7 @@ async fn a_welcome_channel_replicates_as_public_and_stays_out_of_the_directory()
 
     let replica = bind_replica(replica_dir.path()).await;
     let store = replica.channels();
-    let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+    let client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
         .await
         .unwrap();
     let spec = Origin {
@@ -2086,7 +2084,7 @@ async fn a_welcome_channel_replicates_as_public_and_stays_out_of_the_directory()
         interval: std::time::Duration::from_secs(1),
         predecessors: Vec::new(),
     };
-    let took = pull_once(&mut client, &replica, &spec).await.unwrap();
+    let took = pull_once(&client, &replica, &spec).await.unwrap();
     assert!(took[&general].stored >= 2, "{took:?}");
 
     // Served as a public room: to the member the origin seated without a
@@ -2230,10 +2228,10 @@ async fn an_operator_drops_a_copy_and_the_pull_does_not_bring_it_back() {
         predecessors: Vec::new(),
     };
     let pull = async || {
-        let mut client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
+        let client = H3Client::connect(origin_addr, &origin_pub, &replica_sk.to_bytes())
             .await
             .unwrap();
-        pull_once(&mut client, &replica, &spec).await.unwrap()
+        pull_once(&client, &replica, &spec).await.unwrap()
     };
     let took = pull().await;
     assert!(took[&channel].stored >= 2, "{took:?}");

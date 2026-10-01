@@ -843,7 +843,7 @@ impl Server {
         domain: &str,
         held: &PubKey,
     ) -> bool {
-        let Ok(mut client) =
+        let Ok(client) =
             sqex_proto::h3::H3Client::connect(addr, successor.as_bytes(), &self.exchange_seed)
                 .await
         else {
@@ -885,7 +885,7 @@ impl Server {
         );
         // Asked now rather than on the next pull, since the copies' past
         // is under the old key and the next pull is what verifies it.
-        if let Ok(mut client) =
+        if let Ok(client) =
             sqex_proto::h3::H3Client::connect(addr, to.as_bytes(), &self.exchange_seed).await
             && let Ok((200, body)) = client.post("/exchange/lineage", Vec::new()).await
             && let Ok(lineage) = sqex_proto::lineage::Lineage::decode(&body)
@@ -911,7 +911,7 @@ impl Server {
                 return;
             };
             let mine = server.own_domain();
-            let Ok(mut client) =
+            let Ok(client) =
                 sqex_proto::h3::H3Client::connect(addr, home.as_bytes(), &server.exchange_seed)
                     .await
             else {

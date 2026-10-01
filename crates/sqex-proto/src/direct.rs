@@ -234,7 +234,7 @@ pub async fn introduce(
     wait: u16,
 ) -> Result<Meeting, String> {
     let ours = pick_local_port(exchange)?;
-    let mut client = H3Client::connect_from(exchange, server, seed, Some(ours)).await?;
+    let client = H3Client::connect_from(exchange, server, seed, Some(ours)).await?;
     let req = Introduce {
         peer,
         wait_secs: wait.min(MAX_WAIT),

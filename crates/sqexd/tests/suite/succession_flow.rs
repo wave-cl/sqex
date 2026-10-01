@@ -287,7 +287,7 @@ async fn an_account_is_carried_to_its_successor_by_its_will() {
     // derives the same roster the origin holds.
     {
         use sqex_proto::h3::H3Client;
-        let mut peer = H3Client::connect(addr, &server_pub, &replica_sk.to_bytes())
+        let peer = H3Client::connect(addr, &server_pub, &replica_sk.to_bytes())
             .await
             .unwrap();
         let (code, body) = peer
@@ -445,7 +445,7 @@ async fn guardians_carry_an_account_as_a_quorum_and_a_replica_follows() {
             squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
         sqexd::bind(config, None, signing_key).await.unwrap().server
     };
-    let mut peer = H3Client::connect(addr, &server_pub, &replica_sk.to_bytes())
+    let peer = H3Client::connect(addr, &server_pub, &replica_sk.to_bytes())
         .await
         .unwrap();
     let spec = Origin {
@@ -455,7 +455,7 @@ async fn guardians_carry_an_account_as_a_quorum_and_a_replica_follows() {
         interval: std::time::Duration::from_secs(1),
         predecessors: Vec::new(),
     };
-    pull_once(&mut peer, &replica, &spec).await.unwrap();
+    pull_once(&peer, &replica, &spec).await.unwrap();
     assert!(
         replica
             .channels()
@@ -500,7 +500,7 @@ async fn guardians_carry_an_account_as_a_quorum_and_a_replica_follows() {
 
     // The entry carries the policy's signature, which is not a will's; the
     // replica settles it against the origin's record and seats Carol.
-    pull_once(&mut peer, &replica, &spec).await.unwrap();
+    pull_once(&peer, &replica, &spec).await.unwrap();
     let store = replica.channels();
     assert!(
         store.fetch(&carol, &carol, &channel, 0, false).is_ok(),

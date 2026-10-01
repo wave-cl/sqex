@@ -100,7 +100,20 @@ impl H3Client {
     ///
     /// Bounded by what the peer sends: every SIP-35 response has a limit in the
     /// document and a decoder that refuses more.
-    pub async fn post(&mut self, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>), String> {
+    /// **`&self`, so one connection carries many requests at once.** HTTP/3
+    /// multiplexes -- a QUIC connection is many streams -- and `SendRequest` is
+    /// cloneable precisely so each request can have its own. Taking `&mut self`
+    /// here meant one request in flight per connection, which is why a peer that
+    /// should hold one connection held three: a `/peer/wait` parked for twenty-
+    /// five seconds owned the whole client, so a forward or a lookup could not
+    /// share it and dialled its own. sqnr's `Client` reached the same conclusion
+    /// and says so: "a long poll parks for tens of seconds with nothing to say,
+    /// and holding the client for its duration would stop everything else the
+    /// caller does".
+    ///
+    /// The clone is per request and cheap; it is a handle on the connection, not
+    /// a second connection.
+    pub async fn post(&self, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>), String> {
         let req = http::Request::builder()
             .method("POST")
             .uri(format!("https://sqex{path}"))
@@ -108,6 +121,7 @@ impl H3Client {
             .map_err(|e| e.to_string())?;
         let mut stream = self
             .send
+            .clone()
             .send_request(req)
             .await
             .map_err(|e| e.to_string())?;

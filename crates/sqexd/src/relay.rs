@@ -1388,7 +1388,7 @@ pub(crate) async fn take_prekey_at(
     seed: &[u8; 32],
     device: &PubKey,
 ) -> Option<(u16, Vec<u8>)> {
-    let mut client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
+    let client = H3Client::connect(addr, key.as_bytes(), seed).await.ok()?;
     client
         .post(
             "/prekey/take",
