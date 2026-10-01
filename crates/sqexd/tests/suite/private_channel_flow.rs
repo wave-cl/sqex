@@ -1726,3 +1726,122 @@ async fn a_party_who_left_a_direct_message_may_return_to_it() {
         2
     );
 }
+
+/// **A re-key is told, not discovered.**
+///
+/// SIP-17's epoch advance publishes envelopes, not entries, so nothing woke
+/// anybody: no entry was ordered, no signal queued, and the long poll and the
+/// SIP-30 stream both stayed silent. A member learned that the channel had been
+/// re-keyed only when its own periodic floor came round.
+///
+/// That is the one kind of staleness that is not a freshness question but a
+/// readability one. Until a device collects the new envelope it cannot open
+/// anything written under the new epoch, so the gap is not "the list is a
+/// little behind" but "the conversation is unreadable", for as long as the
+/// floor is.
+///
+/// `last_seq` is zero because a re-key numbers nothing, which is the same word
+/// SIP-57's redaction uses for "fetch and see".
+#[tokio::test]
+async fn an_epoch_advance_is_announced_to_the_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let mut alice = Peer::new(addr, pubkey, 71).await;
+    let mut alice_chain = Chain::default();
+    let mut bob = Peer::new(addr, pubkey, 72).await;
+    let channel = [71u8; 32];
+
+    alice.publish_prekeys(4).await;
+    bob.publish_prekeys(4).await;
+
+    let (code, body) = alice
+        .client
+        .post(
+            "/channel/create",
+            private(
+                &alice.signer,
+                &mut alice_chain,
+                channel,
+                instance_for(channel, 0),
+                vec![Invitee {
+                    account: bob.key,
+                    role: Role::Member,
+                }],
+            )
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+
+    // Subscribed before the re-key, which is SIP-30's one unrecoverable
+    // ordering rule: an event in the gap is queued behind the subscription
+    // rather than lost between it and the read.
+    let mut stream = bob
+        .client
+        .stream(
+            "POST",
+            "/events",
+            sqex_proto::events::Subscribe {
+                version: sqex_proto::events::VERSION,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+
+    let epoch1 = ChannelKey::generate();
+    let mut envelopes = Vec::new();
+    for who in [alice.key, bob.key] {
+        let p = alice.take_prekey_for(who).await;
+        envelopes.push(published(
+            &alice.signer,
+            channel,
+            1,
+            seal_envelope(&who, p.id, &p.public, 1, &[epoch1]).unwrap(),
+        ));
+    }
+    let rot = rotation(&alice.signer, &mut alice_chain, channel, 1);
+    let (code, body) = alice
+        .client
+        .post(
+            "/channel/key/put",
+            KeyPut {
+                channel,
+                epoch: 1,
+                envelopes,
+                action: Some(rot),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    assert!(PutAck::decode(&body).unwrap().accepted);
+
+    let mut framer = sqex_proto::events::Framer::new();
+    let told = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let chunk = stream.next().await.unwrap().expect("stream ended");
+            for e in framer.feed(&chunk).unwrap() {
+                if let sqex_proto::events::Event::Channel {
+                    channel: c,
+                    last_seq,
+                } = e
+                    && c == channel
+                {
+                    return last_seq;
+                }
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        told.ok(),
+        Some(0),
+        "Bob held a stream through a re-key of a channel he is in and was \
+         never told; his devices cannot read the next entry until they collect \
+         the envelope"
+    );
+}

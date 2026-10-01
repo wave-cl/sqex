@@ -133,7 +133,19 @@ async fn a_message_arrives_as_an_event_with_nothing_polling() {
         .await
         .unwrap();
 
-    let got = wait_for(&mut bob, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
+    // **The entry's event, not merely a `Channel` one.** Opening a private DM
+    // mints its first SIP-17 epoch, and an epoch advance is now announced the
+    // same way -- `Channel { last_seq: 0 }`, "fetch and see" -- so the first
+    // `Channel` frame Bob sees is the re-key. That frame is doing real work
+    // here: it is what has him collect the envelope he needs to read the
+    // message below. Matching any `Channel` would quietly stop testing the
+    // thing this test is named for.
+    let got = wait_for(
+        &mut bob,
+        |e| matches!(e, ChatEvent::Channel { last_seq, .. } if *last_seq > 0),
+        SOON,
+    )
+    .await;
     let Some(ChatEvent::Channel {
         channel: c,
         last_seq,
@@ -147,7 +159,12 @@ async fn a_message_arrives_as_an_event_with_nothing_polling() {
     // The sender is told too, deliberately: their own message reaches them by
     // the same path as everybody else's, so there is one way a message gets on
     // screen rather than two that have to agree.
-    let mine = wait_for(&mut alice, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
+    let mine = wait_for(
+        &mut alice,
+        |e| matches!(e, ChatEvent::Channel { last_seq, .. } if *last_seq > 0),
+        SOON,
+    )
+    .await;
     assert!(
         mine.is_some(),
         "the sender was not told about their own post"
@@ -192,13 +209,19 @@ async fn an_arriving_event_knocks() {
          for its own timer"
     );
     // And what it was woken for is there to be taken.
-    let events = bob.take_events();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, ChatEvent::Channel { .. })),
-        "woken, and then handed nothing: {events:?}"
-    );
+    //
+    // Waited for rather than taken in one go: opening a private DM mints its
+    // first SIP-17 epoch and that is announced too, so the frame behind the
+    // first knock may be the re-key rather than the entry. Both are real news
+    // and a client acts on both; what this asserts is that the entry's own
+    // frame arrives without anybody having asked for it.
+    let got = wait_for(
+        &mut bob,
+        |e| matches!(e, ChatEvent::Channel { last_seq, .. } if *last_seq > 0),
+        SOON,
+    )
+    .await;
+    assert!(got.is_some(), "woken, and then handed no entry");
 }
 
 #[tokio::test]
@@ -403,7 +426,16 @@ async fn a_change_between_subscribing_and_reading_is_not_lost() {
     let mut timeline = sqex_proto::timeline::Timeline::new();
     bob.poll(&channel, &mut timeline, 0).await.unwrap();
 
-    let got = wait_for(&mut bob, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
+    // An entry's event specifically: a private DM's epoch mint now raises a
+    // `Channel { last_seq: 0 }` of its own, and matching any `Channel` would
+    // let that stand in for the thing this test exists to prove survived the
+    // gap.
+    let got = wait_for(
+        &mut bob,
+        |e| matches!(e, ChatEvent::Channel { last_seq, .. } if *last_seq > 0),
+        SOON,
+    )
+    .await;
     assert!(
         got.is_some(),
         "an event in the subscribe/read gap was dropped"
@@ -627,7 +659,12 @@ async fn a_linked_device_receives_its_accounts_events() {
         .await
         .unwrap();
 
-    let got = wait_for(&mut phone, |e| matches!(e, ChatEvent::Channel { .. }), SOON).await;
+    let got = wait_for(
+        &mut phone,
+        |e| matches!(e, ChatEvent::Channel { last_seq, .. } if *last_seq > 0),
+        SOON,
+    )
+    .await;
     assert!(
         got.is_some(),
         "a linked device heard nothing about its own account's conversation"

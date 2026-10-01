@@ -1573,6 +1573,30 @@ impl Server {
         self.channels.wake(channel);
     }
 
+    /// Tell a channel's members about something that changed **without adding
+    /// an entry**: the SIP-30 event and the SIP-45 wake, and deliberately not
+    /// the notifier a held `/channel/fetch` parks on.
+    ///
+    /// SIP-16 says exactly when a held fetch returns -- "as soon as an entry is
+    /// accepted or a signal arrives for the caller" -- and a SIP-17 epoch
+    /// advance is neither. Poking it anyway answers every parked fetch on the
+    /// channel with nothing: a round trip each, and an answer owed for
+    /// something that did not happen. Two long-poll tests said so when `tell`
+    /// was used here, which is the contract working.
+    ///
+    /// The cost of the distinction is that a peer waiting on this channel
+    /// (SIP-35 §Waiting) is not woken either, though envelopes are something a
+    /// pull carries -- the notifier is shared. A replica therefore picks up new
+    /// envelopes on its next answered wait or its sweep, exactly as it did
+    /// before this event existed, so nothing regresses; it is simply not
+    /// improved here.
+    pub(crate) fn tell_no_entry(&self, channel: &[u8; 32], event: EventKind) {
+        let to = self.channels.members_of(channel);
+        self.events.publish(&to, event);
+        self.tell_the_tail(&to, &event);
+        self.wake(&to, &event);
+    }
+
     /// SIP-51: tell a device that a device of its own account has opened a
     /// session toward it, and wake it for that.
     ///
@@ -4429,7 +4453,36 @@ async fn route(
                     .channels
                     .put_keys(&me, &dev, &req, &account_of, &revoked_since)
                 {
-                    Ok(ack) => (200, "application/octet-stream", ack.encode()),
+                    Ok(ack) => {
+                        // SIP-17: an epoch advanced, and until now nothing said
+                        // so. A re-key publishes envelopes rather than entries,
+                        // so no entry woke anybody and a member learned of it
+                        // only on their own floor -- which is the one kind of
+                        // staleness that is not a freshness question but a
+                        // readability one: until a device collects the new
+                        // envelope it cannot open anything written under the
+                        // new epoch.
+                        //
+                        // Zero, as SIP-57's redaction uses it: there is no
+                        // sequence number to name, and zero is the wire's word
+                        // for "fetch and see". The fetch a client already makes
+                        // collects keys on the way.
+                        //
+                        // Told to every member and not `tell_others`: the
+                        // caller's *other* devices need the envelopes as much
+                        // as anybody's, and SIP-30 makes a redundant hint cost
+                        // one wasted fetch.
+                        if ack.accepted {
+                            server.tell_no_entry(
+                                &req.channel,
+                                EventKind::Channel {
+                                    channel: req.channel,
+                                    last_seq: 0,
+                                },
+                            );
+                        }
+                        (200, "application/octet-stream", ack.encode())
+                    }
                     Err(e) => refused(e),
                 }
             }
