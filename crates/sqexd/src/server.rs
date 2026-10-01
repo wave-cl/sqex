@@ -6902,6 +6902,14 @@ async fn fetch_waiting(
     req: &ChannelFetch,
 ) -> std::result::Result<sqex_proto::channel::Entries, ChannelError> {
     let notify = server.channels.notifier(&req.channel);
+    // Parked before the first read, not after it. `Channels::wake` uses
+    // `notify_waiters`, which stores no permit, so a change landing between the
+    // read and the park is kept for nobody -- and the caller then sits out its
+    // whole `wait_secs` with the answer already in the store. Taking the `Arc`
+    // is not registering; `enable()` is what puts this waiter on the list,
+    // without awaiting it.
+    let mut parked = Box::pin(notify.notified());
+    parked.as_mut().enable();
     let first = server
         .channels
         .fetch(me, device, &req.channel, req.since, req.receipts)?;
@@ -6911,7 +6919,12 @@ async fn fetch_waiting(
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_secs(req.wait_secs as u64);
     loop {
-        let waited = tokio::time::timeout_at(deadline, notify.notified()).await;
+        let waited = tokio::time::timeout_at(deadline, parked.as_mut()).await;
+        // The next park goes on the list before this round reads, for the same
+        // reason the first one did: between a read and a park, a change is
+        // lost.
+        let mut next = Box::pin(notify.notified());
+        next.as_mut().enable();
         // Re-check membership as well as entries: an answer is owed to whoever
         // the caller is *now*, not who they were when they parked.
         let again = server
@@ -6922,6 +6935,7 @@ async fn fetch_waiting(
         if !again.entries.is_empty() || !again.signals.is_empty() || waited.is_err() {
             return Ok(again);
         }
+        parked = next;
     }
 }
 
