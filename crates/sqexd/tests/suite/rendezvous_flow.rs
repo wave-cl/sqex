@@ -22,6 +22,42 @@ use sqnr_core::PubKey;
 
 use crate::common;
 
+/// Retry a `squic` bind that is refused because the port is still held, for
+/// up to ten seconds.
+///
+/// Dropping an `H3Client` aborts its driver, which is what actually releases
+/// the socket, and the OS does not hand the port back synchronously. The test
+/// below used to pause a fixed 200ms and then bind once -- a guess at how long
+/// a release takes. With the ephemeral range under pressure it was not enough:
+/// *both* ports were still held, Alice's `listen` failed with `AddrInUse`, and
+/// Bob's `dial` from his own port failed the same way.
+///
+/// So this waits for the port rather than for a duration. **Bounded on
+/// purpose:** a port genuinely held by something that is not going to let go
+/// still fails the test, with the error it failed with, rather than hanging
+/// until the suite times out. Any error that is not `AddrInUse` fails at once
+/// -- a wrong key or an unparseable version is not something waiting fixes.
+macro_rules! once_the_port_is_free {
+    ($what:expr, $call:expr) => {
+        once_the_port_is_free!($what, $call, Duration::from_secs(10))
+    };
+    ($what:expr, $call:expr, $within:expr) => {{
+        let deadline = tokio::time::Instant::now() + $within;
+        loop {
+            match $call.await {
+                Ok(bound) => break bound,
+                Err(squic::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::AddrInUse
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("{}: {:?}", $what, e),
+            }
+        }
+    }};
+}
+
 async fn server_in(dir: &Path) -> (SocketAddr, [u8; 32], tokio::task::JoinHandle<()>) {
     let key_path = dir.join("host_key");
     let (server_sk, _) = squic::generate_keypair();
@@ -291,16 +327,19 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
     // exchange observes and the one the other peer dials. That is the whole
     // mechanism — an exchange that observed a different socket would be
     // describing a mapping nothing else can use.
-    let port_of = || {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let a = probe.local_addr().unwrap();
-        drop(probe);
-        a
+    //
+    // **Both probes are held at once.** Taken one at a time -- bind, read the
+    // port, drop, repeat -- the second `bind(:0)` is free to hand back the
+    // port the first just released, and the test would put Alice and Bob on
+    // one socket while asserting about two.
+    let (alice_port, bob_port) = {
+        let alices = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bobs = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        (alices.local_addr().unwrap(), bobs.local_addr().unwrap())
     };
+    assert_ne!(alice_port, bob_port, "both peers were given one port");
     let (alice_seed, alice) = who(71);
     let (bob_seed, bob) = who(72);
-    let alice_port = port_of();
-    let bob_port = port_of();
 
     let mut a =
         sqex_proto::h3::H3Client::connect_from(addr, &server_pub, &alice_seed, Some(alice_port))
@@ -351,42 +390,44 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
 
     // Alice listens on hers, Bob dials it from his — the tiebreak the CLI uses,
     // fixed here so the test does not depend on which key sorts lower.
-    // Both exchange connections go, and the ports come free. Dropping an
-    // `H3Client` aborts its driver, which is what actually releases the socket;
-    // the pause is for the OS, which does not do it synchronously.
+    // Both exchange connections go and the ports come free, but not at once:
+    // see `once_the_port_is_free`, which is what each bind below goes through
+    // instead of the fixed pauses this test used to take on faith.
     drop((a, b));
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
+    let (bound, is_bound) = tokio::sync::oneshot::channel();
     let listening = tokio::spawn(async move {
-        let listener = squic::listen(
-            alice_port,
-            &ed25519_dalek::SigningKey::from_bytes(&alice_seed),
-            squic::Config {
-                punch: vec![bob_port],
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("alice could not listen on the port she was introduced at");
+        let key = ed25519_dalek::SigningKey::from_bytes(&alice_seed);
+        let config = squic::Config {
+            punch: vec![bob_port],
+            ..Default::default()
+        };
+        let listener = once_the_port_is_free!(
+            "alice could not listen on the port she was introduced at",
+            squic::listen(alice_port, &key, config.clone())
+        );
+        // Bob dials once she is actually bound. The second fixed pause was
+        // the same guess pointing the other way, and it cannot stand next to
+        // a bind that now waits: his five-second handshake timeout would run
+        // out while she was still waiting for her port.
+        bound.send(()).expect("nobody is waiting for alice");
         let incoming = listener.accept().await.expect("nobody arrived");
         incoming.await.map(|c| c.remote_address())
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    is_bound.await.expect("alice's listener never came up");
 
-    let conn = squic::dial(
-        alice_seen,
-        alice.as_bytes(),
-        squic::Config {
-            local_bind: Some(bob_port),
-            punch: vec![alice_seen],
-            client_key: Some(hex::encode(bob_seed)),
-            advertise_identity: true,
-            handshake_timeout: Some(Duration::from_secs(5)),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("bob could not reach alice at the address the exchange gave him");
+    let bobs = squic::Config {
+        local_bind: Some(bob_port),
+        punch: vec![alice_seen],
+        client_key: Some(hex::encode(bob_seed)),
+        advertise_identity: true,
+        handshake_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let conn = once_the_port_is_free!(
+        "bob could not reach alice at the address the exchange gave him",
+        squic::dial(alice_seen, alice.as_bytes(), bobs.clone())
+    );
     assert_eq!(conn.remote_address(), alice_seen);
 
     let seen_by_alice = listening.await.unwrap().unwrap();
@@ -396,4 +437,34 @@ async fn two_peers_introduced_by_an_exchange_connect_directly() {
         "bob arrived from a port other than the one he was introduced at"
     );
     conn.close(0u32.into(), b"done");
+}
+
+/// The control for `once_the_port_is_free`: a port held by something that
+/// never lets go must still fail the test.
+///
+/// Without this the retry is indistinguishable from `expect` on a port that
+/// happened to be free -- it would wait out its bound and then report the
+/// same `AddrInUse` the old code reported immediately, which is the point,
+/// but nothing here would have proved it rather than hanging or passing. A
+/// short bound keeps it cheap; the mechanism is the same at ten seconds.
+#[tokio::test]
+// Pinned to the *reason*, not the site: `expected` on the message prefix
+// alone would be satisfied by a bad key or an unparseable version failing at
+// the same call, and the control would pass while proving nothing about a
+// held port. `AddrInUse` is the normalised kind, so this reads the same on
+// the Linux runner, where the raw errno is 98 rather than 48.
+#[should_panic(expected = "kind: AddrInUse")]
+async fn a_port_that_never_frees_still_fails_the_bind() {
+    let hog = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let held = hog.local_addr().unwrap();
+    let key = SigningKey::from_bytes(&[9u8; 32]);
+    let config = squic::Config::default();
+    let _listener = once_the_port_is_free!(
+        "a port nothing is going to give back",
+        squic::listen(held, &key, config.clone()),
+        Duration::from_millis(300)
+    );
+    // `hog` is still bound here: dropping it earlier would let the retry
+    // succeed and the control would prove the opposite of what it claims.
+    drop(hog);
 }
