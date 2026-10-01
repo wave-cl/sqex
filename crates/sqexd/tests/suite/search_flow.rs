@@ -210,3 +210,53 @@ async fn a_search_finds_rooms_at_peers_and_says_where_they_live() {
     assert_eq!(f.total, 2);
     assert!(f.rows.iter().all(|r| r.here && r.home == y_key));
 }
+
+/// **The directory is read over one connection, not one a minute.**
+///
+/// This loop dialled the peer, paged `/channel/list` and dropped the connection
+/// every `DIRECTORY_SECS`. Measured on trunk over 297 s with the tail's
+/// connection ids: of the eleven connections the far exchange closed, **nine had
+/// served exactly one request and lived under a second**, and five of those nine
+/// were this. A handshake and a round trip of latency per pass, to re-read a
+/// directory -- while a `Forwarder` beside it answered twelve `/peer/standing`
+/// down a connection it never closed.
+///
+/// Counted at the peer, in its own `/status`, because a connection that is *not*
+/// opened is not observable from this side.
+#[tokio::test]
+async fn the_directory_is_read_over_one_connection() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let y_dir = tempfile::tempdir().unwrap();
+    let y_key = key_in(y_dir.path());
+    let (admin_seed, admin) = identity(241);
+    let (y_addr, y_pub) = exchange_in(y_dir.path(), &[], admin).await;
+    let (x_addr, x_pub) = exchange_in(x_dir.path(), &[("y.test", y_key, y_addr)], admin).await;
+    // X reads Y's directory every second (`directory_secs = 1` above).
+    label_peer(x_addr, x_pub, admin_seed, y_key, "y.test").await;
+
+    let opened = || async {
+        let mut probe = sqnr::Client::connect(y_addr, &y_pub).await.unwrap();
+        let (code, body) = probe.get("/status").await.unwrap();
+        assert_eq!(code, 200);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["connections"].as_u64().unwrap()
+    };
+
+    // Let the first pass dial, so what follows is the reuse and not the dial.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let before = opened().await;
+    // Six seconds at a one-second interval: five or six more passes.
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let after = opened().await;
+
+    // **One** probe of our own is in the delta, not two: the counter is bumped
+    // when a connection is accepted, so the first probe is already inside
+    // `before`. Saturating, because getting that wrong the other way made a
+    // delta of 1 underflow and a passing fix read as a failure.
+    let dialled = (after - before).saturating_sub(1);
+    assert!(
+        dialled <= 1,
+        "the peer accepted {dialled} new connections across six directory passes; \
+         the poll should reuse the one it holds"
+    );
+}

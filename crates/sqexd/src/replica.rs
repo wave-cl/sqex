@@ -1337,6 +1337,48 @@ impl Forwarder {
         Ok(forwarded)
     }
 
+    /// One request to this origin, over the connection already open to it.
+    ///
+    /// The three other methods here each hold a connection and reuse it; the
+    /// SIP-39 directory poll and `relay.rs`'s four one-shot helpers each dialled
+    /// their own, asked one question and dropped it. Measured on trunk over
+    /// 297 s: of the eleven connections the peer closed, **nine had served
+    /// exactly one request and lived under a second** -- five `/channel/list`
+    /// from the directory poll, four `/device/list` from `devices_at`. A
+    /// handshake and a round trip of latency to ask one question, while a
+    /// `Forwarder` sat beside them answering twelve `/peer/standing` down one
+    /// connection it never closed.
+    ///
+    /// `None` means the origin could not be dialled or the request did not come
+    /// back; the status is returned rather than judged, because a caller that
+    /// cares about `404` from a route the origin lacks is not the same as one
+    /// that wants a body.
+    ///
+    /// Requests through one `Forwarder` serialise, because `H3Client::post`
+    /// takes `&mut self`. That is a mutex per origin, so a slow origin delays
+    /// only questions asked of *it* -- and a question on a warm connection is
+    /// sub-millisecond against the ~35 ms and a handshake a fresh dial costs.
+    pub async fn ask(&self, seed: &[u8; 32], path: &str, body: Vec<u8>) -> Option<(u16, Vec<u8>)> {
+        let mut slot = self.client.lock().await;
+        if slot.is_none() {
+            *slot = Some(
+                H3Client::connect(self.addr, self.key.as_bytes(), seed)
+                    .await
+                    .ok()?,
+            );
+        }
+        let client = slot.as_mut().expect("just filled");
+        match client.post(path, body).await {
+            Ok(answer) => Some(answer),
+            // The connection failed, not the question: cleared so the next ask
+            // dials afresh, as every other method here does.
+            Err(_) => {
+                *slot = None;
+                None
+            }
+        }
+    }
+
     /// SIP-60: carry an account's Move to the origin ahead of an act made
     /// for it, so the acts-for gate is open when the act arrives. Best
     /// effort and idempotent: an origin holding it already says stale.

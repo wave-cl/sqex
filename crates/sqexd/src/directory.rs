@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use sqex_proto::channel::{Found, List, Listing, MAX_DIRECTORY, Public, Row};
-use sqex_proto::h3::H3Client;
 use sqnr_core::PubKey;
 
 use crate::server::Server;
@@ -161,14 +160,23 @@ pub async fn run(server: Arc<Server>, seed: [u8; 32]) {
                 tracing::warn!(domain = %peer.domain, expected = %peer.key, found = %key, "a peer's domain names another key");
                 continue;
             }
-            let Ok(mut client) = H3Client::connect(addr, key.as_bytes(), &seed).await else {
+            // **The connection to this peer, not a connection of our own.** This
+            // loop dialled, paged the directory and dropped the connection every
+            // `DIRECTORY_SECS` -- one handshake a minute per peer, to re-read a
+            // directory. Measured on trunk: five of the eleven connections the
+            // far exchange closed in 297 s were this, each having served a
+            // single `/channel/list`. The registry is idempotent, so a peer that
+            // has no forwarder yet gets one and every later pass reuses it.
+            server.add_forwarder(key, addr, peer.domain.clone());
+            let Some(forwarder) = server.forwarder(&key) else {
                 continue;
             };
             let mut rows = Vec::new();
             let mut offset = 0u32;
             while rows.len() < PEER_ROWS {
-                let Ok((200, body)) = client
-                    .post(
+                let Some((200, body)) = forwarder
+                    .ask(
+                        &seed,
                         "/channel/list",
                         List {
                             offset,
