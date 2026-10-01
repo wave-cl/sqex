@@ -858,13 +858,21 @@ impl Server {
         }
         // Resolved, and the same key: the forwarder stands and its clock is
         // restarted, so the next ask inside the window is answered from it.
-        // Where the address has moved the entry is replaced, since
-        // `add_forwarder` will not overwrite one.
+        //
+        // **The address it already has is kept, even when this resolution found
+        // another.** An exchange may be reachable at several -- `ex.trunk.exchange`
+        // publishes an A and an AAAA, and a `[[replicate]]` block names a literal
+        // -- and replacing it here split one peer across two connections: `run`
+        // held the forwarder it was handed at spawn, on the operator's address,
+        // while everything else was handed a replacement on whichever the
+        // resolver preferred. A configured origin's address is the operator's
+        // and is not DNS's to override. An address that really has moved is
+        // reached by the dial failing, which forgets the forwarder and resolves
+        // afresh.
         match self.forwarder(key) {
-            Some(f) if f.addr == addr => f.resolved_now(),
-            Some(_) => {
-                self.forget_forwarder(key);
-                self.add_forwarder(*key, addr, domain.clone());
+            Some(f) => {
+                f.resolved_now();
+                return Some((f.addr, f.domain.clone()));
             }
             None => self.add_forwarder(*key, addr, domain.clone()),
         }
@@ -1604,26 +1612,25 @@ impl Server {
     /// sender exclusion, SIP-21's block filter on profiles and the admin-only
     /// scoping of admission and reports — all at once, which no single account
     /// can. It carries no content, because a SIP-30 event has none to carry.
-    fn tell_the_tail(&self, to: &[PubKey], event: &EventKind) {
-        if !self.tails.watching() {
-            return;
-        }
+    /// One line, with how many accounts were entitled to hear it and how many
+    /// streams it reached. See [`sqex_proto::tail::Record::Event`] for why those
+    /// are two numbers and not one line each.
+    fn tell_the_tail(&self, to: &[PubKey], live: usize, event: &EventKind) {
         let kind = event.kind();
         let channel = event.channel();
-        for who in to {
-            let who = *who;
-            self.tails.publish(|| sqex_proto::tail::Record::Event {
-                to: who,
-                event: kind,
-                channel,
-            });
-        }
+        let entitled = to.len();
+        self.tails.publish(|| sqex_proto::tail::Record::Event {
+            event: kind,
+            channel,
+            to: entitled.min(u32::MAX as usize) as u32,
+            live: live.min(u32::MAX as usize) as u32,
+        });
     }
 
     pub(crate) fn tell(&self, channel: &[u8; 32], event: EventKind) {
         let to = self.channels.members_of(channel);
-        self.events.publish(&to, event);
-        self.tell_the_tail(&to, &event);
+        let live = self.events.publish(&to, event);
+        self.tell_the_tail(&to, live, &event);
         self.wake(&to, &event);
         // SIP-35 §Waiting: and the peers waiting on this channel, for everything a
         // pull would carry -- an entry woke them already; a signal, a
@@ -1650,8 +1657,8 @@ impl Server {
     /// improved here.
     pub(crate) fn tell_no_entry(&self, channel: &[u8; 32], event: EventKind) {
         let to = self.channels.members_of(channel);
-        self.events.publish(&to, event);
-        self.tell_the_tail(&to, &event);
+        let live = self.events.publish(&to, event);
+        self.tell_the_tail(&to, live, &event);
         self.wake(&to, &event);
     }
 
@@ -1678,8 +1685,8 @@ impl Server {
             return;
         }
         let event = EventKind::Sibling { device: *opener };
-        self.events.publish_to_device(&mine, target, event);
-        self.tell_the_tail(std::slice::from_ref(target), &event);
+        let live = self.events.publish_to_device(&mine, target, event);
+        self.tell_the_tail(std::slice::from_ref(target), live, &event);
         if let Some(w) = self.waker.get() {
             w.tell_device(target, &event);
         }
@@ -1702,8 +1709,8 @@ impl Server {
             .into_iter()
             .filter(|m| m != not)
             .collect();
-        self.events.publish(&to, event);
-        self.tell_the_tail(&to, &event);
+        let live = self.events.publish(&to, event);
+        self.tell_the_tail(&to, live, &event);
         self.wake(&to, &event);
         self.channels.wake(channel);
     }
@@ -1715,8 +1722,8 @@ impl Server {
         if !to.contains(also) {
             to.push(*also);
         }
-        self.events.publish(&to, event);
-        self.tell_the_tail(&to, &event);
+        let live = self.events.publish(&to, event);
+        self.tell_the_tail(&to, live, &event);
         self.wake(&to, &event);
         self.channels.wake(channel);
     }
