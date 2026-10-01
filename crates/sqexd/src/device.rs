@@ -1457,6 +1457,23 @@ impl Registry {
     /// SIP-59: the origins the accounts homed here named, grouped by
     /// origin with the domain hint each came with, and the accounts that
     /// named it.
+    /// Drop any `home_origin` row naming this exchange itself, and say how
+    /// many went.
+    ///
+    /// The writers refuse one now, but a store written before they did still
+    /// holds whatever a Move named -- and nothing clears it on its own, because
+    /// the home loop skips `origin == me` and so never reaches the row to
+    /// settle it. Run at every start, as the SIP-40 following above is, so a
+    /// store from before the check is repaired rather than carried.
+    pub fn forget_self_origins(&self, me: &PubKey) -> usize {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "DELETE FROM home_origin WHERE origin = ?1",
+            params![me.as_bytes()],
+        )
+        .unwrap_or(0)
+    }
+
     pub fn homed_here(&self, me: &PubKey) -> Vec<(PubKey, String, Vec<PubKey>)> {
         let db = self.db.lock().unwrap();
         let mut by: std::collections::BTreeMap<(Vec<u8>, String), Vec<PubKey>> =
@@ -1569,4 +1586,53 @@ fn expire(db: &Connection, now: u64) -> Result<(), DeviceError> {
     )
     .map_err(storage("expire revocations"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    /// The heal, for a store written before the writers refused a self-origin.
+    ///
+    /// Such a row cannot be made through the registry any more, so it is put
+    /// there directly -- which is the situation being repaired: a store that
+    /// already holds one. Both directions are asserted, since a delete with no
+    /// `WHERE` would pass on the count alone.
+    #[test]
+    fn a_stored_self_origin_is_dropped_and_the_others_kept() {
+        let r = Registry::open(None).unwrap();
+        let (me, other, account) = (key(1), key(2), key(3));
+        {
+            let db = r.db.lock().unwrap();
+            for o in [&me, &other] {
+                db.execute(
+                    "INSERT INTO home_origin (account, origin, domain) VALUES (?1, ?2, ?3)",
+                    params![account.as_bytes(), o.as_bytes(), "d.test"],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            r.forget_self_origins(&me),
+            1,
+            "the self row was not dropped"
+        );
+        let db = r.db.lock().unwrap();
+        let left: Vec<Vec<u8>> = db
+            .prepare("SELECT origin FROM home_origin")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            left,
+            vec![other.as_bytes().to_vec()],
+            "the real origin was dropped with the self one"
+        );
+    }
 }

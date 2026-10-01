@@ -1962,6 +1962,16 @@ pub async fn bind_with(
             tracing::info!(from = %earlier, rows = n, "holdings of this exchange's earlier key followed to it (SIP-40)");
         }
     }
+    // And an origin row naming this exchange itself, which a Move was once
+    // able to leave behind: no traffic, because the home loop skips it, but
+    // for that same reason a row that can never settle -- its mail stays
+    // pending for good and `/status` shows this exchange failing to reach
+    // itself. The writers refuse one now; this is for the stores that already
+    // have one.
+    let n = server.devices.forget_self_origins(&public_key);
+    if n > 0 {
+        tracing::info!(rows = n, "dropped origin rows naming this exchange itself");
+    }
     // The front door, made once and found by name thereafter. An exchange
     // with nothing in it is a room with no doors: a new account can reach
     // nobody, and be reached by nobody, until somebody hands it a sixty-four
