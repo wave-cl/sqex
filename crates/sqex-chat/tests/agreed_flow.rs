@@ -83,9 +83,11 @@ async fn every_member_derives_the_same_key_and_nobody_chose_it() {
         .await
         .unwrap();
 
-    // The commit is what made epoch 1 exist, and it is an entry in the log
-    // rather than anything the exchange minted.
-    assert_eq!(alice.info(&channel).await.unwrap().epoch, 1);
+    // Two commits, and the second is the one bob is in: a channel is keyed
+    // before anybody is admitted to it, so that no welcome is ever published at
+    // an epoch whose log holds no commit to recognise it by. Each is an entry
+    // in the log rather than anything the exchange minted.
+    assert_eq!(alice.info(&channel).await.unwrap().epoch, 2);
 
     alice.send(&channel, "keyed by all of us").await.unwrap();
 
@@ -107,7 +109,7 @@ async fn every_member_derives_the_same_key_and_nobody_chose_it() {
     // message is not evidence that any of SIP-87 ran.
     assert_eq!(
         bob.agreed_epoch(&channel).unwrap(),
-        Some(1),
+        Some(2),
         "bob read the epoch without being welcomed into the chain behind it"
     );
 
@@ -155,7 +157,7 @@ async fn an_addition_is_in_the_log_before_the_key_it_is_for_exists() {
     catch_up(&mut bob, &channel, &mut bobs).await;
     let added = bobs
         .commits()
-        .find(|c| c.commit.epoch == 2)
+        .find(|c| c.commit.adds.contains(&carol_key))
         .expect("bob never read the commit that admitted carol");
     assert_eq!(added.commit.adds, vec![carol_key]);
     assert_eq!(added.account, identity(1).1, "the committer is attributed");
@@ -204,22 +206,23 @@ async fn a_device_two_epochs_behind_refuses_rather_than_deriving_nonsense() {
     catch_up(&mut bob, &channel, &mut bobs).await;
     assert_eq!(
         bob.agreed_epoch(&channel).unwrap().unwrap(),
-        1,
-        "bob must reach epoch 1 before there is a backup worth restoring"
+        2,
+        "bob must be in before there is a backup worth restoring"
     );
 
-    // The backup, taken while bob stands at epoch 1. Copied rather than
+    // The backup, taken while bob stands at the epoch he was admitted at.
+    // Copied rather than
     // reopened: a restore is a file from before, and reopening the live one
     // would test nothing.
     drop(bob);
-    let backup = dir.path().join("bob-epoch-1.db");
+    let backup = dir.path().join("bob-behind.db");
     std::fs::copy(&bob_db, &backup).unwrap();
 
     // The channel goes on without him. Two commits, so the secret he is handed
     // is for an epoch two above the chain he holds.
     alice.commit(&channel, &[carol_key], &[]).await.unwrap();
     alice.commit(&channel, &[dave_key], &[]).await.unwrap();
-    assert_eq!(alice.info(&channel).await.unwrap().epoch, 3);
+    assert_eq!(alice.info(&channel).await.unwrap().epoch, 4);
     alice
         .send(&channel, "said while bob was away")
         .await
@@ -235,16 +238,16 @@ async fn a_device_two_epochs_behind_refuses_rather_than_deriving_nonsense() {
     // secret never reaches the device at all, and SIP-87 names the party who can
     // arrange that: "the exchange can still withhold", and withholding a commit
     // "stops a member posting" rather than merely hiding a message. So the
-    // envelope for epoch 2 is deleted from the exchange's own store, which is
-    // the one place it lives.
+    // envelope for the epoch between is deleted from the exchange's own store,
+    // which is the one place it lives.
     let db = rusqlite::Connection::open(dir.path().join("channels.db")).unwrap();
     let gone = db
         .execute(
-            "DELETE FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = 2",
+            "DELETE FROM envelope WHERE channel = ?1 AND recipient = ?2 AND epoch = 3",
             rusqlite::params![&channel[..], bob_key.as_bytes()],
         )
         .unwrap();
-    assert_eq!(gone, 1, "there was no epoch 2 envelope for bob to withhold");
+    assert_eq!(gone, 1, "there was no envelope for bob to withhold");
     drop(db);
 
     let mut restored = chat_at(addr, server_pub, 2, &backup).await;
@@ -252,15 +255,16 @@ async fn a_device_two_epochs_behind_refuses_rather_than_deriving_nonsense() {
     catch_up(&mut restored, &channel, &mut theirs).await;
 
     // Refused, and said so. Not "derived something": the chain has not moved,
-    // there is no key for epoch 3, and what it could not do is named.
+    // there is no key for the epoch it was handed, and what it could not do is
+    // named.
     assert_eq!(
         restored.refusal(&channel),
-        Some(Refused::WrongEpoch { held: 1, commit: 3 }),
+        Some(Refused::WrongEpoch { held: 2, commit: 4 }),
         "a device two epochs behind did not refuse the commit secret it was sent"
     );
     assert_eq!(
         restored.agreed_epoch(&channel).unwrap().unwrap(),
-        1,
+        2,
         "the chain moved on a commit it could not derive"
     );
     let said: Vec<String> = theirs
@@ -323,8 +327,8 @@ async fn an_ordinary_member_cannot_commit_merely_because_it_wants_to() {
     );
     // And the channel is where it was: a refused commit leaves no half-keyed
     // epoch behind.
-    assert_eq!(alice.info(&channel).await.unwrap().epoch, 1);
-    assert_eq!(bob.agreed_epoch(&channel).unwrap().unwrap(), 1);
+    assert_eq!(alice.info(&channel).await.unwrap().epoch, 2);
+    assert_eq!(bob.agreed_epoch(&channel).unwrap().unwrap(), 2);
 }
 
 #[tokio::test]
@@ -383,17 +387,17 @@ async fn a_member_whose_chain_is_behind_cannot_commit_at_all() {
         .unwrap();
     let mut bobs = Timeline::new();
     catch_up(&mut bob, &channel, &mut bobs).await;
-    assert_eq!(bob.agreed_epoch(&channel).unwrap(), Some(1));
+    assert_eq!(bob.agreed_epoch(&channel).unwrap(), Some(2));
 
     alice.commit(&channel, &[], &[]).await.unwrap();
-    assert_eq!(alice.info(&channel).await.unwrap().epoch, 2);
+    assert_eq!(alice.info(&channel).await.unwrap().epoch, 3);
 
     // Bob has not read the commit yet, and tries to commit himself.
     let refused = bob.commit(&channel, &[], &[]).await;
     assert_eq!(
         refused.err().map(|e| e.to_string()),
         Some(
-            "this device's chain stands at epoch 1 and the commit creates 3: \
+            "this device's chain stands at epoch 2 and the commit creates 4: \
              it must be admitted again by a commit"
                 .to_string()
         ),
@@ -402,20 +406,20 @@ async fn a_member_whose_chain_is_behind_cannot_commit_at_all() {
     // And nothing of it reached the exchange: no epoch, no envelopes, no entry.
     assert_eq!(
         alice.info(&channel).await.unwrap().epoch,
-        2,
+        3,
         "a refused commit moved the channel"
     );
 
     // Caught up, he may commit, and the chain is one chain.
     catch_up(&mut bob, &channel, &mut bobs).await;
-    assert_eq!(bob.agreed_epoch(&channel).unwrap(), Some(2));
-    assert_eq!(bob.commit(&channel, &[], &[]).await.unwrap(), 3);
+    assert_eq!(bob.agreed_epoch(&channel).unwrap(), Some(3));
+    assert_eq!(bob.commit(&channel, &[], &[]).await.unwrap(), 4);
     bob.send(&channel, "under the epoch bob made")
         .await
         .unwrap();
     let mut alices = Timeline::new();
     catch_up(&mut alice, &channel, &mut alices).await;
-    assert_eq!(alice.agreed_epoch(&channel).unwrap(), Some(3));
+    assert_eq!(alice.agreed_epoch(&channel).unwrap(), Some(4));
     assert!(
         alices
             .messages()
@@ -429,7 +433,91 @@ async fn a_member_whose_chain_is_behind_cannot_commit_at_all() {
     let whole = alice.history(&channel, &[identity(1).1, bob_key]).unwrap();
     assert_eq!(
         whole.commits().map(|c| c.commit.epoch).collect::<Vec<_>>(),
-        vec![1, 2, 3],
+        vec![1, 2, 3, 4],
         "the log does not hold one commit per epoch"
+    );
+}
+
+#[tokio::test]
+async fn nobody_is_welcomed_at_the_first_commit() {
+    // **The window between a commit's envelopes and its entry**, closed by
+    // construction rather than by timing.
+    //
+    // SIP-87 cannot avoid the ordering: the exchange takes a post only at the
+    // epoch in force, so the envelopes that create an epoch go up before the
+    // entry explaining them. In between, a device reading the channel for the
+    // first time has read the whole log, finds no commit anywhere in it, and
+    // has nothing to tell SIP-17's kind from this one. Take the `Welcome` for a
+    // SIP-17 key and the SIP-23 prekey is spent, the chain inside it thrown
+    // away — and the failure hides, because the slot layout leaves such a
+    // device holding the right key for the epoch it was admitted at. It reads
+    // that one epoch and derives nothing after it. That is how this was found:
+    // a sigil session read one message and then quietly stopped.
+    //
+    // So the first commit admits nobody. Every `Welcome` is then for an epoch
+    // of two or more, by which time the log holds the first commit and the
+    // question is settled however the timing falls. This asserts that shape;
+    // `sigil`'s `an_agreed_group_draws_who_the_key_is_for` drives the race
+    // itself, and failed against this file before the rule was added.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+
+    let channel = alice
+        .create_agreed_group("keyed before anybody is let in", &[bob_key])
+        .await
+        .unwrap();
+
+    let whole = alice.history(&channel, &[alice_key, bob_key]).unwrap();
+    let admitting = whole
+        .commits()
+        .find(|c| c.commit.adds.contains(&bob_key))
+        .expect("alice should hold the commit that admitted bob");
+    assert!(
+        admitting.commit.epoch >= 2,
+        "a welcome at the first commit would reach a device with no commit in \
+         its log to recognise it by: epoch {}",
+        admitting.commit.epoch
+    );
+    // And the commit it is safe by is really there, earlier in the log, naming
+    // nobody.
+    let first = whole
+        .commits()
+        .find(|c| c.commit.epoch == 1)
+        .expect("the channel is keyed by a commit before anybody is admitted");
+    assert!(
+        first.seq < admitting.seq,
+        "the keying commit must be in the log before the one that admits"
+    );
+    assert!(
+        first.commit.adds.is_empty() && first.commit.removes.is_empty(),
+        "and must admit nobody: {:?}",
+        first.commit.adds
+    );
+
+    // The invitee still ends up in, which is the point of the extra epoch
+    // being cheap rather than free.
+    let mut bobs = Timeline::new();
+    catch_up(&mut bob, &channel, &mut bobs).await;
+    assert_eq!(
+        bob.agreed_epoch(&channel).unwrap(),
+        Some(admitting.commit.epoch),
+        "the invitee is welcomed at the commit that admitted it"
+    );
+    alice
+        .send(&channel, "in at the second epoch")
+        .await
+        .unwrap();
+    catch_up(&mut bob, &channel, &mut bobs).await;
+    assert!(
+        bobs.messages()
+            .any(|m| m.post.body_text() == Some("in at the second epoch")),
+        "and reads under the key it derived: {:?}",
+        bobs.messages()
+            .filter_map(|m| m.post.body_text())
+            .collect::<Vec<_>>()
     );
 }

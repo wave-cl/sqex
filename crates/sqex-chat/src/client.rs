@@ -3063,24 +3063,39 @@ impl Chat {
             // equally have sent a wrong secret, and the commit is signed, so it
             // is attributable — which is the same trade `contribution` is for.
             let welcome = commits.iter().find(|c| c.admits(&self.me)).cloned();
-            if commits.is_empty() {
-                // **Not opened unless this device can tell which rule produced
-                // the epoch.** Opening spends the SIP-23 prekey, and a key taken
-                // under the wrong rule cannot be given back — a `Welcome`'s
-                // chain stored as though it were an epoch key is thirty-two
-                // bytes that decrypt nothing and an envelope that will never be
-                // served again. SIP-87 puts it as a `MUST`: read the commit
-                // first. The envelope keeps at the exchange, which serves it
+            // **Which rule produced this epoch — asked of the channel first,
+            // and only then of the epoch.** Opening spends the SIP-23 prekey,
+            // and a key taken under the wrong rule cannot be given back.
+            //
+            // A commit anywhere in the log settles the channel: SIP-17's kind
+            // can never hold one, and an agreed channel has held one since the
+            // commit that first keyed it. Asking only per epoch left a window,
+            // and it was a real one — `commit` publishes the envelopes before
+            // it posts the entry, because the exchange takes a post only at the
+            // epoch the envelopes have just created. In between, a device that
+            // had read the whole log was "settled", found no commit for that
+            // epoch, and took a `Welcome` for a SIP-17 key.
+            //
+            // That failure hides itself, which is why it is worth the
+            // paragraph: the slot layout means such a device stores the *right*
+            // key for the epoch it was admitted at and the chain as a junk key
+            // for the epoch below, so it reads that one epoch, derives nothing
+            // after it, and looks like a device with a key rather than one that
+            // threw its chain away.
+            let agreed_channel = held.is_some() || self.store.highest_commit(channel)? > 0;
+            if agreed_channel {
+                // An agreed channel whose commit for *this* epoch has not been
+                // read yet. The envelope keeps at the exchange, which serves it
                 // again on the next collection.
-                //
-                // Three ways to be sure, and the channel being agreed is not one
-                // of them — a device holding a chain and finding no commit for an
-                // epoch has met a channel mixing the two kinds, which SIP-17's
-                // amendment forbids, and the thing to do with it is nothing.
-                let certain = settled || (held.is_none() && self.store.highest_epoch(channel)? > 0);
-                if !certain || held.is_some() {
+                if commits.is_empty() {
                     continue;
                 }
+            } else if !settled {
+                // Not agreed as far as this device knows — and it does not know
+                // far enough. The *absence* of a commit is a fact about the
+                // channel only once the log has been read to the exchange's
+                // head; before that it is a fact about the cursor.
+                continue;
             }
             // Already had, and the question is asked of the right epoch for each
             // of the three kinds this envelope could be.
@@ -4970,7 +4985,25 @@ impl Chat {
         // Before the first commit, and not after: the chain is what the commit
         // is derived from.
         self.store.set_agreement(&channel, &Chain::create())?;
-        self.commit(&channel, invite, &[]).await?;
+        // **Keyed first, and only then opened to anybody.** The first commit
+        // admits nobody, and the invitees arrive on a second.
+        //
+        // An extra epoch at creation, bought for a reason. A commit publishes
+        // its envelopes before it posts its entry -- the exchange takes a post
+        // only at the epoch the envelopes have just created -- so between the
+        // two there is a moment when a `Welcome` exists and the commit
+        // explaining it does not. A device meeting the channel in that moment
+        // has read the whole log, finds no commit anywhere in it, and has
+        // nothing to tell SIP-17's kind from this one.
+        //
+        // Committing to nobody first means every `Welcome` this client ever
+        // publishes is for an epoch of two or more, by which time the log holds
+        // the first commit and the question is settled however the timing
+        // falls.
+        self.commit(&channel, &[], &[]).await?;
+        if !invite.is_empty() {
+            self.commit(&channel, invite, &[]).await?;
+        }
         if !name.is_empty() {
             self.set_name(&channel, name).await?;
         }
