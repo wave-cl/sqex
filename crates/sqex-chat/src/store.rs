@@ -88,8 +88,16 @@ CREATE TABLE IF NOT EXISTS entry (
     bytes    BLOB    NOT NULL,
     PRIMARY KEY (exchange, channel, seq)
 );
--- The keys, sealed. Nothing else in this file needs protecting; these are the
--- conversation.
+-- The keys, sealed; these are the conversation.
+--
+-- This comment used to say "nothing else in this file needs protecting",
+-- and that was read as settling the question for every other column. It did
+-- not: `message.sealed` carries the bodies, `chain` carries SIP-87's
+-- secret, and `channel_meta.avatar` carries a blob key -- which went
+-- unsealed for exactly as long as this sentence stood. **The rule is per
+-- column and it is "seal what is a key or a body".** A name, a topic, a
+-- counter the exchange published anyway: those are in the clear, and each
+-- says so where it is declared.
 CREATE TABLE IF NOT EXISTS channel_key (
     exchange BLOB   NOT NULL,
     channel BLOB    NOT NULL,
@@ -217,6 +225,12 @@ CREATE TABLE IF NOT EXISTS channel_meta (
     -- an encoded `Attachment`, and the sequence number of the entry they came
     -- from. `meta_seq = 0` means no fold has ever reached a metadata entry
     -- here, which is a different fact from a channel its admins never named.
+    --
+    -- `avatar` is **sealed**, unlike `topic` and `label` beside it. An
+    -- encoded `Attachment` carries the blob's own key (SIP-18), so a row in
+    -- the clear put a private group's picture key next to the ciphertext it
+    -- opens. The name and topic are not keys and are not sealed. See
+    -- `Store::remember_meta` and `Store::seal_channel_pictures`.
     topic    TEXT    NOT NULL DEFAULT '',
     avatar   BLOB    NOT NULL DEFAULT x'',
     meta_seq INTEGER NOT NULL DEFAULT 0,
@@ -1184,7 +1198,75 @@ impl Store {
             homes: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         store.sweep_assets()?;
+        store.seal_channel_pictures()?;
         Ok(store)
+    }
+
+    /// Seal any channel picture an older store left in the clear.
+    ///
+    /// # Why this is not in `migrate`
+    ///
+    /// Every other migration here is a shape change, and shape is all a
+    /// `Connection` knows. This one is a *re-encryption*, so it needs the
+    /// store key — which is derived from the seed a moment after `migrate`
+    /// runs. So it goes where the key is, beside [`Store::sweep_assets`],
+    /// which is already a post-construction pass over what is on the disc.
+    ///
+    /// # Why the plaintext is recognised by failing to unseal
+    ///
+    /// There is no version marker to go by, and adding one would mean a
+    /// column whose only job is to describe another column. The AEAD is a
+    /// better discriminator than a flag would be: an already-sealed row
+    /// authenticates and is left alone, and a row of plaintext cannot
+    /// authenticate under any key. So this is idempotent, and a store opened
+    /// twice re-seals nothing the second time.
+    ///
+    /// **The fallback lives here and not in the reader.** `channels` only
+    /// ever unseals. A reader that also accepted plaintext would accept it
+    /// for ever, which is a property quietly not held rather than a
+    /// migration that ran once.
+    ///
+    /// # What a row that is neither can be
+    ///
+    /// A picture written under another identity's key — a store file copied
+    /// between accounts, which the per-identity path makes unlikely but not
+    /// impossible. Re-sealing it would make this identity's key vouch for
+    /// bytes it cannot read, so such a row is left exactly as it is: it will
+    /// not unseal, `channels` drops it, and the next fold of that channel
+    /// writes one that does.
+    fn seal_channel_pictures(&self) -> Result<()> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT exchange, channel, avatar FROM channel_meta
+                 WHERE length(avatar) > 0",
+            )
+            .map_err(storage("prepare the channel picture sweep"))?;
+        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(storage("query channel pictures"))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(storage("read channel pictures"))?;
+        for (exchange, channel, held) in rows {
+            if self.unseal_bytes(&held).is_ok() {
+                continue;
+            }
+            // Only something this store can read as a picture is re-sealed.
+            // Anything else is left for `channels` to drop, for the reason
+            // the doc comment gives.
+            if Attachment::read(&held, &mut 0).is_err() {
+                continue;
+            }
+            let sealed = self.seal_bytes(&held)?;
+            self.db
+                .execute(
+                    "UPDATE channel_meta SET avatar = ?1
+                     WHERE exchange = ?2 AND channel = ?3",
+                    params![sealed, exchange, channel],
+                )
+                .map_err(storage("seal a channel picture"))?;
+        }
+        Ok(())
     }
 
     /// Say which exchange this store is for, and claim what predates the
@@ -2891,10 +2973,17 @@ impl Store {
                 label,
                 admins,
                 topic,
-                // Kept as its wire bytes, so a picture this store cannot make
-                // sense of -- written by a later version -- is dropped rather
-                // than failing the whole list.
-                avatar: Attachment::read(&avatar, &mut 0).ok(),
+                // Sealed at rest; see `remember_meta`. Unsealed and then
+                // read, and **both** steps may fail without failing the
+                // list: a picture this store cannot make sense of -- written
+                // by a later version -- is dropped rather than taking every
+                // other channel with it, and a row that will not unseal is
+                // one `seal_channel_pictures` has not reached, or one
+                // written under another identity's key.
+                avatar: self
+                    .unseal_bytes(&avatar)
+                    .ok()
+                    .and_then(|plain| Attachment::read(&plain, &mut 0).ok()),
                 meta_seq,
             });
         }
@@ -2915,11 +3004,22 @@ impl Store {
             // stored, and an empty name written here would be a claim.
             return Ok(());
         }
-        let avatar = timeline
-            .avatar
-            .as_ref()
-            .map(|a| a.encode())
-            .unwrap_or_default();
+        // **Sealed, because an encoded `Attachment` is a key.**
+        //
+        // `Attachment` carries the blob's own ChaCha20Poly1305 key in it
+        // (SIP-18), and this column held the whole struct in the clear --
+        // so a private group's picture was ciphertext in `assets/` with its
+        // key beside it in the same file. Every other key in this database
+        // is sealed; this one was not, and nothing chose that.
+        //
+        // The bytes in `assets/` are unchanged and still need no sealing of
+        // their own: they are what the exchange served, under this key, and
+        // the id is the hash of exactly them. What had to change is the
+        // key's reach, and that is this row.
+        let avatar = match timeline.avatar.as_ref() {
+            Some(a) => self.seal_bytes(&a.encode())?,
+            None => Vec::new(),
+        };
         self.db
             .execute(
                 "INSERT INTO channel_meta (channel, exchange, label, topic, avatar, meta_seq)
@@ -4842,6 +4942,277 @@ mod tests {
             .unwrap();
         assert_eq!(c.label, "bob", "the peer's name was overwritten");
         assert_eq!(c.topic, "just the two of us");
+    }
+
+    /// A picture for a channel, as a metadata entry carries one.
+    fn a_picture() -> Attachment {
+        Attachment {
+            kind: sqex_proto::blob::KIND_IMAGE,
+            blob: [0xAB; 32],
+            // The one field this is all about: a key that opens the bytes in
+            // `assets/`, distinctive so a test can look for it.
+            key: [0xCD; 32],
+            size: 4096,
+            chunks: 1,
+            mime: "image/png".into(),
+            meta: vec![0, 64, 0, 64],
+            preview: vec![9; 16],
+        }
+    }
+
+    /// What is actually on the disc for a channel's picture.
+    fn avatar_row(s: &Store, channel: &[u8; 32]) -> Vec<u8> {
+        s.db.query_row(
+            "SELECT avatar FROM channel_meta WHERE channel = ?1 AND exchange = ?2",
+            params![&channel[..], s.scope().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Fold a metadata entry naming `avatar`, which is how a channel's
+    /// picture reaches the store at all.
+    fn remember_a_picture(s: &Store, channel: &[u8; 32], avatar: Option<Attachment>) {
+        let meta = Body::Metadata {
+            name: "the group".into(),
+            topic: "about it".into(),
+            avatar,
+        };
+        s.put_message(
+            channel,
+            Kept {
+                seq: 4,
+                account: key(2),
+                posted: 104,
+                kind: KIND_MEMBER,
+                plain: Some(&meta.encode()),
+            },
+        )
+        .unwrap();
+        s.history(channel, &[key(2)]).unwrap();
+    }
+
+    /// **A channel picture's key is not on the disc in the clear.**
+    ///
+    /// `channel_meta.avatar` holds an encoded `Attachment`, and SIP-18 puts
+    /// the blob's own ChaCha20Poly1305 key inside one. So this column held
+    /// the key that opens `assets/<blob>` in the same file as the ciphertext
+    /// it opens -- a private group's picture, readable by anybody who could
+    /// read the database, while every other key in it was sealed.
+    ///
+    /// The assertion is on the bytes of the row, not on the round trip: a
+    /// round trip passes whether or not anything was sealed, which is how
+    /// this went unnoticed.
+    #[test]
+    fn a_channel_pictures_key_is_not_kept_in_the_clear() {
+        let s = scoped(&seed(1), None);
+        let channel = [11; 32];
+        s.put_channel(&channel, true, Some(false), "", &[key(2)])
+            .unwrap();
+        let picture = a_picture();
+        remember_a_picture(&s, &channel, Some(picture.clone()));
+
+        let held = avatar_row(&s, &channel);
+        assert!(!held.is_empty(), "the picture was not remembered at all");
+        // The key, the blob id and the whole encoding: none of them.
+        let find = |needle: &[u8]| held.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            !find(&picture.key),
+            "the blob key is on the disc in the clear"
+        );
+        assert!(
+            !find(&picture.encode()),
+            "the whole attachment is on the disc in the clear"
+        );
+        // Sealed, not merely absent: it must still be the picture when read.
+        let read = s
+            .channels()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.channel == channel)
+            .unwrap()
+            .avatar;
+        assert_eq!(
+            read,
+            Some(picture),
+            "sealing it lost it: a channel picture that cannot be read back \
+             is a picture nobody sees"
+        );
+    }
+
+    /// A channel with no picture keeps an empty row, and reads back as no
+    /// picture rather than as an unreadable one.
+    ///
+    /// The seal is over bytes, and nought bytes is a case: `unseal_bytes`
+    /// refuses anything too short to hold a nonce, so an empty row must not
+    /// be sealed on the way in or the two states -- "no picture" and "a
+    /// picture this store cannot open" -- become one.
+    #[test]
+    fn a_channel_with_no_picture_keeps_an_empty_row() {
+        let s = scoped(&seed(1), None);
+        let channel = [12; 32];
+        s.put_channel(&channel, true, Some(false), "", &[key(2)])
+            .unwrap();
+        remember_a_picture(&s, &channel, None);
+        assert!(
+            avatar_row(&s, &channel).is_empty(),
+            "a channel with no picture wrote something"
+        );
+        assert_eq!(
+            s.channels()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.channel == channel)
+                .unwrap()
+                .avatar,
+            None
+        );
+    }
+
+    /// **A picture an older store left in the clear is sealed when it is
+    /// opened**, and is still the same picture afterwards.
+    ///
+    /// The upgrade path. Rows written before this were the plain encoding,
+    /// and a reader that only unseals would drop every one of them -- so the
+    /// pictures would vanish from the conversation list until each channel
+    /// was folded again, and the keys would stay on the disc in the clear in
+    /// the meantime.
+    #[test]
+    fn a_channel_picture_left_in_the_clear_is_sealed_when_the_store_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let channel = [13; 32];
+        let picture = a_picture();
+        {
+            let s = scoped(&seed(1), Some(&path));
+            s.put_channel(&channel, true, Some(false), "", &[key(2)])
+                .unwrap();
+            remember_a_picture(&s, &channel, Some(picture.clone()));
+            // Put back the way the old code wrote it: the plain encoding.
+            s.db.execute(
+                "UPDATE channel_meta SET avatar = ?1 WHERE channel = ?2",
+                params![picture.encode(), &channel[..]],
+            )
+            .unwrap();
+            assert!(
+                avatar_row(&s, &channel)
+                    .windows(32)
+                    .any(|w| w == picture.key),
+                "the fixture is not what an old store held"
+            );
+        }
+        let s = scoped(&seed(1), Some(&path));
+        assert!(
+            !avatar_row(&s, &channel)
+                .windows(32)
+                .any(|w| w == picture.key),
+            "opening the store left the key in the clear"
+        );
+        assert_eq!(
+            s.channels()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.channel == channel)
+                .unwrap()
+                .avatar,
+            Some(picture),
+            "sealing an old row lost the picture"
+        );
+    }
+
+    /// Sealing is **idempotent**: a store opened twice re-seals nothing.
+    ///
+    /// The pass tells a sealed row from a plain one by whether it
+    /// authenticates, which is also what makes it safe to run on every open.
+    /// If it could not tell, it would seal a sealed row again on each start
+    /// and the picture would be unreadable after the second one.
+    #[test]
+    fn sealing_a_channel_picture_twice_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let channel = [14; 32];
+        let picture = a_picture();
+        let first = {
+            let s = scoped(&seed(1), Some(&path));
+            s.put_channel(&channel, true, Some(false), "", &[key(2)])
+                .unwrap();
+            remember_a_picture(&s, &channel, Some(picture.clone()));
+            avatar_row(&s, &channel)
+        };
+        let s = scoped(&seed(1), Some(&path));
+        assert_eq!(
+            avatar_row(&s, &channel),
+            first,
+            "a sealed row was sealed again on the second open"
+        );
+        assert_eq!(
+            s.channels()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.channel == channel)
+                .unwrap()
+                .avatar,
+            Some(picture),
+            "the picture did not survive a second open"
+        );
+    }
+
+    /// A picture sealed under **another identity's key** is dropped, and is
+    /// not re-sealed under this one.
+    ///
+    /// A store file moved between accounts. Re-sealing such a row would make
+    /// this identity's key vouch for bytes it cannot read, and would write a
+    /// row that looks sound and opens to rubbish; leaving it means `channels`
+    /// drops it and the next fold writes one that works.
+    #[test]
+    fn a_channel_picture_sealed_under_another_key_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+        let channel = [15; 32];
+        let foreign = {
+            // Sealed by a store with a different seed, which is the only way
+            // to get a row this one genuinely cannot open.
+            let other = scoped(&seed(2), Some(&dir.path().join("other.db")));
+            other.seal_bytes(&a_picture().encode()).unwrap()
+        };
+        {
+            let s = scoped(&seed(1), Some(&path));
+            s.put_channel(&channel, true, Some(false), "", &[key(2)])
+                .unwrap();
+            remember_a_picture(&s, &channel, Some(a_picture()));
+            s.db.execute(
+                "UPDATE channel_meta SET avatar = ?1 WHERE channel = ?2",
+                params![&foreign, &channel[..]],
+            )
+            .unwrap();
+        }
+        let s = scoped(&seed(1), Some(&path));
+        assert_eq!(
+            avatar_row(&s, &channel),
+            foreign,
+            "a row this store cannot read was rewritten under its own key"
+        );
+        assert_eq!(
+            s.channels()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.channel == channel)
+                .unwrap()
+                .avatar,
+            None,
+            "a picture this store cannot open was offered as one it can"
+        );
+        // And the rest of the row is untouched: one unreadable picture must
+        // not cost the channel its name.
+        assert_eq!(
+            s.channels()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.channel == channel)
+                .unwrap()
+                .label,
+            "the group"
+        );
     }
 
     /// A store written before the metadata columns existed opens, keeps its
