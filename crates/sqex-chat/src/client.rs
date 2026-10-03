@@ -2044,15 +2044,17 @@ impl Chat {
             landed,
         )
         .await;
-        // The link is marked from the batch as a whole: any answer at all
-        // proves it, and it is lowered only when nothing answered and
-        // something failed to.
+        // **The link is marked from the batch as a whole, and from the
+        // transport and not the status.** Any answer at all proves it --
+        // including a 404, which is the exchange talking -- and it is lowered
+        // only when nothing answered and something failed to. So this runs
+        // before `classified`, which is where a non-200 becomes an `Err`.
         if answers.iter().any(|a| a.is_ok()) {
             self.up();
         } else if answers.iter().any(|a| a.is_err()) {
             self.down();
         }
-        answers
+        classified(path, answers)
     }
 
     /// A handle that can make requests on this client's connection from
@@ -2087,7 +2089,7 @@ pub(crate) async fn each_over(
     patience: Duration,
     in_flight: usize,
     landed: Option<&(dyn Fn(usize) + Send + Sync)>,
-) -> Vec<Result<Vec<u8>>> {
+) -> Vec<Result<(u16, Vec<u8>)>> {
     use futures::stream::StreamExt;
     {
         let requests = requests.clone();
@@ -2123,13 +2125,28 @@ pub(crate) async fn each_over(
                 .collect()
                 .await;
         answers
-            .into_iter()
-            .map(|a| match a? {
-                (200, body) => Ok(body),
-                (code, body) => Err(classify(path, code, &body)),
-            })
-            .collect()
     }
+}
+
+/// What the exchange's answers mean, once the link has been judged.
+///
+/// **Separate from [`each_over`] because the two read a non-200 the opposite
+/// way round.** To a caller, a 404 is a failure: there is no profile, no
+/// name, no blob. To the link, a 404 is the exchange answering, which is the
+/// strongest possible evidence that the connection is up. Folding the two
+/// together is a real bug this had: `each_over` classified before returning,
+/// `post_each` then judged the link from the classified results, and one
+/// honest 404 put the client into "not connected to the exchange" for
+/// everything that followed -- calls that never rang, entries never taken,
+/// a dead client against a healthy exchange.
+pub(crate) fn classified(path: &str, answers: Vec<Result<(u16, Vec<u8>)>>) -> Vec<Result<Vec<u8>>> {
+    answers
+        .into_iter()
+        .map(|a| match a? {
+            (200, body) => Ok(body),
+            (code, body) => Err(classify(path, code, &body)),
+        })
+        .collect()
 }
 
 impl Chat {

@@ -2193,3 +2193,75 @@ async fn a_download_says_how_far_along_it_is() {
         "a cached file reports done, once, and nothing before it"
     );
 }
+
+/// **An honest refusal from the exchange is not the link going down.**
+///
+/// `post_each` asks for several things at once and judges the link from the
+/// batch: any answer at all proves the connection, and it is lowered only
+/// when nothing answered. The judgement has to be made on the *transport*,
+/// because at the status level one answer is read two opposite ways -- a 404
+/// is a failure to the caller and a liveness proof to the link.
+///
+/// # The regression this is the control for
+///
+/// `each_over` was factored out of `post_each` so a download could run off
+/// a caller's loop, and it classified the statuses before returning -- so
+/// `post_each` then judged the link from classified results. A batch in
+/// which every answer was a 404 became a batch in which every answer was an
+/// `Err`, the client called `down()` on itself, and from then on
+/// `offline()` was true and every request was refused without being sent,
+/// against an exchange that was answering perfectly.
+///
+/// **Twenty-three tests in `sigil` failed on it and none in this workspace
+/// did.** `/name/reverse` answers 404 for an account that never claimed a
+/// name (probed, not assumed), `refetch_profiles` asks it for everybody it
+/// refreshes, and a freshly generated key has no name -- so a session loop
+/// hit an all-404 batch within seconds of starting, and nothing here had
+/// ever run that loop.
+#[tokio::test]
+async fn a_batch_of_refusals_does_not_take_the_link_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    bob.open_dm(&alice_key).await.unwrap();
+    assert_eq!(
+        alice.link(),
+        sqex_chat::client::Link::Up,
+        "the fixture starts with the link already down"
+    );
+
+    // Accounts that have claimed no name, so every `/name/reverse` in the
+    // batch is answered with a 404. Several, because the bug needed a batch
+    // in which *nothing* came back `Ok` -- one success anywhere in it would
+    // have marked the link up and hidden this for longer.
+    let nameless: Vec<PubKey> = (90u8..95).map(|b| PubKey::new([b; 32])).collect();
+    let read = alice.refetch_profiles(&nameless, 1_000).await;
+    assert!(
+        read.is_ok(),
+        "refreshing accounts that have published nothing should not fail: {read:?}"
+    );
+
+    // The link, which is the whole point of the test.
+    assert_eq!(
+        alice.link(),
+        sqex_chat::client::Link::Up,
+        "a batch of honest 404s put the client into 'not connected to the \
+         exchange': every request after this is refused without being sent, \
+         against an exchange that just answered five of them"
+    );
+    // And not merely the flag: `offline()` is checked before a request goes
+    // out, so a client that believes itself down fails these without a round
+    // trip.
+    assert!(
+        alice.blob_limits().await.is_ok(),
+        "the client refused the next request after a batch of refusals"
+    );
+    assert!(
+        alice.send(&channel, "still here").await.is_ok(),
+        "a batch of refusals cost the conversation its link"
+    );
+}

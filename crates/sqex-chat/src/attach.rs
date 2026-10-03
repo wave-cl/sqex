@@ -477,15 +477,23 @@ pub async fn fetch_sealed(
         .collect();
     let whole = sqex_proto::blob_store::CHUNK as u64;
     let size = a.size;
-    let answers = crate::client::each_over(
-        requests,
+    // `each_over` answers at the transport level and `classified` turns a
+    // non-200 into the error it means to a caller -- the same two steps
+    // `Chat::post_each` takes, in the same order. There is no link to mark
+    // here: this runs in a task that has no client to lower one, which is
+    // why the split exists at all.
+    let answers = crate::client::classified(
         "/blob/get",
-        asks,
-        crate::client::BLOB_PATIENCE,
-        crate::client::IN_FLIGHT,
-        Some(&|landed: usize| progress((landed as u64 * whole).min(size), size)),
-    )
-    .await;
+        crate::client::each_over(
+            requests,
+            "/blob/get",
+            asks,
+            crate::client::BLOB_PATIENCE,
+            crate::client::IN_FLIGHT,
+            Some(&|landed: usize| progress((landed as u64 * whole).min(size), size)),
+        )
+        .await,
+    );
     let mut sealed = Vec::with_capacity(a.chunks as usize);
     for (index, body) in answers.into_iter().enumerate() {
         let chunk = Chunk::decode(&body?).map_err(|e| ChatError::Protocol(e.to_string()))?;
