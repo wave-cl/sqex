@@ -2074,3 +2074,122 @@ async fn a_downloaded_attachment_is_kept_and_read_back_after_the_exchange_lets_g
         "the sender's own attachment was not kept when it was sent"
     );
 }
+
+/// A download says how far along it is, so a client can draw it.
+///
+/// The numbers are the ones a person is waiting for — bytes of the file they
+/// will end up with — and the test holds them to the three things a bar needs:
+/// they arrive more than once, they never go backwards, and the last one is the
+/// whole file. A download that reported only at the end would pass a test that
+/// checked the total alone, and would leave a picture sitting still for however
+/// long a video takes.
+#[tokio::test]
+async fn a_download_says_how_far_along_it_is() {
+    use sqex_proto::blob_store::CHUNK;
+    use sqex_proto::message::{Part, Post as SipPost};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, alice_key) = identity(1);
+    let (_, bob_key) = identity(2);
+    let mut bob = chat_at(addr, server_pub, 2, &dir.path().join("bob.db")).await;
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    // Three chunks, the last one short: a file whose size is a whole number of
+    // chunks would not catch a count that kept adding whole chunks past the end.
+    let path = dir.path().join("clip.bin");
+    let body: Vec<u8> = (0..(CHUNK * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &body).unwrap();
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let limits = alice.blob_limits().await.unwrap();
+    let prepared = alice.prepare_file(&path, limits.chunk as usize).unwrap();
+    assert_eq!(prepared.chunks(), 3, "expected three chunks at this size");
+    let attachment = alice.upload(&channel, &prepared).await.unwrap();
+    let mut post = SipPost::text("a clip");
+    post.parts.push(Part::Attachment(attachment));
+    alice.send_post(&channel, post).await.unwrap();
+
+    bob.open_dm(&alice_key).await.unwrap();
+    let mut bobs = Timeline::new();
+    let got = bob.poll(&channel, &mut bobs, 0).await.unwrap();
+    let a = got
+        .timeline
+        .messages()
+        .next()
+        .unwrap()
+        .post
+        .attachments()
+        .next()
+        .expect("no attachment arrived")
+        .clone();
+
+    let seen: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let opened = bob
+        .download_reporting(&a, &|done, total| seen.lock().unwrap().push((done, total)))
+        .await
+        .unwrap();
+    assert_eq!(opened, body, "the file did not survive the round trip");
+
+    let seen = seen.into_inner().unwrap();
+    assert!(
+        seen.len() > 1,
+        "a download that reports once is a bar that never moves: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|(_, total)| *total == body.len() as u64),
+        "every report names the whole file: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].0 <= w[1].0),
+        "progress went backwards: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|(done, _)| *done <= body.len() as u64),
+        "progress passed the end of the file, so the last chunk was counted \
+         whole when it is short: {seen:?}"
+    );
+    assert_eq!(
+        seen.last().copied(),
+        Some((body.len() as u64, body.len() as u64)),
+        "the last word is the whole file: {seen:?}"
+    );
+
+    // **The split path gives the same bytes**, which is what lets a client
+    // run the waiting half in a task of its own: the chunks come back over a
+    // connection handle, and the hash, the store and the key stay with the
+    // `Chat`. Two halves that drifted apart would be a picture that downloads
+    // and will not open.
+    let split: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let handle = bob
+        .requests()
+        .expect("a connected client has a request handle");
+    let sealed = sqex_chat::attach::fetch_sealed(&handle, &a, &|done, total| {
+        split.lock().unwrap().push((done, total))
+    })
+    .await
+    .unwrap();
+    assert_eq!(sealed.len(), 3, "a chunk per chunk");
+    let apart = bob.open_fetched(&a, sealed).unwrap();
+    assert_eq!(apart, body, "the split download opened to something else");
+    let split = split.into_inner().unwrap();
+    assert!(
+        split.len() > 1 && split.last() == Some(&(body.len() as u64, body.len() as u64)),
+        "the split download reports as it goes and ends at the whole file: {split:?}"
+    );
+
+    // **And a file already on the disc still says so, once.** Otherwise a
+    // reader would see a bar appear for something that was never fetched —
+    // and the client cannot tell the two apart before it asks.
+    let again: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let twice = bob
+        .download_reporting(&a, &|done, total| again.lock().unwrap().push((done, total)))
+        .await
+        .unwrap();
+    assert_eq!(twice, body);
+    assert_eq!(
+        again.into_inner().unwrap(),
+        vec![(body.len() as u64, body.len() as u64)],
+        "a cached file reports done, once, and nothing before it"
+    );
+}

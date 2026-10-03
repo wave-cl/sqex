@@ -139,10 +139,10 @@ const PATIENCE: Duration = Duration::from_secs(8);
 /// A blob is as large as somebody chose to send and goes over whatever link
 /// they have. Holding it to a control-plane deadline would fail an upload that
 /// was working perfectly.
-const BLOB_PATIENCE: Duration = Duration::from_secs(300);
+pub(crate) const BLOB_PATIENCE: Duration = Duration::from_secs(300);
 
 /// How many chunks of one file are asked for at once. See [`Chat::post_many`].
-const IN_FLIGHT: usize = 8;
+pub(crate) const IN_FLIGHT: usize = 8;
 
 /// How many device lists are asked for at once. Small answers, so more of
 /// them: a channel of sixty members is four waves rather than eight.
@@ -1983,7 +1983,27 @@ impl Chat {
         patience: Duration,
         in_flight: usize,
     ) -> Result<Vec<Vec<u8>>> {
-        self.post_each(path, bodies, patience, in_flight)
+        self.post_each(path, bodies, patience, in_flight, None)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// [`Chat::post_many`], saying so as each answer lands.
+    ///
+    /// For the one caller that has something to show for the waiting: a file
+    /// arrives a chunk at a time and a person watching it arrive should see
+    /// that, rather than a still picture for however long a video takes.
+    /// `landed` is called with the number of answers in by then -- not with
+    /// bytes, because a chunk's size is the caller's to know and this layer
+    /// counts answers.
+    pub(crate) async fn post_many_reporting(
+        &mut self,
+        path: &str,
+        bodies: Vec<Vec<u8>>,
+        landed: &(dyn Fn(usize) + Send + Sync),
+    ) -> Result<Vec<Vec<u8>>> {
+        self.post_each(path, bodies, BLOB_PATIENCE, IN_FLIGHT, Some(landed))
             .await
             .into_iter()
             .collect()
@@ -2003,8 +2023,8 @@ impl Chat {
         bodies: Vec<Vec<u8>>,
         patience: Duration,
         in_flight: usize,
+        landed: Option<&(dyn Fn(usize) + Send + Sync)>,
     ) -> Vec<Result<Vec<u8>>> {
-        use futures::stream::StreamExt;
         if self.offline() {
             return bodies
                 .iter()
@@ -2015,7 +2035,62 @@ impl Chat {
                 })
                 .collect();
         }
-        let requests = self.client.requests();
+        let answers = each_over(
+            &self.client.requests(),
+            path,
+            bodies,
+            patience,
+            in_flight,
+            landed,
+        )
+        .await;
+        // The link is marked from the batch as a whole: any answer at all
+        // proves it, and it is lowered only when nothing answered and
+        // something failed to.
+        if answers.iter().any(|a| a.is_ok()) {
+            self.up();
+        } else if answers.iter().any(|a| a.is_err()) {
+            self.down();
+        }
+        answers
+    }
+
+    /// A handle that can make requests on this client's connection from
+    /// another task.
+    ///
+    /// **For work that should not hold the session still.** A file arrives a
+    /// chunk at a time and `Chat` is held by one owner, so a download that ran
+    /// through it stopped everything else until the last chunk; with this the
+    /// waiting happens elsewhere and the owner keeps drawing. Each request is
+    /// its own stream on the same connection, so this costs no handshake and
+    /// no socket -- see `sqnr::Client::requests`, which is `&self` for exactly
+    /// this reason.
+    ///
+    /// It does not keep the connection alive: when the client redials, a
+    /// request from an older handle fails as it would against any closed
+    /// connection, and the caller treats that as the fetch failing.
+    pub fn requests(&self) -> Option<sqnr::Requests> {
+        self.connection().map(|c| c.requests())
+    }
+}
+
+/// [`Chat::post_each`]'s loop, over a connection handle rather than a `Chat`.
+///
+/// Free of the client so that a task holding only a `sqnr::Requests` can run
+/// it -- which is what lets a download happen off the session's own thread of
+/// control. The link bookkeeping stays with the caller that has a link to
+/// mark.
+pub(crate) async fn each_over(
+    requests: &sqnr::Requests,
+    path: &str,
+    bodies: Vec<Vec<u8>>,
+    patience: Duration,
+    in_flight: usize,
+    landed: Option<&(dyn Fn(usize) + Send + Sync)>,
+) -> Vec<Result<Vec<u8>>> {
+    use futures::stream::StreamExt;
+    {
+        let requests = requests.clone();
         let path_owned = path.to_string();
         let answers: Vec<std::result::Result<(u16, Vec<u8>), ChatError>> =
             futures::stream::iter(bodies)
@@ -2034,13 +2109,19 @@ impl Chat {
                     }
                 })
                 .buffered(in_flight)
+                // **Counted as they arrive, in order.** `buffered` yields the
+                // first answer first however they actually complete, so this
+                // is "how many of the first N are in" -- which is the number a
+                // bar wants, and never goes backwards.
+                .enumerate()
+                .map(|(i, got)| {
+                    if let Some(say) = landed {
+                        say(i + 1);
+                    }
+                    got
+                })
                 .collect()
                 .await;
-        if answers.iter().any(|a| a.is_ok()) {
-            self.up();
-        } else if answers.iter().any(|a| a.is_err()) {
-            self.down();
-        }
         answers
             .into_iter()
             .map(|a| match a? {
@@ -2049,7 +2130,9 @@ impl Chat {
             })
             .collect()
     }
+}
 
+impl Chat {
     async fn post_within(
         &mut self,
         path: &str,
@@ -6328,7 +6411,7 @@ impl Chat {
             .map(|account| ProfileByAccount { account: *account }.encode(profile::TYPE_GET))
             .collect();
         let answers = self
-            .post_each("/profile/get", asks, PATIENCE, LISTS_IN_FLIGHT)
+            .post_each("/profile/get", asks, PATIENCE, LISTS_IN_FLIGHT, None)
             .await;
         let mut asked = 0;
         let mut handles = Vec::new();
@@ -6378,7 +6461,7 @@ impl Chat {
             .map(|account| sqex_proto::name::Reverse { account: *account }.encode())
             .collect();
         let answers = self
-            .post_each("/name/reverse", asks, PATIENCE, LISTS_IN_FLIGHT)
+            .post_each("/name/reverse", asks, PATIENCE, LISTS_IN_FLIGHT, None)
             .await;
         for (account, answer) in handles.iter().zip(answers) {
             let primary = answer

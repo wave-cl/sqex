@@ -327,35 +327,13 @@ impl Chat {
     /// back. The store checks the hash on the way out, so a kept blob is held
     /// to the same standard as a served one.
     pub async fn download(&mut self, a: &Attachment) -> Result<Vec<u8>> {
-        let sealed = match self.store().blob(&a.blob) {
-            Ok(Some(kept)) => kept,
-            _ => {
-                // All the chunks at once, not one after another: see
-                // `post_many` for what the difference costs.
-                let asks = (0..a.chunks)
-                    .map(|index| {
-                        GetChunk {
-                            blob: a.blob,
-                            index,
-                        }
-                        .encode()
-                    })
-                    .collect();
-                let mut sealed = Vec::with_capacity(a.chunks as usize);
-                for (index, body) in self.post_many("/blob/get", asks).await?.iter().enumerate() {
-                    let chunk =
-                        Chunk::decode(body).map_err(|e| ChatError::Protocol(e.to_string()))?;
-                    if !chunk.found {
-                        return Err(ChatError::Protocol(format!(
-                            "the exchange no longer holds chunk {index} — the attachment has \
-                             passed its retention window"
-                        )));
-                    }
-                    sealed.push(chunk.sealed);
-                }
-                sealed
-            }
-        };
+        self.download_reporting(a, &|_, _| {}).await
+    }
+
+    /// The part of a download after the bytes are in hand: it hashes, keeps
+    /// and opens them. Shared by the whole download and by the one whose
+    /// chunks came from another task.
+    fn open_sealed(&mut self, a: &Attachment, sealed: Vec<Vec<u8>>) -> Result<Vec<u8>> {
         if blob_id(&sealed) != a.blob {
             return Err(ChatError::Protocol(
                 "what the exchange served does not hash to the name the message gave".into(),
@@ -384,8 +362,142 @@ impl Chat {
                 out.len()
             )));
         }
+        // Said once at the end whatever happened above: a file off the disc
+        // reported nothing, and a fetched one reported its last chunk before
+        // it was opened and checked. Either way the caller hears "done" after
+        // the bytes are good, and never before.
         Ok(out)
     }
+
+    /// Open a blob whose sealed chunks were fetched elsewhere.
+    ///
+    /// The half of a download that needs this client: the hash check, the
+    /// store, and the key. [`fetch_sealed`] is the half that does not, and
+    /// runs wherever the caller likes.
+    pub fn open_fetched(&mut self, a: &Attachment, sealed: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+        self.open_sealed(a, sealed)
+    }
+
+    /// [`Chat::download`], saying how far along it is as it goes.
+    ///
+    /// `progress` is called with (bytes so far, bytes in all) each time a
+    /// chunk lands, and once with both equal before this returns -- so a
+    /// caller drawing a bar never has to guess that the last chunk finished
+    /// it. It is called at least once even for a file already on the disc,
+    /// where the answer is "all of it, now": a reader should not see a bar
+    /// appear for something that was never fetched.
+    ///
+    /// **The numbers are the file's, not the wire's.** A chunk is
+    /// `blob_store::CHUNK` of plaintext and a little more sealed, and the
+    /// person watching is waiting for a picture rather than for a ciphertext,
+    /// so the count is of the bytes they will end up with -- the last chunk
+    /// short, as it really is.
+    pub async fn download_reporting(
+        &mut self,
+        a: &Attachment,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<Vec<u8>> {
+        // What the n'th answer means in bytes of the finished file: whole
+        // chunks but for the last, which is whatever is left.
+        let so_far = |answers: usize| -> u64 {
+            let whole = sqex_proto::blob_store::CHUNK as u64;
+            (answers as u64 * whole).min(a.size)
+        };
+        let sealed = match self.store().blob(&a.blob) {
+            Ok(Some(kept)) => kept,
+            _ => {
+                // All the chunks at once, not one after another: see
+                // `post_many` for what the difference costs.
+                let asks = (0..a.chunks)
+                    .map(|index| {
+                        GetChunk {
+                            blob: a.blob,
+                            index,
+                        }
+                        .encode()
+                    })
+                    .collect();
+                let mut sealed = Vec::with_capacity(a.chunks as usize);
+                let answers = self
+                    .post_many_reporting("/blob/get", asks, &|landed| {
+                        progress(so_far(landed), a.size)
+                    })
+                    .await?;
+                for (index, body) in answers.iter().enumerate() {
+                    let chunk =
+                        Chunk::decode(body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+                    if !chunk.found {
+                        return Err(ChatError::Protocol(format!(
+                            "the exchange no longer holds chunk {index} — the attachment has \
+                             passed its retention window"
+                        )));
+                    }
+                    sealed.push(chunk.sealed);
+                }
+                sealed
+            }
+        };
+        let out = self.open_sealed(a, sealed)?;
+        progress(a.size, a.size);
+        Ok(out)
+    }
+}
+
+/// Fetch a blob's sealed chunks over a connection handle, saying how far
+/// along it is.
+///
+/// **Free of `Chat` on purpose.** A download is mostly waiting, and a `Chat`
+/// has one owner: run through it, the session stands still until the last
+/// chunk, which is exactly when a person is watching and wants to see
+/// something move. A `sqnr::Requests` makes each request as its own stream on
+/// the connection already open, so this can run in a task of its own while
+/// the session goes on drawing.
+///
+/// What comes back is still sealed and still unchecked: the hash, the store
+/// and the key belong to whoever holds the `Chat`, and
+/// [`Chat::open_fetched`] is where they happen. Keeping it that way is what
+/// lets the store stay on one thread.
+///
+/// `progress` is called with (bytes so far, bytes in all) as each chunk
+/// lands, counted in the bytes of the finished file -- the last chunk short,
+/// as it really is -- because that is the number the person is waiting for.
+pub async fn fetch_sealed(
+    requests: &sqnr::Requests,
+    a: &Attachment,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<Vec<Vec<u8>>> {
+    let asks: Vec<Vec<u8>> = (0..a.chunks)
+        .map(|index| {
+            GetChunk {
+                blob: a.blob,
+                index,
+            }
+            .encode()
+        })
+        .collect();
+    let whole = sqex_proto::blob_store::CHUNK as u64;
+    let size = a.size;
+    let answers = crate::client::each_over(
+        requests,
+        "/blob/get",
+        asks,
+        crate::client::BLOB_PATIENCE,
+        crate::client::IN_FLIGHT,
+        Some(&|landed: usize| progress((landed as u64 * whole).min(size), size)),
+    )
+    .await;
+    let mut sealed = Vec::with_capacity(a.chunks as usize);
+    for (index, body) in answers.into_iter().enumerate() {
+        let chunk = Chunk::decode(&body?).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        if !chunk.found {
+            return Err(ChatError::Protocol(format!(
+                "the exchange no longer holds chunk {index} — the attachment has \
+                 passed its retention window"
+            )));
+        }
+        sealed.push(chunk.sealed);
+    }
+    Ok(sealed)
 }
 
 /// How to describe an attachment in one line of a transcript.
