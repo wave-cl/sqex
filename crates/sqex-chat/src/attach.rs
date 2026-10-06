@@ -174,6 +174,35 @@ impl Chat {
     /// An upload that fails partway is aborted rather than left to expire, so
     /// the caller's next attempt is not refused for holding too many open.
     pub async fn upload(&mut self, channel: &[u8; 32], prepared: &Prepared) -> Result<Attachment> {
+        self.upload_reporting(channel, prepared, &|_, _| {}).await
+    }
+
+    /// [`Chat::upload`], saying how far along it is as it goes.
+    ///
+    /// `progress` is called with (bytes so far, bytes in all) each time a
+    /// chunk lands, and once with both equal before this returns -- so a
+    /// caller drawing a bar never has to guess that the last chunk finished
+    /// it. The twin of [`Chat::download_reporting`], and for the same
+    /// reason: somebody who has just pressed send on a video is waiting on
+    /// something, and a still picture for the length of an upload tells them
+    /// nothing about whether it is moving.
+    ///
+    /// **The numbers are the file's, not the wire's.** A chunk is
+    /// `blob_store::CHUNK` of plaintext and a little more sealed, and the
+    /// person watching is waiting for a picture to go rather than for a
+    /// ciphertext, so the count is of the bytes they chose -- the last chunk
+    /// short, as it really is.
+    ///
+    /// Nothing is reported for `/blob/begin` or `/blob/commit`. They are one
+    /// round trip each against a file's many, and a bar that jumped off
+    /// nought before a byte moved would be describing the handshake rather
+    /// than the upload.
+    pub async fn upload_reporting(
+        &mut self,
+        channel: &[u8; 32],
+        prepared: &Prepared,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<Attachment> {
         let body = self
             .post_raw(
                 "/blob/begin",
@@ -190,7 +219,7 @@ impl Chat {
             .map_err(|e| ChatError::Protocol(e.to_string()))?
             .upload;
 
-        if let Err(e) = self.put_chunks(upload, prepared).await {
+        if let Err(e) = self.put_chunks(upload, prepared, progress).await {
             let _ = self
                 .post_raw(
                     "/blob/abort",
@@ -231,7 +260,18 @@ impl Chat {
     }
 
     /// The exchange takes chunks in any order, so they go up together.
-    async fn put_chunks(&mut self, upload: u64, prepared: &Prepared) -> Result<()> {
+    ///
+    /// `progress` counts in the bytes of the file as the sender chose it,
+    /// not of the sealed chunks that actually travel: a chunk is
+    /// `blob_store::CHUNK` of plaintext and a little more on the wire, and
+    /// the number somebody is watching is the size of their own picture.
+    /// The same arithmetic `fetch_sealed` does coming the other way.
+    async fn put_chunks(
+        &mut self,
+        upload: u64,
+        prepared: &Prepared,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<()> {
         let puts = prepared
             .sealed
             .iter()
@@ -245,7 +285,16 @@ impl Chat {
                 .encode()
             })
             .collect();
-        self.post_many("/blob/put", puts).await?;
+        let whole = sqex_proto::blob_store::CHUNK as u64;
+        let size = prepared.attachment.size;
+        self.post_many_reporting("/blob/put", puts, &|landed: usize| {
+            progress((landed as u64 * whole).min(size), size)
+        })
+        .await?;
+        // **Said once at the end, whatever the chunking did.** The last
+        // chunk is short, so counting whole ones never reaches the size; a
+        // caller drawing a ring would be left one sliver from closed.
+        progress(size, size);
         Ok(())
     }
 

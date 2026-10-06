@@ -141,7 +141,8 @@ const PATIENCE: Duration = Duration::from_secs(8);
 /// was working perfectly.
 pub(crate) const BLOB_PATIENCE: Duration = Duration::from_secs(300);
 
-/// How many chunks of one file are asked for at once. See [`Chat::post_many`].
+/// How many chunks of one file are asked for at once. See
+/// [`Chat::post_many_reporting`].
 pub(crate) const IN_FLIGHT: usize = 8;
 
 /// How many device lists are asked for at once. Small answers, so more of
@@ -1958,24 +1959,17 @@ impl Chat {
     /// `Chat` -- so there was never a reason for the second to wait on the
     /// first except that this code did.
     ///
-    /// Bounded at [`IN_FLIGHT`], because a hundred-megabyte file is four
-    /// hundred chunks and the exchange has other callers. Refused whole on the
-    /// first failure, the way one request is, and the link is marked the same
-    /// way: any answer proves it, silence or a transport error counts against
-    /// it. Every body is a `Vec` because the caller has them all in hand
-    /// (chunks to put) or can name them all (chunks to get).
-    pub(crate) async fn post_many(
-        &mut self,
-        path: &str,
-        bodies: Vec<Vec<u8>>,
-    ) -> Result<Vec<Vec<u8>>> {
-        self.post_many_within(path, bodies, BLOB_PATIENCE, IN_FLIGHT)
-            .await
-    }
-
-    /// [`Chat::post_many`] with the deadline and the bound as arguments: a
-    /// chunk of a file and a device list are not held to the same clock, and
-    /// sixteen small answers in flight is not what eight large ones are.
+    /// Refused whole on the first failure, the way one request is, and the
+    /// link is marked the same way: any answer proves it, silence or a
+    /// transport error counts against it. Every body is a `Vec` because the
+    /// caller has them all in hand (chunks to put) or can name them all
+    /// (chunks to get).
+    ///
+    /// The deadline and the bound are arguments because a chunk of a file
+    /// and a device list are not held to the same clock, and sixteen small
+    /// answers in flight is not what eight large ones are. Blobs take
+    /// [`IN_FLIGHT`], because a hundred-megabyte file is four hundred chunks
+    /// and the exchange has other callers.
     async fn post_many_within(
         &mut self,
         path: &str,
@@ -1989,7 +1983,7 @@ impl Chat {
             .collect()
     }
 
-    /// [`Chat::post_many`], saying so as each answer lands.
+    /// [`Chat::post_many_within`], saying so as each answer lands.
     ///
     /// For the one caller that has something to show for the waiting: a file
     /// arrives a chunk at a time and a person watching it arrive should see

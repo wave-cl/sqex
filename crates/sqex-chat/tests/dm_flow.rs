@@ -2265,3 +2265,73 @@ async fn a_batch_of_refusals_does_not_take_the_link_down() {
         "a batch of refusals cost the conversation its link"
     );
 }
+
+/// An upload says how far along it is, so a client can draw it.
+///
+/// The twin of `a_download_says_how_far_along_it_is`, and held to the same
+/// three things a bar needs: the reports arrive more than once, they never go
+/// backwards, and the last one is the whole file. Somebody who has just
+/// pressed send on a video is waiting on something, and an upload that
+/// reported only at the end would leave them watching a still picture for the
+/// length of it.
+///
+/// The numbers are the file's as the sender chose it, not the sealed chunks
+/// that travel — a chunk is `CHUNK` of plaintext and a little more on the
+/// wire, and what somebody is watching go is their own picture.
+#[tokio::test]
+async fn an_upload_says_how_far_along_it_is() {
+    use sqex_proto::blob_store::CHUNK;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub, _h) = server_in(dir.path()).await;
+    let (_, bob_key) = identity(2);
+    let mut alice = chat_at(addr, server_pub, 1, &dir.path().join("alice.db")).await;
+
+    // Three chunks, the last one short: a file of a whole number of chunks
+    // would not catch a count that kept adding whole chunks past the end.
+    let path = dir.path().join("clip.bin");
+    let body: Vec<u8> = (0..(CHUNK * 2 + 1234)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &body).unwrap();
+
+    let channel = alice.open_dm(&bob_key).await.unwrap();
+    let limits = alice.blob_limits().await.unwrap();
+    let prepared = alice.prepare_file(&path, limits.chunk as usize).unwrap();
+    assert_eq!(prepared.chunks(), 3, "expected three chunks at this size");
+
+    let seen: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+    let attachment = alice
+        .upload_reporting(&channel, &prepared, &|done, total| {
+            seen.lock().unwrap().push((done, total))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        attachment.size,
+        body.len() as u64,
+        "the upload described a different file"
+    );
+
+    let seen = seen.into_inner().unwrap();
+    assert!(
+        seen.len() > 1,
+        "an upload that reports once is a bar that never moves: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|(_, total)| *total == body.len() as u64),
+        "every report names the whole file: {seen:?}"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].0 <= w[1].0),
+        "progress went backwards: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|(done, _)| *done <= body.len() as u64),
+        "progress passed the end of the file, so the last chunk was counted \
+         whole when it is short: {seen:?}"
+    );
+    assert_eq!(
+        seen.last().copied(),
+        Some((body.len() as u64, body.len() as u64)),
+        "the last word is the whole file: {seen:?}"
+    );
+}
