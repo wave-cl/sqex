@@ -308,6 +308,15 @@ pub struct FileLimits {
     /// SIP-85: tunnels opened, per member.
     #[serde(default)]
     pub tunnels: Option<[u32; 2]>,
+    /// SIP-88: posts appended to one's own feed, per account.
+    #[serde(default)]
+    pub feed_appends: Option<[u32; 2]>,
+    /// SIP-88: rows a caller asks `/feed/since` about, per account.
+    #[serde(default)]
+    pub feed_rows: Option<[u32; 2]>,
+    /// SIP-88: changes to one's own feed's policy, per account.
+    #[serde(default)]
+    pub feed_sets: Option<[u32; 2]>,
 }
 
 impl FileLimits {
@@ -329,6 +338,9 @@ impl FileLimits {
             peering: pick(self.peering, d.peering),
             calls: pick(self.calls, d.calls),
             tunnels: pick(self.tunnels, d.tunnels),
+            feed_appends: pick(self.feed_appends, d.feed_appends),
+            feed_rows: pick(self.feed_rows, d.feed_rows),
+            feed_sets: pick(self.feed_sets, d.feed_sets),
         }
     }
 }

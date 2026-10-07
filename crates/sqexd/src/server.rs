@@ -59,6 +59,13 @@ use sqex_proto::device::{
     Register as DeviceRegister, Revoke as DeviceRevoke, TYPE_LIST_FROM,
 };
 use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
+use sqex_proto::feed::{
+    Append as FeedAppend, Appended as FeedAppended, FROM_HERE as FEED_FROM_HERE, Head as FeedHead,
+    Moved as FeedMoved, Read as FeedRead, Row as FeedRow, STATE_GONE as FEED_STATE_GONE,
+    STATE_MOVED as FEED_STATE_MOVED, STATE_RESET as FEED_STATE_RESET,
+    STATE_TRUNCATED as FEED_STATE_TRUNCATED, Set as FeedSet, Since as FeedSince,
+    Withdraw as FeedWithdraw,
+};
 use sqex_proto::home::Moving;
 use sqex_proto::locate::{Locate, Located};
 use sqex_proto::mailbox::{
@@ -360,6 +367,9 @@ pub struct Server {
     name_registration: NameMode,
     /// SIP-38: how many names one account may self-claim (open mode).
     profiles: Profiles,
+    /// SIP-88 feeds. Durable: a feed is an archive with a year's retention by
+    /// default, and one that emptied on a restart would be worse than none.
+    feeds: crate::feed::Feeds,
     admissions: Admissions,
     pub(crate) sessions: Sessions,
     pub(crate) live_conns: Connections,
@@ -1825,6 +1835,10 @@ pub async fn bind_with(
         .state_file
         .as_ref()
         .map(|p| p.with_file_name("profiles.db"));
+    let feed_db = config
+        .state_file
+        .as_ref()
+        .map(|p| p.with_file_name("feeds.db"));
     // Prekeys persist for the same reason the device registry does: a registry
     // of devices nothing can be sealed to is not a registry, and a restart that
     // emptied them would be silent — a client whose own pool looks healthy has
@@ -2026,6 +2040,8 @@ pub async fn bind_with(
         name_registration: config.name_registration,
         profiles: Profiles::open(profile_db.as_deref())
             .map_err(|e| Error::Malformed(format!("cannot open profiles: {e}")))?,
+        feeds: crate::feed::Feeds::open(feed_db.as_deref())
+            .map_err(|e| Error::Malformed(format!("cannot open feeds: {e}")))?,
         // In memory: a pending request is a question somebody asked once, and
         // a queue that survived a restart would be a backlog of decisions
         // nobody remembers being asked to make. Asking again costs a request.
@@ -2353,6 +2369,15 @@ pub async fn serve(bound: Bound) -> Result<()> {
                 // nobody is calling still has to tidy up the ones abandoned
                 // mid-ring.
                 server.relay.sweep(now_unix());
+                // SIP-88: what is past its feed's retention. In `spawn_blocking`
+                // because a feed may hold ten thousand posts and this is SQLite.
+                let feeds = Arc::clone(&server);
+                if let Ok(dropped) =
+                    tokio::task::spawn_blocking(move || feeds.feeds.sweep(now_unix())).await
+                    && dropped > 0
+                {
+                    tracing::info!(dropped, "swept posts past their retention");
+                }
                 // SIP-56: buckets that have refilled are no buckets.
                 server.limiter.sweep();
                 // SIP-27: expiry is the only guarantee an attestation carries,
@@ -2862,6 +2887,14 @@ async fn route(
                 // home's list; it is told where to go instead.
                 | "/device/register"
                 | "/device/revoke"
+                // SIP-88 §Where a feed lives: a feed moves with its account,
+                // so an exchange it has left must stop serving it rather than
+                // serve a log that has stopped. The *reads* make the same
+                // check on their subject, in their own arms, because this one
+                // keys on the caller.
+                | "/feed/append"
+                | "/feed/withdraw"
+                | "/feed/set"
         )
         && let Some(moved) = server.moved_away(&me)
     {
@@ -3544,6 +3577,148 @@ async fn route(
                 Ok(list) => (200, "application/octet-stream", list.encode()),
                 Err(e) => refuse(e.status(), e.code(), None),
             },
+        },
+
+        // SIP-88 feeds: an account's public output, numbered by its author
+        // and served to anybody who asks. There are no members and nothing to
+        // join, so every read is answered to any identified caller -- which
+        // bounds cost rather than access, since an identity is free to mint,
+        // and MUST NOT be presented as access control.
+        ("POST", "/feed/append") => match (who, FeedAppend::decode(body)) {
+            (None, _) => no_identity("appending to a feed"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some((me, _)), Ok(req)) => {
+                if let Err(e) = server.limit(crate::limits::Kind::FeedAppends, &me, [0; 32]) {
+                    return refuse(e.status(), e.code(), e.detail().as_deref());
+                }
+                match server.feeds.append(&me, &req.post, now_unix()) {
+                    Ok((serial, head_input)) => (
+                        200,
+                        "application/octet-stream",
+                        FeedAppended {
+                            serial,
+                            received: now_unix(),
+                            head_input,
+                            now: now_unix(),
+                        }
+                        .encode(),
+                    ),
+                    Err(e) => refuse(e.status(), e.code(), None),
+                }
+            }
+        },
+        ("POST", "/feed/read") => match (account, FeedRead::decode(body)) {
+            (None, _) => no_identity("reading a feed"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                // The subject's side of SIP-59: a feed moves with its account,
+                // so an exchange it has left says so rather than serving a log
+                // that has stopped. The gate above keys on the *caller*.
+                if let Some(moved) = server.moved_away(&req.account) {
+                    return moved;
+                }
+                let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
+                let page = server.feeds.read(&me, &req, now_unix(), &blocked);
+                (200, "application/octet-stream", page.encode())
+            }
+        },
+        ("POST", "/feed/head") => match (account, FeedHead::decode(body)) {
+            (None, _) => no_identity("reading a feed's head"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if let Some(moved) = server.moved_away(&req.account) {
+                    return moved;
+                }
+                let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
+                let headed = server.feeds.head(&me, &req.account, now_unix(), &blocked);
+                (200, "application/octet-stream", headed.encode())
+            }
+        },
+        ("POST", "/feed/withdraw") => match (account, FeedWithdraw::decode(body)) {
+            (None, _) => no_identity("withdrawing a post"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if req.account != me {
+                    return refuse(401, Code::NotYours, None);
+                }
+                match server.feeds.withdraw(&me, req.serial, now_unix()) {
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(e) => refuse(e.status(), e.code(), None),
+                }
+            }
+        },
+        ("POST", "/feed/set") => match (account, FeedSet::decode(body)) {
+            (None, _) => no_identity("setting a feed's policy"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if let Err(e) = server.limit(crate::limits::Kind::FeedSets, &me, [0; 32]) {
+                    return refuse(e.status(), e.code(), e.detail().as_deref());
+                }
+                match server.feeds.set(&me, req.retention_secs, req.max_posts) {
+                    Ok(()) => (
+                        200,
+                        "application/octet-stream",
+                        ChannelAck { now: now_unix() }.encode(),
+                    ),
+                    Err(e) => refuse(e.status(), e.code(), None),
+                }
+            }
+        },
+        // **The route this design exists for.** SIP-50 rejected client-side
+        // reconstruction as "N+1 requests per contact per poll", and a reader
+        // following two hundred people has the same arithmetic. Only the rows
+        // that are not unchanged are carried, so the common answer is twelve
+        // bytes rather than twenty kilobytes.
+        ("POST", "/feed/since") => match (account, FeedSince::decode(body)) {
+            (None, _) => no_identity("asking which feeds moved"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                if let Err(e) = server.limit(crate::limits::Kind::FeedRows, &me, [0; 32]) {
+                    return refuse(e.status(), e.code(), e.detail().as_deref());
+                }
+                let blocked = |s: &PubKey, o: &PubKey| server.profiles.has_blocked(s, o);
+                let now = now_unix();
+                let asked = req.feeds.len() as u16;
+                let mut rows = Vec::new();
+                for (i, (subject, held)) in req.feeds.iter().enumerate() {
+                    let told = match server.feeds.moved(&me, subject, now, &blocked) {
+                        None => Some((FEED_STATE_GONE, 0, 0)),
+                        Some((oldest, newest)) if newest > *held => {
+                            Some((FEED_STATE_MOVED, oldest, newest))
+                        }
+                        // Below what the caller holds is always a fault: a
+                        // feed's serial belongs to its author and never
+                        // restarts, so this is never a new log.
+                        Some((oldest, newest)) if newest < *held => {
+                            Some((FEED_STATE_RESET, oldest, newest))
+                        }
+                        Some((oldest, newest)) if *held > 0 && oldest > *held => {
+                            Some((FEED_STATE_TRUNCATED, oldest, newest))
+                        }
+                        // Unchanged, and therefore not transmitted at all.
+                        Some(_) => None,
+                    };
+                    if let Some((state, oldest, newest)) = told {
+                        rows.push(FeedRow {
+                            index: i as u16,
+                            state,
+                            source: FEED_FROM_HERE,
+                            oldest,
+                            newest,
+                            head_input: [0; 32],
+                        });
+                    }
+                }
+                (
+                    200,
+                    "application/octet-stream",
+                    FeedMoved { now, asked, rows }.encode(),
+                )
+            }
         },
 
         // SIP-22 device registry. A credential is evidence and not authority:

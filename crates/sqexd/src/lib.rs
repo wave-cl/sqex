@@ -10,6 +10,7 @@ pub mod config;
 pub mod device;
 pub mod directory;
 pub mod events;
+pub mod feed;
 pub mod limits;
 pub mod lineage;
 pub mod mailbox;

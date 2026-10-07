@@ -24,6 +24,16 @@ pub enum Kind {
     Calls,
     /// SIP-85: tunnels opened, per member identity.
     Tunnels,
+    /// SIP-88: posts appended to one's own feed, per account.
+    FeedAppends,
+    /// SIP-88: rows a caller asks `/feed/since` about, per account. **The one
+    /// read this document limits**, and SIP-56's own reasoning is why it may
+    /// be: that rule exists so an exchange does not make "its members pay for
+    /// somebody else's flood", and a `Since` flood is the caller's own --
+    /// they asked for five hundred rows.
+    FeedRows,
+    /// SIP-88: changes to one's own feed's policy, per account.
+    FeedSets,
 }
 
 /// A limit: `burst` tokens, refilled at `per_sec`. Zero burst is unlimited.
@@ -62,6 +72,9 @@ pub struct Limits {
     pub peering: Limit,
     pub calls: Limit,
     pub tunnels: Limit,
+    pub feed_appends: Limit,
+    pub feed_rows: Limit,
+    pub feed_sets: Limit,
 }
 
 impl Default for Limits {
@@ -81,6 +94,10 @@ impl Default for Limits {
                 burst: 4.0,
                 per_sec: 10.0 / 3600.0,
             },
+            // SIP-88 §Limits.
+            feed_appends: Limit::per(60, 3600),
+            feed_rows: Limit::per(20_000, 3600),
+            feed_sets: Limit::per(32, 3600),
         }
     }
 }
@@ -97,6 +114,9 @@ impl Limits {
             Kind::Peering => self.peering,
             Kind::Calls => self.calls,
             Kind::Tunnels => self.tunnels,
+            Kind::FeedAppends => self.feed_appends,
+            Kind::FeedRows => self.feed_rows,
+            Kind::FeedSets => self.feed_sets,
         }
     }
 }

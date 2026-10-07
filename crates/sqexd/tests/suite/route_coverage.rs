@@ -166,6 +166,46 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ),
     ("POST", "/block/set", Chat("/block, /unblock"), SelfOnly),
     ("POST", "/block/list", Chat("/blocked"), SelfOnly),
+    // SIP-88 feeds. The reads are `Identity` and that is not a cop-out: a
+    // feed has no members, so an identity is required to apply SIP-56's
+    // limits and SIP-21's block against, which bounds cost and not access.
+    // The client half lands in the next stage.
+    (
+        "POST",
+        "/feed/append",
+        Unreachable("the client half lands with sqex-chat's feed module"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/feed/read",
+        Unreachable("the client half lands with sqex-chat's feed module"),
+        Identity,
+    ),
+    (
+        "POST",
+        "/feed/head",
+        Unreachable("the client half lands with sqex-chat's feed module"),
+        Identity,
+    ),
+    (
+        "POST",
+        "/feed/withdraw",
+        Unreachable("the client half lands with sqex-chat's feed module"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/feed/set",
+        Unreachable("the client half lands with sqex-chat's feed module"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/feed/since",
+        Unreachable("the client half lands with sqex-chat's feed module"),
+        Identity,
+    ),
     (
         "POST",
         "/device/register",
@@ -701,7 +741,17 @@ fn the_unreachable_routes_are_the_ones_we_know_about() {
 
     // Empty, and the assertion below is what keeps it that way: a route added
     // with nothing able to call it fails here until somebody decides which.
-    let expected: Vec<&str> = vec![];
+    // SIP-88's six, until sqex-chat's feed module lands in the next stage.
+    // Listed rather than waved through: this is the visible act that makes an
+    // unreachable route a decision somebody took instead of one that drifted.
+    let expected: Vec<&str> = vec![
+        "/feed/append",
+        "/feed/head",
+        "/feed/read",
+        "/feed/set",
+        "/feed/since",
+        "/feed/withdraw",
+    ];
 
     let mut open_sorted = open.clone();
     open_sorted.sort();

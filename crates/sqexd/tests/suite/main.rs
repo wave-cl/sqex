@@ -40,6 +40,7 @@ mod carried_device_flow;
 mod channel_flow;
 mod device_flow;
 mod devices_away_flow;
+mod feed_flow;
 mod fold_flow;
 mod forgetting_flow;
 mod handover_flow;
