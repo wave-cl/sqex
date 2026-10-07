@@ -207,6 +207,30 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/blob/head", Chat("Chat::fetch_file"), Member),
     ("POST", "/blob/get", Chat("Chat::fetch_file"), Member),
     ("POST", "/blob/attach", Chat("/forward"), Member),
+    // SIP-88 §Attachments. **`SelfOnly`, and that is the whole check** — a
+    // feed has no admins, so there is nobody but the author's own devices
+    // who could be authorised to put a file on it or take one off.
+    (
+        "POST",
+        "/blob/begin-feed",
+        Chat("Chat::upload_to_feed"),
+        SelfOnly,
+    ),
+    // Carrying one's own picture from a conversation into a post: a
+    // reference rather than the bytes. The no-widening refusal lives here,
+    // which is why it has a caller rather than an excuse.
+    (
+        "POST",
+        "/blob/attach-feed",
+        Chat("Chat::attach_to_feed"),
+        SelfOnly,
+    ),
+    (
+        "POST",
+        "/blob/detach-feed",
+        Chat("Chat::detach_from_feed"),
+        SelfOnly,
+    ),
     (
         "POST",
         "/blob/detach",

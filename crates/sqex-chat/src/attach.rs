@@ -298,6 +298,121 @@ impl Chat {
         Ok(())
     }
 
+    /// SIP-88 §Attachments: upload a file against this account's own feed.
+    ///
+    /// The same three round trips as [`Chat::upload_reporting`] — begin, the
+    /// chunks, commit — against the feed's routes rather than a channel's.
+    /// **Its own method and not a flag**, because the thing being named is a
+    /// different thing: SIP-88 forbids an account key and a channel
+    /// identifier sharing a field, since both are 32 opaque bytes and a
+    /// direct message's identifier is derived from two account keys.
+    ///
+    /// `expires_after` must be no greater than the post that will carry it
+    /// (SIP-88). The exchange cannot check that — the reference is inside a
+    /// body it does not parse — so it is the caller's to get right, like
+    /// SIP-18's pairing of a redaction with a detach.
+    pub async fn upload_to_feed(
+        &mut self,
+        prepared: &Prepared,
+        expires_after: u32,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<Attachment> {
+        let me = self.me;
+        let body = self
+            .post_raw(
+                "/blob/begin-feed",
+                sqex_proto::blob_store::BeginFeed {
+                    account: *me.as_bytes(),
+                    size: prepared.attachment.size,
+                    chunks: prepared.attachment.chunks,
+                    expires_after,
+                }
+                .encode(),
+            )
+            .await?;
+        let upload = Begun::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?
+            .upload;
+        if let Err(e) = self.put_chunks(upload, prepared, progress).await {
+            let _ = self
+                .post_raw(
+                    "/blob/abort",
+                    sqex_proto::blob_store::ByUpload { upload }
+                        .encode(sqex_proto::blob_store::TYPE_ABORT),
+                )
+                .await;
+            return Err(e);
+        }
+        let body = self
+            .post_raw(
+                "/blob/commit",
+                Commit {
+                    upload,
+                    blob: prepared.attachment.blob,
+                }
+                .encode(),
+            )
+            .await?;
+        let committed = Committed::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+        if !committed.stored {
+            return Err(ChatError::Protocol(
+                "the exchange refused the upload: what arrived did not hash to its name".into(),
+            ));
+        }
+        let _ = self
+            .store()
+            .keep_blob(&prepared.attachment.blob, &prepared.sealed);
+        Ok(prepared.attachment.clone())
+    }
+
+    /// SIP-88 §Attachments: put a file this account already holds onto its
+    /// own feed.
+    ///
+    /// The feed's twin of [`Chat::attach`], and what carrying one's own
+    /// picture from a conversation into a post costs: a reference rather than
+    /// the bytes.
+    ///
+    /// **It can be refused, and the refusal is the point.** A blob any
+    /// private channel holds is refused outright — SIP-18's no-widening rule,
+    /// which SIP-88 says is sharper for a feed because a public channel has
+    /// admins and a feed has none. The remedy is SIP-18's own: upload it
+    /// again, which gives the public copy its own key and leaves the private
+    /// channel's copy alone.
+    pub async fn attach_to_feed(&mut self, blob: &[u8; 32], expires_after: u32) -> Result<()> {
+        let me = self.me;
+        self.post_raw(
+            "/blob/attach-feed",
+            sqex_proto::blob_store::ByFeedBlob {
+                account: *me.as_bytes(),
+                blob: *blob,
+                expires_after,
+            }
+            .encode(sqex_proto::blob_store::TYPE_ATTACH_FEED),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// SIP-88 §Attachments: take a file off this account's feed.
+    ///
+    /// **To this account's devices alone.** A channel's detach answers to the
+    /// uploader or an admin of the channel holding the attachment; a feed has
+    /// no admins, so there is nobody else who could ask.
+    pub async fn detach_from_feed(&mut self, blob: &[u8; 32]) -> Result<()> {
+        let me = self.me;
+        self.post_raw(
+            "/blob/detach-feed",
+            sqex_proto::blob_store::ByFeedBlob {
+                account: *me.as_bytes(),
+                blob: *blob,
+                expires_after: 0,
+            }
+            .encode(sqex_proto::blob_store::TYPE_DETACH_FEED),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Attach a blob this account can already fetch to another channel.
     ///
     /// Forwarding costs a reference and not the file: the bytes stay where

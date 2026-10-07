@@ -34,8 +34,9 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use sqex_proto::blob_store::{
-    Begin as BlobBegin, ByChannelBlob, Chunk, Headed, MAX_BLOB_CHANNELS, MAX_CHANNEL_BLOB_BYTES,
-    MAX_UPLOADS, PutChunk as BlobPut, UPLOAD_TTL, blob_id,
+    Begin as BlobBegin, BeginFeed, ByChannelBlob, ByFeedBlob, Chunk, Headed, MAX_BLOB_CHANNELS,
+    MAX_CHANNEL_BLOB_BYTES, MAX_FEED_BLOB_BYTES, MAX_UPLOADS, PutChunk as BlobPut, UPLOAD_TTL,
+    blob_id,
 };
 use sqex_proto::channel::{
     ABANDON_SECS, Action, ChannelInfo, Create, Directory, ENTRY_HEADER, EVENT_ADDED, EVENT_CREATED,
@@ -760,6 +761,23 @@ CREATE TABLE IF NOT EXISTS succeeded (
     account   BLOB PRIMARY KEY,
     successor BLOB NOT NULL
 );
+-- SIP-88 §Attachments: a blob attached to an account's *feed*.
+--
+-- Its own table rather than a row in `attachment` with the account in the
+-- channel column. SIP-48's backup does overload it that way and gets away
+-- with it, because nothing but the backup ever looks those rows up. A feed
+-- attachment is looked up by `may_fetch`, by the retention sweep and by the
+-- no-widening check, and every one of those asks `visibility_of` or
+-- `role_of` about what it finds — questions that have no answer for an
+-- account and would be answered wrongly rather than refused.
+CREATE TABLE IF NOT EXISTS feed_attachment (
+    account       BLOB    NOT NULL,
+    blob          BLOB    NOT NULL,
+    attached      INTEGER NOT NULL,
+    expires_after INTEGER NOT NULL,
+    uploader      BLOB    NOT NULL,
+    PRIMARY KEY (account, blob)
+);
 CREATE TABLE IF NOT EXISTS upload (
     id            INTEGER PRIMARY KEY,
     channel       BLOB    NOT NULL,
@@ -811,6 +829,12 @@ impl Channels {
         db.execute_batch(SCHEMA)?;
         // A deployed exchange has a `channel` table without `epoch_at`, and
         // `CREATE TABLE IF NOT EXISTS` will not add it.
+        // SIP-88: whether this upload is for a feed, in which case `channel`
+        // holds an account key. **The discriminator is the point** — SIP-88
+        // forbids an account and a channel being told apart by guessing,
+        // because both are 32 opaque bytes and a direct message's identifier
+        // is derived from two account keys.
+        add_column(&db, "upload", "is_feed", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&db, "channel", "epoch_at", "INTEGER NOT NULL DEFAULT 0")?;
         // SIP-34, added the same way and for the same reason. A channel that
         // predates receipts starts its head at genesis and advances from its
@@ -2577,12 +2601,17 @@ impl Channels {
         // apart, so this catches only what an older version leaked — and it
         // costs one indexed query per sweep to make an existing deployment
         // heal instead of carrying its leak forever.
+        // SIP-88: a feed's attachments hold their blobs too, and this sweep
+        // ran before they existed. Without the second table a published
+        // picture is collected on the next pass.
         let _ = tx.execute(
-            "DELETE FROM blob_chunk WHERE blob NOT IN (SELECT blob FROM attachment)",
+            "DELETE FROM blob_chunk WHERE blob NOT IN (SELECT blob FROM attachment)
+               AND blob NOT IN (SELECT blob FROM feed_attachment)",
             [],
         );
         let _ = tx.execute(
-            "DELETE FROM blob WHERE id NOT IN (SELECT blob FROM attachment)",
+            "DELETE FROM blob WHERE id NOT IN (SELECT blob FROM attachment)
+               AND id NOT IN (SELECT blob FROM feed_attachment)",
             [],
         );
         let _ = tx.commit();
@@ -5586,15 +5615,16 @@ impl Channels {
         if &owner != uploader {
             return Err(ChannelError::NotAMember);
         }
-        let (channel, size, expires_after): ([u8; 32], u64, u32) = tx
+        let (channel, size, expires_after, is_feed): ([u8; 32], u64, u32, bool) = tx
             .query_row(
-                "SELECT channel, size, expires_after FROM upload WHERE id = ?1",
+                "SELECT channel, size, expires_after, is_feed FROM upload WHERE id = ?1",
                 params![upload as i64],
                 |r| {
                     Ok((
                         r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
                         r.get::<_, i64>(1)? as u64,
                         r.get::<_, i64>(2)? as u32,
+                        r.get::<_, i64>(3)? != 0,
                     ))
                 },
             )
@@ -5636,10 +5666,125 @@ impl Channels {
             )
             .map_err(storage("insert blob chunk"))?;
         }
-        attach(&tx, &channel, claimed, uploader, expires_after, now)?;
+        // SIP-88: a feed's upload lands in the feed's own table. `channel`
+        // holds the account for one of these, which is why the row carries
+        // the flag rather than leaving it to be guessed from the bytes.
+        if is_feed {
+            attach_to_feed(&tx, &channel, claimed, uploader, expires_after, now)?;
+        } else {
+            attach(&tx, &channel, claimed, uploader, expires_after, now)?;
+        }
         drop_upload(&tx, upload)?;
         tx.commit().map_err(storage("commit upload"))?;
         Ok(true)
+    }
+
+    /// SIP-88 §Attachments: reserve an upload against a feed's quota.
+    ///
+    /// **The caller must be acting for `account`.** A feed has no admins —
+    /// SIP-88: "`DetachFeed` answers to the author's devices alone" — so
+    /// there is nobody else who could be authorised, which is what makes the
+    /// transport identity the whole of the check.
+    pub fn begin_feed_upload(
+        &self,
+        uploader: &PubKey,
+        req: &BeginFeed,
+    ) -> Result<u64, ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin feed upload"))?;
+        // **Its own account's feed and no other.** The transport has already
+        // authenticated the account this connection acts for, so the check is
+        // that it is the one being written to; a device is bound to its
+        // account by a SIP-20 credential before it can be here at all.
+        if uploader.as_bytes() != &req.account {
+            return Err(ChannelError::NotAMember);
+        }
+        expire_uploads(&tx, now)?;
+        let open: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM upload WHERE uploader = ?1",
+                params![uploader.as_bytes()],
+                |r| r.get(0),
+            )
+            .map_err(storage("count uploads"))?;
+        if open as usize >= MAX_UPLOADS {
+            return Err(ChannelError::TooManyUploads);
+        }
+        if feed_blob_bytes(&tx, &req.account)? + req.size > MAX_FEED_BLOB_BYTES {
+            return Err(ChannelError::BlobQuota);
+        }
+        tx.execute(
+            "INSERT INTO upload (channel, uploader, size, chunks, expires_after, started, is_feed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            params![
+                &req.account[..],
+                uploader.as_bytes(),
+                req.size as i64,
+                req.chunks as i64,
+                req.expires_after as i64,
+                now as i64,
+            ],
+        )
+        .map_err(storage("insert feed upload"))?;
+        let id = tx.last_insert_rowid() as u64;
+        tx.commit().map_err(storage("commit feed upload"))?;
+        Ok(id)
+    }
+
+    /// SIP-88 §Attachments: hold an already-stored blob against a feed.
+    pub fn attach_feed_blob(&self, who: &PubKey, req: &ByFeedBlob) -> Result<(), ChannelError> {
+        let now = now_unix();
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin feed attach"))?;
+        if who.as_bytes() != &req.account {
+            return Err(ChannelError::NotAMember);
+        }
+        if !Self::may_fetch(&tx, who, &req.blob)? {
+            return Err(ChannelError::NoSuchBlob);
+        }
+        // **SIP-18's no-widening refusal, and SIP-88 says it is sharper
+        // here.** A public channel at least has admins; a feed has none, so
+        // `DetachFeed` answers to the author's devices alone and nobody in
+        // the private channel the blob came from has any standing at all.
+        // Publishing it means uploading it again, which gives the public
+        // copy its own key and leaves the private channel's alone.
+        if Self::attached_privately(&tx, &req.blob)? {
+            return Err(ChannelError::WouldPublish);
+        }
+        if feed_blob_bytes(&tx, &req.account)? > MAX_FEED_BLOB_BYTES {
+            return Err(ChannelError::BlobQuota);
+        }
+        attach_to_feed(&tx, &req.account, &req.blob, who, req.expires_after, now)?;
+        tx.commit().map_err(storage("commit feed attach"))?;
+        Ok(())
+    }
+
+    /// SIP-88 §Attachments: take a blob off a feed, deleting it if nothing
+    /// else holds it.
+    ///
+    /// **To the author's devices alone**, which is the whole difference from
+    /// a channel's detach: that one answers to the uploader *or an admin of
+    /// the channel holding the attachment*, and a feed has no admins.
+    pub fn detach_feed_blob(
+        &self,
+        who: &PubKey,
+        account: &[u8; 32],
+        blob: &[u8; 32],
+    ) -> Result<(), ChannelError> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(storage("begin feed detach"))?;
+        if who.as_bytes() != account {
+            return Err(ChannelError::NotAMember);
+        }
+        tx.execute(
+            "DELETE FROM feed_attachment WHERE account = ?1 AND blob = ?2",
+            params![&account[..], &blob[..]],
+        )
+        .map_err(storage("delete feed attachment"))?;
+        collect_blob(&tx, blob)?;
+        tx.commit().map_err(storage("commit feed detach"))?;
+        Ok(())
     }
 
     pub fn abort_upload(&self, uploader: &PubKey, upload: u64) -> Result<(), ChannelError> {
@@ -6123,6 +6268,23 @@ impl Channels {
                     member = true;
                 }
             }
+        }
+        // **SIP-88 §Attachments: a blob attached to a feed is served to any
+        // caller the feed's `Read` would be served to.** A feed is public, so
+        // that is everybody — counted as `public` and therefore still subject
+        // to the `!private` qualifier below, which is the second line against
+        // a blob that a private channel also holds. `attach_feed_blob`
+        // refuses to create that state now; this holds for anything made
+        // before the rule, and errs towards the private audience.
+        //
+        // **Blocking is not checked here.** SIP-21's block is applied where
+        // the feed itself is served, as a predicate passed in, so that this
+        // function stays about what a blob is attached to rather than about
+        // who is asking whom. A blocked reader is refused the post that names
+        // the blob, and a blob fetched without one is a 32-byte hash they had
+        // to be given.
+        if !member && attached_to_a_feed(db, blob)? {
+            public = true;
         }
         Ok(member || (public && !private))
     }
@@ -7076,6 +7238,65 @@ fn record_origin(
     Ok(())
 }
 
+/// SIP-88 §Attachments: hold a blob against an account's feed.
+///
+/// No `MAX_BLOB_CHANNELS` equivalent, because the cap there exists to stop a
+/// blob being kept alive indefinitely by re-forwarding it between channels —
+/// "an attachment ages against its own channel". A feed attachment ages
+/// against one feed and the only account that may make one is the feed's own,
+/// so there is nothing to re-forward it through.
+fn attach_to_feed(
+    db: &Connection,
+    account: &[u8; 32],
+    blob: &[u8; 32],
+    who: &PubKey,
+    expires_after: u32,
+    now: u64,
+) -> Result<(), ChannelError> {
+    db.execute(
+        "INSERT INTO feed_attachment (account, blob, attached, expires_after, uploader)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (account, blob) DO UPDATE SET
+             attached = excluded.attached,
+             expires_after = excluded.expires_after",
+        params![
+            &account[..],
+            &blob[..],
+            now as i64,
+            expires_after as i64,
+            who.as_bytes()
+        ],
+    )
+    .map_err(storage("insert feed attachment"))?;
+    Ok(())
+}
+
+/// How many stored bytes a feed's attachments come to.
+fn feed_blob_bytes(db: &Connection, account: &[u8; 32]) -> Result<u64, ChannelError> {
+    let n: i64 = db
+        .query_row(
+            "SELECT COALESCE(SUM(b.size), 0) FROM feed_attachment a
+             JOIN blob b ON b.id = a.blob
+             WHERE a.account = ?1",
+            params![&account[..]],
+            |r| r.get(0),
+        )
+        .map_err(storage("sum feed blob bytes"))?;
+    Ok(n as u64)
+}
+
+/// Whether a blob is held by any feed at all.
+fn attached_to_a_feed(db: &Connection, blob: &[u8; 32]) -> Result<bool, ChannelError> {
+    let n: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM feed_attachment WHERE blob = ?1",
+            params![&blob[..]],
+            |r| r.get(0),
+        )
+        .map_err(storage("count feed attachments"))?;
+    Ok(n > 0)
+}
+
 fn attach(
     db: &Connection,
     channel: &[u8; 32],
@@ -7133,10 +7354,13 @@ fn succeeded_by(db: &Connection, account: &[u8; 32]) -> Option<PubKey> {
 /// take a photograph out of another.
 fn collect_blob(db: &Connection, blob: &[u8; 32]) -> Result<(), ChannelError> {
     // SIP-60 §Folded attachments: a folded attachment holds a blob alive as any attachment does.
+    // SIP-88: so does a feed's. Leaving it out here would delete a published
+    // picture the moment the channel copy it was uploaded beside went.
     let remaining: i64 = db
         .query_row(
             "SELECT (SELECT COUNT(*) FROM attachment WHERE blob = ?1)
-                  + (SELECT COUNT(*) FROM folded_attachment WHERE blob = ?1)",
+                  + (SELECT COUNT(*) FROM folded_attachment WHERE blob = ?1)
+                  + (SELECT COUNT(*) FROM feed_attachment WHERE blob = ?1)",
             params![&blob[..]],
             |r| r.get(0),
         )

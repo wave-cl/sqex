@@ -27,6 +27,20 @@ pub const TYPE_GET: u8 = 0x06;
 pub const TYPE_ATTACH: u8 = 0x07;
 pub const TYPE_DETACH: u8 = 0x08;
 pub const TYPE_LIMITS: u8 = 0x09;
+/// SIP-88 §Attachments. A feed is an attach target, and it gets type bytes of
+/// its own rather than a field on the existing three.
+///
+/// **Overloading `channel[32]` with an account key is forbidden**, and
+/// SIP-88 says why: both are 32 opaque bytes, so an exchange could not tell
+/// which was meant — and the two spaces are related, since a direct
+/// message's channel identifier is derived from its two account keys. A
+/// client that passed an account where a channel was expected would be
+/// asking about a channel that might exist. The type byte is what tells them
+/// apart, which is SIP-60's precedent: `ListDevicesFrom` sits beside
+/// `ListDevices` at a new byte and the route dispatches.
+pub const TYPE_BEGIN_FEED: u8 = 0x0a;
+pub const TYPE_ATTACH_FEED: u8 = 0x0b;
+pub const TYPE_DETACH_FEED: u8 = 0x0c;
 
 /// Bytes per chunk. Larger than the uniform request cap, which is why an
 /// exchange raises that limit on the blob routes and only there.
@@ -36,6 +50,12 @@ pub const MAX_BLOB: u64 = 100 * 1024 * 1024;
 pub const MAX_CHUNKS: u32 = 400;
 /// Stored blob bytes per channel.
 pub const MAX_CHANNEL_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// SIP-88 §Limits: stored blob bytes per feed.
+///
+/// 256 MiB, where a channel gets 2 GiB. A channel is created deliberately
+/// and an identity may hold 256 of them; **every account has a feed**, so
+/// the per-feed number has to assume every account uses it.
+pub const MAX_FEED_BLOB_BYTES: u64 = 256 * 1024 * 1024;
 /// Channels one blob may be attached to.
 ///
 /// Forwarding costs the reference and not the file, which is the point — but
@@ -263,6 +283,119 @@ impl ByChannelBlob {
             channel: b[1..33].try_into().unwrap(),
             blob: b[33..65].try_into().unwrap(),
             expires_after: if type_byte == TYPE_ATTACH {
+                u32::from_be_bytes(b[65..69].try_into().unwrap())
+            } else {
+                0
+            },
+        })
+    }
+}
+
+/// SIP-88 §Attachments: reserve an upload against a *feed's* quota.
+///
+/// The same shape as [`Begin`] and a different type, because what it names is
+/// a different thing. Kept as its own struct rather than a `Begin` with a
+/// renamed field so that an account cannot be handed to a channel route by
+/// writing one line wrong — the same discipline SIP-89 §Two spaces, one word
+/// asks for between a serial and a sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeginFeed {
+    /// Whose feed. **The caller must be a device of this account**; a feed
+    /// has no admins, so there is nobody else who could be authorised.
+    pub account: [u8; 32],
+    /// Plaintext length. The stored length is this plus 16 bytes per chunk.
+    pub size: u64,
+    pub chunks: u32,
+    /// Seconds, matching the post that will carry it. SIP-88: a client
+    /// appending a post with `expires_after` MUST attach its blobs with one
+    /// no greater. The exchange cannot check that — the reference is inside a
+    /// body it does not parse — which puts it in the same family as SIP-18's
+    /// own pairing of a redaction with a detach.
+    pub expires_after: u32,
+}
+
+impl BeginFeed {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(49);
+        out.push(TYPE_BEGIN_FEED);
+        out.extend_from_slice(&self.account);
+        out.extend_from_slice(&self.size.to_be_bytes());
+        out.extend_from_slice(&self.chunks.to_be_bytes());
+        out.extend_from_slice(&self.expires_after.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<BeginFeed> {
+        if b.len() != 49 {
+            return Err(Error::Malformed(format!(
+                "begin-feed is {} bytes, want 49",
+                b.len()
+            )));
+        }
+        if b[0] != TYPE_BEGIN_FEED {
+            return Err(Error::Malformed(format!(
+                "not a begin-feed (type {:#x})",
+                b[0]
+            )));
+        }
+        let size = u64::from_be_bytes(b[33..41].try_into().unwrap());
+        let chunks = u32::from_be_bytes(b[41..45].try_into().unwrap());
+        if size > MAX_BLOB {
+            return Err(Error::Malformed(format!(
+                "blob is {size} bytes, limit is {MAX_BLOB}"
+            )));
+        }
+        if chunks == 0 || chunks > MAX_CHUNKS {
+            return Err(Error::Malformed(format!(
+                "blob claims {chunks} chunks, want 1..={MAX_CHUNKS}"
+            )));
+        }
+        Ok(BeginFeed {
+            account: b[1..33].try_into().unwrap(),
+            size,
+            chunks,
+            expires_after: u32::from_be_bytes(b[45..49].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-88 §Attachments: a request naming a blob and a *feed*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByFeedBlob {
+    pub account: [u8; 32],
+    pub blob: [u8; 32],
+    /// Only on an attach, as [`ByChannelBlob`] does it.
+    pub expires_after: u32,
+}
+
+impl ByFeedBlob {
+    pub fn encode(&self, type_byte: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(69);
+        out.push(type_byte);
+        out.extend_from_slice(&self.account);
+        out.extend_from_slice(&self.blob);
+        if type_byte == TYPE_ATTACH_FEED {
+            out.extend_from_slice(&self.expires_after.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8], type_byte: u8) -> Result<ByFeedBlob> {
+        let want = if type_byte == TYPE_ATTACH_FEED {
+            69
+        } else {
+            65
+        };
+        if b.len() != want || b[0] != type_byte {
+            return Err(Error::Malformed(format!(
+                "malformed feed-blob request ({} bytes, want {want})",
+                b.len()
+            )));
+        }
+        Ok(ByFeedBlob {
+            account: b[1..33].try_into().unwrap(),
+            blob: b[33..65].try_into().unwrap(),
+            expires_after: if type_byte == TYPE_ATTACH_FEED {
                 u32::from_be_bytes(b[65..69].try_into().unwrap())
             } else {
                 0
@@ -647,5 +780,114 @@ mod tests {
         );
         // Detach carries no timer, so the shapes differ and cannot be confused.
         assert!(ByChannelBlob::decode(&a.encode(TYPE_ATTACH), TYPE_DETACH).is_err());
+    }
+}
+
+#[cfg(test)]
+mod feed_attachment_tests {
+    use super::*;
+
+    /// A round trip, and the bound checks that run before anything is
+    /// allocated.
+    #[test]
+    fn a_begin_feed_round_trips_and_refuses_what_it_should() {
+        let b = BeginFeed {
+            account: [7u8; 32],
+            size: 1234,
+            chunks: 2,
+            expires_after: 3600,
+        };
+        assert_eq!(BeginFeed::decode(&b.encode()).unwrap(), b);
+        assert!(
+            BeginFeed::decode(
+                &BeginFeed {
+                    size: MAX_BLOB + 1,
+                    ..b
+                }
+                .encode()
+            )
+            .is_err(),
+            "a blob over the cap was accepted"
+        );
+        assert!(
+            BeginFeed::decode(&BeginFeed { chunks: 0, ..b }.encode()).is_err(),
+            "a blob claiming no chunks was accepted"
+        );
+        assert!(
+            BeginFeed::decode(
+                &BeginFeed {
+                    chunks: MAX_CHUNKS + 1,
+                    ..b
+                }
+                .encode()
+            )
+            .is_err()
+        );
+    }
+
+    /// Attach carries a timer and detach does not, so the two shapes differ
+    /// and cannot be confused — the same property `ByChannelBlob` has.
+    #[test]
+    fn attach_and_detach_to_a_feed_are_different_lengths() {
+        let r = ByFeedBlob {
+            account: [1u8; 32],
+            blob: [2u8; 32],
+            expires_after: 60,
+        };
+        let attach = r.encode(TYPE_ATTACH_FEED);
+        let detach = r.encode(TYPE_DETACH_FEED);
+        assert_eq!(attach.len(), 69);
+        assert_eq!(detach.len(), 65);
+        assert_eq!(ByFeedBlob::decode(&attach, TYPE_ATTACH_FEED).unwrap(), r);
+        assert_eq!(
+            ByFeedBlob::decode(&detach, TYPE_DETACH_FEED).unwrap(),
+            ByFeedBlob {
+                expires_after: 0,
+                ..r
+            },
+            "a detach carries no timer and must not invent one"
+        );
+    }
+
+    /// **A feed request is not a channel request, and the type byte is what
+    /// says so.**
+    ///
+    /// SIP-88 forbids overloading `channel[32]` with an account key: both are
+    /// 32 opaque bytes, so nothing in the payload could tell them apart — and
+    /// a direct message's channel identifier is *derived from two account
+    /// keys*, so the spaces are not even unrelated. A `BeginFeed` offered to
+    /// `Begin` must be refused rather than read as a channel nobody named.
+    #[test]
+    fn a_feed_request_does_not_decode_as_a_channel_one() {
+        let feed = BeginFeed {
+            account: [9u8; 32],
+            size: 10,
+            chunks: 1,
+            expires_after: 0,
+        };
+        assert!(
+            Begin::decode(&feed.encode()).is_err(),
+            "a feed's begin was read as a channel's, so an account became a channel"
+        );
+        let channel = Begin {
+            channel: [9u8; 32],
+            size: 10,
+            chunks: 1,
+            expires_after: 0,
+        };
+        assert!(
+            BeginFeed::decode(&channel.encode()).is_err(),
+            "a channel's begin was read as a feed's"
+        );
+
+        let both = ByFeedBlob {
+            account: [3u8; 32],
+            blob: [4u8; 32],
+            expires_after: 0,
+        };
+        assert!(
+            ByChannelBlob::decode(&both.encode(TYPE_ATTACH_FEED), TYPE_ATTACH).is_err(),
+            "a feed attach was read as a channel attach"
+        );
     }
 }

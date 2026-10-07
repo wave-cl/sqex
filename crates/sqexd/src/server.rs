@@ -37,9 +37,10 @@ use sqex_proto::attest::{Attestation, Query as AttestQuery};
 use sqex_proto::backup::Manifest as BackupManifest;
 use sqex_proto::beacon::{Beat, BeatAck, Read};
 use sqex_proto::blob_store::{
-    Begin as BlobBegin, Begun, ByBlob, ByChannelBlob, ByUpload, Commit as BlobCommit, Committed,
-    GetChunk, Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT, TYPE_ATTACH as BL_ATTACH,
-    TYPE_DETACH as BL_DETACH, TYPE_HEAD as BL_HEAD,
+    Begin as BlobBegin, BeginFeed, Begun, ByBlob, ByChannelBlob, ByFeedBlob, ByUpload,
+    Commit as BlobCommit, Committed, GetChunk, Limits, PutChunk as BlobPut, TYPE_ABORT as BL_ABORT,
+    TYPE_ATTACH as BL_ATTACH, TYPE_ATTACH_FEED as BL_ATTACH_FEED, TYPE_DETACH as BL_DETACH,
+    TYPE_DETACH_FEED as BL_DETACH_FEED, TYPE_HEAD as BL_HEAD,
 };
 use sqex_proto::channel::{
     Ack as ChannelAck, ByAccount as ChannelByAccount, ByChannel, ByChannelSigned, ByTarget,
@@ -3937,6 +3938,14 @@ async fn route(
         ("POST", "/blob/abort") => blob_write(server, account, device, path, body).await,
         ("POST", "/blob/attach") => blob_write(server, account, device, path, body).await,
         ("POST", "/blob/detach") => blob_write(server, account, device, path, body).await,
+        // SIP-88 §Attachments: the same three acts against a feed, at their
+        // own paths. **Not a field on the three above**: an account key and a
+        // channel identifier are both 32 opaque bytes, so nothing in a
+        // payload could tell them apart, and a direct message's identifier is
+        // derived from two account keys.
+        ("POST", "/blob/begin-feed") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/attach-feed") => blob_write(server, account, device, path, body).await,
+        ("POST", "/blob/detach-feed") => blob_write(server, account, device, path, body).await,
         ("POST", "/blob/head") => match (account, ByBlob::decode(body, BL_HEAD)) {
             (None, _) => no_identity("reading a blob"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -6980,6 +6989,37 @@ fn blob_here(server: &Server, me: &PubKey, path: &str, body: &[u8]) -> (u16, Vec
         "/blob/detach" => match ByChannelBlob::decode(body, BL_DETACH) {
             Err(e) => malformed(e),
             Ok(req) => match server.channels.detach_blob(me, &req.channel, &req.blob) {
+                Ok(()) => (200, ack()),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/begin-feed" => match BeginFeed::decode(body) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.begin_feed_upload(me, &req) {
+                Ok(upload) => (
+                    200,
+                    Begun {
+                        upload,
+                        now: now_unix(),
+                    }
+                    .encode(),
+                ),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/attach-feed" => match ByFeedBlob::decode(body, BL_ATTACH_FEED) {
+            Err(e) => malformed(e),
+            Ok(req) => match server.channels.attach_feed_blob(me, &req) {
+                Ok(()) => (200, ack()),
+                Err(e) => refused(e),
+            },
+        },
+        "/blob/detach-feed" => match ByFeedBlob::decode(body, BL_DETACH_FEED) {
+            Err(e) => malformed(e),
+            Ok(req) => match server
+                .channels
+                .detach_feed_blob(me, &req.account, &req.blob)
+            {
                 Ok(()) => (200, ack()),
                 Err(e) => refused(e),
             },

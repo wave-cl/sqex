@@ -835,3 +835,231 @@ async fn a_blob_attached_twice_survives_one_channel_ending() {
         .unwrap();
     assert_eq!(blobs, 1, "a blob attached elsewhere was collected anyway");
 }
+
+// ---------------------------------------------------------------------------
+// SIP-88 §Attachments: a feed is an attach target
+// ---------------------------------------------------------------------------
+
+/// Upload a blob against a *feed*, the way `upload` does against a channel.
+async fn upload_to_feed(
+    c: &mut Client,
+    account: [u8; 32],
+    sealed: &[Vec<u8>],
+    id: [u8; 32],
+    size: u64,
+    expires_after: u32,
+) -> (u16, Vec<u8>) {
+    let (code, body) = c
+        .post(
+            "/blob/begin-feed",
+            sqex_proto::blob_store::BeginFeed {
+                account,
+                size,
+                chunks: sealed.len() as u32,
+                expires_after,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    if code != 200 {
+        return (code, body);
+    }
+    let up = Begun::decode(&body).unwrap().upload;
+    for (i, s) in sealed.iter().enumerate() {
+        let (code, _) = c
+            .post(
+                "/blob/put",
+                PutChunk {
+                    upload: up,
+                    index: i as u32,
+                    sealed: s.clone(),
+                }
+                .encode(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+    }
+    c.post(
+        "/blob/commit",
+        Commit {
+            upload: up,
+            blob: id,
+        }
+        .encode(),
+    )
+    .await
+    .unwrap()
+}
+
+/// **A picture published to a feed is readable by a stranger.**
+///
+/// That is the whole point of the section: a feed is public, so "a blob
+/// attached to a feed is served by `Get` to any caller the feed's `Read`
+/// would be served to" — which is anybody. A channel's blob is served to its
+/// members; this one has no membership to check.
+#[tokio::test]
+async fn a_blob_attached_to_a_feed_is_served_to_anybody() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (mut author, author_key) = client_for(addr, pubkey, 91).await;
+    let (mut stranger, _) = client_for(addr, pubkey, 92).await;
+
+    let (plain, sealed, id) = seal_file(b"a published photograph", 1024);
+    let (code, body) = upload_to_feed(
+        &mut author,
+        *author_key.as_bytes(),
+        &sealed,
+        id,
+        plain.len() as u64,
+        0,
+    )
+    .await;
+    assert_eq!(code, 200, "{}", common::said(&body));
+    assert!(Committed::decode(&body).unwrap().stored);
+
+    // A stranger with the blob's name gets the bytes. They are ciphertext —
+    // the key rides in the post, which is in the clear in the feed, and the
+    // exchange never sees it.
+    let got = fetch_all(&mut stranger, id, sealed.len() as u32).await;
+    assert_eq!(got, sealed, "a stranger could not read a published picture");
+}
+
+/// **And a feed's blobs answer to the author's devices alone.**
+///
+/// A channel's detach answers to the uploader *or an admin of the channel
+/// holding the attachment*. A feed has no admins, so there is nobody else —
+/// and nobody else may begin an upload against it either.
+#[tokio::test]
+async fn only_the_author_may_attach_to_or_detach_from_their_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (mut author, author_key) = client_for(addr, pubkey, 93).await;
+    let (mut mallory, _) = client_for(addr, pubkey, 94).await;
+
+    let (plain, sealed, id) = seal_file(b"mine", 1024);
+    let (code, _) = upload_to_feed(
+        &mut author,
+        *author_key.as_bytes(),
+        &sealed,
+        id,
+        plain.len() as u64,
+        0,
+    )
+    .await;
+    assert_eq!(code, 200);
+
+    // Somebody else cannot begin an upload against this feed.
+    let (code, _) = mallory
+        .post(
+            "/blob/begin-feed",
+            sqex_proto::blob_store::BeginFeed {
+                account: *author_key.as_bytes(),
+                size: 4,
+                chunks: 1,
+                expires_after: 0,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        code, 200,
+        "a stranger began an upload against another's feed"
+    );
+
+    // Nor detach what is there. The blob survives, which is the part that
+    // matters: a refusal that still removed the attachment would be worse
+    // than no check at all.
+    let (code, _) = mallory
+        .post(
+            "/blob/detach-feed",
+            sqex_proto::blob_store::ByFeedBlob {
+                account: *author_key.as_bytes(),
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(sqex_proto::blob_store::TYPE_DETACH_FEED),
+        )
+        .await
+        .unwrap();
+    assert_ne!(code, 200, "a stranger detached somebody else's picture");
+    let still = fetch_all(&mut mallory, id, sealed.len() as u32).await;
+    assert_eq!(still, sealed, "the refused detach removed it anyway");
+
+    // The author can, and then it is gone.
+    let (code, _) = author
+        .post(
+            "/blob/detach-feed",
+            sqex_proto::blob_store::ByFeedBlob {
+                account: *author_key.as_bytes(),
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(sqex_proto::blob_store::TYPE_DETACH_FEED),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "the author could not detach their own picture");
+    // **Not a refusal code**: SIP-18 answers a blob somebody may not have
+    // exactly as it answers one that is not there, so that a stranger cannot
+    // probe for what exists. What must be gone is the bytes.
+    let (code, body) = mallory
+        .post("/blob/get", GetChunk { blob: id, index: 0 }.encode())
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    assert!(
+        !Chunk::decode(&body).unwrap().found,
+        "a detached blob is still being served"
+    );
+}
+
+/// **The no-widening refusal, which SIP-88 says is sharper for a feed.**
+///
+/// SIP-18 refuses an `Attach` naming a public channel for a blob any private
+/// channel holds, because detach answers to an admin of the channel holding
+/// the attachment and "one member could publish another's file, and nobody
+/// could take it back". A feed is worse on that axis: a public channel has
+/// admins and a feed has none. The remedy is SIP-18's own — upload it again,
+/// which gives the public copy its own key.
+#[tokio::test]
+async fn a_private_blob_cannot_be_published_by_attaching_it_to_a_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (mut alice, alice_key) = client_for(addr, pubkey, 95).await;
+    let private = [11u8; 32];
+
+    let req = signer(pubkey, 95).create(
+        private,
+        instance_for(private, 0),
+        Visibility::Private,
+        3600,
+        "",
+        vec![],
+    );
+    alice.post("/channel/create", req.encode()).await.unwrap();
+    let (_, sealed, id) = seal_file(b"a private photograph", 1024);
+    assert!(upload(&mut alice, private, &sealed, id, 20, 0).await);
+
+    // Alice may fetch her own blob, and may not publish it to her own feed.
+    let (code, body) = alice
+        .post(
+            "/blob/attach-feed",
+            sqex_proto::blob_store::ByFeedBlob {
+                account: *alice_key.as_bytes(),
+                blob: id,
+                expires_after: 0,
+            }
+            .encode(sqex_proto::blob_store::TYPE_ATTACH_FEED),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 409, "a private blob was published to a feed");
+    assert_eq!(
+        sqex_proto::refusal::Refusal::decode(&body).unwrap().code,
+        sqex_proto::refusal::Code::WouldPublish,
+        "and the refusal says why rather than answering as though it were absent"
+    );
+}
