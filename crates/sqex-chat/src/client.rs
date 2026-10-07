@@ -1945,7 +1945,7 @@ impl Chat {
         self.post_within(path, body, BLOB_PATIENCE).await
     }
 
-    async fn post(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+    pub(crate) async fn post(&mut self, path: &str, body: Vec<u8>) -> Result<Vec<u8>> {
         self.post_within(path, body, PATIENCE).await
     }
 

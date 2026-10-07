@@ -28,6 +28,7 @@ pub mod attach;
 pub mod backup;
 pub mod client;
 pub mod events;
+pub mod feed;
 pub mod store;
 pub mod sync;
 

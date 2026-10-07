@@ -58,6 +58,29 @@ CREATE TABLE IF NOT EXISTS contact (
     label   TEXT NOT NULL,
     added   INTEGER NOT NULL
 );
+-- SIP-88 §The follow list: the feeds this person reads, and where each got to.
+--
+-- **Unscoped, like `contact` and `verified` above and unlike almost everything
+-- else here.** Those are unscoped because they are facts the person
+-- established rather than facts about an exchange, and a follow is the same
+-- kind of thing: a feed is named by an account key, which is the same key at
+-- every exchange, and `/feed/since` asks about it wherever that account's
+-- home turns out to be. A scoped table would also have to be named in
+-- `SCOPED` below or it would silently fail to follow a key handover.
+--
+-- The exchange never holds this list, which is what keeps the reading graph
+-- -- broader than the talking graph SIP-16 already calls the largest
+-- disclosure in the stack -- off it entirely. It survives a lost device
+-- through SIP-48's sealed backup and nowhere else.
+--
+-- `serial` is the newest post this client has read, which is what
+-- `/feed/since` is asked from; 0 means never read. Not sealed: an account key
+-- and a counter the exchange served us anyway.
+CREATE TABLE IF NOT EXISTS follow (
+    account BLOB PRIMARY KEY,
+    serial  INTEGER NOT NULL DEFAULT 0,
+    added   INTEGER NOT NULL
+);
 -- SIP-44 §The handover: a direct message whose other party changed key keeps its
 -- channel; this is how the conversation with the *new* key is found
 -- without deriving a second one. A fact about the correspondent, not
@@ -1678,6 +1701,74 @@ impl Store {
         self.unseal_bytes(sealed)?
             .try_into()
             .map_err(|_| StoreError::Sealed("a row held the wrong number of bytes".into()))
+    }
+
+    // ---- contacts -------------------------------------------------------
+
+    // ---- SIP-88 follows -------------------------------------------------
+
+    /// Follow a feed, or leave an existing row's cursor alone.
+    pub fn follow(&self, account: &PubKey, now: u64) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT INTO follow (account, serial, added) VALUES (?1, 0, ?2)
+                 ON CONFLICT (account) DO NOTHING",
+                params![account.as_bytes(), now as i64],
+            )
+            .map_err(storage("follow"))?;
+        Ok(())
+    }
+
+    /// Stop following. The cursor goes with it: following again starts from
+    /// what the feed holds rather than from where this client once was, which
+    /// is what a person means by unfollowing and following again.
+    pub fn unfollow(&self, account: &PubKey) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM follow WHERE account = ?1",
+                params![account.as_bytes()],
+            )
+            .map_err(storage("unfollow"))?;
+        Ok(())
+    }
+
+    /// Everyone followed, with the serial each was last read to.
+    pub fn follows(&self) -> Result<Vec<(PubKey, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT account, serial FROM follow ORDER BY added, account")
+            .map_err(storage("prepare follows"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    PubKey::new(r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32])),
+                    r.get::<_, i64>(1)? as u64,
+                ))
+            })
+            .map_err(storage("query follows"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage("read follows"))
+    }
+
+    /// Whether this person follows an account.
+    pub fn follows_account(&self, account: &PubKey) -> Result<bool> {
+        self.db
+            .prepare("SELECT 1 FROM follow WHERE account = ?1")
+            .and_then(|mut s| s.exists(params![account.as_bytes()]))
+            .map_err(storage("read a follow"))
+    }
+
+    /// Move a followed feed's cursor forward. **Never backwards**: a serial
+    /// belongs to its author and never restarts, so a lower one is a fault at
+    /// the exchange and not a feed to re-read.
+    pub fn read_feed_to(&self, account: &PubKey, serial: u64) -> Result<()> {
+        self.db
+            .execute(
+                "UPDATE follow SET serial = MAX(serial, ?2) WHERE account = ?1",
+                params![account.as_bytes(), serial as i64],
+            )
+            .map_err(storage("mark a feed read"))?;
+        Ok(())
     }
 
     // ---- contacts -------------------------------------------------------

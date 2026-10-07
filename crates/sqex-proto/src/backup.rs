@@ -26,6 +26,14 @@ pub const KIND_CONTACTS: u8 = 0x02;
 pub const KIND_STATE: u8 = 0x03;
 /// An existing blob the account holds past its channel's retention.
 pub const KIND_HELD: u8 = 0x04;
+/// SIP-88 §The follow list: the feeds this person reads.
+///
+/// Its own kind rather than riding in `KIND_STATE` for the reason
+/// `KIND_CONTACTS` has one -- a person's own findings travel with them -- and
+/// with more force: **a follow list is the one thing in a store that cannot
+/// be re-derived from anywhere else.** Lose it with no backup and it is gone;
+/// keep it as opaque client state and it does not survive changing client.
+pub const KIND_FOLLOWS: u8 = 0x05;
 
 /// The most a sealed manifest may be.
 pub const MAX_SEALED: usize = 1024 * 1024;

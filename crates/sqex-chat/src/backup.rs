@@ -9,7 +9,8 @@
 use std::collections::HashMap;
 
 use sqex_proto::backup::{
-    Held, KIND_CONTACTS, KIND_HISTORY, Manifest, Plain, Segment, ask, drop_all, open, words,
+    Held, KIND_CONTACTS, KIND_FOLLOWS, KIND_HISTORY, Manifest, Plain, Segment, ask, drop_all, open,
+    words,
 };
 use sqex_proto::blob::{Attachment, KIND_FILE};
 use sqex_proto::channel_key::ChannelKey;
@@ -35,6 +36,8 @@ pub struct BackedUp {
     /// Channels whose segment from last time still covered them.
     pub kept: usize,
     pub contacts: usize,
+    /// SIP-88: feeds followed.
+    pub follows: usize,
     pub bytes: u64,
     pub quota: u64,
     pub used: u64,
@@ -48,6 +51,8 @@ pub struct Restored {
     pub entries: usize,
     pub keys: usize,
     pub contacts: usize,
+    /// SIP-88: feeds followed.
+    pub follows: usize,
     /// Segments this client could not apply: a channel the exchange no
     /// longer serves, a kind it does not know, a blob that would not open.
     pub skipped: Vec<String>,
@@ -128,6 +133,38 @@ fn contacts_from(bytes: &[u8]) -> Result<Vec<(PubKey, bool, String)>> {
         let label = String::from_utf8_lossy(&bytes[at..at + len]).into_owned();
         at += len;
         out.push((account, verified, label));
+    }
+    Ok(out)
+}
+
+fn follows_segment(follows: &[(PubKey, u64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + follows.len() * 40);
+    out.extend_from_slice(&(follows.len() as u32).to_be_bytes());
+    for (account, serial) in follows {
+        out.extend_from_slice(account.as_bytes());
+        out.extend_from_slice(&serial.to_be_bytes());
+    }
+    out
+}
+
+fn follows_from(bytes: &[u8]) -> Result<Vec<(PubKey, u64)>> {
+    if bytes.len() < 4 {
+        return Err(ChatError::Protocol("a follows segment is cut short".into()));
+    }
+    let count = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    if bytes.len() != 4 + count * 40 {
+        return Err(ChatError::Protocol(format!(
+            "a follows segment says {count} and is {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = 4 + i * 40;
+        out.push((
+            PubKey::new(bytes[at..at + 32].try_into().unwrap()),
+            u64::from_be_bytes(bytes[at + 32..at + 40].try_into().unwrap()),
+        ));
     }
     Ok(out)
 }
@@ -287,6 +324,25 @@ impl Chat {
                 last: 0,
             });
         }
+        // SIP-88's follow list. Written every time, as contacts are and for
+        // the same reason: it is small, and it is the part that cannot be
+        // got back any other way -- no exchange holds it, by design.
+        let follows = self.store().follows()?;
+        report.follows = follows.len();
+        if !follows.is_empty() {
+            let bytes = follows_segment(&follows);
+            let prepared = self.prepare_bytes("follows", &bytes, chunk)?;
+            let a = self.upload(me.as_bytes(), &prepared).await?;
+            report.bytes += a.size;
+            segments.push(Segment {
+                kind: KIND_FOLLOWS,
+                blob: a.blob,
+                key: a.key,
+                channel: [0; 32],
+                first: 0,
+                last: 0,
+            });
+        }
         // Held blobs from last time stay held.
         segments.extend(
             previous
@@ -361,7 +417,7 @@ impl Chat {
         };
         let mut timelines: HashMap<[u8; 32], Timeline> = HashMap::new();
         for s in &plain.segments {
-            if s.kind != KIND_HISTORY && s.kind != KIND_CONTACTS {
+            if s.kind != KIND_HISTORY && s.kind != KIND_CONTACTS && s.kind != KIND_FOLLOWS {
                 continue;
             }
             let headed = self.head(&s.blob).await?;
@@ -392,6 +448,14 @@ impl Chat {
                     continue;
                 }
             };
+            if s.kind == KIND_FOLLOWS {
+                for (who, serial) in follows_from(&bytes)? {
+                    self.store().follow(&who, now())?;
+                    self.store().read_feed_to(&who, serial)?;
+                    report.follows += 1;
+                }
+                continue;
+            }
             if s.kind == KIND_CONTACTS {
                 for (who, verified, label) in contacts_from(&bytes)? {
                     self.store().add_contact(&who, &label, now())?;
