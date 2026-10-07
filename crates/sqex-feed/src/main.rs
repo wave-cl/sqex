@@ -443,6 +443,16 @@ async fn cited(chat: &mut Chat, mine: &Mine, who: PubKey, serial: u64) -> String
             }
         }
     }
+    said_of(&who.to_base58(), serial, found)
+}
+
+/// One citation's outcome, in words.
+///
+/// Separate from `cited` so the succession arm can use it on the successor's
+/// answer: a post at a succeeded account is still withdrawn, or evicted, or
+/// shown, and SIP-89's rule that no two of these read alike does not stop
+/// applying because the feed changed hands.
+fn said_of(who: &str, serial: u64, found: Cited) -> String {
     match found {
         Cited::Got(q) => match Body::decode(&q.post.body) {
             Ok(Some(Body::Post(orig))) => {
@@ -467,6 +477,23 @@ async fn cited(chat: &mut Chat, mine: &Mine, who: PubKey, serial: u64) -> String
             format!("{who} {serial}: at {domain}, which disagrees about where it lives")
         }
         Cited::Unresolved => format!("{who} {serial}: could not be reached"),
+        // **Not "did not verify".** SIP-89 names reporting this as forged the
+        // thing a client must not do: the key is the author's own, withdrawn
+        // after it signed, and nothing here settles whether that was a
+        // routine retirement or the reason the key was withdrawn.
+        Cited::Unverifiable => format!(
+            "{who} {serial}: signed by a device this account has since withdrawn — \
+             it cannot be settled either way"
+        ),
+        // The successor's answer, under the successor's name. Printed through
+        // the same arms, so a withdrawn post at a succeeded account reads as
+        // withdrawn rather than as a succession.
+        Cited::Succeeded { successor, found } => format!(
+            "{who} {serial}: this account is now {successor} — {}",
+            said_of(&successor.to_base58(), serial, *found)
+        ),
+        Cited::TooDeep => format!("{who} {serial}: a quote of a quote, not followed"),
+        Cited::Circular => format!("{who} {serial}: cites itself or its own future"),
     }
 }
 

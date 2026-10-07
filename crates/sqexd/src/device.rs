@@ -202,11 +202,9 @@ CREATE INDEX IF NOT EXISTS home_by_home ON home (home);
 
 /// How far ahead of us an account's clock may be on a revocation.
 ///
-/// A withdrawal that its author's fast clock made unacceptable would be a
-/// recovery that failed at the moment it was needed. There is deliberately no
-/// bound in the other direction: a revocation that lapsed would re-admit the
-/// key it withdrew.
-pub const REVOCATION_SKEW: u64 = 5 * 60;
+/// Re-exported rather than restated: a reader verifying the same artifact for
+/// SIP-89 reaches for it too, and the two must agree.
+pub use sqex_proto::credential::REVOCATION_SKEW;
 
 /// SIP-60 §A device hints its home: origin hints kept per account; the oldest go past this.
 pub const MAX_HINTS: usize = 32;
@@ -522,6 +520,45 @@ impl Registry {
         .ok()
         .flatten()
         .and_then(|b| b.try_into().ok().map(PubKey::new))
+    }
+
+    /// What `account` has revoked, as `/device/list` with
+    /// [`TYPE_LIST_REVOKED`](sqex_proto::device::TYPE_LIST_REVOKED) serves it.
+    ///
+    /// **Rows with no artifact are returned, not filtered.** The column is
+    /// `NOT NULL DEFAULT x\'\'` and the succession path writes no revocation
+    /// at all, so an empty blob is the ordinary case for anything this
+    /// exchange recorded without the account\'s own signature. Dropping those
+    /// rows would answer "never revoked" for a device that was — and SIP-89
+    /// sends a reader holding a quote signed by it to *forged* instead of
+    /// *unverifiable*, which is the one substitution the pair exists to stop.
+    ///
+    /// Bounded by [`MAX_REVOKED`](sqex_proto::device::MAX_REVOKED), newest
+    /// first, because the answer has to encode and the decoder refuses more.
+    pub fn revoked_by(&self, account: &PubKey) -> Vec<(PubKey, u64, Vec<u8>)> {
+        let db = self.db.lock().unwrap();
+        let Ok(mut q) = db.prepare(
+            "SELECT device, at, revocation FROM revoked WHERE account = ?1
+             ORDER BY at DESC LIMIT ?2",
+        ) else {
+            return Vec::new();
+        };
+        let rows = q.query_map(
+            params![account.as_bytes(), sqex_proto::device::MAX_REVOKED as i64],
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, Vec<u8>>(2).unwrap_or_default(),
+                ))
+            },
+        );
+        let Ok(rows) = rows else {
+            return Vec::new();
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(d, at, v)| d.try_into().ok().map(|k| (PubKey::new(k), at, v)))
+            .collect()
     }
 
     /// SIP-44: the recorded succession of `account`, as `/account/succession`

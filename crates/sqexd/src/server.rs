@@ -3833,6 +3833,40 @@ async fn route(
         // of the three it is, so a client sealing a key to a stale one
         // can wait instead.
         ("POST", "/device/list") => match body.first() {
+            // SIP-89 §When it cannot be resolved: what this account has
+            // revoked. Served on the same terms as the device list above —
+            // a revocation names both keys in the clear to whoever verifies
+            // one, so there is nothing here the list did not already give.
+            Some(&sqex_proto::device::TYPE_LIST_REVOKED) => {
+                match sqex_proto::device::ListRevoked::decode(body) {
+                    Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
+                    Ok(req) => {
+                        let rows = server
+                            .devices
+                            .revoked_by(&req.account)
+                            .into_iter()
+                            .map(|(device, at, raw)| sqex_proto::device::Withdrawn {
+                                device,
+                                at,
+                                // An empty blob is a row this exchange
+                                // recorded without the account's signature,
+                                // which is reported as such rather than
+                                // dressed up or dropped.
+                                revocation: sqex_proto::credential::Revocation::decode(&raw).ok(),
+                            })
+                            .collect();
+                        (
+                            200,
+                            "application/octet-stream",
+                            sqex_proto::device::Revoked {
+                                now: crate::state::now_unix(),
+                                rows,
+                            }
+                            .encode(),
+                        )
+                    }
+                }
+            }
             Some(&TYPE_LIST_FROM) => match ListDevicesFrom::decode(body) {
                 Err(e) => refuse(400, Code::Malformed, Some(&e.to_string())),
                 Ok(req) => match server.devices_from(&req.account).await {

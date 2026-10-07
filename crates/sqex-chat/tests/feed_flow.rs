@@ -15,6 +15,7 @@ use sqex_chat::client::Chat;
 use sqex_chat::feed::Cited;
 use sqex_chat::store::Store;
 use sqex_proto::blob::Attachment;
+use sqex_proto::credential::SCOPE_CHAT;
 use sqex_proto::message::{Body, Part, Post as SipPost};
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -614,4 +615,257 @@ async fn an_account_with_only_a_feed_is_known_to_the_home_route() {
         asker.resolve_quote(&carol_key, 1).await,
         Cited::Got(_)
     ));
+}
+
+/// Alice with a linked device: the account key, and a laptop bound to it by a
+/// SIP-20 credential that the account signed.
+async fn alice_and_her_laptop(
+    addr: SocketAddr,
+    server_pub: [u8; 32],
+    dir: &Path,
+) -> (Chat, Chat, PubKey, PubKey) {
+    let (a_seed, a_key) = identity(41);
+    let (d_seed, d_key) = identity(42);
+    let mut account = chat_at(addr, server_pub, 41, &dir.join("alice.db")).await;
+
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Herself first: a device is registered by the delegate itself or by an
+    // already-registered device of the same account, so the account key has
+    // to be on its own list before it can put anything else there.
+    let mine =
+        sqex_proto::credential::Credential::issue(&a_seed, &a_key, SCOPE_CHAT, n - 1, n + 3600)
+            .unwrap();
+    account.register_self(&mine).await.unwrap();
+    let cred =
+        sqex_proto::credential::Credential::issue(&a_seed, &d_key, SCOPE_CHAT, n - 1, n + 3600)
+            .unwrap();
+    account.register_device(&cred).await.unwrap();
+
+    // The laptop's own `Chat`: its own transport seed, acting for Alice's
+    // account. Posts it signs name `a_key` and carry `d_key` as `device`,
+    // which is the shape SIP-88 §One chain exists for.
+    let client = Client::connect_as(addr, &server_pub, &d_seed)
+        .await
+        .unwrap();
+    let store = Store::open(&d_seed, Some(&dir.join("laptop.db"))).unwrap();
+    let laptop = Chat::new(client, d_seed, a_key, PubKey::new(server_pub), store);
+    (account, laptop, a_key, d_key)
+}
+
+/// **A post signed by a linked device resolves, and the binding is checked.**
+///
+/// The control for the revocation test below, and the first test of SIP-89
+/// §Resolving one step 4's second half at all: until now the signature was
+/// checked and the SIP-20 credential binding `device` to `account` was not
+/// checked by anybody, which SIP-89 §Reference implementation recorded as a
+/// `verified_author` that was never written.
+#[tokio::test]
+async fn a_post_signed_by_a_linked_device_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (_account, mut laptop, alice, _d_key) =
+        alice_and_her_laptop(addr, server_pub, dir.path()).await;
+    let mut bob = chat_at(addr, server_pub, 43, &dir.path().join("b.db")).await;
+
+    let at = laptop.publish(&text("said on the laptop")).await.unwrap();
+    match bob.resolve_quote(&alice, at.serial).await {
+        Cited::Got(q) => {
+            assert_eq!(
+                Body::decode(&q.post.body)
+                    .unwrap()
+                    .and_then(|b| match b {
+                        Body::Post(p) => p.body_text().map(str::to_string),
+                        _ => None,
+                    })
+                    .unwrap(),
+                "said on the laptop"
+            );
+        }
+        other => panic!("a post from a registered device did not resolve: {other:?}"),
+    }
+}
+
+/// **A device the account has withdrawn reads as unverifiable, not forged.**
+///
+/// SIP-89 §When it cannot be resolved spends a row on this and names the
+/// failure in its own column: *report forged* is what a client MUST NOT do.
+/// A forgery is somebody else's key. This is the author's own key, withdrawn
+/// after it signed — which may be a laptop that was replaced, or may be the
+/// reason the key was withdrawn, and nothing a reader holds settles which.
+#[tokio::test]
+async fn a_post_from_a_withdrawn_device_is_unverifiable_and_not_forged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (mut account, mut laptop, alice, d_key) =
+        alice_and_her_laptop(addr, server_pub, dir.path()).await;
+    let mut bob = chat_at(addr, server_pub, 44, &dir.path().join("b.db")).await;
+
+    let at = laptop
+        .publish(&text("said before the laptop went"))
+        .await
+        .unwrap();
+
+    // The control: it resolves while the device is still hers. Without this,
+    // the assertion below would hold on a client that answered
+    // `Unverifiable` for everything.
+    assert!(
+        matches!(bob.resolve_quote(&alice, at.serial).await, Cited::Got(_)),
+        "the control failed: it did not resolve before the revocation"
+    );
+
+    account.revoke_device(&d_key).await.unwrap();
+
+    assert_eq!(
+        bob.resolve_quote(&alice, at.serial).await,
+        Cited::Unverifiable,
+        "a post signed by a withdrawn device did not read as unverifiable"
+    );
+    // And specifically not as the state SIP-89 forbids for it.
+    assert_ne!(
+        bob.resolve_quote(&alice, at.serial).await,
+        Cited::Forged,
+        "a withdrawn device's post was reported as forged"
+    );
+}
+
+/// **`QUOTE_DEPTH` is a bound on requests, so it is checked before any.**
+///
+/// SIP-89 §Recursion: each hop is a request to a possibly different exchange
+/// and a disclosure of the reader to it, so "an implementation that resolves
+/// eagerly or recursively will find that out from somebody else's exchange".
+/// A depth check made after the read would bound what is *shown* and not what
+/// is asked, which is the wrong quantity.
+#[tokio::test]
+async fn a_quote_past_the_depth_bound_is_labelled_and_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 45, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 46, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(45);
+
+    let at = alice.publish(&text("the innermost post")).await.unwrap();
+
+    // The control: inside the bound it resolves, from the same client against
+    // the same post. The two differ in the depth and in nothing else.
+    assert!(
+        matches!(
+            bob.resolve_quote_from(&alice_key, at.serial, None, sqex_chat::feed::QUOTE_DEPTH)
+                .await,
+            Cited::Got(_)
+        ),
+        "the control failed: it did not resolve at the bound itself"
+    );
+    assert_eq!(
+        bob.resolve_quote_from(
+            &alice_key,
+            at.serial,
+            None,
+            sqex_chat::feed::QUOTE_DEPTH + 1
+        )
+        .await,
+        Cited::TooDeep,
+        "a quote past the depth bound was followed anyway"
+    );
+}
+
+/// **A post citing itself or its own future is discarded before anything is
+/// asked** (SIP-89 §Resolving one, step 1).
+#[tokio::test]
+async fn a_post_citing_itself_is_discarded_without_asking_anybody() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 47, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 48, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(47);
+
+    alice.publish(&text("one")).await.unwrap();
+    let at = alice.publish(&text("two")).await.unwrap();
+
+    // Itself, and its own future.
+    for serial in [at.serial, at.serial + 1] {
+        assert_eq!(
+            bob.resolve_quote_from(&alice_key, serial, Some((&alice_key, at.serial)), 1)
+                .await,
+            Cited::Circular,
+            "a post citing serial {serial} from serial {} was followed",
+            at.serial
+        );
+    }
+    // The control: the post below it is an ordinary citation and resolves.
+    assert!(
+        matches!(
+            bob.resolve_quote_from(&alice_key, at.serial - 1, Some((&alice_key, at.serial)), 1)
+                .await,
+            Cited::Got(_)
+        ),
+        "the control failed: an earlier post of the same feed did not resolve"
+    );
+}
+
+/// **A citation of a succeeded account resolves at the successor.**
+///
+/// SIP-89 §When it cannot be resolved: *the account has succeeded* → resolve
+/// at the successor, and MUST NOT treat the old posts as forged. The feed of
+/// a succeeded account answers `found: 0` — indistinguishable from an account
+/// nobody ever heard of unless the succession is asked after — so without
+/// this a key change silently turned every quote of that person into "a feed
+/// that could not be found".
+///
+/// **The seam chain is not verified here**, and that half of the row is not
+/// met: SIP-88 §Succession's seams are carried in `Headed.seams`, which this
+/// exchange never populates (`seams: Vec::new()`, unconditionally). There is
+/// nothing to check and nothing claims there is. What is met is the MUST NOT,
+/// which is the half with a reader on the other end of it.
+#[tokio::test]
+async fn a_citation_of_a_succeeded_account_resolves_at_the_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (alice_seed, alice_key) = identity(51);
+    let (_, carol_key) = identity(52);
+    let mut carol = chat_at(addr, server_pub, 52, &dir.path().join("c.db")).await;
+    let mut bob = chat_at(addr, server_pub, 53, &dir.path().join("b.db")).await;
+
+    // Carol publishes at serial 1 under her own key; Alice names her as her
+    // successor and Carol claims it. A citation of *Alice* at serial 1 then
+    // has to find Carol's post.
+    let at = carol.publish(&text("carol's first")).await.unwrap();
+
+    // The control: before the succession, a citation of Alice at that serial
+    // is a feed with nothing in it. Without this, the assertion below would
+    // hold on a client that resolved Alice's citations at Carol's feed for
+    // no reason at all.
+    assert_eq!(
+        bob.resolve_quote(&alice_key, at.serial).await,
+        Cited::NoFeed,
+        "the control failed: Alice's feed already answered before she was succeeded"
+    );
+
+    let will = sqex_proto::succession::Will::sign(&alice_seed, &carol_key, 1000);
+    carol
+        .succeed(sqex_proto::succession::Proof::Will(will))
+        .await
+        .unwrap();
+
+    match bob.resolve_quote(&alice_key, at.serial).await {
+        Cited::Succeeded { successor, found } => {
+            assert_eq!(successor, carol_key, "it went to the wrong key");
+            assert!(
+                matches!(*found, Cited::Got(_)),
+                "the successor's feed was asked and did not answer the post: {found:?}"
+            );
+        }
+        other => panic!("a succeeded account's citation did not follow: {other:?}"),
+    }
+
+    // And it is not the state the row forbids.
+    assert!(
+        !matches!(
+            bob.resolve_quote(&alice_key, at.serial).await,
+            Cited::Forged
+        ),
+        "a succeeded account's posts were called forged"
+    );
 }

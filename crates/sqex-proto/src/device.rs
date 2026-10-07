@@ -20,6 +20,8 @@ pub const TYPE_LIST: u8 = 0x03;
 pub const TYPE_ADMISSION: u8 = 0x04;
 /// SIP-60 §Saying whose list it is: list an account's devices and say whose list it is.
 pub const TYPE_LIST_FROM: u8 = 0x05;
+/// SIP-89 §When it cannot be resolved: ask what an account has revoked.
+pub const TYPE_LIST_REVOKED: u8 = 0x06;
 
 /// SIP-60 §Saying whose list it is `DevicesFrom::from`: this exchange's own registry -- the
 /// account's home is here, or nowhere on record.
@@ -37,6 +39,11 @@ pub const FROM_STALE: u8 = 0x02;
 /// arithmetic, where recipients are devices: a 256-account channel at eight
 /// devices each is 2 048 envelopes on a rotation.
 pub const MAX_DEVICES: usize = 8;
+/// A bound on a revocation listing. Larger than [`MAX_DEVICES`] because
+/// revocations accumulate over an account's life where live devices do not,
+/// and kept finite because a decoder that trusts a length is a decoder that
+/// allocates whatever a stranger says.
+pub const MAX_REVOKED: usize = 256;
 /// Registrations one account may make per hour.
 pub const MAX_REGISTRATIONS_PER_HOUR: usize = 16;
 
@@ -136,6 +143,138 @@ impl Revoke {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListDevices {
     pub account: PubKey,
+}
+
+/// Ask what an account has revoked: `POST /device/list` with
+/// `| type = 0x06 | account[32] |`, answered with [`Revoked`].
+///
+/// **Answerable to anybody, for the reason [`ListDevices`] already is**: a
+/// revocation names both keys in the clear to whoever verifies one, exactly
+/// as a credential does, so serving it discloses nothing the device list did
+/// not. The same route, dispatched on the type byte; an exchange from before
+/// this refuses it as malformed and a caller falls back.
+///
+/// SIP-89 §When it cannot be resolved needs this and nothing else does yet: a
+/// reader holding a quote whose post was signed by a device the account no
+/// longer lists must say **unverifiable** rather than **forged**, and without
+/// the revocations "revoked since" and "never registered" are one observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListRevoked {
+    pub account: PubKey,
+}
+
+impl ListRevoked {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33);
+        out.push(TYPE_LIST_REVOKED);
+        out.extend_from_slice(self.account.as_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<ListRevoked> {
+        if b.len() != 33 || b[0] != TYPE_LIST_REVOKED {
+            return Err(Error::Malformed(format!(
+                "list-revoked is {} bytes, want 33",
+                b.len()
+            )));
+        }
+        Ok(ListRevoked {
+            account: PubKey::new(b[1..33].try_into().unwrap()),
+        })
+    }
+}
+
+/// One device an account has withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawn {
+    pub device: PubKey,
+    /// When this exchange recorded it. **The exchange's clock and not the
+    /// account's**, so it is not signed and must not be presented as the
+    /// moment the account acted; the signed `issued` is inside `revocation`
+    /// where there is one.
+    pub at: u64,
+    /// The account's own signed revocation, where this exchange kept one.
+    ///
+    /// `None` for a row recorded before revocations were retained, and for
+    /// one carried between exchanges without its artifact. A reader that
+    /// cannot check the signature has only this exchange's word — which is
+    /// why the state it leads to is *unverifiable* and never *forged*: an
+    /// exchange that invented a revocation could withhold a post, which it
+    /// can do anyway, and could not make one verify as somebody else's.
+    pub revocation: Option<Revocation>,
+}
+
+/// What an account has revoked, as this exchange has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revoked {
+    pub now: u64,
+    pub rows: Vec<Withdrawn>,
+}
+
+impl Revoked {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.rows.len() * (40 + REVOCATION_LEN));
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.rows.len() as u16).to_be_bytes());
+        for r in &self.rows {
+            out.extend_from_slice(r.device.as_bytes());
+            out.extend_from_slice(&r.at.to_be_bytes());
+            // Length-prefixed and zero where none is held, as `Devices` does
+            // it for a credential and for the same reason: an absent artifact
+            // is a fact to report, not a row to omit.
+            match &r.revocation {
+                Some(v) => {
+                    let bytes = v.encode();
+                    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&bytes);
+                }
+                None => out.extend_from_slice(&0u16.to_be_bytes()),
+            }
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Revoked> {
+        if b.len() < 10 {
+            return Err(Error::Malformed(format!(
+                "revoked is {} bytes, want at least 10",
+                b.len()
+            )));
+        }
+        let now = u64::from_be_bytes(b[0..8].try_into().unwrap());
+        let count = u16::from_be_bytes(b[8..10].try_into().unwrap()) as usize;
+        if count > MAX_REVOKED {
+            return Err(Error::Malformed(format!(
+                "revoked names {count} devices, at most {MAX_REVOKED}"
+            )));
+        }
+        let mut rows = Vec::with_capacity(count);
+        let mut i = 10;
+        for _ in 0..count {
+            if b.len() < i + 42 {
+                return Err(Error::Malformed("revoked ends inside a row".into()));
+            }
+            let device = PubKey::new(b[i..i + 32].try_into().unwrap());
+            let at = u64::from_be_bytes(b[i + 32..i + 40].try_into().unwrap());
+            let len = u16::from_be_bytes(b[i + 40..i + 42].try_into().unwrap()) as usize;
+            i += 42;
+            if b.len() < i + len {
+                return Err(Error::Malformed("revoked ends inside a revocation".into()));
+            }
+            let revocation = if len == 0 {
+                None
+            } else {
+                Some(Revocation::decode(&b[i..i + len])?)
+            };
+            i += len;
+            rows.push(Withdrawn {
+                device,
+                at,
+                revocation,
+            });
+        }
+        Ok(Revoked { now, rows })
+    }
 }
 
 /// SIP-44 §Which account a device is: `GET /device/account`, the account the caller's transport
@@ -584,5 +723,69 @@ mod admission_tests {
             ..r
         };
         assert_eq!(AdmissionRequest::decode(&empty.encode()).unwrap(), empty);
+    }
+
+    /// **A revocation listing round-trips, with and without the artifact.**
+    ///
+    /// The pair matters rather than the encoding: SIP-89 sends a reader to
+    /// *unverifiable* when a post's device was revoked, and a row whose
+    /// signed revocation this exchange does not hold still has to arrive as a
+    /// row. Dropping it would turn "revoked, on the exchange's word alone"
+    /// into "never registered", which is the state the reader must not reach.
+    #[test]
+    fn a_revocation_listing_keeps_a_row_that_has_no_artifact() {
+        let account_seed = [9u8; 32];
+        let device = PubKey::new([3u8; 32]);
+        let signed = Revocation::issue(&account_seed, &device, 1000);
+        let listing = Revoked {
+            now: 2000,
+            rows: vec![
+                Withdrawn {
+                    device,
+                    at: 1001,
+                    revocation: Some(signed),
+                },
+                Withdrawn {
+                    device: PubKey::new([4u8; 32]),
+                    at: 1002,
+                    revocation: None,
+                },
+            ],
+        };
+        let back = Revoked::decode(&listing.encode()).unwrap();
+        assert_eq!(back, listing);
+        assert!(
+            back.rows[1].revocation.is_none(),
+            "a row with no artifact came back carrying one"
+        );
+        assert_eq!(
+            back.rows.len(),
+            2,
+            "a row with no artifact was dropped, which reads as never revoked"
+        );
+    }
+
+    /// An empty listing is a listing, not a malformed answer: an account that
+    /// has revoked nothing is the ordinary case.
+    #[test]
+    fn an_account_that_revoked_nothing_answers_an_empty_listing() {
+        let none = Revoked {
+            now: 7,
+            rows: Vec::new(),
+        };
+        assert_eq!(Revoked::decode(&none.encode()).unwrap(), none);
+    }
+
+    /// And the ask round-trips under its own type byte, so the shared route
+    /// can tell it from a device list.
+    #[test]
+    fn the_revoked_ask_is_told_apart_from_a_device_list() {
+        let account = PubKey::new([1u8; 32]);
+        let ask = ListRevoked { account };
+        assert_eq!(ListRevoked::decode(&ask.encode()).unwrap(), ask);
+        // The control: a device list of the same shape is not decodable as
+        // this one, which is what keeps the two apart on one route.
+        assert!(ListRevoked::decode(&ListDevices { account }.encode()).is_err());
+        assert!(ListDevices::decode(&ask.encode()).is_err());
     }
 }

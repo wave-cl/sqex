@@ -27,7 +27,7 @@ use sqex_proto::channel_key::{
     Absent, ChannelKey, Envelope, Get as KeyGet, Got, Put as KeyPut, PutAck, TYPE_MISSING,
     open_envelope, seal_envelope, sign_envelope, verify_envelope,
 };
-use sqex_proto::credential::{Credential, Revocation, SCOPE_CHAT};
+use sqex_proto::credential::{Credential, REVOCATION_SKEW, Revocation, SCOPE_CHAT};
 use sqex_proto::device::{
     AdmissionRequest, Device, Devices, DevicesFrom, FROM_STALE, ListDevices, ListDevicesFrom,
     Register, Revoke,
@@ -3616,6 +3616,67 @@ impl Chat {
         )
         .await?;
         Ok(())
+    }
+
+    /// Somebody's registered devices, as this exchange lists them.
+    ///
+    /// The raw listing, credentials and all, because the one thing a caller
+    /// wants it for is checking a binding itself — the exchange used to
+    /// verify and throw the credential away, which left SIP-31's second step
+    /// performable by nobody.
+    pub async fn devices_listed(&mut self, account: &PubKey) -> Result<Devices> {
+        let body = self
+            .post("/device/list", ListDevices { account: *account }.encode())
+            .await?;
+        Devices::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
+    }
+
+    /// What `account` has revoked, as this exchange has it (SIP-89 §When it
+    /// cannot be resolved).
+    ///
+    /// **Each artifact is verified under `account` before it is returned**,
+    /// and a row whose signature does not hold is dropped: the exchange is
+    /// not in the trust path for a public, signed fact. A row the exchange
+    /// holds no artifact for is kept with `revocation: None` — it is the
+    /// exchange's unsupported word, and a caller that treats it as such is
+    /// told something true.
+    ///
+    /// An exchange too old for the type byte refuses it as malformed, which
+    /// comes back as an empty listing rather than an error: "this exchange
+    /// cannot tell me" and "this account revoked nothing" lead a reader to
+    /// the same place here, because both leave a device's standing unproven.
+    pub async fn revoked_by(
+        &mut self,
+        account: &PubKey,
+    ) -> Result<Vec<sqex_proto::device::Withdrawn>> {
+        let body = match self
+            .post(
+                "/device/list",
+                sqex_proto::device::ListRevoked { account: *account }.encode(),
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(ChatError::Refused(400, _)) | Err(ChatError::NoChatHere(_)) => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(e),
+        };
+        let listing = sqex_proto::device::Revoked::decode(&body)
+            .map_err(|e| ChatError::Protocol(e.to_string()))?;
+        let now = listing.now;
+        Ok(listing
+            .rows
+            .into_iter()
+            .filter(|r| match &r.revocation {
+                // The device the artifact names must be the row's own, which
+                // `verify` does not check: it binds the signature to the
+                // account, and a row could otherwise carry a valid revocation
+                // of some *other* device of the same account.
+                Some(v) => v.device == r.device && v.verify(account, now, REVOCATION_SKEW).is_ok(),
+                None => true,
+            })
+            .collect())
     }
 
     /// SIP-44: what the exchange recorded of `account`'s succession, if it

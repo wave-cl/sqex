@@ -108,7 +108,94 @@ pub enum Cited {
     },
     /// Nothing could be asked: the home is unreachable, or unknown.
     Unresolved,
+    /// **The post verifies under a device this account has since withdrawn.**
+    ///
+    /// SIP-89 §When it cannot be resolved makes this distinct from
+    /// [`Cited::Forged`] and says why in its own column: *report forged* is
+    /// the thing a client MUST NOT do here. A forgery is somebody else's key;
+    /// this is the author's own key, withdrawn after it signed. The post may
+    /// be exactly what it claims — a device revoked last week does not
+    /// retract what it published last year — and it may be the output of a
+    /// stolen key, which is what revocation is usually *for*. A reader is
+    /// told it cannot be settled, because it cannot.
+    Unverifiable,
+    /// **The account has been succeeded, and this is what the successor
+    /// serves at that serial** (SIP-89 §When it cannot be resolved, SIP-44).
+    ///
+    /// Not an error: the row's MUST NOT is *treat the old posts as forged*.
+    /// The post is carried so a reader sees it, and `successor` is carried so
+    /// the reader is told whose feed answered — a key change is the one thing
+    /// about a cited post that no amount of reading the words would reveal.
+    Succeeded {
+        successor: PubKey,
+        /// What the successor's feed gave, resolved there under every rule
+        /// that applies here. Boxed because it is this enum again.
+        found: Box<Cited>,
+    },
+    /// **`QUOTE_DEPTH` reached: a labelled reference, deliberately not
+    /// followed.**
+    ///
+    /// SIP-89 §Recursion: each hop is a request to a possibly different
+    /// exchange and a disclosure of the reader to it, so depth is an
+    /// amplification primitive — "one post in a well-read feed becomes
+    /// readers × hops". The bound is 2 and the unasked budget is 1. This is
+    /// the answer at the bound, and it is a state rather than silence because
+    /// §When it cannot be resolved says none of its rows may be.
+    TooDeep,
+    /// **A post citing itself or its own future** (SIP-89 §Resolving one,
+    /// step 1), discarded before anything is asked of any exchange.
+    ///
+    /// Its own state because the alternative was `Unresolved`, which says
+    /// "could not be reached" about a citation that was never going to
+    /// resolve and that nothing could fix — and which would have had this
+    /// client ask an exchange about it, on a retry, for as long as the post
+    /// was on a screen.
+    Circular,
 }
+
+/// What a reader could establish about the device that signed a post.
+///
+/// **Three answers and not two.** "I checked and it is not bound" and "I
+/// could not check" are different facts about a post, and SIP-89 spends a
+/// whole row on keeping them apart: the first is *forged*, the second is
+/// *unverifiable*, and reporting the second as the first is what that row
+/// forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    /// A credential this reader checked binds it to the account, or the
+    /// account signed for itself.
+    Yes,
+    /// Checked, and it does not hold: the account lists this device under a
+    /// credential that names somebody else, or that has expired, or whose
+    /// signature is wrong.
+    No,
+    /// **Not established, and not disproved either.** Four ways to get here,
+    /// and they share an answer because they share a consequence:
+    ///
+    /// - the account has withdrawn the device since it signed — SIP-89's own
+    ///   row, and the reason this variant exists;
+    /// - the account lists it with no credential behind it, which SIP-22
+    ///   calls a registration awaiting renewal and an exchange MUST report as
+    ///   such rather than invent one. An earlier draft of this called that
+    ///   forged, which would have accused every account whose device was
+    ///   linked before credentials were retained;
+    /// - the device list could not be asked at all;
+    /// - the exchange says it was revoked but holds no signed revocation, so
+    ///   the claim rests on its word.
+    ///
+    /// In all four the reader has not seen a proof, and in none of them has
+    /// it seen a disproof.
+    Unprovable,
+}
+
+/// How far a reader follows a chain of quotes (SIP-89 §Recursion).
+///
+/// Two, as the specification sets it, and the reason is in
+/// [`Cited::TooDeep`]: this is an amplification bound and not a display
+/// preference. The unasked budget is one, which is what
+/// [`Chat::resolve_quote`] spends — a caller that wants the second hop asks
+/// for it.
+pub const QUOTE_DEPTH: u8 = 2;
 
 impl Chat {
     // ---- publishing ------------------------------------------------------
@@ -468,8 +555,42 @@ impl Chat {
     /// a false attribution, which is the whole reason a pointer was chosen
     /// over a copy.
     pub async fn resolve_quote(&mut self, account: &PubKey, serial: u64) -> Cited {
+        self.resolve_quote_from(account, serial, None, 1).await
+    }
+
+    /// [`Chat::resolve_quote`], told where it is standing.
+    ///
+    /// `citer` is the post carrying the quote, where there is one: SIP-89
+    /// §Resolving one step 1 discards a citation whose `account` is the
+    /// citing post's own and whose `serial` is at or above it, which is a
+    /// post citing itself or its own future. A caller that does not have the
+    /// citing post passes `None` and that half of step 1 does not apply —
+    /// there is nothing for it to compare against.
+    ///
+    /// `depth` is how many hops this is, counting from 1. Past
+    /// [`QUOTE_DEPTH`] it answers [`Cited::TooDeep`] without asking anybody,
+    /// which is the whole point of the bound.
+    pub async fn resolve_quote_from(
+        &mut self,
+        account: &PubKey,
+        serial: u64,
+        citer: Option<(&PubKey, u64)>,
+        depth: u8,
+    ) -> Cited {
+        // **Step 1, before anything is asked.** Each of these is a citation
+        // that cannot resolve however many exchanges are consulted, so
+        // consulting one is a request nobody needed to make.
+        if depth > QUOTE_DEPTH {
+            return Cited::TooDeep;
+        }
         if serial == 0 {
-            return Cited::Unresolved;
+            return Cited::Circular;
+        }
+        if let Some((who, at)) = citer
+            && who == account
+            && serial >= at
+        {
+            return Cited::Circular;
         }
         // **Step 2: find the feed.** A feed lives at its account's home
         // (SIP-88 §Where a feed lives) and that is not necessarily here. Read
@@ -508,6 +629,22 @@ impl Chat {
             Err(_) => return Cited::Unresolved,
         };
         if !page.found {
+            // **Before calling it absent, ask whether the account moved on.**
+            // SIP-89: *the account has succeeded* -> resolve at the successor,
+            // and MUST NOT treat the old posts as forged. A succeeded account
+            // answers `found: 0` here, which is indistinguishable from an
+            // account nobody ever heard of unless this is asked.
+            if let Some(next) = self.successor_of(account).await {
+                // One hop, and the depth budget pays for it: a chain of
+                // successions must not become a chain of requests any more
+                // than a chain of quotes may.
+                let found =
+                    Box::pin(self.resolve_quote_from(&next, serial, citer, depth + 1)).await;
+                return Cited::Succeeded {
+                    successor: next,
+                    found: Box::new(found),
+                };
+            }
             return Cited::NoFeed;
         }
         if serial < page.oldest {
@@ -525,7 +662,97 @@ impl Chat {
         if stored.post.withdrawn() {
             return self.who_took_it_off(account, serial, page.newest).await;
         }
-        Cited::Got(Box::new(stored))
+        // **Step 4's second half, which nothing performed.** The signature
+        // holding proves a key signed; binding that key to the account is a
+        // SIP-20 credential, and SIP-89 §Reference implementation recorded
+        // this as the gap behind a `verified_author` that was never written.
+        match self.bound_to(account, &stored.post.device).await {
+            Bound::Yes => Cited::Got(Box::new(stored)),
+            Bound::Unprovable => Cited::Unverifiable,
+            Bound::No => Cited::Forged,
+        }
+    }
+
+    /// Whether `device` is bound to `account` by a credential this reader can
+    /// check, or was and has been withdrawn.
+    ///
+    /// **An account signing its own post needs no credential.** A credential
+    /// delegates, and there is nothing to delegate when the signer *is* the
+    /// account; requiring one would make an account with no linked devices
+    /// unable to publish anything a reader would show.
+    ///
+    /// Everything else is checked under `account` and never on the
+    /// exchange's word: the device list carries each registration's
+    /// credential precisely so this can be done by whoever holds the account
+    /// key, which is everybody.
+    async fn bound_to(&mut self, account: &PubKey, device: &PubKey) -> Bound {
+        if device == account {
+            return Bound::Yes;
+        }
+        // **The list first, and the revocations only if it does not answer.**
+        // A revocation deletes the device row, so the two questions never
+        // both land: a device that is listed was not revoked. Asking in this
+        // order costs one round trip for the ordinary case -- a post from a
+        // device the account still holds -- where asking the other way round
+        // cost two for every citation of every linked device.
+        let Ok(listed) = self.devices_listed(account).await else {
+            // Nothing could be asked. Not evidence against the post, so not
+            // `No` -- which would say forged about a post whose standing this
+            // reader simply could not look up.
+            return Bound::Unprovable;
+        };
+        let Some(row) = listed.devices.iter().find(|d| &d.device == device) else {
+            // Absent from the list, which is where *revoked since* and
+            // *never registered* become one observation. SIP-89: reporting
+            // the first as the second is what this must not do.
+            if let Ok(gone) = self.revoked_by(account).await
+                && gone.iter().any(|r| &r.device == device)
+            {
+                return Bound::Unprovable;
+            }
+            // Listed nowhere and revoked nowhere. The account does not claim
+            // it, and this reader asked both questions and got both answers,
+            // which is the one route to `No`.
+            return Bound::No;
+        };
+        // A registration awaiting renewal (SIP-22): a mapping with no
+        // artifact behind it. The exchange's word, which is not nothing and
+        // is not a proof.
+        let Some(c) = &row.credential else {
+            return Bound::Unprovable;
+        };
+        if c.delegate == *device
+            && c.account == *account
+            && c.verify(account, sqex_proto::credential::SCOPE_CHAT, listed.now)
+                .is_ok()
+        {
+            Bound::Yes
+        } else {
+            Bound::No
+        }
+    }
+
+    /// Who holds this account now, if it was succeeded and the proof holds.
+    ///
+    /// **The proof is checked here and the exchange is not believed.** SIP-44
+    /// keeps the proof as it was presented so that anybody may check it, and
+    /// a successor taken on an exchange's word would be an exchange able to
+    /// redirect a citation at a key of its choosing — which is exactly what
+    /// SIP-89 §Resolving one means by "the reader never trusts the exchange
+    /// that served it".
+    ///
+    /// `None` where there is no succession, where the route is absent, or
+    /// where the proof does not hold. The last of those is deliberately not
+    /// distinguished: a bad proof is not a successor, and a reader shown
+    /// `NoFeed` for it has been told something true.
+    async fn successor_of(&mut self, account: &PubKey) -> Option<PubKey> {
+        let got = self.succession_of(account).await.ok().flatten()?;
+        // Both halves: that the proof proves *this* successor, and that it is
+        // about the account asked after. `proves` checks only the first --
+        // an exchange could otherwise answer with somebody else's perfectly
+        // valid succession and redirect the citation at their feed.
+        (got.proof.account() == *account && got.proof.proves(&got.successor))
+            .then_some(got.successor)
     }
 
     /// Which of SIP-88 §Withdrawal's two tombstones this is.

@@ -46,6 +46,18 @@ pub const REVOCATION_CONTEXT: &[u8] = b"sqnr-revoke-v1";
 
 /// Bytes of a revocation.
 pub const REVOCATION_LEN: usize = 32 + 32 + 8 + 64;
+/// How far ahead of the verifier an account's clock may be on a revocation.
+///
+/// A withdrawal that its author's fast clock made unacceptable would be a
+/// recovery that failed at the moment it was needed. There is deliberately no
+/// bound in the other direction: a revocation that lapsed would re-admit the
+/// key it withdrew.
+///
+/// **Here rather than in the exchange**, because a reader checking a
+/// revocation for SIP-89 and an exchange accepting one have to reach the same
+/// verdict on the same artifact. Two copies of this number would be two
+/// answers to one question, and the disagreement would be silent.
+pub const REVOCATION_SKEW: u64 = 5 * 60;
 
 /// The scope this stack's chat services check for.
 pub const SCOPE_CHAT: &str = "sqex-chat";
