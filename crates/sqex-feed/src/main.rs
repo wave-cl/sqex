@@ -180,6 +180,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let client = Client::connect_as(addr, server.as_bytes(), &seed)
         .await
         .map_err(|e| e.to_string())?;
+    let mine = Mine { seed, device: me };
     let mut chat = Chat::new(client, seed, me, server, store);
     // So a handle naming this exchange is resolved here and one naming another
     // is located, rather than both being asked of whoever answered.
@@ -202,7 +203,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 println!("nothing to read there");
                 return Ok(());
             }
-            show(&mut chat, &page).await;
+            show(&mut chat, &mine, &page).await;
         }
         Command::Follow { who } => {
             let account = whose(&mut chat, &who).await?;
@@ -214,7 +215,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             chat.unfollow(&account).map_err(|e| e.to_string())?;
             println!("no longer following {account}");
         }
-        Command::Timeline { mark } => timeline(&mut chat, mark).await?,
+        Command::Timeline { mark } => timeline(&mut chat, &mine, mark).await?,
         Command::Withdraw { serial } => {
             chat.withdraw(serial).await.map_err(|e| e.to_string())?;
             println!(
@@ -309,7 +310,7 @@ async fn publish(
     Ok(())
 }
 
-async fn timeline(chat: &mut Chat, mark: bool) -> Result<(), String> {
+async fn timeline(chat: &mut Chat, mine: &Mine, mark: bool) -> Result<(), String> {
     let caught = chat.feeds_since().await.map_err(|e| e.to_string())?;
     // Said first, and plainly. A feed whose home could not be asked is not a
     // feed that said nothing, and a reader not told the difference has a
@@ -346,7 +347,7 @@ async fn timeline(chat: &mut Chat, mark: bool) -> Result<(), String> {
             }
         };
         println!("— {} ({} new) —", s.account, s.behind());
-        show(chat, &page).await;
+        show(chat, mine, &page).await;
         if mark {
             // What was shown, not what was reported as the head: a page is
             // capped and marking past it would skip the remainder silently.
@@ -355,6 +356,15 @@ async fn timeline(chat: &mut Chat, mark: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What a second connection needs: the seed to dial with and the device key to
+/// present. Carried rather than taken from the `Chat` in hand, whose `device`
+/// is deliberately private.
+#[derive(Clone, Copy)]
+struct Mine {
+    seed: [u8; 32],
+    device: PubKey,
 }
 
 /// One line for a feed's retention policy, printed by `head` and by `policy`
@@ -378,7 +388,7 @@ fn highest(page: &Page) -> u64 {
 /// serial, and what is shown is what came back and verified. Where it will not
 /// resolve, that is said rather than guessed at — SIP-89 is explicit that a
 /// citation rendered before verification is a smear primitive.
-async fn show(chat: &mut Chat, page: &Page) {
+async fn show(chat: &mut Chat, mine: &Mine, page: &Page) {
     let mut posts: Vec<_> = page.posts.iter().collect();
     posts.sort_by_key(|s| s.post.serial);
     for s in posts {
@@ -401,13 +411,32 @@ async fn show(chat: &mut Chat, page: &Page) {
             shown.body_text().unwrap_or("")
         );
         if let Some((who, serial)) = shown.quoted() {
-            println!("          > {}", cited(chat, who, serial).await);
+            println!("          > {}", cited(chat, mine, who, serial).await);
         }
     }
 }
 
-async fn cited(chat: &mut Chat, who: PubKey, serial: u64) -> String {
-    match chat.resolve_quote(&who, serial).await {
+async fn cited(chat: &mut Chat, mine: &Mine, who: PubKey, serial: u64) -> String {
+    let mut found = chat.resolve_quote(&who, serial).await;
+    // **SIP-89 §Resolving one, step 2.** A feed lives at its account's home,
+    // and a citation may well name somebody at another exchange. The library
+    // finds the home and stops there, because resolving it needs a connection
+    // it does not have and this binary is where name resolution lives; so the
+    // walk is finished here rather than reported as a failure.
+    //
+    // One hop, deliberately: the second exchange is that account's home and
+    // answers for its own feed, so an `Elsewhere` from *there* would be a
+    // disagreement between two exchanges about where somebody lives and not a
+    // chain to follow.
+    if let Cited::Elsewhere { home, domain } = &found {
+        match resolve_there(mine, home, domain, &who, serial).await {
+            Ok(there) => found = there,
+            Err(e) => {
+                return format!("{who} {serial}: at {domain}, which could not be asked ({e})");
+            }
+        }
+    }
+    match found {
         Cited::Got(q) => match Body::decode(&q.post.body) {
             Ok(Some(Body::Post(orig))) => {
                 format!("{who} {serial}: {}", orig.body_text().unwrap_or(""))
@@ -418,8 +447,54 @@ async fn cited(chat: &mut Chat, who: PubKey, serial: u64) -> String {
         Cited::Evicted => format!("{who} {serial}: no longer held"),
         Cited::NoFeed => format!("{who}: nothing to read there"),
         Cited::Forged => format!("{who} {serial}: did not verify — not shown"),
+        // Reached only when the home was named with no domain to dial, or
+        // when the hop above came back saying the same thing again.
+        Cited::Elsewhere { domain, .. } if domain.is_empty() => {
+            format!("{who} {serial}: lives at an exchange this one named by key alone")
+        }
+        Cited::Elsewhere { domain, .. } => {
+            format!("{who} {serial}: at {domain}, which disagrees about where it lives")
+        }
         Cited::Unresolved => format!("{who} {serial}: could not be reached"),
     }
+}
+
+/// Resolve a citation at the exchange that is the account's home.
+///
+/// A throwaway connection with an **in-memory** store: this reads one post
+/// under a key it already holds, writes nothing, and must not file a row about
+/// another exchange in the store belonging to this one.
+async fn resolve_there(
+    mine: &Mine,
+    home: &PubKey,
+    domain: &str,
+    who: &PubKey,
+    serial: u64,
+) -> Result<Cited, String> {
+    if domain.is_empty() {
+        return Err("no name to dial".into());
+    }
+    let found = sqex_discovery::discover(domain)
+        .await
+        .map_err(|e| e.to_string())?;
+    // The key this exchange named for that home must be the key that answers
+    // there. Without this, an exchange could point a citation at a host it
+    // chose and the signature check would be the only thing standing in the
+    // way -- which is enough for a post, and not enough for everything else a
+    // connection then does.
+    if found.key != *home {
+        return Err(format!(
+            "{domain} answers for {}, not the {home} it was named as",
+            found.key
+        ));
+    }
+    let addr = sqex_discovery::resolve_addr(&found.address)?;
+    let client = Client::connect_as(addr, home.as_bytes(), &mine.seed)
+        .await
+        .map_err(|e| e.to_string())?;
+    let store = Store::open(&mine.seed, None).map_err(|e| e.to_string())?;
+    let mut there = Chat::new(client, mine.seed, mine.device, *home, store);
+    Ok(there.resolve_quote(who, serial).await)
 }
 
 /// A base58 account key, if that is what this is. `None` for anything else,

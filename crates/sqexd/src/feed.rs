@@ -516,6 +516,19 @@ impl Feeds {
 
     /// Where a feed has got to, for one row of a `/feed/since`. `None` where
     /// the caller is told nothing about it.
+    /// Whether this exchange holds a feed for `account` at all.
+    ///
+    /// Not a read of the feed and not subject to blocking: the question is
+    /// "does this account exist here", which `/account/home` needs to answer
+    /// so that SIP-88 §Where a feed lives is true. Before this, an account
+    /// that had only ever published a feed was unknown to `/account/home`,
+    /// so a SIP-89 citation of it could not be resolved even on the exchange
+    /// that was serving the feed.
+    pub fn has_feed(&self, account: &PubKey) -> bool {
+        let db = self.db.lock().unwrap();
+        Self::head_row(&db, account).is_some()
+    }
+
     pub fn moved(
         &self,
         caller: &PubKey,

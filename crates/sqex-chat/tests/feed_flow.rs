@@ -330,3 +330,165 @@ async fn the_follow_list_survives_a_lost_device() {
     want.sort();
     assert_eq!(got, want, "the cursors did not come back with the list");
 }
+
+// ---------------------------------------------------------------------------
+// SIP-89 §Resolving one, step 2: a feed lives at its account's home, which is
+// not necessarily the exchange the reader is talking to.
+// ---------------------------------------------------------------------------
+
+/// An exchange that can be told where to find another by name, so a move can
+/// be made without DNS. Shaped as `moving_flow.rs`'s, which is where a
+/// two-exchange test in this suite already lives.
+async fn exchange_in(dir: &Path, found: &[(&str, PubKey, SocketAddr)]) -> (SocketAddr, [u8; 32]) {
+    let key_path = dir.join("host_key");
+    if !key_path.exists() {
+        let (server_sk, _) = squic::generate_keypair();
+        std::fs::write(&key_path, hex::encode(server_sk.to_bytes())).unwrap();
+    }
+    let config_toml = format!(
+        "listen = \"127.0.0.1:0\"\nkey_file = {:?}\nstate_file = {:?}\nadmins = []\n\
+         welcome_channel = \"\"\nhome_secs = 1\n",
+        key_path.to_string_lossy(),
+        dir.join("sqex.state").to_string_lossy(),
+    );
+    let file: FileConfig = toml::from_str(&config_toml).unwrap();
+    let config = file.resolve().unwrap();
+    let (signing_key, _pub) =
+        squic::load_keypair(&std::fs::read_to_string(&config.key_file).unwrap()).unwrap();
+    let map = found
+        .iter()
+        .map(|(d, k, a)| ((*d).to_string(), (*k, *a)))
+        .collect();
+    let bound = sqexd::bind_with(config, None, signing_key, sqexd::relay::Find::Fixed(map))
+        .await
+        .unwrap();
+    let addr = bound.local_addr;
+    let server_pub = bound.public_key.to_bytes();
+    tokio::spawn(async move {
+        let _ = sqexd::serve(bound).await;
+    });
+    (addr, server_pub)
+}
+
+async fn chat_named(
+    addr: SocketAddr,
+    server_pub: [u8; 32],
+    domain: &str,
+    b: u8,
+    store_path: &Path,
+) -> Chat {
+    let mut chat = chat_at(addr, server_pub, b, store_path).await;
+    chat.set_domain(Some(domain.to_string()));
+    chat
+}
+
+/// A citation of somebody whose feed lives at another exchange resolves there.
+///
+/// Two exchanges. Alice is known at X and moves her home to B, so X records
+/// where she went; she publishes at B. Bob, at X, holds a citation of her
+/// post — and X cannot serve it.
+///
+/// **The control is the old behaviour.** Before this walk existed, reading
+/// first and asking never gave `Cited::Unresolved` here: X refuses a feed it
+/// has handed off, and a refusal became "could not be reached", which reads to
+/// a person as a post that may not exist. So the assertion is specifically
+/// that it is *not* `Unresolved`, and names B.
+#[tokio::test]
+async fn a_citation_of_a_feed_at_another_exchange_resolves_there() {
+    let x_dir = tempfile::tempdir().unwrap();
+    let b_dir = tempfile::tempdir().unwrap();
+    let (b_addr, b_pub) = exchange_in(b_dir.path(), &[]).await;
+    let b_key = PubKey::new(b_pub);
+    // X is told where b.test is, which is the part DNS does in production.
+    let (x_addr, x_pub) = exchange_in(x_dir.path(), &[("b.test", b_key, b_addr)]).await;
+
+    let alice_store = x_dir.path().join("alice.db");
+    let (_, alice_key) = identity(21);
+    {
+        let mut alice_at_x = chat_named(x_addr, x_pub, "x.test", 21, &alice_store).await;
+        alice_at_x
+            .move_home(b_addr, &b_key, "b.test", None)
+            .await
+            .unwrap();
+    }
+    let mut alice_at_b = chat_named(b_addr, b_pub, "b.test", 21, &alice_store).await;
+    alice_at_b.publish(&text("said at B")).await.unwrap();
+
+    // Bob is at X, where Alice no longer lives.
+    let mut bob = chat_named(x_addr, x_pub, "x.test", 22, &x_dir.path().join("bob.db")).await;
+    let found = bob.resolve_quote(&alice_key, 1).await;
+    assert!(
+        !matches!(found, Cited::Unresolved),
+        "the old behaviour: a feed whose home X knows, reported as unreachable"
+    );
+    match found {
+        Cited::Elsewhere { home, domain } => {
+            assert_eq!(home, b_key, "named the wrong exchange");
+            assert_eq!(domain, "b.test", "did not say how to reach it");
+        }
+        other => panic!("expected the home of the feed, got {other:?}"),
+    }
+
+    // The second hop, which is what a caller does with `Elsewhere`: the same
+    // reader, connected to B, resolves it.
+    let mut bob_at_b = chat_named(b_addr, b_pub, "b.test", 22, &b_dir.path().join("bob.db")).await;
+    match bob_at_b.resolve_quote(&alice_key, 1).await {
+        Cited::Got(stored) => assert_eq!(
+            said(&sqex_proto::feed::Page {
+                found: true,
+                oldest: 1,
+                newest: 1,
+                now: 0,
+                posts: vec![*stored],
+            }),
+            vec!["said at B".to_string()]
+        ),
+        other => panic!("at its own home the post should resolve, got {other:?}"),
+    }
+
+    // **The control for the hop.** A serial that feed does not have must not
+    // come back as `Got` just because the exchange was the right one.
+    assert!(
+        !matches!(bob_at_b.resolve_quote(&alice_key, 9).await, Cited::Got(_)),
+        "a serial the feed never had resolved to a post"
+    );
+}
+
+/// An account that has only ever published a feed is known to `/account/home`.
+///
+/// SIP-88 §Where a feed lives has a reader find a feed by asking that route,
+/// and until this was fixed the route did not count a feed as knowing
+/// somebody: an account with no device registered, no name claimed and no
+/// channel joined answered 404, so a citation of it could not be resolved
+/// even on the exchange serving its feed.
+#[tokio::test]
+async fn an_account_with_only_a_feed_is_known_to_the_home_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let (_, carol_key) = identity(23);
+
+    let mut asker = chat_at(addr, server_pub, 24, &dir.path().join("asker.db")).await;
+    // The control, first: before Carol publishes, nothing here knows her.
+    assert!(
+        asker.account_home(&carol_key).await.is_err(),
+        "an account with nothing here was reported as living here"
+    );
+
+    let mut carol = chat_at(addr, server_pub, 23, &dir.path().join("carol.db")).await;
+    carol.publish(&text("the only thing I have")).await.unwrap();
+
+    let homed = asker
+        .account_home(&carol_key)
+        .await
+        .expect("an account with a feed here is known here");
+    assert_eq!(
+        homed.home,
+        PubKey::new(server_pub),
+        "the feed is here, so this is where she lives"
+    );
+    // And so the citation resolves rather than falling to `NoFeed`.
+    assert!(matches!(
+        asker.resolve_quote(&carol_key, 1).await,
+        Cited::Got(_)
+    ));
+}

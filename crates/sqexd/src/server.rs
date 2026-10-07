@@ -3261,10 +3261,16 @@ async fn route(
                     .encode(),
                 ),
                 // Known here: the caller itself, which is connected here,
-                // or an account with devices, names or memberships here.
+                // or an account with devices, names, memberships or a feed
+                // here. The feed was the late addition, and it had to be: a
+                // feed is the one thing an account can have with nothing else
+                // beside it -- no device registered, no name claimed, no
+                // channel joined -- and SIP-88 §Where a feed lives has a
+                // reader find a feed by asking this very route.
                 None if account == Some(asked)
                     || server.devices.has_devices(&asked)
                     || server.channels.has_memberships(&asked)
+                    || server.feeds.has_feed(&asked)
                     || !server.names.names_for(&asked).is_empty() =>
                 {
                     (

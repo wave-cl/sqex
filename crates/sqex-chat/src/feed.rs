@@ -78,6 +78,23 @@ pub enum Cited {
     NoFeed,
     /// Fetched and the signature does not hold under the device it names.
     Forged,
+    /// **The feed lives at another exchange** (SIP-89 §Resolving one, step 2).
+    ///
+    /// Not a failure: the home was found and named, and the walk stops here
+    /// because resolving it needs a connection this `Chat` does not have. A
+    /// caller that can reach `domain` connects there and resolves it with a
+    /// `Chat` of its own; one that cannot shows the citation unresolved.
+    ///
+    /// This exists because the alternative was answering `Unresolved` for a
+    /// feed whose home is known, which is what this client used to do and
+    /// which reads to a person as "that post may not exist" rather than as
+    /// "it is somewhere I did not look".
+    Elsewhere {
+        home: PubKey,
+        /// How to reach that exchange. **May be empty**, when the exchange
+        /// answering knew a key and no name; there is then nothing to dial.
+        domain: String,
+    },
     /// Nothing could be asked: the home is unreachable, or unknown.
     Unresolved,
 }
@@ -346,6 +363,37 @@ impl Chat {
     pub async fn resolve_quote(&mut self, account: &PubKey, serial: u64) -> Cited {
         if serial == 0 {
             return Cited::Unresolved;
+        }
+        // **Step 2: find the feed.** A feed lives at its account's home
+        // (SIP-88 §Where a feed lives) and that is not necessarily here. Read
+        // first and ask afterwards and a feed homed elsewhere comes back as a
+        // `moved` refusal, which this client used to report as `Unresolved` --
+        // a feed whose home it had been told, described to the reader as a
+        // post that might not exist.
+        match self.account_home(account).await {
+            Ok(homed) if homed.home != self.exchange_key() => {
+                return Cited::Elsewhere {
+                    home: homed.home,
+                    domain: homed.domain,
+                };
+            }
+            // Known here, so read here.
+            Ok(_) => {}
+            // **A failed lookup falls through rather than failing.** This step
+            // can only ever improve an answer: an exchange that does not know
+            // where somebody lives answers 404, an exchange too old to carry
+            // the route answers the router's own, and `classify` folds both
+            // into one error -- so neither can be told from the other here.
+            // Reading locally then gives `NoFeed` for an account nobody knows,
+            // which is what §When it cannot be resolved asks for, and the
+            // right answer for an old exchange too.
+            //
+            // **Which also means cross-exchange resolution reaches only as far
+            // as the reader's own exchange knows.** A citation of somebody who
+            // never lived here is unresolvable, and SIP-89's table says to
+            // show that as a feed that could not be found rather than to guess
+            // an exchange.
+            Err(_) => {}
         }
         // Read the one post at `serial`: forward from the one below it.
         let page = match self.page_of(account, serial - 1, 1, DIR_FORWARD).await {
