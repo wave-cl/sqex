@@ -20,7 +20,7 @@ use sqex_proto::feed::{
     MAX_SINCE, Moved, Page, Post, Read, STATE_GONE, STATE_MOVED, STATE_RESET, STATE_TRUNCATED, Set,
     Since, Stored, Withdraw,
 };
-use sqex_proto::message::Body;
+use sqex_proto::message::{Body, Part};
 use sqnr_core::PubKey;
 
 use crate::client::{Chat, ChatError};
@@ -70,8 +70,19 @@ pub struct Caught {
 pub enum Cited {
     /// Fetched, and its signature holds.
     Got(Box<Stored>),
-    /// Its author withdrew it, or it passed its own timer.
+    /// Its author withdrew it, or it passed its own timer: a tombstone with
+    /// a SIP-19 `Redact` from that account standing behind it.
     Withdrawn,
+    /// **A tombstone with nothing behind it, which is the exchange's own
+    /// act.** SIP-88 §Withdrawal makes the pair a reader MUST be able to
+    /// tell apart, and SIP-32 is the reason: an exchange dropping a post
+    /// must not pass as an ordinary deletion by its author.
+    ///
+    /// A feed's corroboration is stronger than a channel's, which is what
+    /// makes the absence mean something: a channel's `Redact` may come from
+    /// an admin and may have been pruned, where a feed has exactly one
+    /// authorised party and prunes only from the oldest end.
+    Removed,
     /// The feed is there and this serial is below its oldest.
     Evicted,
     /// The feed is absent, withheld, or its owner has blocked this reader.
@@ -198,11 +209,82 @@ impl Chat {
     /// in a settings screen.
     pub async fn withdraw(&mut self, serial: u64) -> Result<()> {
         let account = self.me;
+
+        // **Read the body before it is gone**, because the attachments are
+        // in it and a tombstone has none. SIP-88 §Withdrawal: a client
+        // deleting a post "MUST detach any attachment (SIP-18)" — and the
+        // only record of which blobs those were is the body about to be
+        // removed.
+        let blobs = self.blobs_of_own_post(serial).await;
+
         let body = self
             .post("/feed/withdraw", Withdraw { account, serial }.encode())
             .await?;
         sqex_proto::channel::Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
+
+        // **The MUST, after the body is gone and not before.** Detaching
+        // first would leave a window where the post still serves and its
+        // picture does not, which is the one ordering that makes the feed
+        // inconsistent for a reader.
+        //
+        // Attached per account rather than per post (`feed_attachment` is
+        // keyed `(account, blob)`), so withdrawing one of two posts that
+        // carry the *same* bytes detaches it for both. That is the
+        // specification's own granularity, and the direction it chose: a
+        // body nobody can fetch is the point of a withdrawal, and a picture
+        // this account can upload again is the cheaper mistake.
+        for blob in &blobs {
+            // Reported but not fatal. The withdrawal has happened; failing
+            // the call here would tell a caller the post is still up.
+            let _ = self.detach_from_feed(blob).await;
+        }
+
+        // **The corroboration, which is what makes it the author's act.**
+        // SIP-88 §Withdrawal: a reader distinguishes *withdrawn* — a
+        // tombstone with a `Redact` from this account behind it — from
+        // *removed*, which is the exchange's own act and which SIP-32
+        // requires be visible as such. Without this every withdrawal this
+        // client made read as the exchange having dropped the post.
+        //
+        // Best effort, for the same reason as the detach: the body is
+        // already gone either way, and a caller told the withdrawal failed
+        // would go on showing a post that is no longer there.
+        let _ = self.publish(&Body::Redact { target: serial }).await;
         Ok(())
+    }
+
+    /// The blobs one of this account's own posts carries, if it can be read.
+    ///
+    /// Answers an empty list for anything it cannot determine — a post that
+    /// is already a tombstone, a body this version cannot parse, a read that
+    /// failed. Detaching nothing is the safe direction: it leaves bytes
+    /// served that should not be, which the next withdrawal of a post naming
+    /// them can still fix, where detaching a blob guessed at takes a picture
+    /// off a post nobody withdrew.
+    async fn blobs_of_own_post(&mut self, serial: u64) -> Vec<[u8; 32]> {
+        if serial == 0 {
+            return Vec::new();
+        }
+        let me = self.me;
+        let Ok(page) = self.page_of(&me, serial - 1, 1, DIR_FORWARD).await else {
+            return Vec::new();
+        };
+        let Some(stored) = page.posts.into_iter().find(|s| s.post.serial == serial) else {
+            return Vec::new();
+        };
+        let Ok(Some(body)) = Body::decode(&stored.post.body) else {
+            return Vec::new();
+        };
+        let Body::Post(post) = body else {
+            return Vec::new();
+        };
+        post.parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Attachment(a) => Some(a.blob),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Set this account's own feed's retention, size and listing, whole.
@@ -441,11 +523,60 @@ impl Chat {
             };
         };
         if stored.post.withdrawn() {
-            return Cited::Withdrawn;
+            return self.who_took_it_off(account, serial, page.newest).await;
         }
         Cited::Got(Box::new(stored))
     }
+
+    /// Which of SIP-88 §Withdrawal's two tombstones this is.
+    ///
+    /// **A `Redact` is published at a higher serial than the post it names**,
+    /// so the corroboration is looked for forward from the tombstone. The
+    /// walk is bounded by [`CORROBORATE`]: a feed may be very long, and a
+    /// reader resolving one citation must not read the whole of somebody's
+    /// output to do it.
+    ///
+    /// Past the bound it answers `Removed`, which **claims less**: the
+    /// exchange's act is the weaker statement — it says the author may not
+    /// have done this — where `Withdrawn` asserts they did. A reader misled
+    /// in that direction doubts something true; in the other, they are told
+    /// an author took down a post that an exchange took from them, which is
+    /// exactly what SIP-32 asks a client not to hide.
+    async fn who_took_it_off(&mut self, account: &PubKey, serial: u64, newest: u64) -> Cited {
+        let mut from = serial;
+        while from < newest {
+            let want = CORROBORATE.min((newest - from).min(u64::from(u16::MAX)) as u16);
+            let Ok(page) = self.page_of(account, from, want, DIR_FORWARD).await else {
+                return Cited::Removed;
+            };
+            let Some(last) = page.posts.last().map(|s| s.post.serial) else {
+                return Cited::Removed;
+            };
+            for s in &page.posts {
+                if let Ok(Some(Body::Redact { target })) = Body::decode(&s.post.body)
+                    && target == serial
+                {
+                    return Cited::Withdrawn;
+                }
+            }
+            if last <= from || last.saturating_sub(serial) >= u64::from(CORROBORATE) {
+                break;
+            }
+            from = last;
+        }
+        Cited::Removed
+    }
 }
+
+/// How far forward a reader looks for the `Redact` that corroborates a
+/// tombstone, in posts.
+///
+/// A client issues the two together (SIP-88 §Withdrawal), so in practice the
+/// corroboration is the very next post of that feed and this bound is never
+/// approached. It exists for the feed that published a hundred things between
+/// the withdrawal and the notice of it, and it is the reason the answer past
+/// the bound has to be the one that claims less.
+pub const CORROBORATE: u16 = 64;
 
 /// Whether a refusal was the exchange saying this serial is not the next one.
 fn stale(e: &ChatError) -> bool {

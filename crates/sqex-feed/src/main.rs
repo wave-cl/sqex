@@ -451,6 +451,10 @@ async fn cited(chat: &mut Chat, mine: &Mine, who: PubKey, serial: u64) -> String
             _ => format!("{who} {serial}: (nothing this version can show)"),
         },
         Cited::Withdrawn => format!("{who} {serial}: withdrawn by its author"),
+        // Said apart from the line above, which is the whole point of the
+        // pair: SIP-32 requires that an exchange dropping a post not read as
+        // its author deleting it.
+        Cited::Removed => format!("{who} {serial}: taken off by the exchange, not by its author"),
         Cited::Evicted => format!("{who} {serial}: no longer held"),
         Cited::NoFeed => format!("{who}: nothing to read there"),
         Cited::Forged => format!("{who} {serial}: did not verify — not shown"),

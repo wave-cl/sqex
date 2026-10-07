@@ -14,6 +14,7 @@ use ed25519_dalek::SigningKey;
 use sqex_chat::client::Chat;
 use sqex_chat::feed::Cited;
 use sqex_chat::store::Store;
+use sqex_proto::blob::Attachment;
 use sqex_proto::message::{Body, Part, Post as SipPost};
 use sqexd::config::FileConfig;
 use sqnr::Client;
@@ -56,6 +57,31 @@ async fn chat_at(addr: SocketAddr, server_pub: [u8; 32], b: u8, store_path: &Pat
     let client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
     let store = Store::open(&seed, Some(store_path)).unwrap();
     Chat::new(client, seed, me, PubKey::new(server_pub), store)
+}
+
+/// `/feed/withdraw` and nothing else — **what an exchange's own removal
+/// leaves behind**, and what `Chat::withdraw` used to leave behind before it
+/// published the corroborating `Redact`. Posted raw because the client's own
+/// withdrawal is now the corroborated one by construction, and a fixture for
+/// the uncorroborated case has to come from somewhere.
+async fn raw_withdraw(addr: SocketAddr, server_pub: [u8; 32], b: u8, serial: u64) {
+    let (seed, me) = identity(b);
+    let mut client = Client::connect_as(addr, &server_pub, &seed).await.unwrap();
+    let (code, body) = client
+        .post(
+            "/feed/withdraw",
+            sqex_proto::feed::Withdraw {
+                account: me,
+                serial,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code, 200,
+        "the fixture's own withdrawal was refused: {body:?}"
+    );
 }
 
 fn text(s: &str) -> Body {
@@ -222,6 +248,103 @@ async fn a_withdrawn_post_resolves_as_withdrawn_and_not_as_missing() {
         bob.resolve_quote(&alice_key, at.serial).await,
         Cited::Withdrawn
     );
+}
+
+/// **A tombstone with nothing behind it is the exchange's act, and says so.**
+///
+/// SIP-88 §Withdrawal gives a reader three states and this is the pair that
+/// matters: *withdrawn* is a tombstone with a `Redact` from that account
+/// behind it, *removed* is one with nothing, "which is the exchange's own
+/// act, and SIP-32 requires a reader be able to see that rather than have it
+/// pass as an ordinary deletion".
+///
+/// The exchange's own act is what `/feed/withdraw` performs with no `Redact`
+/// after it — which is what this client did for every withdrawal until the
+/// corroboration was published, so every one of them read as the exchange
+/// having taken the post.
+#[tokio::test]
+async fn a_tombstone_with_nothing_behind_it_is_not_the_authors_act() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 21, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 22, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(21);
+
+    let at = alice.publish(&text("taken by somebody")).await.unwrap();
+
+    // The exchange's act: the body goes and no `Redact` follows it. Posted
+    // through the raw route for exactly that reason — `withdraw` publishes
+    // the corroboration, and this is the case where there is none.
+    raw_withdraw(addr, server_pub, 21, at.serial).await;
+
+    assert_eq!(
+        bob.resolve_quote(&alice_key, at.serial).await,
+        Cited::Removed,
+        "a tombstone nobody corroborated reads as the author's own deletion"
+    );
+
+    // The control, in the same feed and over the same serial: the author's
+    // own act, which is the corroborated one. Without this the assertion
+    // above would hold on a client that answered `Removed` for everything.
+    let second = alice.publish(&text("taken by me")).await.unwrap();
+    alice.withdraw(second.serial).await.unwrap();
+    assert_eq!(
+        bob.resolve_quote(&alice_key, second.serial).await,
+        Cited::Withdrawn,
+        "the author's own withdrawal reads as the exchange's act"
+    );
+}
+
+/// **Withdrawing detaches what the post carried.** SIP-88 §Withdrawal makes
+/// it a MUST, and it is the half that is actually about the bytes: a
+/// tombstone stops the exchange serving a body, and leaves the picture in
+/// that body fetchable by anybody holding the reference.
+#[tokio::test]
+async fn withdrawing_a_post_takes_its_attachment_down_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, server_pub) = server_in(dir.path()).await;
+    let mut alice = chat_at(addr, server_pub, 23, &dir.path().join("a.db")).await;
+    let mut bob = chat_at(addr, server_pub, 24, &dir.path().join("b.db")).await;
+    let (_, alice_key) = identity(23);
+
+    let bytes = vec![7u8; 4096];
+    let prepared = sqex_chat::attach::Prepared::from_bytes("p.bin", &bytes, 1024).expect("prepare");
+    let attachment = alice
+        .upload_to_feed(&prepared, 0, &|_, _| {})
+        .await
+        .expect("upload");
+    let blob = attachment.blob;
+    let at = alice
+        .publish(&Body::Post(SipPost {
+            parts: vec![Part::Attachment(attachment)],
+            unknown: 0,
+        }))
+        .await
+        .unwrap();
+
+    // The control: it is fetchable while the post stands. Without this, a
+    // fetch that fails after the withdrawal proves nothing — it may never
+    // have worked.
+    let carried = Attachment {
+        blob,
+        ..prepared.attachment.clone()
+    };
+    assert!(
+        bob.download(&carried).await.is_ok(),
+        "the control failed: the attachment was not there to take down"
+    );
+
+    alice.withdraw(at.serial).await.unwrap();
+
+    // **A reader who never fetched it**, because `download` keeps what it
+    // fetched: asking bob again would be asking his own disc, which would
+    // answer the bytes however the exchange had been left.
+    let mut carol = chat_at(addr, server_pub, 25, &dir.path().join("c.db")).await;
+    assert!(
+        carol.download(&carried).await.is_err(),
+        "the body is gone and its attachment is still served"
+    );
+    let _ = alice_key;
 }
 
 #[tokio::test]

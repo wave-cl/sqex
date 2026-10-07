@@ -180,12 +180,7 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     // exchange needs an account to apply SIP-56 and blocking against, which
     // bounds cost and not access — and nobody is in the listing who did not
     // ask to be.
-    (
-        "POST",
-        "/feed/listed",
-        Chat("Chat::listed_feeds"),
-        Identity,
-    ),
+    ("POST", "/feed/listed", Chat("Chat::listed_feeds"), Identity),
     (
         "POST",
         "/device/register",
