@@ -85,6 +85,10 @@ pub const PART_VIA: u8 = 0x06;
 /// SIP-53 §Posting again: when the poster first said this -- a post sent again after the
 /// entry that carried it was stranded by a move (SIP-53).
 pub const PART_SAID: u8 = 0x07;
+/// SIP-89: a post in somebody's SIP-88 feed, named by that account and the
+/// serial. The poster's own word about what they are quoting, and nothing a
+/// reader may render before it has resolved and verified it.
+pub const PART_QUOTE: u8 = 0x08;
 
 pub const REACT_ADD: u8 = 0x01;
 pub const REACT_REMOVE: u8 = 0x02;
@@ -159,6 +163,16 @@ pub enum Part {
     /// own word; a reader shows the message at this time, marked, and the
     /// entry's `posted` still orders the log.
     Said(u64),
+    /// SIP-89: a post in a SIP-88 feed -- the account whose feed it is, and
+    /// the serial in it. Forty bytes and no copy of what they name: the
+    /// account key is both the locator and the verifying key, so a reader
+    /// fetches the post and checks it under a key it already holds, and a
+    /// citer who lies produces a citation that will not resolve rather than
+    /// a false attribution. **A reader concludes nothing from it until it
+    /// has.** It carries no author name on purpose -- a name here would be a
+    /// claim rendered before anything could be checked, which is the same
+    /// objection `Mention` answers.
+    Quote(PubKey, u64),
 }
 
 /// A message, an edit to one, a reaction, a redaction, or channel metadata.
@@ -248,6 +262,7 @@ impl Post {
         let mut mentions = 0usize;
         let mut via = 0usize;
         let mut said = 0usize;
+        let mut quote = 0usize;
         for p in &self.parts {
             match p {
                 Part::Text(_) => text += 1,
@@ -257,6 +272,7 @@ impl Post {
                 Part::Mention(_) => mentions += 1,
                 Part::Via(_) => via += 1,
                 Part::Said(_) => said += 1,
+                Part::Quote(_, _) => quote += 1,
             }
         }
         // The "at most one" kinds are the ones whose excess has no sensible
@@ -266,6 +282,9 @@ impl Post {
         cap(reply, 1, "reply parts")?;
         cap(via, 1, "via parts")?;
         cap(said, 1, "said parts")?;
+        // A second citation changes what the post is *about*, and a post
+        // about two things is two posts.
+        cap(quote, 1, "quote parts")?;
         cap(attachments, MAX_ATTACHMENTS, "attachments")?;
         cap(links, MAX_LINKS, "link previews")?;
         cap(mentions, MAX_MENTIONS, "mentions")?;
@@ -300,6 +319,16 @@ impl Post {
     pub fn said(&self) -> Option<u64> {
         self.parts.iter().find_map(|p| match p {
             Part::Said(at) => Some(*at),
+            _ => None,
+        })
+    }
+
+    /// SIP-89: the feed post this quotes, if any -- the account whose feed
+    /// it is and the serial in it. **Unresolved and unverified**: a reader
+    /// must fetch the post and check it before showing anything of it.
+    pub fn quoted(&self) -> Option<(PubKey, u64)> {
+        self.parts.iter().find_map(|p| match p {
+            Part::Quote(who, serial) => Some((*who, *serial)),
             _ => None,
         })
     }
@@ -344,6 +373,12 @@ fn write_part(part: &Part, out: &mut Vec<u8>) {
         Part::Mention(m) => (PART_MENTION, m.as_bytes().to_vec()),
         Part::Via(v) => (PART_VIA, v.as_bytes().to_vec()),
         Part::Said(at) => (PART_SAID, at.to_be_bytes().to_vec()),
+        Part::Quote(who, serial) => {
+            let mut b = Vec::with_capacity(40);
+            b.extend_from_slice(who.as_bytes());
+            b.extend_from_slice(&serial.to_be_bytes());
+            (PART_QUOTE, b)
+        }
         Part::Link(l) => {
             let mut b = Vec::new();
             b.extend_from_slice(&(l.url.len() as u16).to_be_bytes());
@@ -450,6 +485,18 @@ fn read_part(kind: u8, b: &[u8]) -> Result<Option<Part>> {
                 description,
                 image,
             })))
+        }
+        PART_QUOTE => {
+            if b.len() != 40 {
+                return Err(Error::Malformed(format!(
+                    "quote is {} bytes, want 40",
+                    b.len()
+                )));
+            }
+            Ok(Some(Part::Quote(
+                PubKey::new(b[0..32].try_into().unwrap()),
+                u64::from_be_bytes(b[32..40].try_into().unwrap()),
+            )))
         }
         _ => Ok(None),
     }
@@ -923,6 +970,47 @@ mod tests {
         }
         post.parts.push(Part::Said(5));
         assert!(post.validate().is_err(), "two said parts were allowed");
+    }
+
+    /// SIP-89: a citation round trips, is at most one, and carries exactly
+    /// forty bytes.
+    #[test]
+    fn a_quote_part_round_trips_and_is_at_most_one() {
+        let mut post = Post::text("worth reading");
+        post.parts.push(Part::Quote(key(9), 42));
+        let body = Body::Post(post.clone());
+        let back = Body::decode(&body.encode()).unwrap().unwrap();
+        assert_eq!(back, body);
+        match back {
+            Body::Post(p) => assert_eq!(p.quoted(), Some((key(9), 42))),
+            _ => panic!("not a post"),
+        }
+        post.parts.push(Part::Quote(key(8), 1));
+        assert!(post.validate().is_err(), "two quote parts were allowed");
+    }
+
+    /// A quote of the wrong width is corruption, not a part from a later
+    /// version: `len` says forty and forty is what it must be.
+    #[test]
+    fn a_quote_of_the_wrong_length_is_an_error() {
+        let mut out = vec![TYPE_POST, 1];
+        out.push(PART_QUOTE);
+        out.extend_from_slice(&39u32.to_be_bytes());
+        out.extend_from_slice(&[7u8; 39]);
+        assert!(Body::decode(&out).is_err(), "a short quote was accepted");
+    }
+
+    /// A bare re-post is a post with a citation and no words, and it is not
+    /// an empty post: SIP-89 wants it shown as what travelled.
+    #[test]
+    fn a_bare_repost_is_a_post_with_only_a_citation() {
+        let post = Post {
+            parts: vec![Part::Quote(key(9), 7)],
+            unknown: 0,
+        };
+        assert!(post.validate().is_ok());
+        assert_eq!(post.body_text(), None, "a re-post carries no words");
+        assert_eq!(post.quoted(), Some((key(9), 7)));
     }
 
     #[test]

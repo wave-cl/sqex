@@ -25,6 +25,7 @@ pub mod direct;
 pub mod entry_sig;
 pub mod events;
 pub mod exchange;
+pub mod feed;
 pub mod h3;
 pub mod handles;
 pub mod home;
