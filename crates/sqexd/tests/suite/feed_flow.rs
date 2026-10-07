@@ -429,6 +429,7 @@ async fn a_feeds_policy_is_set_whole_and_bounded() {
         .post(
             "/feed/set",
             Set {
+                listed: false,
                 retention_secs: 86_400,
                 max_posts: 50,
             }
@@ -446,6 +447,7 @@ async fn a_feeds_policy_is_set_whole_and_bounded() {
         .post(
             "/feed/set",
             Set {
+                listed: false,
                 retention_secs: 1,
                 max_posts: 50,
             }
@@ -484,4 +486,105 @@ async fn a_feed_with_no_identity_is_refused() {
         .unwrap();
     assert_eq!(code, 403, "{}", common::said(&body));
     assert_eq!(code_of(&body), Code::NoIdentity);
+}
+
+/// **A directory holds only the accounts that asked to be in it.**
+///
+/// SIP-88 refused a feed directory in one sentence: "one feed per account,
+/// listed with a last-activity time and mirrored to every peer every sixty
+/// seconds, is a timestamped census of every active account." SIP-90 keeps
+/// the shape and removes three of those four clauses, of which this is the
+/// load-bearing one — an account that did not ask is absent, so the listing
+/// is a record of volunteers rather than a census.
+#[tokio::test]
+async fn a_feed_directory_holds_only_those_who_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, pubkey, _h) = server_in(dir.path()).await;
+    let (mut listed, listed_key, lseed) = peer(addr, pubkey, 61).await;
+    let (mut quiet, quiet_key, qseed) = peer(addr, pubkey, 62).await;
+    let (mut reader, _, _) = peer(addr, pubkey, 63).await;
+
+    // Both publish, so both have feeds. Only one asks to be found.
+    let (code, _) = Pen::new(listed_key, lseed)
+        .append(&mut listed, b"something")
+        .await;
+    assert_eq!(code, 200);
+    let (code, _) = Pen::new(quiet_key, qseed)
+        .append(&mut quiet, b"something")
+        .await;
+    assert_eq!(code, 200);
+    let (code, _) = listed
+        .post(
+            "/feed/set",
+            sqex_proto::feed::Set {
+                retention_secs: sqex_proto::feed::MIN_RETENTION,
+                max_posts: 100,
+                listed: true,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+
+    let (code, body) = reader
+        .post(
+            "/feed/listed",
+            sqex_proto::feed::Listed {
+                since: 0,
+                limit: 64,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200, "{}", common::said(&body));
+    let listing = sqex_proto::feed::Listing::decode(&body).unwrap();
+    let keys: Vec<PubKey> = listing.rows.iter().map(|r| r.account).collect();
+    assert!(
+        keys.contains(&listed_key),
+        "an account that asked to be listed is not in the directory: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&quiet_key),
+        "an account that published and never asked is in the directory, which \
+         makes it the census SIP-88 refused"
+    );
+    assert!(
+        listing.rows.iter().all(|r| r.listed_at > 0),
+        "a row carries no moment at all"
+    );
+
+    // And it can be taken back, which is what makes it a choice.
+    let (code, _) = listed
+        .post(
+            "/feed/set",
+            sqex_proto::feed::Set {
+                retention_secs: sqex_proto::feed::MIN_RETENTION,
+                max_posts: 100,
+                listed: false,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(code, 200);
+    let (_, body) = reader
+        .post(
+            "/feed/listed",
+            sqex_proto::feed::Listed {
+                since: 0,
+                limit: 64,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        sqex_proto::feed::Listing::decode(&body)
+            .unwrap()
+            .rows
+            .is_empty(),
+        "an account that asked to be taken off the directory is still in it"
+    );
 }

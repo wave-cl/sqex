@@ -89,6 +89,18 @@ pub const PART_SAID: u8 = 0x07;
 /// serial. The poster's own word about what they are quoting, and nothing a
 /// reader may render before it has resolved and verified it.
 pub const PART_QUOTE: u8 = 0x08;
+/// SIP-90: how the citer regards what they cite.
+///
+/// A **regard** is a `Quote` and a `Regard` in one post with no `Text`: the
+/// quote names what is regarded and this says how. It is the form a reaction
+/// takes in a system where nothing comes in — it lands in the reactor's own
+/// feed, which is the only log they may append to, and so it is signed,
+/// attributable and verifiable like anything else they publish.
+///
+/// **What is lost is the total.** No party can enumerate the feeds holding
+/// one, so no count is possible and SIP-89 §Counting forbids showing a
+/// sample as one. What is gained is that every regard has a name on it.
+pub const PART_REGARD: u8 = 0x09;
 
 pub const REACT_ADD: u8 = 0x01;
 pub const REACT_REMOVE: u8 = 0x02;
@@ -173,6 +185,12 @@ pub enum Part {
     /// claim rendered before anything could be checked, which is the same
     /// objection `Mention` answers.
     Quote(PubKey, u64),
+    /// SIP-90: an emoji saying how the poster regards what their `Quote`
+    /// names. One grapheme, at most [`MAX_EMOJI`] bytes.
+    ///
+    /// A `Regard` with no `Quote` is malformed: a regard with no subject is
+    /// a mood.
+    Regard(String),
 }
 
 /// A message, an edit to one, a reaction, a redaction, or channel metadata.
@@ -263,6 +281,7 @@ impl Post {
         let mut via = 0usize;
         let mut said = 0usize;
         let mut quote = 0usize;
+        let mut regard = 0usize;
         for p in &self.parts {
             match p {
                 Part::Text(_) => text += 1,
@@ -273,6 +292,7 @@ impl Post {
                 Part::Via(_) => via += 1,
                 Part::Said(_) => said += 1,
                 Part::Quote(_, _) => quote += 1,
+                Part::Regard(_) => regard += 1,
             }
         }
         // The "at most one" kinds are the ones whose excess has no sensible
@@ -285,6 +305,18 @@ impl Post {
         // A second citation changes what the post is *about*, and a post
         // about two things is two posts.
         cap(quote, 1, "quote parts")?;
+        // SIP-90. At most one for the reason a quote is: two regards of one
+        // post is two opinions, which is two posts.
+        cap(regard, 1, "regard parts")?;
+        // **A regard with no subject is a mood.** Malformed rather than
+        // ignored: the ignore rules cover a kind a reader has not heard of,
+        // and this is a kind it knows being used without the thing it is
+        // about.
+        if regard > 0 && quote == 0 {
+            return Err(Error::Malformed(
+                "a regard with no quote names nothing".into(),
+            ));
+        }
         cap(attachments, MAX_ATTACHMENTS, "attachments")?;
         cap(links, MAX_LINKS, "link previews")?;
         cap(mentions, MAX_MENTIONS, "mentions")?;
@@ -373,6 +405,7 @@ fn write_part(part: &Part, out: &mut Vec<u8>) {
         Part::Mention(m) => (PART_MENTION, m.as_bytes().to_vec()),
         Part::Via(v) => (PART_VIA, v.as_bytes().to_vec()),
         Part::Said(at) => (PART_SAID, at.to_be_bytes().to_vec()),
+        Part::Regard(emoji) => (PART_REGARD, emoji.as_bytes().to_vec()),
         Part::Quote(who, serial) => {
             let mut b = Vec::with_capacity(40);
             b.extend_from_slice(who.as_bytes());
@@ -485,6 +518,17 @@ fn read_part(kind: u8, b: &[u8]) -> Result<Option<Part>> {
                 description,
                 image,
             })))
+        }
+        PART_REGARD => {
+            if b.is_empty() || b.len() > MAX_EMOJI {
+                return Err(Error::Malformed(format!(
+                    "regard is {} bytes, want 1..={MAX_EMOJI}",
+                    b.len()
+                )));
+            }
+            let emoji = std::str::from_utf8(b)
+                .map_err(|_| Error::Malformed("regard is not utf-8".into()))?;
+            Ok(Some(Part::Regard(emoji.to_string())))
         }
         PART_QUOTE => {
             if b.len() != 40 {
@@ -1332,5 +1376,73 @@ mod call_tests {
         assert!(!yields_to(&low, &high));
         // A device never yields to itself, which would leave nobody in the room.
         assert!(!yields_to(&low, &low));
+    }
+}
+
+#[cfg(test)]
+mod regard_tests {
+    use super::*;
+
+    fn key(b: u8) -> PubKey {
+        PubKey::new([b; 32])
+    }
+
+    /// A regard round trips, and is one part beside the quote it is about.
+    #[test]
+    fn a_regard_rides_with_the_quote_it_is_about() {
+        let post = Post {
+            parts: vec![Part::Quote(key(3), 7), Part::Regard("👍".into())],
+            unknown: 0,
+        };
+        post.validate().expect("a quote and a regard is a regard");
+        let body = Body::Post(post.clone());
+        let back = Body::decode(&body.encode()).unwrap().unwrap();
+        assert_eq!(back, body, "a regard did not survive the wire");
+    }
+
+    /// **A regard with no quote names nothing**, and is malformed rather
+    /// than ignored: the ignore rules are for a kind a reader has not heard
+    /// of, and this is a known kind used without its subject.
+    #[test]
+    fn a_regard_with_nothing_to_regard_is_refused() {
+        let post = Post {
+            parts: vec![Part::Regard("👍".into())],
+            unknown: 0,
+        };
+        assert!(
+            post.validate().is_err(),
+            "a regard with no quote was accepted, so a reader would be shown an \
+             opinion about nothing"
+        );
+    }
+
+    /// At most one, for the reason a quote is at most one: two regards of a
+    /// post is two opinions, which is two posts.
+    #[test]
+    fn a_post_regards_what_it_cites_once() {
+        let post = Post {
+            parts: vec![
+                Part::Quote(key(3), 7),
+                Part::Regard("👍".into()),
+                Part::Regard("👎".into()),
+            ],
+            unknown: 0,
+        };
+        assert!(post.validate().is_err(), "two regards on one post");
+    }
+
+    /// An over-long or non-UTF-8 regard is refused at the decoder, before
+    /// anything is allocated from it.
+    #[test]
+    fn a_regard_is_bounded_and_is_text() {
+        let long = Part::Regard("x".repeat(MAX_EMOJI + 1));
+        let post = Body::Post(Post {
+            parts: vec![Part::Quote(key(1), 1), long],
+            unknown: 0,
+        });
+        assert!(
+            Body::decode(&post.encode()).is_err(),
+            "a regard longer than an emoji was accepted"
+        );
     }
 }

@@ -62,10 +62,10 @@ use sqex_proto::device::{
 use sqex_proto::events::{Event as EventKind, MEMBER_JOINED, MEMBER_LEFT, MEMBER_REMOVED};
 use sqex_proto::feed::{
     Append as FeedAppend, Appended as FeedAppended, FROM_HERE as FEED_FROM_HERE, Head as FeedHead,
-    Moved as FeedMoved, Read as FeedRead, Row as FeedRow, STATE_GONE as FEED_STATE_GONE,
-    STATE_MOVED as FEED_STATE_MOVED, STATE_RESET as FEED_STATE_RESET,
-    STATE_TRUNCATED as FEED_STATE_TRUNCATED, Set as FeedSet, Since as FeedSince,
-    Withdraw as FeedWithdraw,
+    Listed as FeedListed, Moved as FeedMoved, Read as FeedRead, Row as FeedRow,
+    STATE_GONE as FEED_STATE_GONE, STATE_MOVED as FEED_STATE_MOVED,
+    STATE_RESET as FEED_STATE_RESET, STATE_TRUNCATED as FEED_STATE_TRUNCATED, Set as FeedSet,
+    Since as FeedSince, Withdraw as FeedWithdraw,
 };
 use sqex_proto::home::Moving;
 use sqex_proto::locate::{Locate, Located};
@@ -3658,6 +3658,25 @@ async fn route(
                 }
             }
         },
+        // SIP-90: who here asked to be findable. **Identified, like every
+        // other feed route**, so there is an account to apply SIP-56 and
+        // blocking against — which SIP-88 says bounds cost and not access,
+        // and an implementation MUST NOT present as access control.
+        ("POST", "/feed/listed") => match (account, FeedListed::decode(body)) {
+            (None, _) => no_identity("reading the feed directory"),
+            (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
+            (Some(me), Ok(req)) => {
+                let mut listing = server.feeds.listed(req.since, req.limit, now_unix());
+                // An account that has blocked this caller is absent from the
+                // listing, exactly as its feed answers `found: 0` — SIP-21
+                // forbids stating a block, so it is taken out rather than
+                // marked.
+                listing
+                    .rows
+                    .retain(|row| !server.profiles.has_blocked(&row.account, &me));
+                (200, "application/octet-stream", listing.encode())
+            }
+        },
         ("POST", "/feed/set") => match (account, FeedSet::decode(body)) {
             (None, _) => no_identity("setting a feed's policy"),
             (_, Err(e)) => refuse(400, Code::Malformed, Some(&e.to_string())),
@@ -3665,7 +3684,10 @@ async fn route(
                 if let Err(e) = server.limit(crate::limits::Kind::FeedSets, &me, [0; 32]) {
                     return refuse(e.status(), e.code(), e.detail().as_deref());
                 }
-                match server.feeds.set(&me, req.retention_secs, req.max_posts) {
+                match server
+                    .feeds
+                    .set(&me, req.retention_secs, req.max_posts, req.listed)
+                {
                     Ok(()) => (
                         200,
                         "application/octet-stream",

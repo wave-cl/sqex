@@ -115,6 +115,11 @@ enum Command {
         /// At most this many posts.
         #[arg(long)]
         max_posts: Option<u32>,
+        /// SIP-90: ask this exchange to list your feed in its directory, or
+        /// stop. **Nobody is listed without asking**, which is the whole of
+        /// what makes a directory not the census SIP-88 refused.
+        #[arg(long)]
+        listed: Option<bool>,
     },
 }
 
@@ -236,6 +241,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Policy {
             retention,
             max_posts,
+            listed,
         } => {
             if retention.is_none() && max_posts.is_none() {
                 return Err("say --retention, or --max-posts, or both".into());
@@ -245,14 +251,15 @@ async fn run(cli: Cli) -> Result<(), String> {
             // holds -- and from SIP-88's own defaults for a feed that does not
             // exist yet, which is not the same as zero: zero is refused.
             let held = chat.feed_head().await.map_err(|e| e.to_string())?;
-            let (was_retention, was_max) = if held.found {
-                (held.retention_secs, held.max_posts)
+            let (was_retention, was_max, was_listed) = if held.found {
+                (held.retention_secs, held.max_posts, held.listed)
             } else {
-                (feed::DEFAULT_RETENTION, feed::MAX_POSTS)
+                (feed::DEFAULT_RETENTION, feed::MAX_POSTS, false)
             };
             chat.set_feed(
                 retention.unwrap_or(was_retention),
                 max_posts.unwrap_or(was_max),
+                listed.unwrap_or(was_listed),
             )
             .await
             .map_err(|e| e.to_string())?;

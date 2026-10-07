@@ -29,8 +29,8 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sqex_proto::feed::{
-    DIR_BACKWARD, Headed, MAX_BODY, MAX_FEED_BYTES, MAX_PAGE, MAX_PAGE_BYTES, MAX_POSTS,
-    MAX_RETENTION, MIN_RETENTION, Page, Post, Read, Stored,
+    DIR_BACKWARD, Headed, ListedFeed, Listing, MAX_BODY, MAX_FEED_BYTES, MAX_LISTING, MAX_PAGE,
+    MAX_PAGE_BYTES, MAX_POSTS, MAX_RETENTION, MIN_RETENTION, Page, Post, Read, Stored,
 };
 use sqex_proto::refusal::Code;
 use sqnr_core::PubKey;
@@ -135,7 +135,14 @@ CREATE TABLE IF NOT EXISTS feed (
     posts      INTEGER NOT NULL,
     bytes      INTEGER NOT NULL,
     retention_secs INTEGER NOT NULL,
-    max_posts  INTEGER NOT NULL
+    max_posts  INTEGER NOT NULL,
+    -- SIP-90: this account asks to be findable in this exchange's directory.
+    -- Absent by default, because a directory nobody opted into is the
+    -- timestamped census SIP-88 refused.
+    listed     INTEGER NOT NULL DEFAULT 0,
+    -- When they asked. **Not when they last posted**, which is the field
+    -- SIP-88's census objection is actually about.
+    listed_at  INTEGER NOT NULL DEFAULT 0
 );
 -- The log. `post` is the signed artifact stored whole and served back
 -- verbatim, as SIP-32's profile record is: what a reader checks must be the
@@ -173,6 +180,7 @@ struct HeadRow {
     bytes: u64,
     retention_secs: u32,
     max_posts: u32,
+    listed: bool,
 }
 
 impl Feeds {
@@ -189,7 +197,8 @@ impl Feeds {
 
     fn head_row(db: &Connection, account: &PubKey) -> Option<HeadRow> {
         db.query_row(
-            "SELECT oldest, newest, head_input, posts, bytes, retention_secs, max_posts
+            "SELECT oldest, newest, head_input, posts, bytes, retention_secs, max_posts,
+                    listed
              FROM feed WHERE account = ?1",
             params![account.as_bytes()],
             |r| {
@@ -202,6 +211,7 @@ impl Feeds {
                     bytes: r.get::<_, i64>(4)? as u64,
                     retention_secs: r.get::<_, i64>(5)? as u32,
                     max_posts: r.get::<_, i64>(6)? as u32,
+                    listed: r.get::<_, i64>(7)? != 0,
                 })
             },
         )
@@ -441,6 +451,7 @@ impl Feeds {
             retention_secs: h.retention_secs,
             max_posts: h.max_posts,
             now,
+            listed: h.listed,
             // SIP-88 §Succession is not built; the field is on the wire so
             // that building it is not a wire change.
             seams: Vec::new(),
@@ -484,12 +495,40 @@ impl Feeds {
         Ok(())
     }
 
-    /// Set a feed's retention and size, whole. There is no partial update.
+    /// SIP-90: the accounts here that asked to be findable.
+    ///
+    /// **Only those that asked**, which is the whole of what separates this
+    /// from the census SIP-88 refused. Blocking is applied by the caller, as
+    /// it is for every other feed route: this says who is listed and the
+    /// route above it takes out whoever has blocked the asker.
+    pub fn listed(&self, since: u64, limit: u16, now: u64) -> Listing {
+        let db = self.db.lock().unwrap();
+        let limit = limit.clamp(1, MAX_LISTING);
+        let mut rows = Vec::new();
+        if let Ok(mut stmt) = db.prepare(
+            "SELECT account, listed_at FROM feed
+             WHERE listed = 1 AND listed_at > ?1
+             ORDER BY listed_at, account LIMIT ?2",
+        ) && let Ok(found) = stmt.query_map(params![since as i64, limit as i64], |r| {
+            let key: Vec<u8> = r.get(0)?;
+            Ok(ListedFeed {
+                account: PubKey::new(key.try_into().unwrap_or([0; 32])),
+                listed_at: r.get::<_, i64>(1)? as u64,
+            })
+        }) {
+            rows = found.flatten().collect();
+        }
+        Listing { now, rows }
+    }
+
+    /// Set a feed's retention, size and listing, whole. There is no partial
+    /// update — SIP-21's rule, which SIP-88 repeats for this record.
     pub fn set(
         &self,
         account: &PubKey,
         retention_secs: u32,
         max_posts: u32,
+        listed: bool,
     ) -> Result<(), FeedError> {
         if !(MIN_RETENTION..=MAX_RETENTION).contains(&retention_secs) {
             return Err(FeedError::BadRetention);
@@ -500,14 +539,21 @@ impl Feeds {
         let db = self.db.lock().unwrap();
         db.execute(
             "INSERT INTO feed (account, oldest, newest, head_input, posts, bytes,
-                               retention_secs, max_posts)
-             VALUES (?1, 0, 0, ?4, 0, 0, ?2, ?3)
-             ON CONFLICT (account) DO UPDATE SET retention_secs = ?2, max_posts = ?3",
+                               retention_secs, max_posts, listed, listed_at)
+             VALUES (?1, 0, 0, ?4, 0, 0, ?2, ?3, ?5, ?6)
+             ON CONFLICT (account) DO UPDATE SET
+                 retention_secs = ?2, max_posts = ?3, listed = ?5,
+                 -- The moment they *first* asked, so a policy change does
+                 -- not reshuffle a caller's paging under them.
+                 listed_at = CASE WHEN feed.listed = 1 AND ?5 = 1
+                                  THEN feed.listed_at ELSE ?6 END",
             params![
                 account.as_bytes(),
                 retention_secs as i64,
                 max_posts as i64,
-                &sqex_proto::entry_sig::GENESIS[..]
+                &sqex_proto::entry_sig::GENESIS[..],
+                i64::from(listed),
+                crate::state::now_unix() as i64
             ],
         )
         .map_err(storage("set a feed's policy"))?;
@@ -859,7 +905,7 @@ mod tests {
     fn past_the_cap_the_oldest_goes_and_oldest_follows_it() {
         let f = Feeds::open(None).unwrap();
         let me = key(1);
-        f.set(&me, MIN_RETENTION, 3).unwrap();
+        f.set(&me, MIN_RETENTION, 3, false).unwrap();
         fill(&f, 1, 5, 1_000);
         let page = f.read(&key(2), &asking(me, 0, 10, 0), 2_000, &nobody_blocked);
         assert_eq!(page.posts.len(), 3, "the cap did not bind");
@@ -884,7 +930,7 @@ mod tests {
             b"from the future".to_vec(),
         );
         f.append(&me, &p, 1_000).unwrap();
-        f.set(&me, MIN_RETENTION, MAX_POSTS).unwrap();
+        f.set(&me, MIN_RETENTION, MAX_POSTS, false).unwrap();
         assert_eq!(f.sweep(1_000 + MIN_RETENTION as u64 + 1), 1);
         assert!(
             f.read(&key(2), &asking(me, 0, 10, 0), 9_999_999, &nobody_blocked)
@@ -914,15 +960,15 @@ mod tests {
     #[test]
     fn a_retention_outside_the_bounds_is_refused() {
         let f = Feeds::open(None).unwrap();
-        assert_eq!(f.set(&key(1), 1, 10), Err(FeedError::BadRetention));
+        assert_eq!(f.set(&key(1), 1, 10, false), Err(FeedError::BadRetention));
         assert_eq!(
-            f.set(&key(1), MAX_RETENTION + 1, 10),
+            f.set(&key(1), MAX_RETENTION + 1, 10, false),
             Err(FeedError::BadRetention)
         );
         assert_eq!(
-            f.set(&key(1), MIN_RETENTION, 0),
+            f.set(&key(1), MIN_RETENTION, 0, false),
             Err(FeedError::BadRetention)
         );
-        assert!(f.set(&key(1), MIN_RETENTION, 10).is_ok());
+        assert!(f.set(&key(1), MIN_RETENTION, 10, false).is_ok());
     }
 }

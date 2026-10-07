@@ -27,6 +27,11 @@ pub const TYPE_WITHDRAW: u8 = 0x03;
 pub const TYPE_SINCE: u8 = 0x04;
 pub const TYPE_HEAD: u8 = 0x05;
 pub const TYPE_SET: u8 = 0x06;
+/// SIP-90: the accounts at this exchange that asked to be findable.
+pub const TYPE_LISTED: u8 = 0x07;
+
+/// SIP-90: rows one [`Listing`] may carry.
+pub const MAX_LISTING: u16 = 256;
 
 /// Which way [`Read`] pages.
 ///
@@ -97,7 +102,7 @@ pub const MAX_RETENTION: u32 = 365 * 24 * 3600;
 pub const POST_HEADER: usize = 32 + 32 + 8 + 32 + 8 + 4 + 1 + 32 + 4;
 
 /// Bytes of a [`Headed`] before its seams.
-const HEADED_FIXED: usize = 1 + 8 + 8 + 32 + 4 + 8 + 4 + 4 + 8 + 1;
+const HEADED_FIXED: usize = 1 + 8 + 8 + 32 + 4 + 8 + 4 + 4 + 8 + 1 + 1;
 
 /// A post in a feed, as it is signed and as it is stored.
 ///
@@ -531,27 +536,136 @@ impl Head {
 pub struct Set {
     pub retention_secs: u32,
     pub max_posts: u32,
+    /// SIP-90: this account asks to be findable in this exchange's feed
+    /// directory. 0 is the default and means absent from it.
+    ///
+    /// **Here rather than on the SIP-21 profile**, which refuses unknown
+    /// flag bits by design — so a bit there would break every reader of
+    /// every profile for a feature only feed-aware clients want. It is also
+    /// the right shape for this record: SIP-88 calls `Set` unsigned because
+    /// "pruning is the exchange's act, nothing a reader repeats depends on
+    /// the policy", and being listed in one exchange's directory is exactly
+    /// that.
+    pub listed: bool,
 }
 
 impl Set {
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(9);
+        let mut out = Vec::with_capacity(10);
         out.push(TYPE_SET);
         out.extend_from_slice(&self.retention_secs.to_be_bytes());
         out.extend_from_slice(&self.max_posts.to_be_bytes());
+        out.push(u8::from(self.listed));
         out
     }
 
     pub fn decode(b: &[u8]) -> Result<Set> {
-        if b.len() != 9 || b[0] != TYPE_SET {
+        if b.len() != 10 || b[0] != TYPE_SET {
             return Err(Error::Malformed(format!(
-                "feed set is {} bytes, want 9",
+                "feed set is {} bytes, want 10",
                 b.len()
             )));
         }
         Ok(Set {
             retention_secs: u32::from_be_bytes(b[1..5].try_into().unwrap()),
             max_posts: u32::from_be_bytes(b[5..9].try_into().unwrap()),
+            listed: b[9] != 0,
+        })
+    }
+}
+
+/// SIP-90: ask for a page of this exchange's feed directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Listed {
+    /// Only accounts listed after this moment, so a caller pages forward.
+    pub since: u64,
+    pub limit: u16,
+}
+
+impl Listed {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(11);
+        out.push(TYPE_LISTED);
+        out.extend_from_slice(&self.since.to_be_bytes());
+        out.extend_from_slice(&self.limit.to_be_bytes());
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Listed> {
+        if b.len() != 11 || b[0] != TYPE_LISTED {
+            return Err(Error::Malformed(format!(
+                "feed listed is {} bytes, want 11",
+                b.len()
+            )));
+        }
+        Ok(Listed {
+            since: u64::from_be_bytes(b[1..9].try_into().unwrap()),
+            limit: u16::from_be_bytes(b[9..11].try_into().unwrap()),
+        })
+    }
+}
+
+/// SIP-90: who asked to be findable here, and when they asked.
+///
+/// **A key and a moment, and nothing else.** No last-activity time, no post
+/// count, no topic — SIP-88 refused a directory because one "listed with a
+/// last-activity time and mirrored to every peer every sixty seconds, is a
+/// timestamped census of every active account", and three of those four
+/// clauses are removed by what this does not carry and does not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListedFeed {
+    pub account: PubKey,
+    /// When this account asked to be listed. **Not when it last posted**,
+    /// which is the field SIP-88's census objection is actually about.
+    pub listed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub now: u64,
+    pub rows: Vec<ListedFeed>,
+}
+
+impl Listing {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10 + self.rows.len() * 40);
+        out.extend_from_slice(&self.now.to_be_bytes());
+        out.extend_from_slice(&(self.rows.len() as u16).to_be_bytes());
+        for r in &self.rows {
+            out.extend_from_slice(r.account.as_bytes());
+            out.extend_from_slice(&r.listed_at.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Listing> {
+        if b.len() < 10 {
+            return Err(Error::Malformed("feed listing is truncated".into()));
+        }
+        let count = u16::from_be_bytes(b[8..10].try_into().unwrap());
+        if count > MAX_LISTING {
+            return Err(Error::Malformed(format!(
+                "feed listing carries {count} rows, limit is {MAX_LISTING}"
+            )));
+        }
+        let want = 10 + count as usize * 40;
+        if b.len() != want {
+            return Err(Error::Malformed(format!(
+                "feed listing is {} bytes, want {want}",
+                b.len()
+            )));
+        }
+        let mut rows = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let at = 10 + i * 40;
+            rows.push(ListedFeed {
+                account: PubKey::new(b[at..at + 32].try_into().unwrap()),
+                listed_at: u64::from_be_bytes(b[at + 32..at + 40].try_into().unwrap()),
+            });
+        }
+        Ok(Listing {
+            now: u64::from_be_bytes(b[0..8].try_into().unwrap()),
+            rows,
         })
     }
 }
@@ -718,6 +832,9 @@ pub struct Headed {
     pub retention_secs: u32,
     pub max_posts: u32,
     pub now: u64,
+    /// SIP-90: this account asks to be findable in this exchange's
+    /// directory. Read back so an author can see what they set.
+    pub listed: bool,
     /// SIP-88 §Succession, newest last. Always empty until succession is
     /// built; the field is here so that building it is not a wire change.
     pub seams: Vec<Seam>,
@@ -735,6 +852,7 @@ impl Headed {
             retention_secs: 0,
             max_posts: 0,
             now,
+            listed: false,
             seams: Vec::new(),
         }
     }
@@ -750,6 +868,7 @@ impl Headed {
         out.extend_from_slice(&self.retention_secs.to_be_bytes());
         out.extend_from_slice(&self.max_posts.to_be_bytes());
         out.extend_from_slice(&self.now.to_be_bytes());
+        out.push(u8::from(self.listed));
         out.push(self.seams.len() as u8);
         for s in &self.seams {
             out.extend_from_slice(&s.at.to_be_bytes());
@@ -793,6 +912,7 @@ impl Headed {
             retention_secs: u32::from_be_bytes(b[61..65].try_into().unwrap()),
             max_posts: u32::from_be_bytes(b[65..69].try_into().unwrap()),
             now: u64::from_be_bytes(b[69..77].try_into().unwrap()),
+            listed: b[77] != 0,
             seams: out,
         })
     }
@@ -1014,6 +1134,7 @@ mod tests {
         let h = Head { account: key(9) };
         assert_eq!(Head::decode(&h.encode()).unwrap(), h);
         let st = Set {
+            listed: true,
             retention_secs: 86400,
             max_posts: 100,
         };
@@ -1049,6 +1170,7 @@ mod tests {
         assert_eq!(Page::decode(&page.encode()).unwrap(), page);
 
         let headed = Headed {
+            listed: false,
             found: true,
             oldest: 1,
             newest: 9,

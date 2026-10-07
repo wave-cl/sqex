@@ -16,9 +16,9 @@
 
 use sqex_proto::entry_sig::GENESIS;
 use sqex_proto::feed::{
-    Append, Appended, DIR_BACKWARD, DIR_FORWARD, Head, Headed, MAX_BODY, MAX_PAGE, MAX_SINCE,
-    Moved, Page, Post, Read, STATE_GONE, STATE_MOVED, STATE_RESET, STATE_TRUNCATED, Set, Since,
-    Stored, Withdraw,
+    Append, Appended, DIR_BACKWARD, DIR_FORWARD, Head, Headed, Listed, Listing, MAX_BODY, MAX_PAGE,
+    MAX_SINCE, Moved, Page, Post, Read, STATE_GONE, STATE_MOVED, STATE_RESET, STATE_TRUNCATED, Set,
+    Since, Stored, Withdraw,
 };
 use sqex_proto::message::Body;
 use sqnr_core::PubKey;
@@ -205,20 +205,45 @@ impl Chat {
         Ok(())
     }
 
-    /// Set this account's own feed's retention and size, whole.
-    pub async fn set_feed(&mut self, retention_secs: u32, max_posts: u32) -> Result<()> {
+    /// Set this account's own feed's retention, size and listing, whole.
+    ///
+    /// **Whole**, which is SIP-21's rule and SIP-88 repeats: "there is no
+    /// partial update". A caller changing one of the three reads the head
+    /// first and passes the other two back.
+    pub async fn set_feed(
+        &mut self,
+        retention_secs: u32,
+        max_posts: u32,
+        listed: bool,
+    ) -> Result<()> {
         let body = self
             .post(
                 "/feed/set",
                 Set {
                     retention_secs,
                     max_posts,
+                    listed,
                 }
                 .encode(),
             )
             .await?;
         sqex_proto::channel::Ack::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
         Ok(())
+    }
+
+    /// SIP-90: the accounts this exchange holds feeds for that asked to be
+    /// findable.
+    ///
+    /// **Nobody is here without asking.** SIP-88 refused a directory because
+    /// one of every account, carrying a last-activity time and mirrored
+    /// between peers, is "a timestamped census of every active account";
+    /// this carries a key and the moment its owner asked, is not mirrored,
+    /// and holds only those who opted in.
+    pub async fn listed_feeds(&mut self, since: u64, limit: u16) -> Result<Listing> {
+        let body = self
+            .post("/feed/listed", Listed { since, limit }.encode())
+            .await?;
+        Listing::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))
     }
 
     // ---- reading ---------------------------------------------------------

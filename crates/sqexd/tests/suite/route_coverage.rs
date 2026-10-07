@@ -176,6 +176,16 @@ const ROUTES: &[(&str, &str, By, Who)] = &[
     ("POST", "/feed/withdraw", Chat("/feed/withdraw"), SelfOnly),
     ("POST", "/feed/set", Chat("/feed/set"), SelfOnly),
     ("POST", "/feed/since", Chat("/feed/since"), Identity),
+    // SIP-90. `Identity` for the reason every other feed read is: the
+    // exchange needs an account to apply SIP-56 and blocking against, which
+    // bounds cost and not access — and nobody is in the listing who did not
+    // ask to be.
+    (
+        "POST",
+        "/feed/listed",
+        Chat("Chat::listed_feeds"),
+        Identity,
+    ),
     (
         "POST",
         "/device/register",
