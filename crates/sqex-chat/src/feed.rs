@@ -239,11 +239,16 @@ impl Chat {
             )
             .await?;
         let page = Page::decode(&body).map_err(|e| ChatError::Protocol(e.to_string()))?;
-        // **Step two of SIP-31's two.** A signature proves a key signed; it
-        // says nothing about whose key it is. What is dropped here is a post
-        // whose signature does not hold at all, which is the cheap half; the
-        // credential binding device to account is the caller's to check, and
-        // `verified_author` is where this client does it.
+        // **Step one of SIP-31's two, and only step one.** A signature proves
+        // a key signed; it says nothing about whose key it is. What is dropped
+        // here is a post whose signature does not hold at all, which is the
+        // cheap half.
+        //
+        // The SIP-20 credential binding `device` to `account` is **not checked
+        // anywhere**. An earlier version of this comment sent the reader to a
+        // `verified_author` that was never written, which is worse than
+        // silence: it reads as a reassurance. SIP-89 §Reference implementation
+        // records the gap, and closing it belongs here.
         Ok(Page {
             posts: page.posts.into_iter().filter(|s| s.post.verify()).collect(),
             ..page
