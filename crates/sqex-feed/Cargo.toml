@@ -1,0 +1,33 @@
+[package]
+name = "sqex-feed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SIP-88 feeds: publish to your own, follow others, and read a timeline. One-shot commands, no interactive client."
+
+[[bin]]
+name = "sqex-feed"
+path = "src/main.rs"
+
+[dependencies]
+sqnr = { workspace = true }
+sqnr-core = { workspace = true }
+sqex-proto = { workspace = true }
+# The implementation lives in the chat library, because SIP-89 means an
+# interactive client has to resolve feed posts anyway. This binary is a mouth
+# for it, not a second copy.
+sqex-chat = { path = "../sqex-chat" }
+sqex-discovery = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+rpassword = "7"
+
+[dev-dependencies]
+# The tests run a whole exchange in-process and drive the binary's own paths.
+sqexd = { path = "../sqexd" }
+squic = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
+bs58 = { workspace = true }

@@ -6,6 +6,7 @@ members = [
     "crates/sqex-cli",
     "crates/sqex-voice",
     "crates/sqex-chat",
+    "crates/sqex-feed",
     "crates/sqex-discovery",
 ]
 

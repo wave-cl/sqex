@@ -12,7 +12,7 @@ whitelist with **Ed25519-signed commands**, ready for a YubiKey.
 
 ## Install
 
-Clients (`sqex`, `sqex-chat`) and the server (`sqexd`):
+Clients (`sqex`, `sqex-chat`, `sqex-feed`) and the server (`sqexd`):
 
 ```
 curl -fsSL https://raw.githubusercontent.com/wave-cl/sqex/main/install.sh | sh
@@ -50,6 +50,7 @@ SQEX_SERVER=host:443 SQEX_SERVER_KEY=<b58> sqex status   # environment
 | Relayed session | [12](https://github.com/wave-cl/sips/blob/main/sip-0012.md) | `sqex session talk` |
 | Rooms and voice | [13](https://github.com/wave-cl/sips/blob/main/sip-0013.md), [15](https://github.com/wave-cl/sips/blob/main/sip-0015.md) | `sqex-voice call`, `sqex-voice room` |
 | Chat: messages, groups, public channels, files | [16–24](https://github.com/wave-cl/sips/blob/main/sip-0016.md) | `sqex-chat` |
+| Feeds: posts, quoting, a timeline | [88](https://github.com/wave-cl/sips/blob/main/sip-0088.md), [89](https://github.com/wave-cl/sips/blob/main/sip-0089.md) | `sqex-feed` |
 
 ## Chat
 
@@ -185,6 +186,45 @@ the other party comes from the member list the exchange enforces — and is then
 checked by re-deriving the identifier from it. A channel that does not hash
 back is not a direct message with that person, whatever the exchange said.
 
+## Feeds
+
+A feed is not a conversation, and SIP-88 does not build it out of one. Your
+account *is* your feed: there is nothing to create, nobody to admit, no epoch
+and no key — anybody holding your account key can read it, and the exchange
+serves it to them. Every post is signed by one of your devices and carries the
+previous post's hash, so the log is yours and not the exchange's: it cannot
+insert, reorder or fork what you published.
+
+The serial belongs to the author too, and the space is dense. A tombstone marks
+a post withdrawn mid-log, and eviction only ever happens from the oldest end —
+so a **hole** in the middle is not retention, it is the exchange having dropped
+something, and a reader can tell.
+
+SIP-89 adds quoting, as a pointer and never a copy: a quote names an account and
+a serial, which is why withdrawing a post reaches every quote of it. A citation
+is resolved and verified before it is shown, and where it will not resolve the
+client says so rather than rendering what the quoter claimed about it.
+
+```
+sqex-feed publish "something to say"
+sqex-feed publish "worth reading" --quoting <who> 42
+sqex-feed follow <key|name@domain>   # your own list; no exchange is told
+sqex-feed timeline --mark            # one request for every feed you follow
+sqex-feed read [who]                 # newest first; yours by default
+sqex-feed withdraw 42                # a tombstone, not a recall
+sqex-feed head                       # where your feed is, and its retention
+```
+
+`sqex-feed` is one-shot and does not take the chat store's exclusive lock: that
+lock guards the SIP-17 message counter, and **a feed never seals**. So it runs
+beside a live `sqex-chat` on the same identity and the same store, which is the
+point — publishing should not mean closing the client you are talking to people
+in.
+
+Not built yet, and said here rather than discovered: a feed does not follow an
+account changing home or key, there is no push (polling works without one), and
+the terminal chat client does not show feeds.
+
 ## How admin commands work
 
 Admins sign **transactions** — an ordered batch of operations — with
@@ -302,6 +342,9 @@ the tests use.
 - `sqex-voice` — calls and rooms: capture, Opus, relay, mix, play.
 - `sqex-chat` — the terminal chat client, and the client-side key store the
   chat stack needs and the exchange cannot provide.
+- `sqex-feed` — the `sqex-feed` command: SIP-88 feeds, one shot at a time. The
+  implementation is in `sqex-chat`'s library, because a chat client has to
+  resolve a SIP-89 citation anyway.
 
 ## Running
 

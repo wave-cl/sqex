@@ -2983,6 +2983,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqex-feed"
+version = "0.123.0"
+dependencies = [
+ "bs58",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "rpassword",
+ "sqex-chat",
+ "sqex-discovery",
+ "sqex-proto",
+ "sqexd",
+ "sqnr",
+ "sqnr-core",
+ "squic",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "sqex-proto"
 version = "0.123.0"
 dependencies = [
